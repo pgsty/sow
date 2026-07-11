@@ -1,0 +1,63 @@
+schema: sow/v1
+
+state:
+  snapshot_materialization_months: 6
+
+gpg:
+  public_key: keys/pigsty.asc
+  private_key: env://SOW_GPG_PRIVATE_KEY
+  passphrase: env://SOW_GPG_PASSPHRASE
+
+pools:
+  public: {}
+  gated: {}
+
+repos:
+  - id: assets-bin
+    type: asset
+    path: bin
+    default_pool: public
+    include: ["**"]
+    asset:
+      kind: bin
+
+  - id: pgsql-el9-x86-64
+    type: yum
+    path: yum/pgsql/el9.x86_64
+    default_pool: public
+    arches: [x86_64]
+    os: {family: el, major: 9, lifecycle: active}
+    yum: {compression: zstd}
+
+  - id: pgsql-trixie-amd64
+    type: apt
+    path: apt/pgsql/trixie
+    default_pool: public
+    arches: [amd64]
+    os: {family: debian, major: 13, suite: trixie, lifecycle: active}
+    apt:
+      suites: [trixie]
+      components: [main]
+
+upstreams: []
+
+views:
+  beta:
+    access: public
+    allowed_pools: [public]
+    append_only: false
+  latest:
+    access: public
+    allowed_pools: [public]
+    append_only: false
+  stable:
+    access: pro
+    allowed_pools: [public, gated]
+    append_only: true
+
+# Local init/fsck do not require cloud targets. Production declares both closed unions.
+targets: {}
+
+edge:
+  pro_prefix: /pro/v1/{token}/
+  token_verifier: provider://pigsty-entitlements

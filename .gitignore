@@ -1,0 +1,15 @@
+.bmad-loop/runs/
+.bmad-loop/cache/
+.bmad-loop/policy.toml
+.agents/
+.claude/
+.codex/
+.bmad-loop/
+.idea/
+*.iml
+.DS_Store
+sow
+*.test
+coverage.out
+.sow/
+.pool/
