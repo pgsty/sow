@@ -374,12 +374,10 @@ func validateNginxRoutePath(value string) error {
 	if value == "" || strings.HasPrefix(value, "/") || path.Clean(value) != value || strings.Contains(value, "//") {
 		return fmt.Errorf("unsafe Nginx route %q", value)
 	}
-	for _, character := range value {
-		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
-			character >= '0' && character <= '9' || strings.ContainsRune("._-/", character) {
-			continue
+	for _, segment := range strings.Split(value, "/") {
+		if err := config.ValidateRouteSegment(segment); err != nil {
+			return fmt.Errorf("unsafe Nginx route segment %q: %w", segment, err)
 		}
-		return fmt.Errorf("unsafe character %q in Nginx route %q", character, value)
 	}
 	return nil
 }

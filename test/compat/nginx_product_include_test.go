@@ -54,13 +54,13 @@ func TestProductGeneratedNginxIncludeLoopbackContract(t *testing.T) {
 			body string
 		}{
 			{path: "/apt/pgsql/trixie/probe", want: http.StatusOK, body: "apt public\n"},
-			{path: "/yum/pgsql/el9.x86_64/raw", want: http.StatusOK, body: "yum raw bridge\n"},
+			{path: "/yum/pgsql%5Enext/el9.x86_64/raw", want: http.StatusOK, body: "yum raw bridge\n"},
 			{path: "/yum/infra/x86_64/legacy", want: http.StatusOK, body: "compat raw bridge\n"},
 			{path: "/_sow/v1/mirrorlist/latest/yum-el9/el9/x86_64.txt", want: http.StatusOK, body: "ordinary mirrorlist\n"},
 			{path: "/_sow/v1/mirrorlist/latest/infra-legacy-x86-64/cross-el/x86_64.txt", want: http.StatusNotFound},
-			{path: "/_sow/v1/g/00000000000000000001/yum/pgsql/el9.x86_64/repodata/probe", want: http.StatusOK, body: "ordinary generation\n"},
-			{path: "/_sow/v1/g/00000000000000000001/yum/pgsql/el9.x86_64/flat.rpm", want: http.StatusNotFound},
-			{path: "/_sow/v1/g/00000000000000000001/yum/pgsql/el9.x86_64/Packages/p/pkg.rpm", want: http.StatusOK, body: "ordinary package\n"},
+			{path: "/_sow/v1/g/00000000000000000001/yum/pgsql%5Enext/el9.x86_64/repodata/probe", want: http.StatusOK, body: "ordinary generation\n"},
+			{path: "/_sow/v1/g/00000000000000000001/yum/pgsql%5Enext/el9.x86_64/flat.rpm", want: http.StatusNotFound},
+			{path: "/_sow/v1/g/00000000000000000001/yum/pgsql%5Enext/el9.x86_64/Packages/p/pkg.rpm", want: http.StatusOK, body: "ordinary package\n"},
 			{path: "/_sow/v1/g/00000000000000000001/yum/infra/x86_64/repodata/probe", want: http.StatusNotFound},
 			{path: "/keys/repository.asc", want: http.StatusOK, body: "public repository trust\n"},
 			{path: "/keys/rpm-signers.asc", want: http.StatusOK, body: "public rpm signer bundle\n"},
@@ -73,7 +73,7 @@ func TestProductGeneratedNginxIncludeLoopbackContract(t *testing.T) {
 			{path: "/_sow/unowned-secret", want: http.StatusNotFound},
 			{path: "/sow.yaml", want: http.StatusNotFound},
 			{path: "/operator-secret", want: http.StatusNotFound},
-			{path: "/_sow/v1/g/00000000000000000001/yum/pgsql/el9Xx86_64/operator-secret", want: http.StatusNotFound},
+			{path: "/_sow/v1/g/00000000000000000001/yum/pgsql%5Enext/el9Xx86_64/operator-secret", want: http.StatusNotFound},
 		}
 		for _, check := range checks {
 			response := requestNginx(t, client, port, check.path, "", "")
@@ -99,7 +99,7 @@ func TestProductGeneratedNginxIncludeLoopbackContract(t *testing.T) {
 		port, stop := startProductNginxInclude(t, body)
 		defer stop()
 		client := &http.Client{Timeout: 5 * time.Second}
-		owned := "/pro/v1/basic/_sow/v1/g/00000000000000000001/yum/pgsql/el9.x86_64/repodata/probe"
+		owned := "/pro/v1/basic/_sow/v1/g/00000000000000000001/yum/pgsql%5Enext/el9.x86_64/repodata/probe"
 		anonymous := requestNginx(t, client, port, owned, "", "")
 		if anonymous.status != http.StatusUnauthorized || !strings.HasPrefix(anonymous.wwwAuthenticate, "Basic ") || anonymous.cacheControl != "private, no-store" {
 			t.Fatalf("anonymous owned route status=%d auth=%q cache=%q", anonymous.status, anonymous.wwwAuthenticate, anonymous.cacheControl)
@@ -140,21 +140,21 @@ func TestProductGeneratedNginxIncludeLoopbackContract(t *testing.T) {
 func writeProductNginxTree(t *testing.T, root, view string, compatibility bool) {
 	t.Helper()
 	files := map[string]string{
-		"apt/pgsql/trixie/probe":                                                 "apt public\n",
-		"yum/pgsql/el9.x86_64/raw":                                               "yum raw bridge\n",
-		"_sow/v1/mirrorlist/" + view + "/yum-el9/el9/x86_64.txt":                 "ordinary mirrorlist\n",
-		"_sow/v1/g/00000000000000000001/yum/pgsql/el9.x86_64/repodata/probe":     "ordinary generation\n",
-		"_sow/v1/g/00000000000000000001/yum/pgsql/el9.x86_64/flat.rpm":           "flat generation canary\n",
-		"_sow/v1/g/00000000000000000001/yum/pgsql/el9.x86_64/Packages/p/pkg.rpm": "ordinary package\n",
-		"_sow/v1/g/00000000000000000001/yum/pgsql/el9Xx86_64/operator-secret":    "dotted regex widening canary\n",
-		"asset/bootstrap/pkg":                                                    "root exact asset\n",
-		"asset/pig/latest":                                                       "nested asset\n",
-		"pkg/child/secret":                                                       "unowned pkg child canary\n",
-		"apt/unowned-secret":                                                     "unowned apt canary\n",
-		"yum/unowned-secret":                                                     "unowned yum canary\n",
-		"_sow/unowned-secret":                                                    "unowned serving canary\n",
-		"sow.yaml":                                                               "operator config canary\n",
-		"operator-secret":                                                        "operator secret canary\n",
+		"apt/pgsql/trixie/probe":                                                      "apt public\n",
+		"yum/pgsql^next/el9.x86_64/raw":                                               "yum raw bridge\n",
+		"_sow/v1/mirrorlist/" + view + "/yum-el9/el9/x86_64.txt":                      "ordinary mirrorlist\n",
+		"_sow/v1/g/00000000000000000001/yum/pgsql^next/el9.x86_64/repodata/probe":     "ordinary generation\n",
+		"_sow/v1/g/00000000000000000001/yum/pgsql^next/el9.x86_64/flat.rpm":           "flat generation canary\n",
+		"_sow/v1/g/00000000000000000001/yum/pgsql^next/el9.x86_64/Packages/p/pkg.rpm": "ordinary package\n",
+		"_sow/v1/g/00000000000000000001/yum/pgsql^next/el9Xx86_64/operator-secret":    "dotted regex widening canary\n",
+		"asset/bootstrap/pkg": "root exact asset\n",
+		"asset/pig/latest":    "nested asset\n",
+		"pkg/child/secret":    "unowned pkg child canary\n",
+		"apt/unowned-secret":  "unowned apt canary\n",
+		"yum/unowned-secret":  "unowned yum canary\n",
+		"_sow/unowned-secret": "unowned serving canary\n",
+		"sow.yaml":            "operator config canary\n",
+		"operator-secret":     "operator secret canary\n",
 	}
 	if compatibility {
 		files["yum/infra/x86_64/legacy"] = "compat raw bridge\n"
@@ -171,8 +171,8 @@ func writeProductNginxTree(t *testing.T, root, view string, compatibility bool) 
 	outside := filepath.Join(t.TempDir(), "outside-secret")
 	writeFile(t, outside, []byte("must never escape\n"), 0o444)
 	for _, link := range []string{
-		"yum/pgsql/el9.x86_64/symlink-escape",
-		"_sow/v1/g/00000000000000000001/yum/pgsql/el9.x86_64/repodata/symlink-escape",
+		"yum/pgsql^next/el9.x86_64/symlink-escape",
+		"_sow/v1/g/00000000000000000001/yum/pgsql^next/el9.x86_64/repodata/symlink-escape",
 	} {
 		filename := filepath.Join(root, filepath.FromSlash(link))
 		if err := os.MkdirAll(filepath.Dir(filename), 0o755); err != nil {
@@ -185,8 +185,8 @@ func writeProductNginxTree(t *testing.T, root, view string, compatibility bool) 
 	outsideDirectory := t.TempDir()
 	writeFile(t, filepath.Join(outsideDirectory, "secret"), []byte("must never escape directory\n"), 0o444)
 	for _, link := range []string{
-		"yum/pgsql/el9.x86_64/symlink-dir",
-		"_sow/v1/g/00000000000000000001/yum/pgsql/el9.x86_64/repodata/symlink-dir",
+		"yum/pgsql^next/el9.x86_64/symlink-dir",
+		"_sow/v1/g/00000000000000000001/yum/pgsql^next/el9.x86_64/repodata/symlink-dir",
 	} {
 		filename := filepath.Join(root, filepath.FromSlash(link))
 		if err := os.Symlink(outsideDirectory, filename); err != nil {
@@ -197,7 +197,7 @@ func writeProductNginxTree(t *testing.T, root, view string, compatibility bool) 
 
 func assertProductNginxTraversalAndSymlinkDenied(t *testing.T, port int, prefix string) {
 	t.Helper()
-	base := prefix + "/_sow/v1/g/00000000000000000001/yum/pgsql/el9.x86_64/repodata/"
+	base := prefix + "/_sow/v1/g/00000000000000000001/yum/pgsql%5Enext/el9.x86_64/repodata/"
 	for _, target := range []string{
 		base + "symlink-escape",
 		base + "symlink-dir/secret",
@@ -211,8 +211,8 @@ func assertProductNginxTraversalAndSymlinkDenied(t *testing.T, port int, prefix 
 		}
 	}
 	for _, rawPrefix := range []string{
-		prefix + "/yum/pgsql/el9.x86_64/symlink-escape",
-		prefix + "/yum/pgsql/el9.x86_64/symlink-dir/secret",
+		prefix + "/yum/pgsql%5Enext/el9.x86_64/symlink-escape",
+		prefix + "/yum/pgsql%5Enext/el9.x86_64/symlink-dir/secret",
 	} {
 		status, body := rawProductNginxRequest(t, port, rawPrefix, prefix != "")
 		if status == http.StatusOK || strings.Contains(body, "must never escape") {
@@ -387,7 +387,7 @@ repos:
     asset: {kind: release, public_path: pkg/pig}
   - id: yum-el9
     type: yum
-    path: yum/pgsql/el9.x86_64
+    path: yum/pgsql^next/el9.x86_64
     default_pool: public
     arches: [x86_64]
     os: {family: el, major: 9, lifecycle: active}

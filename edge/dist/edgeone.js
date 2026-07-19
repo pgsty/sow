@@ -281,14 +281,52 @@ function parseStrictRequestURL(rawURL) {
     return null;
   }
   const rawPath = match[1] || "/";
-  if (!rawPath.startsWith("/") || rawPath.includes("//") || rawPath.includes("\\") || rawPath.includes("%") || rawPath.includes("\0")) {
+  if (!rawPath.startsWith("/") || rawPath.includes("//") ||
+      (rawPath.length > 1 && rawPath.endsWith("/")) ||
+      rawPath.includes("\\") || rawPath.includes("\0")) {
     return null;
   }
-  const segments = rawPath.split("/").slice(1).filter((segment) => segment !== "");
-  if (segments.some((segment) => segment === "." || segment === ".." || !SAFE_SEGMENT.test(segment))) {
-    return null;
+  const segments = [];
+  const rawSegments = rawPath === "/" ? [] : rawPath.slice(1).split("/");
+  for (const rawSegment of rawSegments) {
+    const segment = decodeCanonicalPathSegment(rawSegment);
+    if (segment === null) {
+      return null;
+    }
+    segments.push(segment);
   }
   return { segments };
+}
+
+// WHATWG URL serializers and RFC 3986 normalizers must encode caret in a path
+// as %5E, while RPM versions may legitimately contain caret. Accept exactly
+// that one canonical wire representation and immediately recover the object-key
+// byte. Re-encoding the decoded segment proves there is only one spelling:
+// lowercase hex, encoded unreserved bytes, encoded separators, double encoding,
+// a trailing empty segment, and a raw caret are all rejected rather than
+// becoming cache-key aliases.
+function decodeCanonicalPathSegment(rawSegment) {
+  const decoded = rawSegment.replace(/%5E/g, "^");
+  if (decoded.includes("%") || decoded.replace(/\^/g, "%5E") !== rawSegment ||
+      decoded === "." || decoded === ".." || !SAFE_SEGMENT.test(decoded)) {
+    return null;
+  }
+  return decoded;
+}
+
+// Serialize a clean object-key path for a client-facing URL without widening
+// the accepted alphabet. Caret is the only literal key byte in SAFE_SEGMENT
+// that the WHATWG path serializer must percent-encode; every other byte stays
+// byte-identical. Returning null keeps derived URLs fail-closed if an internal
+// caller ever supplies a non-canonical segment.
+function encodeCanonicalClientPath(segments, trailingSlash = false) {
+  if (!Array.isArray(segments) || segments.length === 0 ||
+      segments.some((segment) => typeof segment !== "string" || segment === "." ||
+        segment === ".." || !SAFE_SEGMENT.test(segment))) {
+    return null;
+  }
+  const path = `/${segments.map((segment) => segment.replace(/\^/g, "%5E")).join("/")}`;
+  return trailingSlash ? `${path}/` : path;
 }
 
 function isMirrorlist(segments) {
@@ -334,11 +372,20 @@ async function renderMirrorlist(request, segments, access, credentialSegment, pu
 	const baseOrigin = access === "public" && publicView === "beta"
 		? new URL(dependencies.betaBaseURL).origin
 		: (dependencies.publicBaseURL || requestOrigin);
-  let prefix = "";
+  const routeSegments = [];
   if (access === "pro") {
-    prefix = `/pro/v1/${credentialSegment}`;
+    routeSegments.push("pro", "v1", credentialSegment);
   }
-  const body = `${baseOrigin}${prefix}/_sow/v1/g/${generation}/${legacyRoot}/\n`;
+  routeSegments.push("_sow", "v1", "g", generation, ...legacyRoot.split("/"));
+  const clientPath = encodeCanonicalClientPath(routeSegments, true);
+  if (clientPath === null) {
+    return privateError(503, "temporarily_unavailable");
+  }
+  const clientURL = new URL(clientPath, baseOrigin);
+  if (clientURL.origin !== baseOrigin || clientURL.pathname !== clientPath || clientURL.search || clientURL.hash) {
+    return privateError(503, "temporarily_unavailable");
+  }
+  const body = `${clientURL.href}\n`;
   const headers = new Headers({
     "Content-Type": "text/plain; charset=utf-8",
     "X-Content-Type-Options": "nosniff",

@@ -89,6 +89,54 @@ func TestRenderNginxIncludeIsDeterministicAndExact(t *testing.T) {
 	}
 }
 
+func TestRenderNginxIncludePreservesCaretLiteralRoutes(t *testing.T) {
+	cfg := nginxFixtureConfig(t)
+	repos := append([]config.Repo(nil), cfg.Repos...)
+	for index := range repos {
+		if repos[index].ID == "yum-el9" {
+			repos[index].Path = "yum/pgsql^next/el9.x86_64"
+		}
+	}
+	root := t.TempDir()
+	body, err := RenderNginxInclude(cfg, repos, NginxIncludeOptions{View: "latest", Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := string(body)
+	for _, wanted := range []string{
+		"location ^~ /yum/pgsql^next/el9.x86_64/ {",
+		`location ~ "^/_sow/v1/g/([0-9]{20})/yum/pgsql\^next/el9\.x86_64/`,
+		"/$1/yum/pgsql^next/el9.x86_64/$2\";",
+	} {
+		if !strings.Contains(document, wanted) {
+			t.Fatalf("caret route is missing %q:\n%s", wanted, document)
+		}
+	}
+	if strings.Contains(document, "%5E") {
+		t.Fatalf("origin-facing Nginx include persisted a wire escape:\n%s", document)
+	}
+}
+
+func TestValidateNginxRoutePathUsesFrozenLiteralAlphabet(t *testing.T) {
+	for _, route := range []string{
+		"yum/tool+debug_1.0~rc^2:amd64/x86_64",
+		"_sow/v1/g/00000000000000000001",
+	} {
+		if err := validateNginxRoutePath(route); err != nil {
+			t.Fatalf("frozen literal route %q rejected: %v", route, err)
+		}
+	}
+	for _, route := range []string{
+		"", "/yum/owned", "yum//owned", "yum/../owned", "yum/./owned",
+		"yum/bad;return/owned", "yum/bad space/owned", "yum/$variable/owned",
+		`yum/bad"quote/owned`, "yum/caret%5Ewire/owned",
+	} {
+		if err := validateNginxRoutePath(route); err == nil {
+			t.Fatalf("unsafe Nginx route %q accepted", route)
+		}
+	}
+}
+
 func TestRenderNginxStableIncludeAuthenticatesEveryOwnedRoute(t *testing.T) {
 	cfg := nginxFixtureConfig(t)
 	root := filepath.Join(t.TempDir(), "stable")

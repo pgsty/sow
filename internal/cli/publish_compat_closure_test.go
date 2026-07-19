@@ -285,7 +285,7 @@ func TestRolledBackCompatibilityPlanRequiresExactPositiveAndNegativeClosure(t *t
 
 func TestCompatibilityPlanRouteRequiresExactObjectsVerifyAndPurge(t *testing.T) {
 	canonical := state.New(filepath.Join(t.TempDir(), ".sow"))
-	identity := pub.CompatibilityState{ID: "infra-legacy", RouteRoot: "yum/infra/x86_64", RepomdSHA256: strings.Repeat("d", 64)}
+	identity := pub.CompatibilityState{ID: "infra-legacy", RouteRoot: "yum/infra^next/x86_64", RepomdSHA256: strings.Repeat("d", 64)}
 	entries := []manifest.Entry{
 		compatibilityTestManifestEntry("Packages/p/pkg.rpm", "1"),
 		compatibilityTestManifestEntry("pkg.rpm", "2"),
@@ -369,6 +369,14 @@ func TestCompatibilityPlanRouteRequiresExactObjectsVerifyAndPurge(t *testing.T) 
 		{remotePath: config.YUMCompatibilityRepositoryTrustRoute(identity.ID), size: repositorySize, sha256: repositorySHA},
 	}
 	plan := compatibilityExactPlanFixture(t, entries, trust, identity, channel, generation.Generation)
+	clientURLs := append([]string(nil), plan.PurgeURLs...)
+	for _, verification := range plan.Verify {
+		clientURLs = append(clientURLs, verification.URL)
+	}
+	joinedClientURLs := strings.Join(clientURLs, "\n")
+	if strings.Contains(joinedClientURLs, "infra^next") || !strings.Contains(joinedClientURLs, "infra%5Enext") {
+		t.Fatalf("compatibility client URLs are not canonical: %s", joinedClientURLs)
+	}
 	if err := validateCompatibilityPlanRoute(canonical, commit, generation, plan, identity, channel, candidatePath); err != nil {
 		t.Fatalf("exact compatibility plan was rejected: %v", err)
 	}

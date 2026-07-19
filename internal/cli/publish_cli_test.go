@@ -373,8 +373,12 @@ func (transport *cloudProtocolTransport) cdnResponse(request *http.Request) (*ht
 		if err := json.Unmarshal(channel.body, &document); err != nil {
 			return nil, err
 		}
-		body := "https://" + request.URL.Host + proPrefix + "/_sow/v1/g/" + document.Generation + "/" + document.LegacyRoot + "/\n"
-		return protocolResponse(request, http.StatusOK, body, nil), nil
+		route := path.Join(strings.TrimPrefix(proPrefix, "/"), "_sow/v1/g", document.Generation, document.LegacyRoot)
+		clientURL, err := config.CanonicalRouteURL("https://"+request.URL.Host, route, true)
+		if err != nil {
+			return nil, err
+		}
+		return protocolResponse(request, http.StatusOK, clientURL+"\n", nil), nil
 	}
 	if strings.HasPrefix(key, "_sow/v1/snapshots/") {
 		parts := strings.SplitN(strings.TrimPrefix(key, "_sow/v1/snapshots/"), "/", 2)

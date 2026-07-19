@@ -1,5 +1,6 @@
 README.md
 _bmad-output/brainstorming/brainstorm-sow-repo-cli-2026-07-11/brainstorm-intent.md
+_bmad-output/implementation-artifacts/spec-route-wire-canonicalization.md
 _bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/addendum.md
 _bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/prd.md
 _bmad-output/planning-artifacts/research/technical-sow-repo-cli-tech-validation-research-2026-07-11.md
@@ -40,6 +41,7 @@ docs/adr/0035-cloudflare-provider-attestation-and-log-sink-lease.md
 docs/adr/0036-provider-delete-capability-and-checkpoint-fenced-fallback.md
 docs/adr/0037-pre-upload-confidential-edge-denial-attestation.md
 docs/adr/0038-yum-consumer-preflight-receipt.md
+docs/adr/0039-caret-url-wire-canonicalization.md
 docs/architecture.md
 docs/client-installation.md
 docs/evidence/2026-07-11-client-compat.md
@@ -115,6 +117,7 @@ docs/evidence/2026-07-19-pigsty-yum-consumer-preflight.md
 docs/evidence/2026-07-19-r2-bootstrap-two-phase-recovery.md
 docs/evidence/2026-07-19-r2-lease-cas-retirement.md
 docs/evidence/2026-07-19-r2-resource-stable-lease-rotation.md
+docs/evidence/2026-07-19-route-safe-caret-url-canonicalization.md
 docs/evidence/2026-07-19-state-lock-atomic-publication.md
 docs/evidence/README.md
 docs/examples/sow-pgdg.yaml

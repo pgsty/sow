@@ -97,6 +97,36 @@ func TestContentDerivedGenerationAndChannelAreCanonical(t *testing.T) {
 	}
 }
 
+func TestMirrorlistBodyCanonicalCaretWireForm(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		view, base, want string
+	}{
+		{"latest", "https://repo.example", "https://repo.example/_sow/v1/g/00000000000000000042/yum/infra%5Enext/x86_64/\n"},
+		{"stable", "https://repo.example/pro/v1/basic", "https://repo.example/pro/v1/basic/_sow/v1/g/00000000000000000042/yum/infra%5Enext/x86_64/\n"},
+	} {
+		channel := Channel{
+			View: tc.view, BaseURL: tc.base, Generation: "00000000000000000042",
+			LegacyRoot: "yum/infra^next/x86_64",
+		}
+		body, err := channel.MirrorlistBody()
+		if err != nil || string(body) != tc.want || bytes.Contains(body, []byte("^")) {
+			t.Fatalf("view=%s body=%q want=%q err=%v", tc.view, body, tc.want, err)
+		}
+		if got := GenerationPath(channel.Generation, channel.LegacyRoot); got != "_sow/v1/g/00000000000000000042/yum/infra^next/x86_64/" {
+			t.Fatalf("literal filesystem generation path changed: %q", got)
+		}
+	}
+	for _, channel := range []Channel{
+		{View: "latest", BaseURL: "https://repo.example", Generation: "42", LegacyRoot: "yum/infra^next/x86_64"},
+		{View: "latest", BaseURL: "https://repo.example", Generation: "00000000000000000042", LegacyRoot: "yum/../private"},
+	} {
+		if body, err := channel.MirrorlistBody(); err == nil {
+			t.Fatalf("non-canonical channel rendered mirrorlist %q", body)
+		}
+	}
+}
+
 func TestInstallGenerationImportsCASHardlinksAndRejectsDrift(t *testing.T) {
 	root := t.TempDir()
 	manifestPath := writeServingFixture(t, root)

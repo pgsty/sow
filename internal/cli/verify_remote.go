@@ -786,9 +786,13 @@ func buildL4Checks(cfg *config.Config, canonical *state.Store, repos []config.Re
 					if leaf.repo.YUM.Compression == "gzip" {
 						compression = yumrepo.CompressionGzip
 					}
+					expectedGenerationURL, err := expectedYUMGenerationURL(baseURL, credentialPrefix, channel)
+					if err != nil {
+						return nil, fmt.Errorf("render expected YUM generation URL: %w", err)
+					}
 					probe := verify.YUMProtocolProbe{
 						Client: verificationHTTPClient, CDNBaseURL: baseURL, MirrorlistPath: mirrorlist,
-						ExpectedGenerationURL: expectedYUMGenerationURL(baseURL, credentialPrefix, channel), Headers: headers,
+						ExpectedGenerationURL: expectedGenerationURL, Headers: headers,
 						Architecture: leaf.arch, Compression: compression, Verifier: yumVerifier,
 						PackageKeyring: packageKeyring, VerifyAt: verificationTime, TempDir: tempDir, ChunkEntries: values.chunk,
 					}
@@ -812,7 +816,11 @@ func buildL4Checks(cfg *config.Config, canonical *state.Store, repos []config.Re
 					checks = append(checks, verificationStateCheck(id, verify.LayerL4, target, &verificationStateError{code: "YUM_COMPATIBILITY_PACKAGE_TRUST_DRIFT", category: verify.CategoryIntegrity, message: err.Error()}))
 					continue
 				}
-				checks = append(checks, buildCompatibilityL4Checks(cfg, target, id, projection, channel, headers, yumVerifier, packageKeyring, verificationTime, tempDir, values.chunk, networkFailure)...)
+				compatibilityChecks, buildErr := buildCompatibilityL4Checks(cfg, target, id, projection, channel, headers, yumVerifier, packageKeyring, verificationTime, tempDir, values.chunk, networkFailure)
+				if buildErr != nil {
+					return nil, buildErr
+				}
+				checks = append(checks, compatibilityChecks...)
 			}
 		}
 	}
@@ -826,8 +834,12 @@ func buildL4Checks(cfg *config.Config, canonical *state.Store, repos []config.Re
 // mirrorlist/generation check proves the atomic channel contract while the raw
 // check preserves the frozen legacy URL. Sharing the frozen metadata verifier
 // and S1 package keyring does not let either route substitute for the other.
-func buildCompatibilityL4Checks(cfg *config.Config, target, id string, projection config.YUMCompatibilityProjection, channel pub.ChannelState, headers http.Header, verifier yumrepo.DetachedVerifier, packageKeyring openpgp.KeyRing, verificationTime time.Time, tempDir string, chunkEntries int, networkFailure *atomic.Bool) []verify.Check {
+func buildCompatibilityL4Checks(cfg *config.Config, target, id string, projection config.YUMCompatibilityProjection, channel pub.ChannelState, headers http.Header, verifier yumrepo.DetachedVerifier, packageKeyring openpgp.KeyRing, verificationTime time.Time, tempDir string, chunkEntries int, networkFailure *atomic.Bool) ([]verify.Check, error) {
 	baseURL := verificationCDNBase(cfg, target, "latest")
+	expectedGenerationURL, err := expectedYUMGenerationURL(baseURL, "", channel)
+	if err != nil {
+		return nil, fmt.Errorf("render compatibility generation URL: %w", err)
+	}
 	markNetworkFailure := func() {
 		if networkFailure != nil {
 			networkFailure.Store(true)
@@ -836,7 +848,7 @@ func buildCompatibilityL4Checks(cfg *config.Config, target, id string, projectio
 	generationProbe := verify.YUMProtocolProbe{
 		Client: verificationHTTPClient, CDNBaseURL: baseURL,
 		MirrorlistPath:        path.Join("_sow/v1/mirrorlist", "latest", projection.ID, "cross-el", projection.Source.Arch+".txt"),
-		ExpectedGenerationURL: expectedYUMGenerationURL(baseURL, "", channel), Headers: headers,
+		ExpectedGenerationURL: expectedGenerationURL, Headers: headers,
 		Architecture: projection.Source.Arch, Compression: yumrepo.CompressionGzip, Verifier: verifier,
 		PackageKeyring: packageKeyring, VerifyAt: verificationTime, TempDir: tempDir, ChunkEntries: chunkEntries,
 	}
@@ -848,7 +860,7 @@ func buildCompatibilityL4Checks(cfg *config.Config, target, id string, projectio
 	return []verify.Check{
 		verify.ClientCheck{CheckID: id + "/generation", Probe: generationProbe, MarkNetworkFailure: markNetworkFailure},
 		verify.ClientCheck{CheckID: id + "/raw", Probe: rawProbe, MarkNetworkFailure: markNetworkFailure},
-	}
+	}, nil
 }
 
 // loadFrozenCompatibilityPackageKeyring opens the S1 trust bytes at the exact
@@ -1274,8 +1286,12 @@ func runtimeTokenMirrorlistExpectation(cfg *config.Config, target, viewName, req
 			continue
 		}
 		base := strings.TrimSuffix(verificationCDNBase(cfg, target, viewName), "/")
-		body := fmt.Sprintf("%s/pro/v1/%s/_sow/v1/g/%020d/%s/\n", base, proToken, channel.Generation, channel.LegacyRoot)
-		return []byte(body), true, nil
+		route := "pro/v1/" + string(proToken) + "/_sow/v1/g/" + fmt.Sprintf("%020d", channel.Generation) + "/" + channel.LegacyRoot
+		clientURL, renderErr := config.CanonicalRouteURL(base, route, true)
+		if renderErr != nil {
+			return nil, true, renderErr
+		}
+		return []byte(clientURL + "\n"), true, nil
 	}
 	return nil, true, errors.New("runtime mirrorlist has no committed channel")
 }
@@ -1311,9 +1327,12 @@ func generationChannel(generation pub.TargetGeneration, viewName string, leaf vi
 	return pub.ChannelState{}, false
 }
 
-func expectedYUMGenerationURL(baseURL, credentialPrefix string, channel pub.ChannelState) string {
-	root := path.Join(credentialPrefix, "_sow/v1/g", fmt.Sprintf("%020d", channel.Generation), channel.LegacyRoot)
-	return strings.TrimSuffix(baseURL, "/") + "/" + root + "/"
+func expectedYUMGenerationURL(baseURL, credentialPrefix string, channel pub.ChannelState) (string, error) {
+	root := "_sow/v1/g/" + fmt.Sprintf("%020d", channel.Generation) + "/" + channel.LegacyRoot
+	if credentialPrefix != "" {
+		root = credentialPrefix + "/" + root
+	}
+	return config.CanonicalRouteURL(baseURL, root, true)
 }
 
 func generationHasSnapshotLeaf(generation pub.TargetGeneration, snapshotID string, leaf viewLeaf) bool {

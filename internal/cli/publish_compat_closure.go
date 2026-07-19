@@ -326,8 +326,11 @@ func validateCompatibilityPlanRoute(canonical *state.Store, commit plumbing.Hash
 		if !classOK || object.Size != want.size || object.SHA256 != want.sha256 || object.CDNPath != want.cdnPath {
 			return fmt.Errorf("compatibility plan object %s differs from frozen routed candidate", object.RemoteKey)
 		}
-		url := strings.TrimSuffix(plan.CDNBaseURL, "/") + "/" + strings.TrimPrefix(want.cdnPath, "/")
-		verification, exists := verify[url]
+		verificationURL, err := config.CanonicalRouteURL(plan.CDNBaseURL, strings.TrimPrefix(want.cdnPath, "/"), false)
+		if err != nil {
+			return fmt.Errorf("compatibility plan object %s has an invalid CDN route: %w", object.RemoteKey, err)
+		}
+		verification, exists := verify[verificationURL]
 		if !exists || verification.Size != want.size || verification.SHA256 != want.sha256 {
 			return fmt.Errorf("compatibility plan object %s lacks exact CDN verification", object.RemoteKey)
 		}
@@ -717,5 +720,9 @@ func compatibilityPurgeTouchesRoute(plan pub.Plan, purgeURL string, identity pub
 	if !strings.HasPrefix(purgeURL, base) {
 		return false, fmt.Errorf("compatibility plan purge %s is outside CDN base %s", purgeURL, plan.CDNBaseURL)
 	}
-	return compatibilityRemoteKeyTouchesRoute(strings.TrimPrefix(purgeURL, base), identity, channel), nil
+	literalPath, err := config.DecodeRouteWirePath(strings.TrimPrefix(purgeURL, base))
+	if err != nil {
+		return false, fmt.Errorf("compatibility plan purge %s is not canonical: %w", purgeURL, err)
+	}
+	return compatibilityRemoteKeyTouchesRoute(literalPath, identity, channel), nil
 }

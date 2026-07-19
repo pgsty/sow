@@ -74,6 +74,13 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   三类中断、成功后响应丢失、跨多次恢复保留的 canonical lineage、同 run 幂等、跨
   run/plan/resource/stale ETag/伪造 digest/readiness 负例及零 Delete；ordinary/race/static/
   clean-delivery 均从当前源码复现。未触云，POC-06 不变。
+- `2026-07-19-route-safe-caret-url-canonicalization.md`：关闭 Go 接受 RPM 合法 `^`、
+  标准 URL 却序列化为 `%5E`、旧 edge 因 blanket percent rejection 永久 404 的协议裂缝；
+  Go 的 static/local/dynamic-plan/verify/purge 与两家 adapter 共用唯一 uppercase `%5E` wire
+  contract，并在 origin/ownership 比对前恢复同一 literal key。caret YUM root 的
+  beta→latest、stable token/Basic CLI E2E、真实 Nginx public/Basic 回环与
+  lowercase/double/unreserved/slash 负例通过；
+  仅本地/protocol 合同，不冒充真边缘。
 - `2026-07-19-state-lock-atomic-publication.md`：本地 state lock 以 boot/start token
   区分 PID 复用，并把完整 v1 记录先写入 leased private inode，再用 create-only hardlink
   单点发布；真实子进程在提交点前后退出、partial unpublished、legacy create collision、

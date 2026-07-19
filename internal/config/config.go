@@ -1431,10 +1431,11 @@ func validateRouteStringList(field string, values []string) error {
 	return nil
 }
 
-// ValidateRouteSegment enforces the clean URL segment contract shared with
-// edge/shared/contract.mjs. The edge rejects percent-encoded aliases, query
-// strings, and fragments, so every public key segment must already be safe to
-// place in a URL without escaping or normalization.
+// ValidateRouteSegment enforces the literal object-key alphabet shared with
+// edge/shared/contract.mjs. Every admitted byte is preserved in manifests and
+// origin keys. Standard URL serializers encode only caret from this alphabet;
+// the edge accepts its exact uppercase %5E wire form and recovers the literal
+// byte before applying route and entitlement gates.
 func ValidateRouteSegment(value string) error {
 	if value == "" || value == "." || value == ".." {
 		return errors.New("must be a non-empty, non-dot URL segment")
@@ -1450,6 +1451,73 @@ func ValidateRouteSegment(value string) error {
 		return fmt.Errorf("contains byte 0x%02x outside [A-Za-z0-9+._~^:-]", character)
 	}
 	return nil
+}
+
+// EncodeRouteWirePath converts a canonical literal object-key path into the
+// sole client-visible URL spelling shared with the edge contract. The frozen
+// route alphabet is preserved byte-for-byte except for caret, which WHATWG URL
+// serializers represent as uppercase %5E. This is deliberately not a general
+// URI encoder and never accepts an already escaped input.
+func EncodeRouteWirePath(value string) (string, error) {
+	if err := validateRoutePath(value); err != nil {
+		return "", err
+	}
+	return strings.ReplaceAll(value, "^", "%5E"), nil
+}
+
+// DecodeRouteWirePath is the exact inverse accepted at a raw URL-string
+// boundary. Decode-and-reencode equality rejects lowercase escapes, encoded
+// unreserved bytes, separators, double encoding, and raw caret aliases.
+func DecodeRouteWirePath(value string) (string, error) {
+	decoded := strings.ReplaceAll(value, "%5E", "^")
+	if strings.Contains(decoded, "%") {
+		return "", errors.New("contains a non-canonical percent escape")
+	}
+	encoded, err := EncodeRouteWirePath(decoded)
+	if err != nil {
+		return "", err
+	}
+	if encoded != value {
+		return "", errors.New("is not the canonical route wire spelling")
+	}
+	return decoded, nil
+}
+
+// CanonicalRouteURL appends one canonical literal route path to a clean HTTP(S)
+// base URL and returns its exact client-visible spelling. Callers use it for
+// generated mirrorlists and verification expectations so the URL body, purge
+// plan, and edge decoder cannot disagree about caret-bearing object keys.
+func CanonicalRouteURL(baseURL, literalPath string, trailingSlash bool) (string, error) {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Host == "" || parsed.User != nil ||
+		(parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Opaque != "" ||
+		parsed.RawPath != "" || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return "", errors.New("base URL must be a clean absolute HTTP(S) URL")
+	}
+	basePath := strings.TrimSuffix(strings.TrimPrefix(parsed.Path, "/"), "/")
+	if parsed.Path != "" && parsed.Path != "/" && parsed.Path != "/"+basePath && parsed.Path != "/"+basePath+"/" {
+		return "", errors.New("base URL path is not canonical")
+	}
+	if basePath != "" {
+		if err := validateRoutePath(basePath); err != nil {
+			return "", fmt.Errorf("base URL path: %w", err)
+		}
+	}
+	wirePath, err := EncodeRouteWirePath(literalPath)
+	if err != nil {
+		return "", fmt.Errorf("route path: %w", err)
+	}
+	parsed.Path = "/" + basePath
+	if basePath == "" {
+		parsed.Path = ""
+	}
+	parsed.RawPath = ""
+	canonicalBase := strings.TrimSuffix(parsed.String(), "/")
+	result := canonicalBase + "/" + wirePath
+	if trailingSlash {
+		result += "/"
+	}
+	return result, nil
 }
 
 func validateRoutePath(value string) error {

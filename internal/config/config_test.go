@@ -918,6 +918,69 @@ func TestRouteSegmentContractMatchesEdgeSafeVocabulary(t *testing.T) {
 	}
 }
 
+func TestRouteSegmentContractExhaustiveBytes(t *testing.T) {
+	const allowed = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+._~^:-"
+	for value := 0; value <= 0xff; value++ {
+		candidate := string([]byte{'x', byte(value), 'x'})
+		wantSafe := value < 0x80 && strings.ContainsRune(allowed, rune(value))
+		err := ValidateRouteSegment(candidate)
+		if wantSafe && err != nil {
+			t.Fatalf("allowed byte 0x%02x rejected: %v", value, err)
+		}
+		if !wantSafe && err == nil {
+			t.Fatalf("byte 0x%02x outside the frozen edge alphabet accepted", value)
+		}
+	}
+}
+
+func TestCanonicalRouteWirePathAndURL(t *testing.T) {
+	t.Parallel()
+	const literal = "_sow/v1/g/00000000000000000042/yum/infra^next/x86_64"
+	wire, err := EncodeRouteWirePath(literal)
+	if err != nil || wire != "_sow/v1/g/00000000000000000042/yum/infra%5Enext/x86_64" {
+		t.Fatalf("wire=%q err=%v", wire, err)
+	}
+	decoded, err := DecodeRouteWirePath(wire)
+	if err != nil || decoded != literal {
+		t.Fatalf("decoded=%q err=%v", decoded, err)
+	}
+	for _, alias := range []string{
+		"_sow/v1/g/00000000000000000042/yum/infra^next/x86_64",
+		"_sow/v1/g/00000000000000000042/yum/infra%5enext/x86_64",
+		"_sow/v1/g/00000000000000000042/yum/infra%255Enext/x86_64",
+		"_sow/v1/g/00000000000000000042/yum/infra%41next/x86_64",
+		"_sow/v1/g/00000000000000000042/yum/infra%2Fnext/x86_64",
+		"_sow/v1/g/00000000000000000042/yum/infra%5Enext/x86_64/",
+	} {
+		if _, err := DecodeRouteWirePath(alias); err == nil {
+			t.Fatalf("non-canonical wire path %q was accepted", alias)
+		}
+	}
+	for _, tc := range []struct {
+		base, want string
+	}{
+		{"https://repo.example", "https://repo.example/" + wire + "/"},
+		{"https://repo.example/", "https://repo.example/" + wire + "/"},
+		{"https://repo.example/pro/v1/basic", "https://repo.example/pro/v1/basic/" + wire + "/"},
+		{"http://127.0.0.1:8080", "http://127.0.0.1:8080/" + wire + "/"},
+	} {
+		got, err := CanonicalRouteURL(tc.base, literal, true)
+		if err != nil || got != tc.want {
+			t.Fatalf("base=%q got=%q want=%q err=%v", tc.base, got, tc.want, err)
+		}
+	}
+	for _, unsafe := range []string{"https://user@example.com", "https://repo.example/a/../b", "https://repo.example?x=1"} {
+		if _, err := CanonicalRouteURL(unsafe, literal, true); err == nil {
+			t.Fatalf("unsafe base %q was accepted", unsafe)
+		}
+	}
+	for _, unsafe := range []string{"_sow/v1/../private", "_sow/v1//private", "_sow/v1/private/", "_sow/v1/%5E"} {
+		if _, err := CanonicalRouteURL("https://repo.example", unsafe, true); err == nil {
+			t.Fatalf("unsafe literal route %q was accepted", unsafe)
+		}
+	}
+}
+
 func TestDecodeRejectsNonRoutableRepositoryDimensions(t *testing.T) {
 	aptRepo := `
   - id: apt-main

@@ -1803,12 +1803,16 @@ func augmentPublicationPlan(cfg *config.Config, target string, prepared prepared
 			// generation and served root. Re-deriving either value from the current
 			// projection would let a route transition emit a mirrorlist whose bytes
 			// disagree with ChannelState and its checkpoint identity.
-			generationPath := path.Join("_sow/v1/g", fmt.Sprintf("%020d", channel.Generation), channel.LegacyRoot) + "/"
 			bodyPrefix := ""
 			if prepared.view == "stable" {
 				bodyPrefix = "/pro/v1/basic"
 			}
-			rendered := []byte(cdnBase + bodyPrefix + "/" + generationPath + "\n")
+			generationPath := "_sow/v1/g/" + fmt.Sprintf("%020d", channel.Generation) + "/" + channel.LegacyRoot
+			clientURL, err := config.CanonicalRouteURL(cdnBase+bodyPrefix, generationPath, true)
+			if err != nil {
+				return fmt.Errorf("render YUM channel %s: %w", channel.RemoteKey, err)
+			}
+			rendered := []byte(clientURL + "\n")
 			if prepared.view != "stable" {
 				mirrorSource, err := writeStaticMirrorlistSource(cfg, target, prepared.view, projection, rendered)
 				if err != nil {

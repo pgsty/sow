@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pgsty/sow/internal/config"
 )
 
 type ParentExpectation struct {
@@ -795,8 +797,12 @@ func validateIntentCDNBindings(generation TargetGeneration, plan Plan) error {
 		if object.Class != ObjectPointer || object.Size != int64(len(body)) || object.SHA256 != digestBytes(body) {
 			return fmt.Errorf("channel pointer %s does not upload its canonical channel body", object.RemoteKey)
 		}
-		rendered := []byte(strings.TrimSuffix(plan.CDNBaseURL, "/") + "/pro/v1/basic/_sow/v1/g/" +
-			fmt.Sprintf("%020d", generation.Generation) + "/" + channel.LegacyRoot + "/\n")
+		route := "pro/v1/basic/_sow/v1/g/" + fmt.Sprintf("%020d", generation.Generation) + "/" + channel.LegacyRoot
+		clientURL, err := config.CanonicalRouteURL(plan.CDNBaseURL, route, true)
+		if err != nil {
+			return err
+		}
+		rendered := []byte(clientURL + "\n")
 		if object.VerificationSize != int64(len(rendered)) || object.VerificationSHA256 != digestBytes(rendered) {
 			return fmt.Errorf("channel pointer %s has an unbound transformed verification expectation", object.RemoteKey)
 		}

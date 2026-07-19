@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/pgsty/sow/internal/config"
 )
 
 const (
@@ -159,8 +160,8 @@ func (c ChannelState) CanonicalBody() ([]byte, error) {
 		return nil, errors.New("invalid channel generation or legacy root")
 	}
 	for _, segment := range strings.Split(c.LegacyRoot, "/") {
-		if !channelSegmentPattern.MatchString(segment) {
-			return nil, fmt.Errorf("invalid channel legacy root segment %q", segment)
+		if err := config.ValidateRouteSegment(segment); err != nil {
+			return nil, fmt.Errorf("invalid channel legacy root segment %q: %w", segment, err)
 		}
 	}
 	body := struct {
@@ -190,7 +191,12 @@ func YUMChannelPointer(cdnBaseURL string, c ChannelState) (string, []byte, error
 			}
 		}
 		key := path.Join("_sow/v1/mirrorlist", c.View, c.Repo, c.OS, c.Arch+".txt")
-		body := []byte(strings.TrimSuffix(cdnBaseURL, "/") + "/_sow/v1/g/" + fmt.Sprintf("%020d", c.Generation) + "/" + c.LegacyRoot + "/\n")
+		route := "_sow/v1/g/" + fmt.Sprintf("%020d", c.Generation) + "/" + c.LegacyRoot
+		clientURL, err := config.CanonicalRouteURL(cdnBaseURL, route, true)
+		if err != nil {
+			return "", nil, fmt.Errorf("render channel mirrorlist: %w", err)
+		}
+		body := []byte(clientURL + "\n")
 		return key, body, nil
 	default:
 		return "", nil, fmt.Errorf("invalid channel view %q", c.View)

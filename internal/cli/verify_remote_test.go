@@ -52,12 +52,15 @@ func TestBuildCompatibilityL4ChecksBindsIndependentGenerationAndRawRoutes(t *tes
 		t.Fatal(err)
 	}
 	projection := config.YUMCompatibilityProjection{
-		ID: "infra-legacy-x86-64", Root: "yum/infra/x86_64",
+		ID: "infra-legacy-x86-64", Root: "yum/infra^next/x86_64",
 		Source: config.YUMCompatibilitySource{Arch: "x86_64"},
 	}
 	channel := pub.ChannelState{Generation: 42, LegacyRoot: projection.Root}
 	var networkFailure atomic.Bool
-	checks := buildCompatibilityL4Checks(cfg, "local", "client/local/latest/compatibility/"+projection.ID, projection, channel, http.Header{"X-Test": []string{"bound"}}, metadataVerifier, packageKeyring, verificationTime, t.TempDir(), 7, &networkFailure)
+	checks, err := buildCompatibilityL4Checks(cfg, "local", "client/local/latest/compatibility/"+projection.ID, projection, channel, http.Header{"X-Test": []string{"bound"}}, metadataVerifier, packageKeyring, verificationTime, t.TempDir(), 7, &networkFailure)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(checks) != 2 {
 		t.Fatalf("compatibility L4 checks=%d want=2", len(checks))
 	}
@@ -74,7 +77,7 @@ func TestBuildCompatibilityL4ChecksBindsIndependentGenerationAndRawRoutes(t *tes
 		probes[clientCheck.CheckID] = probe
 	}
 	generation := probes["client/local/latest/compatibility/"+projection.ID+"/generation"]
-	if generation.MirrorlistPath != "_sow/v1/mirrorlist/latest/infra-legacy-x86-64/cross-el/x86_64.txt" || generation.RepositoryPath != "" || generation.ExpectedGenerationURL != "https://repo.example.invalid/_sow/v1/g/00000000000000000042/yum/infra/x86_64/" {
+	if generation.MirrorlistPath != "_sow/v1/mirrorlist/latest/infra-legacy-x86-64/cross-el/x86_64.txt" || generation.RepositoryPath != "" || generation.ExpectedGenerationURL != "https://repo.example.invalid/_sow/v1/g/00000000000000000042/yum/infra%5Enext/x86_64/" {
 		t.Fatalf("generation probe=%+v", generation)
 	}
 	raw := probes["client/local/latest/compatibility/"+projection.ID+"/raw"]
@@ -153,7 +156,10 @@ func TestCompatibilityL4ChecksConsumeBothLoopbackRoutesIndependently(t *testing.
 	projection := config.YUMCompatibilityProjection{ID: "infra-legacy-x86-64", Root: "yum/infra/x86_64", Source: config.YUMCompatibilitySource{Arch: "x86_64"}}
 	channel := pub.ChannelState{Generation: 42, LegacyRoot: projection.Root}
 	var networkFailure atomic.Bool
-	checks := buildCompatibilityL4Checks(cfg, "local", "client/local/latest/compatibility/"+projection.ID, projection, channel, nil, metadataVerifier, fixture.packageKeyring, verificationTime, t.TempDir(), 2, &networkFailure)
+	checks, err := buildCompatibilityL4Checks(cfg, "local", "client/local/latest/compatibility/"+projection.ID, projection, channel, nil, metadataVerifier, fixture.packageKeyring, verificationTime, t.TempDir(), 2, &networkFailure)
+	if err != nil {
+		t.Fatal(err)
+	}
 	byID := make(map[string]verify.Check, len(checks))
 	for _, check := range checks {
 		byID[check.ID()] = check
@@ -408,7 +414,8 @@ func TestBuildL4ChecksCarriesSparseSuiteComponentsThroughLocalProtocol(t *testin
 func TestVerifyCLIL3AndL4ClosePublishedAPTAndYUMProtocols(t *testing.T) {
 	root := nginxWorkerTempDir(t)
 	configPath := filepath.Join(root, "sow.yaml")
-	if err := os.WriteFile(configPath, []byte(publishPackageConfig), 0o600); err != nil {
+	caretConfig := strings.Replace(publishPackageConfig, "path: yum/test/x86_64", "path: yum/test^next/x86_64", 1)
+	if err := os.WriteFile(configPath, []byte(caretConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	debPath := decodeVerifyFixture(t, filepath.Join("..", "aptrepo", "testdata", "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64"), filepath.Join(root, "libpqtypes.deb"))
@@ -460,7 +467,7 @@ func TestVerifyCLIL3AndL4ClosePublishedAPTAndYUMProtocols(t *testing.T) {
 	aptURLs := append([]string(nil), transport.cdnURLs...)
 	transport.cdnURLs = nil
 	transport.mutex.Unlock()
-	if joined := strings.Join(aptURLs, "\n"); len(aptURLs) == 0 || !strings.Contains(joined, "/apt/test/") || strings.Contains(joined, "/yum/test/") || strings.Contains(joined, "/_sow/v1/mirrorlist/") {
+	if joined := strings.Join(aptURLs, "\n"); len(aptURLs) == 0 || !strings.Contains(joined, "/apt/test/") || strings.Contains(joined, "/yum/test%5Enext/") || strings.Contains(joined, "/_sow/v1/mirrorlist/") {
 		t.Fatalf("selected APT L3 escaped its repository leaf: %v", aptURLs)
 	}
 	if code, stdout, stderr := run("verify", "--layer", "L3", "--view", "beta", "--target", "cf", "--repo", "rpm-test", "--os", "el10", "--arch", "x86_64", "--config", configPath, "--workers", "2"); code != ExitOK || !strings.Contains(stdout, "outcome=passed") {
@@ -470,7 +477,7 @@ func TestVerifyCLIL3AndL4ClosePublishedAPTAndYUMProtocols(t *testing.T) {
 	yumURLs := append([]string(nil), transport.cdnURLs...)
 	transport.cdnURLs = nil
 	transport.mutex.Unlock()
-	if joined := strings.Join(yumURLs, "\n"); len(yumURLs) == 0 || !strings.Contains(joined, "/yum/test/") || !strings.Contains(joined, "/_sow/v1/mirrorlist/beta/rpm-test/el10/x86_64.txt") || strings.Contains(joined, "/apt/test/") {
+	if joined := strings.Join(yumURLs, "\n"); len(yumURLs) == 0 || !strings.Contains(joined, "/yum/test%5Enext/") || strings.Contains(joined, "/yum/test^next/") || !strings.Contains(joined, "/_sow/v1/mirrorlist/beta/rpm-test/el10/x86_64.txt") || strings.Contains(joined, "/apt/test/") {
 		t.Fatalf("selected YUM L3 escaped or omitted its exact logical channel: %v", yumURLs)
 	}
 	// Publishing another view advances the bucket-global checkpoint. The beta
@@ -530,7 +537,8 @@ func TestVerifyCLIL3AndL4ClosePublishedAPTAndYUMProtocols(t *testing.T) {
 func TestVerifyCLIStableUsesRuntimeTokenWithoutPersistingOrLoggingIt(t *testing.T) {
 	root := nginxWorkerTempDir(t)
 	configPath := filepath.Join(root, "sow.yaml")
-	if err := os.WriteFile(configPath, []byte(publishPackageConfig), 0o600); err != nil {
+	caretConfig := strings.Replace(publishPackageConfig, "path: yum/test/x86_64", "path: yum/test^next/x86_64", 1)
+	if err := os.WriteFile(configPath, []byte(caretConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	debPath := decodeVerifyFixture(t, filepath.Join("..", "aptrepo", "testdata", "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64"), filepath.Join(root, "libpqtypes.deb"))

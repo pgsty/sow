@@ -445,7 +445,18 @@ func (channel Channel) MirrorlistBody() ([]byte, error) {
 	if err := config.ValidateServingBaseURL(channel.BaseURL, wantPath); err != nil {
 		return nil, err
 	}
-	body := []byte(strings.TrimSuffix(channel.BaseURL, "/") + "/" + GenerationPath(channel.Generation, channel.LegacyRoot) + "\n")
+	if !generationIDPattern.MatchString(channel.Generation) {
+		return nil, errors.New("invalid mirrorlist generation")
+	}
+	if err := validateLegacyRoot(channel.LegacyRoot); err != nil {
+		return nil, err
+	}
+	route := "_sow/v1/g/" + channel.Generation + "/" + channel.LegacyRoot
+	clientURL, err := config.CanonicalRouteURL(channel.BaseURL, route, true)
+	if err != nil {
+		return nil, fmt.Errorf("render mirrorlist URL: %w", err)
+	}
+	body := []byte(clientURL + "\n")
 	if len(body) > mirrorlistMaxBytes {
 		return nil, fmt.Errorf("mirrorlist body exceeds %d-byte limit", mirrorlistMaxBytes)
 	}

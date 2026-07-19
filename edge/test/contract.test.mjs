@@ -350,12 +350,12 @@ test("all generated deployment bundles load without source-tree imports", async 
   }
 });
 
-async function vendorFixtures(runtimeOverrides = {}, originResponder = originResponseFor) {
+async function vendorFixtures(runtimeOverrides = {}, originResponder = originResponseFor, entitlementOverrides = {}) {
   const tokenEntitlements = JSON.stringify([
-    entitlement(await sha256Hex(tokenA)),
-    entitlement(await sha256Hex(tokenB)),
+    entitlement(await sha256Hex(tokenA), entitlementOverrides),
+    entitlement(await sha256Hex(tokenB), entitlementOverrides),
   ]);
-  const basicEntitlements = JSON.stringify([entitlement(await sha256Hex(basicValue))]);
+  const basicEntitlements = JSON.stringify([entitlement(await sha256Hex(basicValue), entitlementOverrides)]);
   return [
     makeCloudflareFixture(tokenEntitlements, basicEntitlements, runtimeOverrides, originResponder),
     makeEdgeOneFixture(tokenEntitlements, basicEntitlements, runtimeOverrides, originResponder),
@@ -482,6 +482,92 @@ test("Cloudflare and EdgeOne strip credentials onto the same clean origin URL wi
       assert.notEqual(call.authorization, `Bearer ${tokenB}`, fixture.name);
     }
   }
+});
+
+test("both vendors route RPM caret bytes through one canonical URL spelling", async () => {
+	const admission = routeAdmission({ asset_roots: ["pkg", "pkg^next"] });
+	const runtime = {
+		SOW_PUBLIC_PREFIXES: '["apt/infra","pkg","pkg^next","yum"]',
+		SOW_COMPATIBILITY_ADMISSION: JSON.stringify(admission),
+	};
+	for (const fixture of await vendorFixtures(runtime)) {
+		const literal = new Request("https://repo.example/pkg^next/tool-1.0^git.rpm");
+		assert.equal(literal.url, "https://repo.example/pkg%5Enext/tool-1.0%5Egit.rpm", fixture.name);
+		const response = await fixture.handler(literal);
+		assert.equal(response.status, 200, fixture.name);
+		assert.equal(await response.text(), "origin:pkg^next/tool-1.0^git.rpm", fixture.name);
+		assert.equal(
+			decodeURIComponent(new URL(fixture.calls.at(-1).url).pathname.slice(1)),
+			"pkg^next/tool-1.0^git.rpm",
+			fixture.name,
+		);
+		const gated = await fixture.handler(new Request(
+			`https://repo.example/pro/v1/${tokenA}/pkg^next/tool-1.0^git.rpm`,
+		));
+		assert.equal(gated.status, 200, fixture.name);
+		assert.equal(await gated.text(), "origin:.sow/gated/pkg^next/tool-1.0^git.rpm", fixture.name);
+		assert.equal(
+			decodeURIComponent(new URL(fixture.calls.at(-1).url).pathname.slice(1)),
+			".sow/gated/pkg^next/tool-1.0^git.rpm",
+			fixture.name,
+		);
+
+		for (const alias of [
+			"pkg%5enext/tool.rpm",
+			"pkg%255Enext/tool.rpm",
+			"pkg%41next/tool.rpm",
+			"pkg%2Fnext/tool.rpm",
+			"pkg%5Enext/tool.rpm/",
+		]) {
+			const before = fixture.calls.length;
+			const denied = await fixture.handler(new Request(`https://repo.example/${alias}`));
+			assert.equal(denied.status, 404, `${fixture.name}/${alias}`);
+			assert.equal(fixture.calls.length, before, `${fixture.name}/${alias} reached origin`);
+		}
+		const rawCaret = new Request("https://repo.example/pkg%5Enext/tool.rpm");
+		Object.defineProperty(rawCaret, "url", { value: "https://repo.example/pkg^next/tool.rpm" });
+		const beforeRawCaret = fixture.calls.length;
+		const deniedRawCaret = await fixture.handler(rawCaret);
+		assert.equal(deniedRawCaret.status, 404, `${fixture.name}/raw-caret`);
+		assert.equal(fixture.calls.length, beforeRawCaret, `${fixture.name}/raw-caret reached origin`);
+	}
+});
+
+test("WHATWG-normalized aliases re-enter final route and entitlement gates", async () => {
+	const canonicalPath = "yum/infra/x86_64/Packages/p/pkg.rpm";
+	const canonicalURL = `https://repo.example/${canonicalPath}`;
+	const aliases = [
+		"https://repo.example/pkg/%2e%2e/yum/infra/x86_64/Packages/p/pkg.rpm",
+		String.raw`https://repo.example/pkg\..\yum\infra\x86_64\Packages\p\pkg.rpm`,
+	];
+	for (const fixture of await vendorFixtures()) {
+		for (const alias of aliases) {
+			const request = new Request(alias);
+			assert.equal(request.url, canonicalURL, `${fixture.name}/${alias}`);
+			const response = await fixture.handler(request);
+			assert.equal(response.status, 200, `${fixture.name}/${alias}`);
+			assert.equal(await response.text(), `origin:${canonicalPath}`, `${fixture.name}/${alias}`);
+		}
+
+		const deniedRequest = new Request("https://repo.example/pkg/%2e%2e/private/secret");
+		assert.equal(deniedRequest.url, "https://repo.example/private/secret", fixture.name);
+		const before = fixture.calls.length;
+		const denied = await fixture.handler(deniedRequest);
+		assert.equal(denied.status, 404, fixture.name);
+		assert.equal(fixture.calls.length, before, `${fixture.name} normalized path bypassed the route allowlist`);
+	}
+
+	const scoped = { path_prefixes: ["/pkg"] };
+	for (const fixture of await vendorFixtures({}, originResponseFor, scoped)) {
+		const request = new Request(
+			`https://repo.example/pro/v1/${tokenA}/pkg/%2e%2e/${canonicalPath}`,
+		);
+		assert.equal(request.url, `https://repo.example/pro/v1/${tokenA}/${canonicalPath}`, fixture.name);
+		const before = fixture.calls.length;
+		const denied = await fixture.handler(request);
+		assert.equal(denied.status, 403, fixture.name);
+		assert.equal(fixture.calls.length, before, `${fixture.name} normalized path bypassed entitlement scope`);
+	}
 });
 
 test("both vendors deny undeclared root objects and unknown _sow routes before origin", async () => {
@@ -972,6 +1058,47 @@ test("dynamic mirrorlists inject only the authorized credential and pin one gene
 	assert.equal(fixture.calls.at(-1).url.endsWith("/_sow/v1/mirrorlist/beta/infra/el9/x86_64.txt"), true, `${fixture.name} did not fetch the static beta mirrorlist`);
     for (const call of fixture.calls) {
       assert.equal(call.url.includes(tokenA), false, `${fixture.name} mirrorlist lookup leaked token`);
+    }
+  }
+});
+
+test("dynamic mirrorlists serialize caret roots canonically for token and Basic on both vendors", async () => {
+  const legacyRoot = "yum/infra^next/x86_64";
+  const runtime = {
+    SOW_COMPATIBILITY_ADMISSION: JSON.stringify(routeAdmission({
+      yum_roots: [legacyRoot],
+      yum_channels: runtimeRouteAdmission.yum_channels.map((channel) => ({
+        ...channel,
+        root: legacyRoot,
+      })),
+    })),
+  };
+  const originResponder = (path) => path.startsWith(".sow/channels/")
+    ? new Response(JSON.stringify({ generation: "42", legacy_root: legacyRoot }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    })
+    : originResponseFor(path);
+  const credentials = [
+    { name: "token", prefix: `https://repo.example/pro/v1/${tokenA}`, headers: undefined },
+    { name: "basic", prefix: "https://repo.example/pro/v1/basic", headers: { Authorization: `Basic ${btoa(basicValue)}` } },
+  ];
+
+  for (const fixture of await vendorFixtures(runtime, originResponder)) {
+    for (const credential of credentials) {
+      const response = await fixture.handler(new Request(
+        `${credential.prefix}/_sow/v1/mirrorlist/stable/infra/el9/x86_64.txt`,
+        { headers: credential.headers },
+      ));
+      assert.equal(response.status, 200, `${fixture.name}/${credential.name}`);
+      const body = await response.text();
+      assert.equal(
+        body,
+        `${credential.prefix}/_sow/v1/g/00000000000000000042/yum/infra%5Enext/x86_64/\n`,
+        `${fixture.name}/${credential.name}`,
+      );
+      assert.equal(body.includes("^"), false, `${fixture.name}/${credential.name} emitted a raw caret`);
+      assert.equal(new URL(body.trim()).pathname.includes("%5E"), true, `${fixture.name}/${credential.name}`);
     }
   }
 });

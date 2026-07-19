@@ -2,9 +2,10 @@
 title: '冻结可路由 URL 路径字符契约'
 type: 'bugfix'
 created: '2026-07-12'
-status: 'in-review'
-review_loop_iteration: 0
-baseline_commit: '84800a60e01aaaf8dc5b189c3ddb1380930f4865'
+status: 'superseded'
+review_loop_iteration: 1
+baseline_commit: '0a1d520fa4ee9a5030cff8a1f9125f01cd45466a'
+superseded_by: 'spec-route-wire-canonicalization.md'
 context:
   - '{project-root}/_bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/prd.md'
   - '{project-root}/_bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/addendum.md'
@@ -39,6 +40,15 @@ context:
 
 </frozen-after-approval>
 
+## Supersession
+
+此 frozen block 原样保留，不把协议冲突悄悄改写成通过。审计证明其同时要求允许 RPM
+合法 `^`、无需 percent serialization 且 edge 拒绝全部 `%`，但 WHATWG path serializer
+必须把 caret 写成 `%5E`；三者不可同时成立。后继
+[`spec-route-wire-canonicalization.md`](spec-route-wire-canonicalization.md) 与 ADR-0039
+显式区分 literal object-key alphabet、标准 `Request.url` wire form 和供应商 raw
+request/cache normalization 证据边界。本 spec 因而 superseded，而不是伪报 done。
+
 ## Code Map
 
 - `internal/config/config.go` -- schema 预检、repo expanded paths 与 URL 维度验证。
@@ -62,6 +72,8 @@ context:
 
 ## Spec Change Log
 
+- 2026-07-19：独立盲审确认 frozen AC 与标准 URL wire format 不可同时满足；原文不改，状态改为 superseded，由后继 spec 与 ADR-0039 承接。
+
 ## Design Notes
 
 Go 端单一谓词按字节判断 ASCII 白名单，避免正则与 JavaScript 字符类漂移。配置的 `{arch}` 仅在原始 YUM 模板中暂时存在；契约在 `ExpandedPaths()` 后验证实际输出，同时独立验证 arch，使模板仍可用。
@@ -70,6 +82,5 @@ Go 端单一谓词按字节判断 ASCII 白名单，避免正则与 JavaScript �
 
 **Commands:**
 - `gofmt -w internal/config/config.go internal/config/config_test.go internal/cli/add.go internal/cli/add_test.go`
-- `go test -count=1 ./internal/config ./internal/cli -run '<route-safe focused tests>'`
-- `go test -race -count=1 ./internal/config ./internal/cli -run '<route-safe focused tests>'`
-- `npm test --prefix edge` -- 共享 edge 字符与路由契约仍全部通过。
+- `go test -count=1 ./internal/config ./internal/cli -run 'RouteSegmentContract|NonRoutable|Routable|AssetLogicalPath|AssetAddRejectsNonRoutable'` -- PASS（config 0.527s，CLI 1.509s）。
+- `go test -race -count=1 ./internal/config ./internal/cli -run 'RouteSegmentContract|NonRoutable|Routable|AssetLogicalPath|AssetAddRejectsNonRoutable'` -- PASS（config 1.438s，CLI 2.808s）。

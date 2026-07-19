@@ -116,6 +116,61 @@ func TestTargetGenerationCarriesCanonicalChannelVector(t *testing.T) {
 	}
 }
 
+func TestYUMChannelPointerCanonicalCaretWireForm(t *testing.T) {
+	t.Parallel()
+	for _, viewName := range []string{"beta", "latest"} {
+		channel := ChannelState{
+			View: viewName, Repo: "infra", OS: "el9", Arch: "x86_64", Generation: 42,
+			RemoteKey:  ".sow/channels/" + viewName + "/infra/el9/x86_64.json",
+			LegacyRoot: "yum/infra^next/x86_64",
+		}
+		canonical, err := channel.CanonicalBody()
+		if err != nil || !bytes.Contains(canonical, []byte(`"legacy_root":"yum/infra^next/x86_64"`)) {
+			t.Fatalf("view=%s canonical=%s err=%v", viewName, canonical, err)
+		}
+		key, body, err := YUMChannelPointer("https://repo.example/", channel)
+		if err != nil {
+			t.Fatalf("view=%s: %v", viewName, err)
+		}
+		wantKey := "_sow/v1/mirrorlist/" + viewName + "/infra/el9/x86_64.txt"
+		wantBody := "https://repo.example/_sow/v1/g/00000000000000000042/yum/infra%5Enext/x86_64/\n"
+		if key != wantKey || string(body) != wantBody || bytes.Contains(body, []byte("^")) {
+			t.Fatalf("view=%s key=%q body=%q", viewName, key, body)
+		}
+	}
+}
+
+func TestValidateIntentCDNBindingsCanonicalCaretStableMirrorlist(t *testing.T) {
+	t.Parallel()
+	channel := ChannelState{
+		View: "stable", Repo: "infra", OS: "el9", Arch: "x86_64", Generation: 42,
+		RemoteKey:  ".sow/channels/stable/infra/el9/x86_64.json",
+		LegacyRoot: "yum/infra^next/x86_64",
+	}
+	body, err := channel.CanonicalBody()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const rendered = "https://repo.example/pro/v1/basic/_sow/v1/g/00000000000000000042/yum/infra%5Enext/x86_64/\n"
+	object := PlannedObject{
+		SourcePath: channel.RemoteKey, RemoteKey: channel.RemoteKey, Class: ObjectPointer,
+		Size: int64(len(body)), SHA256: digestBytes(body),
+		CDNPath:          "pro/v1/basic/_sow/v1/mirrorlist/stable/infra/el9/x86_64.txt",
+		VerificationSize: int64(len(rendered)), VerificationSHA256: digestBytes([]byte(rendered)),
+	}
+	generation := TargetGeneration{IntentView: "stable", Generation: 42, Channels: []ChannelState{channel}}
+	plan := Plan{CDNBaseURL: "https://repo.example/", Objects: []PlannedObject{object}}
+	if err := validateIntentCDNBindings(generation, plan); err != nil {
+		t.Fatalf("canonical caret stable binding failed: %v", err)
+	}
+	rawAlias := "https://repo.example/pro/v1/basic/_sow/v1/g/00000000000000000042/yum/infra^next/x86_64/\n"
+	plan.Objects[0].VerificationSize = int64(len(rawAlias))
+	plan.Objects[0].VerificationSHA256 = digestBytes([]byte(rawAlias))
+	if err := validateIntentCDNBindings(generation, plan); err == nil || !strings.Contains(err.Error(), "unbound transformed verification") {
+		t.Fatalf("raw-caret transformed expectation was accepted: %v", err)
+	}
+}
+
 func TestCheckpointStrictCanonicalRoundTrip(t *testing.T) {
 	t.Parallel()
 	checkpoint, err := NewCheckpoint(generationFixture(TargetTencent, 1), "tx-1", hashString("checkpoint-plan"), PhaseCheckpointCommitted, time.Date(2026, 7, 12, 1, 2, 3, 4, time.UTC))
@@ -733,6 +788,19 @@ func TestPlanRejectsMutableOrIncompleteYUMRepomdPair(t *testing.T) {
 	}}}
 	if _, err := aliasMetadataOnly.Canonical(); err == nil || !strings.Contains(err.Error(), "requires a complete repomd.xml+asc") {
 		t.Fatalf("orphan YUM alias metadata was not rejected: %v", err)
+	}
+}
+
+func TestJoinCDNURLUsesCanonicalCaretWireForm(t *testing.T) {
+	t.Parallel()
+	base, _, err := parseCDNBaseURL("https://repo.example/", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "yum/infra/x86_64/Packages/t/tool-1.0^git-1.x86_64.rpm"
+	const want = "https://repo.example/yum/infra/x86_64/Packages/t/tool-1.0%5Egit-1.x86_64.rpm"
+	if got := joinCDNURL(base, key); got != want {
+		t.Fatalf("caret CDN URL=%q want=%q", got, want)
 	}
 }
 
