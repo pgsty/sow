@@ -17,6 +17,7 @@ import (
 
 const lockHelperStateEnv = "SOW_TEST_STATE_LOCK_HELPER_ROOT"
 const lockHelperModeEnv = "SOW_TEST_STATE_LOCK_HELPER_MODE"
+const stateLockCrashExitCode = 86
 
 func TestStateLockHelperProcess(t *testing.T) {
 	statePath := os.Getenv(lockHelperStateEnv)
@@ -24,6 +25,12 @@ func TestStateLockHelperProcess(t *testing.T) {
 		return
 	}
 	switch os.Getenv(lockHelperModeEnv) {
+	case "crash-before-publish":
+		crashStateLockPublish(t, stateLeaseFaultBeforePublish)
+		return
+	case "crash-after-publish":
+		crashStateLockPublish(t, stateLeaseFaultAfterPublish)
+		return
 	case "barrier":
 		if _, err := fmt.Fprintln(os.Stdout, "armed"); err != nil {
 			t.Fatal(err)
@@ -64,6 +71,20 @@ func TestStateLockHelperProcess(t *testing.T) {
 	if readErr != nil || releaseErr != nil {
 		t.Fatal(errors.Join(readErr, releaseErr))
 	}
+}
+
+func crashStateLockPublish(t *testing.T, crashStage string) {
+	restore := replaceStateLockLeaseFault(func(name, stage string) error {
+		if name == "state.lock" && stage == crashStage {
+			os.Exit(stateLockCrashExitCode)
+		}
+		return nil
+	})
+	defer restore()
+	if _, err := AcquireLock(os.Getenv(lockHelperStateEnv), "crash-during-lock-publication", false); err != nil {
+		t.Fatal(err)
+	}
+	t.Fatal("state lock publication crash seam was not reached")
 }
 
 func runLegacyRecordFlockHelper(t *testing.T, statePath string) {
@@ -710,7 +731,7 @@ func TestStateLockHolderRevalidatesProcessInstanceBeforeValidateAndRelease(t *te
 func TestStateLockCreateLeaseFailureLeavesNoOrphan(t *testing.T) {
 	leaseFailure := errors.New("injected advisory lease failure")
 	restore := replaceStateLockLeaseTry(func(file *os.File) (bool, error) {
-		if filepath.Base(file.Name()) == "state.lock" {
+		if strings.HasPrefix(filepath.Base(file.Name()), stateLockUnpublishedPrefix) {
 			return false, leaseFailure
 		}
 		return tryStateLockLease(file)
@@ -738,7 +759,7 @@ func TestStateLockCreateLeaseFailureLeavesNoOrphan(t *testing.T) {
 
 func TestStateLockCreatedButUnacquiredLeaseLeavesNoOrphan(t *testing.T) {
 	restore := replaceStateLockLeaseTry(func(file *os.File) (bool, error) {
-		if filepath.Base(file.Name()) == "state.lock" {
+		if strings.HasPrefix(filepath.Base(file.Name()), stateLockUnpublishedPrefix) {
 			return false, nil
 		}
 		return tryStateLockLease(file)
@@ -758,7 +779,7 @@ func TestStateLockCreatePostFlockFailureLeavesNoOrphan(t *testing.T) {
 		t.Run(stage, func(t *testing.T) {
 			injected := fmt.Errorf("injected post-flock %s failure", stage)
 			restore := replaceStateLockLeaseFault(func(name, observedStage string) error {
-				if name == "state.lock" && observedStage == stage {
+				if strings.HasPrefix(name, stateLockUnpublishedPrefix) && observedStage == stage {
 					return injected
 				}
 				return nil
@@ -781,6 +802,260 @@ func TestStateLockCreatePostFlockFailureLeavesNoOrphan(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestStateLockPublicationCrashNeverLeavesPartialAuthoritativeRecord(t *testing.T) {
+	tests := []struct {
+		name             string
+		helperMode       string
+		visibleAfterExit bool
+	}{
+		{name: "before atomic publish", helperMode: "crash-before-publish"},
+		{name: "after atomic publish", helperMode: "crash-after-publish", visibleAfterExit: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			statePath := filepath.Join(t.TempDir(), ".sow")
+			command := exec.Command(os.Args[0], "-test.run=^TestStateLockHelperProcess$")
+			command.Env = append(os.Environ(), lockHelperStateEnv+"="+statePath, lockHelperModeEnv+"="+test.helperMode)
+			err := command.Run()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != stateLockCrashExitCode {
+				t.Fatalf("publication crash helper exit=%v want=%d", err, stateLockCrashExitCode)
+			}
+
+			pending := unpublishedLockFiles(t, statePath)
+			if len(pending) != 1 {
+				t.Fatalf("publication crash pending evidence=%v want exactly one", pending)
+			}
+			pendingInfo, err := os.Lstat(pending[0])
+			if err != nil || !pendingInfo.Mode().IsRegular() || pendingInfo.Mode().Perm() != 0o600 {
+				t.Fatalf("unpublished lock evidence is unsafe: info=%v err=%v", pendingInfo, err)
+			}
+			pendingBody, err := os.ReadFile(pending[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			pendingRecord := decodeLockRecordFixture(t, pendingBody)
+			if _, err := pendingRecord.kind(); err != nil || pendingRecord.PID != command.Process.Pid {
+				t.Fatalf("unpublished lock record is incomplete: record=%+v err=%v child_pid=%d", pendingRecord, err, command.Process.Pid)
+			}
+
+			lockPath := filepath.Join(statePath, "locks", "state.lock")
+			visibleInfo, visibleErr := os.Lstat(lockPath)
+			if test.visibleAfterExit {
+				if visibleErr != nil || !os.SameFile(pendingInfo, visibleInfo) {
+					t.Fatalf("post-publish crash did not leave the exact complete prepared inode: visible=%v err=%v", visibleInfo, visibleErr)
+				}
+				visibleBody := readLockBytes(t, statePath)
+				if !bytes.Equal(pendingBody, visibleBody) {
+					t.Fatal("post-publish crash exposed bytes different from the prepared record")
+				}
+				if _, err := AcquireLock(statePath, "after-publish-crash", false); err == nil || !strings.Contains(err.Error(), "rerun with --recover") {
+					t.Fatalf("complete crashed publication was not reported as recoverable stale evidence: %v", err)
+				}
+				lock, err := AcquireLock(statePath, "after-publish-crash", true)
+				if err != nil {
+					t.Fatalf("recover complete crash-published record: %v", err)
+				}
+				stale := staleLockFiles(t, statePath)
+				if len(stale) != 1 {
+					t.Fatalf("post-publish crash recovery stale evidence=%v want one", stale)
+				}
+				staleBody, err := os.ReadFile(stale[0])
+				if err != nil || !bytes.Equal(staleBody, pendingBody) {
+					t.Fatalf("post-publish crash recovery changed old evidence: err=%v", err)
+				}
+				if err := lock.Release(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if !errors.Is(visibleErr, os.ErrNotExist) {
+					t.Fatalf("pre-publish crash exposed an authoritative state.lock: %v", visibleErr)
+				}
+				lock, err := AcquireLock(statePath, "after-unpublished-crash", false)
+				if err != nil {
+					t.Fatalf("unpublished crash evidence incorrectly required recovery: %v", err)
+				}
+				if err := lock.Release(); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			afterPending, err := os.Lstat(pending[0])
+			afterBody, readErr := os.ReadFile(pending[0])
+			if err != nil || readErr != nil || !os.SameFile(pendingInfo, afterPending) || !bytes.Equal(pendingBody, afterBody) {
+				t.Fatalf("later acquisition changed unpublished crash evidence: stat=%v read=%v", err, readErr)
+			}
+			if _, err := os.Lstat(lockPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("successful release retained authoritative state.lock: %v", err)
+			}
+		})
+	}
+}
+
+func TestStateLockPublicationFailureRemovesPreparedAndVisibleNames(t *testing.T) {
+	for _, stage := range []string{stateLeaseFaultBeforePublish, stateLeaseFaultAfterPublish} {
+		t.Run(stage, func(t *testing.T) {
+			injected := fmt.Errorf("injected state lock publication failure at %s", stage)
+			restore := replaceStateLockLeaseFault(func(name, observedStage string) error {
+				if name == "state.lock" && observedStage == stage {
+					return injected
+				}
+				return nil
+			})
+			defer restore()
+			statePath := filepath.Join(t.TempDir(), ".sow")
+			if _, err := AcquireLock(statePath, "publication-failure", false); !errors.Is(err, injected) {
+				t.Fatalf("publication failure was not returned: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(statePath, "locks", "state.lock")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("publication failure retained authoritative state.lock: %v", err)
+			}
+			if pending := unpublishedLockFiles(t, statePath); len(pending) != 0 {
+				t.Fatalf("publication failure retained prepared names: %v", pending)
+			}
+			restore()
+			lock, err := AcquireLock(statePath, "after-publication-failure", false)
+			if err != nil {
+				t.Fatalf("clean retry after publication failure: %v", err)
+			}
+			if err := lock.Release(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestPartialUnpublishedStateLockIsPreservedButNeverAuthoritative(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), ".sow")
+	locksPath := filepath.Join(statePath, "locks")
+	if err := os.MkdirAll(locksPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pendingPath := filepath.Join(locksPath, stateLockUnpublishedPrefix+strings.Repeat("a", 64))
+	partial := []byte(`{"schema_version":1`)
+	if err := os.WriteFile(pendingPath, partial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(pendingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := AcquireLock(statePath, "after-partial-unpublished-record", false)
+	if err != nil {
+		t.Fatalf("partial unpublished evidence blocked ordinary acquisition: %v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Lstat(pendingPath)
+	afterBody, readErr := os.ReadFile(pendingPath)
+	if err != nil || readErr != nil || !os.SameFile(before, after) || !bytes.Equal(partial, afterBody) {
+		t.Fatalf("ordinary acquisition changed partial unpublished evidence: stat=%v read=%v", err, readErr)
+	}
+	if _, err := os.Lstat(filepath.Join(locksPath, "state.lock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("successful release retained authoritative state.lock: %v", err)
+	}
+}
+
+func TestStateLockAtomicPublishCollisionCleansOnlyPreparedInode(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), ".sow")
+	lockPath := filepath.Join(statePath, "locks", "state.lock")
+	collisionRecord := fixtureLegacyLockRecord(definitelyDeadPID(t))
+	var collisionBody []byte
+	injected := false
+	restore := replaceStateLockLeaseFault(func(name, stage string) error {
+		if name != "state.lock" || stage != stateLeaseFaultBeforePublish || injected {
+			return nil
+		}
+		injected = true
+		file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+		if err != nil {
+			return err
+		}
+		encodeErr := json.NewEncoder(file).Encode(collisionRecord)
+		syncErr := file.Sync()
+		closeErr := file.Close()
+		if err := errors.Join(encodeErr, syncErr, closeErr); err != nil {
+			return err
+		}
+		collisionBody, err = os.ReadFile(lockPath)
+		return err
+	})
+	defer restore()
+	if _, err := AcquireLock(statePath, "atomic-publish-collision", false); err == nil || !strings.Contains(err.Error(), "rerun with --recover") {
+		t.Fatalf("collision record was not classified after atomic link lost the race: %v", err)
+	}
+	if !injected {
+		t.Fatal("atomic publication collision seam was not reached")
+	}
+	if pending := unpublishedLockFiles(t, statePath); len(pending) != 0 {
+		t.Fatalf("atomic publication collision retained its private prepared inode: %v", pending)
+	}
+	after, err := os.ReadFile(lockPath)
+	if err != nil || !bytes.Equal(after, collisionBody) {
+		t.Fatalf("atomic publication collision changed the winning record: read=%v", err)
+	}
+	restore()
+	lock, err := AcquireLock(statePath, "recover-atomic-publish-collision", true)
+	if err != nil {
+		t.Fatalf("recover collision winner: %v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStateLockVisibleReplacementFailsBeforePermissionReconciliation(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), ".sow")
+	if err := os.MkdirAll(statePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	controlPath := filepath.Join(statePath, "must-not-be-reconciled")
+	if err := os.WriteFile(controlPath, []byte("control\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(controlPath, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	beforeControl, err := os.Lstat(controlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(statePath, "locks", "state.lock")
+	displacedPath := lockPath + ".displaced-during-publish"
+	replacement := []byte("foreign replacement must remain untouched\n")
+	replaced := false
+	restore := replaceStateLockLeaseFault(func(name, stage string) error {
+		if name != "state.lock" || stage != stateLeaseFaultAfterPublish || replaced {
+			return nil
+		}
+		replaced = true
+		if err := os.Rename(lockPath, displacedPath); err != nil {
+			return err
+		}
+		return os.WriteFile(lockPath, replacement, 0o600)
+	})
+	defer restore()
+	if _, err := AcquireLock(statePath, "visible-replacement", false); err == nil || !strings.Contains(err.Error(), "before protected corridor preparation") {
+		t.Fatalf("visible state.lock replacement was not rejected before permission reconciliation: %v", err)
+	}
+	if !replaced {
+		t.Fatal("visible replacement seam was not reached")
+	}
+	afterControl, err := os.Lstat(controlPath)
+	if err != nil || afterControl.Mode().Perm() != beforeControl.Mode().Perm() || !afterControl.ModTime().Equal(beforeControl.ModTime()) {
+		t.Fatalf("failed pre-mutation validation reconciled unrelated control permissions: before=%v after=%v err=%v", beforeControl, afterControl, err)
+	}
+	afterReplacement, err := os.ReadFile(lockPath)
+	if err != nil || !bytes.Equal(afterReplacement, replacement) {
+		t.Fatalf("failed pre-mutation validation changed replacement state.lock: read=%v", err)
+	}
+	displaced, err := os.Lstat(displacedPath)
+	if err != nil || !displaced.Mode().IsRegular() {
+		t.Fatalf("failed pre-mutation validation removed displaced original evidence: info=%v err=%v", displaced, err)
 	}
 }
 
@@ -1201,6 +1476,15 @@ func decodeLockRecordFixture(t *testing.T, data []byte) lockRecord {
 func staleLockFiles(t *testing.T, statePath string) []string {
 	t.Helper()
 	files, err := filepath.Glob(filepath.Join(statePath, "locks", "state.lock.stale-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return files
+}
+
+func unpublishedLockFiles(t *testing.T, statePath string) []string {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(statePath, "locks", stateLockUnpublishedPrefix+"*"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -74,6 +74,11 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   三类中断、成功后响应丢失、跨多次恢复保留的 canonical lineage、同 run 幂等、跨
   run/plan/resource/stale ETag/伪造 digest/readiness 负例及零 Delete；ordinary/race/static/
   clean-delivery 均从当前源码复现。未触云，POC-06 不变。
+- `2026-07-19-state-lock-atomic-publication.md`：本地 state lock 以 boot/start token
+  区分 PID 复用，并把完整 v1 记录先写入 leased private inode，再用 create-only hardlink
+  单点发布；真实子进程在提交点前后退出、partial unpublished、legacy create collision、
+  可见 inode 替换与 permission-reconciliation 前置门禁均通过 ordinary/race/双平台编译。
+  全程仅临时目录，无网络或云访问；不替代 FR-28/NFR-09 的真双云验证。
 - `2026-07-17-yum-infra-current-compatibility-cutover.md`：当前生产
   `yum/infra` 只读 234-file 快照的精确可写副本；216/216 RPM 由 Pigsty key
   验签，两个 root `modules.yaml` 只在副本 quarantine，完成双架构

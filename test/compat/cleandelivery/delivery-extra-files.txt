@@ -115,6 +115,7 @@ docs/evidence/2026-07-19-pigsty-yum-consumer-preflight.md
 docs/evidence/2026-07-19-r2-bootstrap-two-phase-recovery.md
 docs/evidence/2026-07-19-r2-lease-cas-retirement.md
 docs/evidence/2026-07-19-r2-resource-stable-lease-rotation.md
+docs/evidence/2026-07-19-state-lock-atomic-publication.md
 docs/evidence/README.md
 docs/examples/sow-pgdg.yaml
 docs/migration/audit-legacy-targets.sh

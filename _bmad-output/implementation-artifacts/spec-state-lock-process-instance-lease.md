@@ -2,9 +2,9 @@
 title: 'State lock process-instance lease'
 type: 'bugfix'
 created: '2026-07-15'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
-baseline_commit: '84800a60e01aaaf8dc5b189c3ddb1380930f4865'
+baseline_commit: 'f0b9632c8a6a504a83931d84e79570252ef62a39'
 context:
   - '{project-root}/_bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/prd.md'
   - '{project-root}/docs/adr/0001-core-contracts.md'
@@ -52,10 +52,11 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `internal/state/lock.go` -- 增加版本化实例记录、稳定 lease 文件、恢复分类、持有期身份校验和保守 legacy 迁移。
-- [ ] `internal/state/process_identity*.go` -- 用 OS 启动实例 + 进程启动 token 实现可比较身份，不依赖外部命令。
-- [ ] `internal/state/lock_instance_test.go` -- 覆盖矩阵中的正常、边界、跨进程和篡改路径。
-- [ ] `docs/adr/0025-state-lock-process-instance-lease.md` -- 冻结协议与运维恢复边界。
+- [x] `internal/state/lock.go` -- 增加版本化实例记录、稳定 lease 文件、恢复分类、持有期身份校验和保守 legacy 迁移。
+- [x] `internal/state/process_identity*.go` -- 用 OS 启动实例 + 进程启动 token 实现可比较身份，不依赖外部命令。
+- [x] `internal/state/lock_instance_test.go` -- 覆盖矩阵中的正常、边界、跨进程和篡改路径。
+- [x] `docs/adr/0025-state-lock-process-instance-lease.md` -- 冻结协议与运维恢复边界。
+- [x] `docs/evidence/2026-07-19-state-lock-atomic-publication.md` -- 固化当前源码、真实崩溃点和证据边界。
 
 **Acceptance Criteria:**
 - Given 同一锁的精确进程实例仍持有 lease, when 另一调用带或不带 `--recover`, then 调用失败且现有记录不变。
@@ -65,14 +66,50 @@ context:
 
 ## Spec Change Log
 
+- 2026-07-19：恢复本规格验收时发现“create 空 `state.lock` → encode”之间存在真实崩溃窗口；改为私有 inode 完整写入并 fsync，再以 create-only hardlink 原子发布。真实子进程退出测试覆盖发布点前后、部分 unpublished 记录、返回错误清理和后续恢复。
+- 2026-07-19：独立边界审查发现原子发布完成到权限协调之间尚未绑定可见路径；完整 holder 绑定现提前到任何 chmod 之前，路径替换负例证明 replacement/evidence/control mode 均不被触碰。最终盲审与边界复核均无剩余高置信 finding。
+
 ## Design Notes
 
 boot token 区分重启前后的 PID 空间，process start token 区分同一次启动中的 PID 复用，随机 lock ID 则绑定一次具体的锁获取与持有者校验。legacy 记录没有实例证明，所以只有 PID 已死时才允许自动迁移；身份探测失败、损坏或未知协议都不能证明原实例已退出，自动恢复失败关闭。
 
+权威 `state.lock` 也必须自身可恢复：完整 v1 记录先写入 mode-0600 的 `state.lock.unpublished-<lock-id>` 并 fsync，持有同一 inode 的 flock 后通过 hardlink 单点提交。提交前崩溃不产生权威锁且保留 unpublished 证据；提交后崩溃只留下完整记录，沿既有 `--recover` 路径保留旧证据并取得新锁。
+
 ## Verification
 
 **Commands:**
-- `go test -count=1 ./internal/state -run 'Lock|AcquireLock'` -- 聚焦功能通过。
-- `go test -race -count=1 ./internal/state -run 'Lock|AcquireLock'` -- 并发与身份注册无竞态。
-- `go vet ./internal/state` -- 静态检查通过。
-- `GOOS=linux go test -c ./internal/state` 与 `GOOS=darwin go test -c ./internal/state` -- 两平台可编译。
+- `go test -count=1 ./internal/state` -- PASS（4.693s），含真实 Darwin 身份探测与原子发布崩溃矩阵。
+- `go test -race -count=1 ./internal/state` -- PASS（11.105s），并发、跨进程与身份注册无竞态。
+- `go vet ./internal/state`；`staticcheck -checks='SA*,S1*' ./internal/state` -- PASS，无输出。
+- `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c -o /tmp/sow-state-linux-amd64.test ./internal/state` 与 Darwin arm64 对应命令 -- PASS。
+- `go test ./... -run '^$'` -- PASS（14.158s），全模块测试源码重新编译，无云或生产仓库访问。
+- `SOW_RUN_REAL_CLOUD=0 SOW_RUN_REAL_EDGE_EVIDENCE=0 SOW_RUN_REAL_UPSTREAM=0 go test -count=1 ./test/compat/cleandelivery` -- PASS（1.954s），新增证据文件已纳入干净交付闭包。
+
+## Suggested Review Order
+
+**原子权威记录**
+
+- 私有完整 inode 通过 create-only hardlink 提供单点提交。
+  [`lock.go:298`](../../internal/state/lock.go#L298)
+
+- 完整 holder 绑定先于任何权限或正典状态变更。
+  [`lock.go:680`](../../internal/state/lock.go#L680)
+
+- ADR 冻结提交点两侧的崩溃与证据语义。
+  [`0025-state-lock-process-instance-lease.md:38`](../../docs/adr/0025-state-lock-process-instance-lease.md#L38)
+
+**故障与边界证据**
+
+- 真实子进程分别在原子提交前后退出并重放。
+  [`lock_instance_test.go:808`](../../internal/state/lock_instance_test.go#L808)
+
+- 可见路径替换必须在 permission reconciliation 前失败。
+  [`lock_instance_test.go:1011`](../../internal/state/lock_instance_test.go#L1011)
+
+- 日期化报告汇总命令、结果与明确外部边界。
+  [`2026-07-19-state-lock-atomic-publication.md:7`](../../docs/evidence/2026-07-19-state-lock-atomic-publication.md#L7)
+
+**需求账本**
+
+- V-28 将本地闭合与仍开放的真双云门禁分开。
+  [`requirements-traceability.md:96`](../../docs/requirements-traceability.md#L96)

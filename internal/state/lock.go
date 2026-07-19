@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -21,8 +22,12 @@ const (
 	lockIDBytes             = 32
 	maxLockRecordBytes      = 16 << 10
 
-	stateLeaseFaultChmod    = "chmod"
-	stateLeaseFaultIdentity = "identity"
+	stateLeaseFaultChmod         = "chmod"
+	stateLeaseFaultIdentity      = "identity"
+	stateLeaseFaultBeforePublish = "before-publish"
+	stateLeaseFaultAfterPublish  = "after-publish"
+
+	stateLockUnpublishedPrefix = "state.lock.unpublished-"
 
 	statePermissionAfterChildLstat = "after-child-lstat"
 	statePermissionBeforeRootChmod = "before-root-chmod"
@@ -61,6 +66,8 @@ var localStateLockLeases = struct {
 	next uint64
 	held map[uint64]os.FileInfo
 }{held: make(map[uint64]os.FileInfo)}
+
+var errStateLockPublicationCollision = errors.New("state lock appeared during atomic publication")
 
 var stateLockLeaseTrySource = struct {
 	sync.RWMutex
@@ -146,7 +153,7 @@ func replaceStatePermissionFault(fault func(string, string) error) func() {
 func openAdvisoryLease(root *os.Root, name string, flags int, mode os.FileMode) (*os.File, os.FileInfo, uint64, bool, error) {
 	localStateLockLeases.Lock()
 	defer localStateLockLeases.Unlock()
-	createdStateLock := name == "state.lock" && flags&os.O_CREATE != 0 && flags&os.O_EXCL != 0
+	createdEntry := flags&os.O_CREATE != 0 && flags&os.O_EXCL != 0
 	file, err := root.OpenFile(name, flags, mode)
 	if err != nil {
 		return nil, nil, 0, false, err
@@ -166,28 +173,28 @@ func openAdvisoryLease(root *os.Root, name string, flags int, mode os.FileMode) 
 	acquired, lockErr := callStateLockLeaseTry(file)
 	if lockErr != nil {
 		var cleanupErr error
-		if createdStateLock {
-			cleanupErr = removeCreatedStateLockAfterLeaseFailure(root, file, opened)
+		if createdEntry {
+			cleanupErr = removeCreatedLeaseEntryAfterFailure(root, name, file, opened)
 		}
 		closeErr := file.Close()
 		return nil, nil, 0, false, errors.Join(lockErr, cleanupErr, closeErr)
 	}
 	if !acquired {
 		var cleanupErr error
-		if createdStateLock {
-			cleanupErr = removeCreatedStateLockAfterLeaseFailure(root, file, opened)
+		if createdEntry {
+			cleanupErr = removeCreatedLeaseEntryAfterFailure(root, name, file, opened)
 		}
 		closeErr := file.Close()
 		return nil, nil, 0, false, errors.Join(cleanupErr, closeErr)
 	}
 	failAfterAcquire := func(failure error) (*os.File, os.FileInfo, uint64, bool, error) {
-		// A create-only state.lock belongs to this acquisition attempt. Remove it
+		// A create-only lease entry belongs to this acquisition attempt. Remove it
 		// while its advisory lease is still held, prove the path is still the same
 		// inode, and fsync the directory before releasing the lease. Otherwise a
-		// chmod or post-flock identity failure would strand a false live record.
+		// chmod or post-flock identity failure would strand private debris.
 		var cleanupErr error
-		if createdStateLock {
-			cleanupErr = removeCreatedStateLockAfterLeaseFailure(root, file, opened)
+		if createdEntry {
+			cleanupErr = removeCreatedLeaseEntryAfterFailure(root, name, file, opened)
 		}
 		unlockErr := releaseStateLockLease(file)
 		closeErr := file.Close()
@@ -221,18 +228,18 @@ func openAdvisoryLease(root *os.Root, name string, flags int, mode os.FileMode) 
 	return file, opened, leaseID, true, nil
 }
 
-func removeCreatedStateLockAfterLeaseFailure(root *os.Root, file *os.File, identity os.FileInfo) error {
-	if root == nil || file == nil || identity == nil {
-		return errors.New("created state lock identity is unavailable after advisory lease failure")
+func removeCreatedLeaseEntryAfterFailure(root *os.Root, name string, file *os.File, identity os.FileInfo) error {
+	if root == nil || filepath.Base(name) != name || name == "." || name == "" || file == nil || identity == nil {
+		return errors.New("created state lease entry identity is unavailable after advisory lease failure")
 	}
 	opened, statErr := file.Stat()
-	current, lstatErr := root.Lstat("state.lock")
+	current, lstatErr := root.Lstat(name)
 	if statErr != nil || lstatErr != nil || opened == nil || !opened.Mode().IsRegular() ||
 		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
 		!os.SameFile(identity, opened) || !os.SameFile(identity, current) {
-		return errors.Join(statErr, lstatErr, errors.New("refusing to remove a created state lock whose inode changed after advisory lease failure"))
+		return errors.Join(statErr, lstatErr, errors.New("refusing to remove a created state lease entry whose inode changed after advisory lease failure"))
 	}
-	if err := root.Remove("state.lock"); err != nil {
+	if err := root.Remove(name); err != nil {
 		return err
 	}
 	return syncRootDirectory(root)
@@ -259,20 +266,132 @@ func closeStateLockLease(file *os.File, leaseID uint64) error {
 }
 
 func removeLeasedStateLock(root *os.Root, directory *os.File, file *os.File, identity os.FileInfo) error {
+	return removeLeasedStateEntry(root, directory, file, identity, "state.lock")
+}
+
+func removeLeasedStateEntry(root *os.Root, directory *os.File, file *os.File, identity os.FileInfo, name string) error {
 	if root == nil || directory == nil || file == nil || identity == nil {
 		return errors.New("state lock removal lease is incomplete")
 	}
+	if filepath.Base(name) != name || name == "." || name == "" {
+		return errors.New("state lock removal name is unsafe")
+	}
 	opened, statErr := file.Stat()
-	current, lstatErr := root.Lstat("state.lock")
+	current, lstatErr := root.Lstat(name)
 	if statErr != nil || lstatErr != nil || opened == nil || !opened.Mode().IsRegular() ||
 		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
 		!os.SameFile(identity, opened) || !os.SameFile(identity, current) {
 		return errors.Join(statErr, lstatErr, errors.New("refusing to unlink a state lock outside the held advisory lease"))
 	}
-	if err := root.Remove("state.lock"); err != nil {
+	if err := root.Remove(name); err != nil {
 		return err
 	}
 	return directory.Sync()
+}
+
+// publishPreparedStateLock makes the visible record crash-atomic. The record is
+// fully encoded and fsynced on a private inode while its advisory lease is
+// already held. A create-only hardlink then publishes those exact bytes as
+// state.lock in one namespace operation. A crash before the link leaves only
+// non-authoritative evidence; a crash after it leaves a complete recoverable
+// record, never a zero-byte or partially encoded authoritative lock.
+func publishPreparedStateLock(root *os.Root, directory *os.File, record lockRecord) (*os.File, os.FileInfo, uint64, bool, error) {
+	if root == nil || directory == nil {
+		return nil, nil, 0, false, errors.New("state lock publication root is unavailable")
+	}
+	if _, err := record.kind(); err != nil {
+		return nil, nil, 0, false, fmt.Errorf("validate prepared state lock record: %w", err)
+	}
+	pendingName := stateLockUnpublishedPrefix + record.LockID
+	file, identity, leaseID, acquired, err := openAdvisoryLease(
+		root, pendingName, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600,
+	)
+	if err != nil || !acquired {
+		return nil, nil, 0, acquired, err
+	}
+	published := false
+	fail := func(failure error) (*os.File, os.FileInfo, uint64, bool, error) {
+		cleanupErr := removePreparedStateLockAttempt(root, directory, file, identity, pendingName, published)
+		leaseErr := closeStateLockLease(file, leaseID)
+		return nil, nil, 0, false, errors.Join(failure, cleanupErr, leaseErr)
+	}
+	if err := json.NewEncoder(file).Encode(record); err != nil {
+		return fail(fmt.Errorf("encode prepared state lock: %w", err))
+	}
+	if err := file.Sync(); err != nil {
+		return fail(fmt.Errorf("sync prepared state lock: %w", err))
+	}
+	prepared, statErr := file.Stat()
+	current, lstatErr := root.Lstat(pendingName)
+	if statErr != nil || lstatErr != nil || prepared == nil || current == nil ||
+		!prepared.Mode().IsRegular() || prepared.Mode().Perm() != 0o600 ||
+		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || current.Mode().Perm() != 0o600 ||
+		!os.SameFile(identity, prepared) || !os.SameFile(identity, current) {
+		return fail(errors.Join(statErr, lstatErr, errors.New("prepared state lock changed before publication")))
+	}
+	if faultErr := callStateLockLeaseFault("state.lock", stateLeaseFaultBeforePublish); faultErr != nil {
+		return fail(faultErr)
+	}
+	if err := root.Link(pendingName, "state.lock"); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			cleanupErr := removePreparedStateLockAttempt(root, directory, file, identity, pendingName, false)
+			leaseErr := closeStateLockLease(file, leaseID)
+			if cleanupErr != nil || leaseErr != nil {
+				return nil, nil, 0, false, fmt.Errorf("discard prepared state lock after publication collision: %w", errors.Join(cleanupErr, leaseErr))
+			}
+			return nil, nil, 0, false, errStateLockPublicationCollision
+		}
+		return fail(err)
+	}
+	published = true
+	visible, visibleErr := root.Lstat("state.lock")
+	current, lstatErr = root.Lstat(pendingName)
+	if visibleErr != nil || lstatErr != nil || visible == nil || current == nil ||
+		visible.Mode()&os.ModeSymlink != 0 || !visible.Mode().IsRegular() || visible.Mode().Perm() != 0o600 ||
+		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || current.Mode().Perm() != 0o600 ||
+		!os.SameFile(identity, visible) || !os.SameFile(identity, current) {
+		return fail(errors.Join(visibleErr, lstatErr, errors.New("published state lock does not match the prepared inode")))
+	}
+	observed, readErr := readLockFileAt(root, "state.lock", file, identity)
+	if readErr != nil || !sameLockRecord(record, observed) {
+		return fail(errors.Join(readErr, errors.New("published state lock bytes do not match the prepared record")))
+	}
+	if faultErr := callStateLockLeaseFault("state.lock", stateLeaseFaultAfterPublish); faultErr != nil {
+		return fail(faultErr)
+	}
+	if err := removeLeasedStateEntry(root, directory, file, identity, pendingName); err != nil {
+		return fail(fmt.Errorf("remove unpublished state lock name: %w", err))
+	}
+	return file, identity, leaseID, true, nil
+}
+
+func removePreparedStateLockAttempt(root *os.Root, directory *os.File, file *os.File, identity os.FileInfo, pendingName string, published bool) error {
+	if root == nil || directory == nil || file == nil || identity == nil ||
+		!strings.HasPrefix(pendingName, stateLockUnpublishedPrefix) || filepath.Base(pendingName) != pendingName {
+		return errors.New("prepared state lock cleanup binding is incomplete")
+	}
+	var cleanupErr error
+	removeExact := func(name string) {
+		current, err := root.Lstat(name)
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		opened, statErr := file.Stat()
+		if err != nil || statErr != nil || current == nil || opened == nil ||
+			current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
+			!os.SameFile(identity, current) || !os.SameFile(identity, opened) {
+			cleanupErr = errors.Join(cleanupErr, err, statErr, fmt.Errorf("refusing to remove prepared state lock name %s after its inode changed", name))
+			return
+		}
+		if err := root.Remove(name); err != nil {
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
+	}
+	if published {
+		removeExact("state.lock")
+	}
+	removeExact(pendingName)
+	return errors.Join(cleanupErr, directory.Sync())
 }
 
 func preserveLeasedStateLock(root *os.Root, directory *os.File, file *os.File, identity os.FileInfo, staleName string) error {
@@ -295,10 +414,7 @@ func preserveLeasedStateLock(root *os.Root, directory *os.File, file *os.File, i
 	if staleErr != nil || stale.Mode()&os.ModeSymlink != 0 || !stale.Mode().IsRegular() || !os.SameFile(identity, stale) {
 		return errors.Join(staleErr, errors.New("preserved stale state lock does not match the leased inode"))
 	}
-	if err := root.Remove("state.lock"); err != nil {
-		return err
-	}
-	return directory.Sync()
+	return removeLeasedStateLock(root, directory, file, identity)
 }
 
 func bootstrapStateLockRoot(stateDir string) (string, error) {
@@ -550,63 +666,67 @@ func AcquireLock(stateDir, operation string, recoverStale bool) (*Lock, error) {
 	}
 	var prepared *lockRecord
 	for attempt := 0; attempt < 3; attempt++ {
-		file, fileIdentity, recordLeaseID, acquired, createErr := openAdvisoryLease(
-			locksRoot, "state.lock", os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600,
-		)
-		if createErr == nil && acquired {
-			// Permission reconciliation can mutate unrelated state children. It
-			// runs only after both the persistent lease and the legacy-compatible
-			// record lease are owned, so blocked contenders stay read-only.
-			if prepareErr := prepareStateRootPermissions(stateRoot, boundState); prepareErr != nil {
-				removeErr := removeLeasedStateLock(locksRoot, locksFile, file, fileIdentity)
-				recordLeaseErr := closeStateLockLease(file, recordLeaseID)
-				return nil, errors.Join(fmt.Errorf("prepare protected state/serving corridor: %w", prepareErr), removeErr, recordLeaseErr)
-			}
-			if validateErr := lock.validatePathIdentity(); validateErr != nil {
-				removeErr := removeLeasedStateLock(locksRoot, locksFile, file, fileIdentity)
-				recordLeaseErr := closeStateLockLease(file, recordLeaseID)
-				return nil, errors.Join(fmt.Errorf("validate state after protected corridor preparation: %w", validateErr), removeErr, recordLeaseErr)
-			}
+		_, visibleErr := locksRoot.Lstat("state.lock")
+		if errors.Is(visibleErr, os.ErrNotExist) {
 			var record lockRecord
 			if prepared != nil {
 				record = *prepared
-				prepared = nil
 			} else {
-				record, createErr = newLockRecord(operation)
+				record, err = newLockRecord(operation)
+				if err != nil {
+					return nil, err
+				}
 			}
-			if createErr != nil {
-				removeErr := removeLeasedStateLock(locksRoot, locksFile, file, fileIdentity)
-				leaseErr := closeStateLockLease(file, recordLeaseID)
-				return nil, errors.Join(createErr, removeErr, leaseErr)
+			file, fileIdentity, recordLeaseID, acquired, createErr := publishPreparedStateLock(locksRoot, locksFile, record)
+			if createErr == nil && acquired {
+				prepared = nil
+				lockIdentity, statErr := file.Stat()
+				if statErr != nil || lockIdentity == nil ||
+					!lockIdentity.Mode().IsRegular() || !os.SameFile(fileIdentity, lockIdentity) {
+					removeErr := removeLeasedStateLock(locksRoot, locksFile, file, fileIdentity)
+					leaseErr := closeStateLockLease(file, recordLeaseID)
+					return nil, errors.Join(statErr, removeErr, leaseErr)
+				}
+				lock.lockIdentity = lockIdentity
+				lock.lockFile = file
+				lock.localRecordID = recordLeaseID
+				lock.lockRecord = record
+				closePublished := func() error {
+					removeErr := lock.removeOwnedLock()
+					leaseErr := closeStateLockLease(file, recordLeaseID)
+					lock.lockIdentity, lock.lockFile = nil, nil
+					lock.localRecordID = 0
+					lock.lockRecord = lockRecord{}
+					return errors.Join(removeErr, leaseErr)
+				}
+				if validateErr := lock.validatePathIdentity(); validateErr != nil {
+					return nil, fmt.Errorf("validate state lock before protected corridor preparation: %w", errors.Join(validateErr, closePublished()))
+				}
+				// Permission reconciliation can mutate unrelated state children. It
+				// runs only after both the persistent lease and the legacy-compatible
+				// record lease are owned and a complete record is visible, so blocked
+				// contenders stay read-only and a crash never leaves a partial record.
+				if prepareErr := prepareStateRootPermissions(stateRoot, boundState); prepareErr != nil {
+					return nil, fmt.Errorf("prepare protected state/serving corridor: %w", errors.Join(prepareErr, closePublished()))
+				}
+				if validateErr := lock.validatePathIdentity(); validateErr != nil {
+					return nil, fmt.Errorf("validate state after protected corridor preparation: %w", errors.Join(validateErr, closePublished()))
+				}
+				if err := errors.Join(locksFile.Sync(), lock.validatePathIdentity()); err != nil {
+					return nil, fmt.Errorf("validate acquired state lock: %w", errors.Join(err, closePublished()))
+				}
+				closeState, closeLocks, closeLocksFile = false, false, false
+				leaseOpen = false
+				return lock, nil
 			}
-			encodeErr := json.NewEncoder(file).Encode(record)
-			syncErr := file.Sync()
-			lockIdentity, statErr := file.Stat()
-			if encodeErr != nil || syncErr != nil || statErr != nil || lockIdentity == nil ||
-				!lockIdentity.Mode().IsRegular() || !os.SameFile(fileIdentity, lockIdentity) {
-				removeErr := removeLeasedStateLock(locksRoot, locksFile, file, fileIdentity)
-				leaseErr := closeStateLockLease(file, recordLeaseID)
-				return nil, errors.Join(encodeErr, syncErr, statErr, removeErr, leaseErr)
+			if createErr == nil && !acquired {
+				return nil, errors.New("state is locked by an active process instance holding the advisory lease")
 			}
-			lock.lockIdentity = lockIdentity
-			lock.lockFile = file
-			lock.localRecordID = recordLeaseID
-			lock.lockRecord = record
-			if err := errors.Join(locksFile.Sync(), lock.validatePathIdentity()); err != nil {
-				removeErr := lock.removeOwnedLock()
-				leaseErr := closeStateLockLease(file, recordLeaseID)
-				lock.lockFile = nil
-				return nil, fmt.Errorf("validate acquired state lock: %w", errors.Join(err, removeErr, leaseErr))
+			if !errors.Is(createErr, errStateLockPublicationCollision) {
+				return nil, fmt.Errorf("publish state lock: %w", createErr)
 			}
-			closeState, closeLocks, closeLocksFile = false, false, false
-			leaseOpen = false
-			return lock, nil
-		}
-		if createErr == nil && !acquired {
-			return nil, errors.New("state is locked by an active process instance holding the advisory lease")
-		}
-		if !errors.Is(createErr, os.ErrExist) {
-			return nil, fmt.Errorf("acquire state lock: %w", createErr)
+		} else if visibleErr != nil {
+			return nil, fmt.Errorf("inspect existing state lock: %w", visibleErr)
 		}
 
 		// Existing evidence remains byte- and metadata-stable until it has been

@@ -29,18 +29,34 @@ New records use schema v1 and bind one acquisition with all of:
   `state.lock` inode.
 
 Identity is mandatory for a new lock. Failure to read or validate the current
-process identity aborts acquisition and removes any create-only `state.lock`
-while its inode binding is still known. `Validate`, mutation-boundary
-capabilities, and `Release` re-read the current process identity. A mismatch or
-unavailable probe fails closed; release keeps both leases and the durable
-record intact so the same holder can retry after a transient probe failure,
-rather than deleting evidence it can no longer prove it owns.
+process identity aborts acquisition. `Validate`, mutation-boundary capabilities,
+and `Release` re-read the current process identity. A mismatch or unavailable
+probe fails closed; release keeps both leases and the durable record intact so
+the same holder can retry after a transient probe failure, rather than deleting
+evidence it can no longer prove it owns.
 
-An `O_EXCL` creator that fails or loses the immediate nonblocking record-flock
-attempt also removes that still-empty path only after proving it is the exact
-inode it created and syncing the directory. No valid record was published, so
-another observer of that empty inode has no mutation capability; retaining it
-would instead create an automatically unrecoverable zero-byte record.
+The visible record is never created empty. SOW first encodes and fsyncs the
+complete v1 record on a private mode-0600
+`state.lock.unpublished-<lock-id>` inode while already holding that inode's
+advisory lease. A create-only hardlink publishes the same inode as
+`state.lock`; the prepared name is then removed and the lock directory is
+fsynced before permission reconciliation or any canonical mutation begins.
+This gives the record a single namespace commit point on both Linux and macOS.
+
+An abrupt exit before that hardlink leaves only non-authoritative unpublished
+evidence, so a later invocation may acquire normally without `--recover` and
+must not rewrite that evidence. An exit after the hardlink leaves a complete,
+leased record and follows the ordinary explicit stale-recovery path. The
+unpublished name can remain as an additional hardlink if the exit occurs
+between publication and cleanup; it is evidence, never an ownership signal.
+Malformed or foreign unpublished entries are not guessed away automatically.
+
+An `O_EXCL` creator that fails or loses the immediate nonblocking prepared-inode
+flock removes that still-private name only after proving it is the exact inode
+it created and syncing the directory. No visible record was published, so
+another observer of that private inode has no mutation capability; retaining it
+after an ordinary returned error would only create unnecessary unpublished
+evidence.
 
 Recovery never uses elapsed time. With the record lease held, an observed v1
 identity is compared with the PID's current identity. An exact active instance
@@ -92,7 +108,8 @@ visible record is removed; no canonical mutation occurs after that removal.
 platform identity tests cover exact-instance exclusion, PID reuse, dead and
 zombie classification, unavailable probes, conservative legacy migration,
 blocked-contender zero-write behavior, create/failure cleanup, inode/path
-replacement, descriptor-bound chmod, and release evidence preservation. The
+replacement, descriptor-bound chmod, release evidence preservation, and real
+child-process exits on both sides of the atomic record-publication point. The
 focused suite is required in ordinary and race modes, with `go vet` plus Linux
 and Darwin compilation, under the repository's strict offline/no-cloud test
 environment.
