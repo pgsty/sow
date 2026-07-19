@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { webcrypto } from "node:crypto";
+import { Buffer } from "node:buffer";
 
 import { createSowEdgeHandler, sha256Hex } from "../shared/contract.mjs";
 import { createCloudflareR2OriginHandler } from "../cloudflare/origin.mjs";
@@ -1422,6 +1423,81 @@ test("Basic Auth is the only credential fallback and is stripped before origin",
     }));
     assert.equal(denied.status, 401, fixture.name);
   }
+});
+
+test("Basic authorization is bounded canonical ASCII on both vendors", async () => {
+	const encoded = btoa(basicValue);
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	const padBitIndex = encoded.length - 2;
+	const padBitAlias = `${encoded.slice(0, padBitIndex)}${alphabet[alphabet.indexOf(encoded[padBitIndex]) ^ 1]}=`;
+	for (const vendor of ["cloudflare", "edgeone"]) {
+		const makeFixture = vendor === "cloudflare" ? makeCloudflareFixture : makeEdgeOneFixture;
+		const canonical = makeFixture("[]", JSON.stringify([entitlement(await sha256Hex(basicValue))]));
+		for (const authorization of [`Basic ${encoded}`, `basic ${encoded}`, `BASIC   ${encoded}`]) {
+			const before = canonical.calls.length;
+			const response = await canonical.handler(new Request("https://repo.example/pro/v1/basic/yum/infra/private.rpm", {
+				headers: { Authorization: authorization },
+			}));
+			assert.equal(response.status, 200, `${vendor}/${authorization.slice(0, 8)}`);
+			assert.equal(canonical.calls.length, before + 1, `${vendor}/${authorization.slice(0, 8)} origin count`);
+			assert.notEqual(canonical.calls.at(-1).authorization, authorization, `${vendor}/${authorization.slice(0, 8)} leaked Basic authorization`);
+			assert.equal(canonical.calls.at(-1).authorization?.includes(encoded) ?? false, false, `${vendor}/${authorization.slice(0, 8)} leaked Basic credential bytes`);
+		}
+		for (const decoded of ["pigsty:", "pigsty:password:with:colons"]) {
+			const fixture = makeFixture("[]", JSON.stringify([entitlement(await sha256Hex(decoded))]));
+			const response = await fixture.handler(new Request("https://repo.example/pro/v1/basic/yum/infra/private.rpm", {
+				headers: { Authorization: `Basic ${btoa(decoded)}` },
+			}));
+			assert.equal(response.status, 200, `${vendor}/${decoded}`);
+			assert.equal(fixture.calls.length, 1, `${vendor}/${decoded} origin count`);
+		}
+
+		for (const candidate of [
+			{ name: "tab-separator", authorization: `Basic\t${encoded}` },
+			{ name: "unpadded", authorization: `Basic ${encoded.slice(0, -1)}` },
+			{ name: "embedded-space", authorization: `Basic ${encoded.slice(0, 4)} ${encoded.slice(4)}` },
+			{ name: "url-safe-alphabet", authorization: "Basic ab-c" },
+			{ name: "nonzero-pad-bits", authorization: `Basic ${padBitAlias}` },
+			{ name: "oversized-header", authorization: `Basic ${"A".repeat(4091)}` },
+		]) {
+			const before = canonical.calls.length;
+			const response = await canonical.handler(new Request("https://repo.example/pro/v1/basic/yum/infra/private.rpm", {
+				headers: { Authorization: candidate.authorization },
+			}));
+			assert.equal(response.status, 401, `${vendor}/wire/${candidate.name}`);
+			assert.equal(response.headers.get("WWW-Authenticate"), 'Basic realm="Pigsty Pro"', `${vendor}/wire/${candidate.name} challenge`);
+			assert.equal(canonical.calls.length, before, `${vendor}/wire/${candidate.name} touched origin`);
+		}
+
+		const utf8 = "用户:密码";
+		const utf8Bytes = Buffer.from(utf8, "utf8");
+		const invalidCredentials = [
+			{ name: "empty-user", decoded: ":password", token: btoa(":password") },
+			{ name: "missing-colon", decoded: "pigsty", token: btoa("pigsty") },
+			{ name: "control", decoded: "pigsty:line\nbreak", token: btoa("pigsty:line\nbreak") },
+			{ name: "delete", decoded: "pigsty:delete\x7f", token: btoa("pigsty:delete\x7f") },
+			{ name: "utf8", decoded: String.fromCharCode(...utf8Bytes), token: utf8Bytes.toString("base64") },
+			{ name: "oversized", decoded: `u:${"a".repeat(1023)}`, token: btoa(`u:${"a".repeat(1023)}`) },
+		];
+		for (const candidate of invalidCredentials) {
+			const fixture = makeFixture("[]", JSON.stringify([entitlement(await sha256Hex(candidate.decoded))]));
+			const response = await fixture.handler(new Request("https://repo.example/pro/v1/basic/yum/infra/private.rpm", {
+				headers: { Authorization: `Basic ${candidate.token}` },
+			}));
+			assert.equal(response.status, 401, `${vendor}/${candidate.name}`);
+			assert.equal(response.headers.get("WWW-Authenticate"), 'Basic realm="Pigsty Pro"', `${vendor}/${candidate.name} challenge`);
+			assert.equal(fixture.calls.length, 0, `${vendor}/${candidate.name} touched origin`);
+		}
+
+		const maximum = `u:${"a".repeat(1022)}`;
+		assert.equal(maximum.length, 1024);
+		const maximumFixture = makeFixture("[]", JSON.stringify([entitlement(await sha256Hex(maximum))]));
+		const maximumResponse = await maximumFixture.handler(new Request("https://repo.example/pro/v1/basic/yum/infra/private.rpm", {
+			headers: { Authorization: `Basic ${btoa(maximum)}` },
+		}));
+		assert.equal(maximumResponse.status, 200, `${vendor}/maximum`);
+		assert.equal(maximumFixture.calls.length, 1, `${vendor}/maximum origin count`);
+	}
 });
 
 test("shared verifier maps insufficient scope and outages without origin access", async () => {

@@ -65,6 +65,13 @@ username=USER
 password=PASSWORD
 ```
 
+若该路径由 Cloudflare Worker/EdgeOne 边缘函数提供 Basic 鉴权，`USER:PASSWORD`
+必须是最长 1024 字节的可打印 US-ASCII：用户名非空且不含冒号，密码可继续包含冒号；
+控制字符、DEL、非 ASCII 与非规范/无 padding 的 Base64 均拒绝。entitlement 中保存的是
+精确解码后 `USER:PASSWORD` 的 SHA-256，而不是 `Authorization` 头里的 Base64 文本。
+边缘挑战因此不宣称 UTF-8。独立 Nginx fallback 的密码字符能力仍由实际 htpasswd/Nginx
+实现决定，但客户端配置同样不应依赖含糊的跨编码凭据。
+
 凭据只落在 root-only 配置或客户端 secret provider；不能进入 mirrorlist、canonical
 ledger、日志或 URL userinfo。只有边缘层在 cache lookup 前完成 Basic 鉴权并发出干净
 子请求时，Authorization 才能从共享缓存键排除；独立 Nginx 回退在源站才鉴权，因此

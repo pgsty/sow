@@ -89,6 +89,14 @@ boundary-aware path prefixes, for example:
 [{"sha256":"0000000000000000000000000000000000000000000000000000000000000000","expires_at":"2027-01-01T00:00:00Z","audiences":["repo.example"],"path_prefixes":["/yum/infra"]}]
 ```
 
+For `SOW_BASIC_ENTITLEMENTS`, `sha256` is the SHA-256 of the exact decoded
+printable US-ASCII `user:password` bytes, never of the Base64 text. The user is
+non-empty and cannot contain `:`; the password may contain further colons; the
+combined value is at most 1024 bytes. The wire parser accepts a case-insensitive
+`Basic` scheme, one or more literal spaces, and canonical padded RFC 4648 Base64
+only. It rejects control/DEL/non-ASCII bytes and deliberately emits no UTF-8
+challenge because Unicode normalization is not part of this digest contract.
+
 Expired credentials return 401; a valid digest with the wrong audience or path
 returns 403. Provider denial uses the same status mapping; provider transport
 failure returns 503. A timezone-less, offset, fractional, calendar-normalized,

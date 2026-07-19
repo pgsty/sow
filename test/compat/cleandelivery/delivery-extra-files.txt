@@ -113,6 +113,7 @@ docs/evidence/2026-07-18-cloudflare-pro-domain-readiness.md
 docs/evidence/2026-07-18-durability-teardown-audit.md
 docs/evidence/2026-07-18-legacy-adoption-50k-performance.md
 docs/evidence/2026-07-18-real-r2-storage-protocol.md
+docs/evidence/2026-07-19-basic-auth-wire-canonicalization.md
 docs/evidence/2026-07-19-confidential-edge-preflight.md
 docs/evidence/2026-07-19-edge-entitlement-expiry-canonicalization.md
 docs/evidence/2026-07-19-legacy-migration-review-hardening.md

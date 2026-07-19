@@ -1539,3 +1539,45 @@ archive digest above. This is the current V-14/V-33 delivery identity. It does
 not upgrade real Worker/CDN/purge/provider-log evidence, COS/EdgeOne access,
 production migration, or operational metrics; the long-term Goal remains
 active.
+
+## 2026-07-19 V-34 Basic authorization wire delivery identity
+
+This section supersedes V-33 after the shared Cloudflare/EdgeOne Basic
+fallback was tightened to one bounded ASCII wire form. The scheme is
+case-insensitive, separation is one or more literal SP bytes, Base64 is
+canonical padded RFC 4648, and the decoded `user:password` is at most 1024
+printable US-ASCII bytes with a non-empty user. The digest remains over the
+exact decoded bytes. Wire aliases, missing user/separator, CTL, DEL, UTF-8 and
+oversized inputs now fail with a realm-only 401 before either origin adapter is
+called; empty passwords and additional password colons remain supported.
+
+The source shared suite, generated-bundle freshness, three syntax/import gates
+and independent UTC/Asia-Shanghai runs each passed 47/47. The Go compat bridge,
+all-package compile gate, two vet profiles, Staticcheck, module integrity,
+clean-delivery policy and current real apt/YUM/DNF/Nginx Docker matrix also
+passed; the Docker package completed in 77.657s. All validation was local or
+loopback/Docker. No cloud credential, Cloudflare/R2/COS/EdgeOne request, or
+production repository write was used.
+
+After delivery content was frozen, two independent fresh HOME/GOMODCACHE/
+GOCACHE reconstructions used only the local read-only Go module download cache
+and returned exactly:
+
+```text
+PRODUCT_SOURCE_SHA256=7b678d6745071625a0e153d1513ea3f9c269956c462cc92e4dd53020b42f8a3c
+PRODUCT_SOURCE_FILES=538
+DELIVERY_CONTENT_SHA256=761c8e650f5b7373ab8b56279d96eb08a5ef317f569cf9d61955041f82a3d7e5
+DELIVERY_FILES=699
+ARCHIVE_SHA256=1aca2e1c58fac937a7ea320bd7b16456742725fd4811808df1748955da1bae01
+```
+
+Archives:
+
+- `/tmp/sow-clean-delivery-basic-wire-v34-reviewed-a/sow-delivery-761c8e650f5b7373.tgz`
+- `/tmp/sow-clean-delivery-basic-wire-v34-reviewed-b/sow-delivery-761c8e650f5b7373.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This is the current V-14/V-34 delivery identity. It does
+not upgrade real Worker/CDN/purge/provider-log evidence, COS/EdgeOne access,
+production migration, or operational metrics; the long-term Goal remains
+active.

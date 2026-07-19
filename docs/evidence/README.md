@@ -62,6 +62,11 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
 
 其余证据报告与验收入口如下；每项是否实跑、源码日期及外部边界以自身正文为准：
 
+- `2026-07-19-basic-auth-wire-canonicalization.md`：Cloudflare/EdgeOne 共享
+  Basic fallback 收紧为 case-insensitive scheme、literal SP、规范 padded Base64 与最长
+  1024 字节 printable US-ASCII `user:password`；alias/CTL/DEL/UTF-8/超长负例均在
+  401 前零 origin call，challenge 不再虚报 UTF-8。source/dist、47/47 shared contract、
+  双时区与 Go compat bridge 全部通过；仅本地，不替代真 Worker/CDN。
 - `2026-07-19-edge-entitlement-expiry-canonicalization.md`：静态 token/Basic
   entitlement 的 expiry 收紧为唯一 whole-second UTC RFC3339 wire form，拒绝无时区、
   offset、fractional、calendar rollover 与 `24:00:00`；畸形 Basic 文档也在两个 adapter

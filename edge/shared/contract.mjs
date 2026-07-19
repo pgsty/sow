@@ -563,17 +563,31 @@ function sanitizedResponseHeaders(source) {
   return headers;
 }
 
+const MAX_BASIC_CREDENTIAL_BYTES = 1024;
+const MAX_BASIC_TOKEN_BYTES = 4 * Math.ceil(MAX_BASIC_CREDENTIAL_BYTES / 3);
+const MAX_BASIC_HEADER_BYTES = 4096;
+const BASIC_AUTHORIZATION = /^Basic +([A-Za-z0-9+/]+={0,2})$/i;
+
 function parseBasicAuthorization(value) {
-  if (typeof value !== "string" || !value.startsWith("Basic ")) {
+  if (typeof value !== "string" || value.length > MAX_BASIC_HEADER_BYTES) {
+    return null;
+  }
+  const matched = BASIC_AUTHORIZATION.exec(value);
+  if (!matched) return null;
+  const token = matched[1];
+  if (token.length > MAX_BASIC_TOKEN_BYTES || token.length % 4 !== 0) {
     return null;
   }
   try {
-    const decoded = atob(value.slice(6));
-    const separator = decoded.indexOf(":");
-    if (separator <= 0 || decoded.length > 1024) {
+    const decoded = atob(token);
+    if (decoded.length > MAX_BASIC_CREDENTIAL_BYTES || btoa(decoded) !== token) {
       return null;
     }
-    if ([...decoded].some((character) => character.charCodeAt(0) > 0x7f || character === "\0")) {
+    const separator = decoded.indexOf(":");
+    if (separator <= 0 || [...decoded].some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 0x20 || code > 0x7e;
+    })) {
       return null;
     }
     return { username: decoded.slice(0, separator), password: decoded.slice(separator + 1), encoded: decoded };
@@ -585,7 +599,7 @@ function parseBasicAuthorization(value) {
 function authError(status) {
   const response = privateError(status, status === 403 ? "forbidden" : "unauthorized");
   if (status === 401) {
-    response.headers.set("WWW-Authenticate", 'Basic realm="Pigsty Pro", charset="UTF-8"');
+    response.headers.set("WWW-Authenticate", 'Basic realm="Pigsty Pro"');
   }
   return response;
 }

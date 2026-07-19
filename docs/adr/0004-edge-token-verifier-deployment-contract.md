@@ -44,6 +44,15 @@ credential validity independent of vendor runtime timezone and prevents a
 malformed Basic document from surviving deployment as a request-time-only
 outage.
 
+The executable Basic fallback follows a closed ASCII subset of
+[RFC 7617](https://www.rfc-editor.org/rfc/rfc7617.html): a case-insensitive
+scheme, one or more SP bytes, canonical padded RFC 4648 Base64, and at most
+1024 decoded printable US-ASCII bytes containing a non-empty user and colon.
+Control/DEL/non-ASCII bytes and Base64 aliases fail with 401 before origin
+access. Entitlements hash the exact decoded `user:password`, not the Base64
+wrapper. Because the implementation intentionally has no Unicode normalization
+or digest migration, its challenge does not advertise `charset="UTF-8"`.
+
 ### 2026-07-15 route-admission amendment
 
 The executable runtime contract is now `sow-edge-runtime/v2`. Version 2 is an
