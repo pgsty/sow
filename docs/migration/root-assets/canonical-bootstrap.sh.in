@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+set -o pipefail
+
+# This file is an external asset-builder template, not a SOW runtime helper.
+# The builder replaces the single token below with get, pig, pkg, or beta.
+readonly ASSET_KIND='@ASSET_KIND@'
+readonly GLOBAL_REPO_URL='https://repo.pigsty.io'
+readonly CHINA_REPO_URL='https://repo.pigsty.cc'
+
+log_info() { printf '[ OK ] %s\n' "$*"; }
+log_warn() { printf '[WARN] %s\n' "$*" >&2; }
+log_error() { printf '[FAIL] %s\n' "$*" >&2; }
+
+select_mirrors() {
+    case "${PIGSTY_REPO_URL:-}" in
+        '')
+            case "${PIGSTY_REGION:-global}" in
+                global|world|io)
+                    PIGSTY_REPO_URL=${GLOBAL_REPO_URL}
+                    PIGSTY_REPO_FALLBACK_URL=${CHINA_REPO_URL}
+                    ;;
+                cn|china|cc)
+                    PIGSTY_REPO_URL=${CHINA_REPO_URL}
+                    PIGSTY_REPO_FALLBACK_URL=${GLOBAL_REPO_URL}
+                    ;;
+                *)
+                    log_error "PIGSTY_REGION must be global or cn"
+                    return 64
+                    ;;
+            esac
+            ;;
+        "${GLOBAL_REPO_URL}")
+            PIGSTY_REPO_FALLBACK_URL=${CHINA_REPO_URL}
+            ;;
+        "${CHINA_REPO_URL}")
+            PIGSTY_REPO_FALLBACK_URL=${GLOBAL_REPO_URL}
+            ;;
+        *)
+            log_error "PIGSTY_REPO_URL must be exactly ${GLOBAL_REPO_URL} or ${CHINA_REPO_URL}"
+            return 64
+            ;;
+    esac
+    readonly PIGSTY_REPO_URL PIGSTY_REPO_FALLBACK_URL
+}
+
+download_from_mirrors() {
+    local relative_path=$1
+    local destination=$2
+    local temporary
+    temporary=$(mktemp "${destination}.part.XXXXXX") || return 1
+    for candidate in "${PIGSTY_REPO_URL}" "${PIGSTY_REPO_FALLBACK_URL}"; do
+        log_info "download ${candidate}/${relative_path}"
+        if curl --fail --location --show-error --retry 3 --connect-timeout 10 \
+            --output "${temporary}" "${candidate}/${relative_path}"; then
+            if [[ ! -s ${temporary} ]]; then
+                log_warn "empty response from ${candidate}/${relative_path}"
+                continue
+            fi
+            chmod 0600 "${temporary}" || {
+                rm -f "${temporary}"
+                return 1
+            }
+            mv -f "${temporary}" "${destination}" || return 1
+            SELECTED_REPO_URL=${candidate}
+            readonly SELECTED_REPO_URL
+            return 0
+        fi
+        : >"${temporary}"
+    done
+    rm -f "${temporary}"
+    return 1
+}
+
+print_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1"
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1"
+    else
+        log_warn "sha256sum/shasum unavailable; downloaded bytes were not locally summarized"
+    fi
+}
+
+valid_version() {
+    [[ $1 =~ ^v?[0-9][0-9A-Za-z._+~-]*$ && $1 != *..* ]]
+}
+
+install_pig_cli() {
+    local version package_type architecture filename download_to
+    version=${1:-${PIG_VERSION:-1.5.1}}
+    version=${version#v}
+    valid_version "${version}" || {
+        log_error "invalid pig version"
+        return 64
+    }
+    [[ $(uname -s) == Linux ]] || {
+        log_error "pig installer supports Linux only"
+        return 1
+    }
+    architecture=$(uname -m)
+    case ${architecture} in
+        x86_64|aarch64) ;;
+        *) log_error "unsupported architecture: ${architecture}"; return 2 ;;
+    esac
+    if command -v dpkg >/dev/null 2>&1; then
+        package_type=deb
+        if [[ ${architecture} == x86_64 ]]; then
+            architecture=amd64
+        else
+            architecture=arm64
+        fi
+        filename="pig_${version}-1_${architecture}.deb"
+    elif command -v rpm >/dev/null 2>&1; then
+        package_type=rpm
+        filename="pig-${version}-1.${architecture}.rpm"
+    else
+        log_error "cannot determine rpm/deb package type"
+        return 3
+    fi
+    download_to="${TMPDIR:-/tmp}/${filename}"
+    download_from_mirrors "pkg/pig/v${version}/${filename}" "${download_to}" || {
+        log_error "pig package download failed on both reviewed mirrors"
+        return 4
+    }
+    print_sha256 "${download_to}"
+    if [[ ${EUID} -eq 0 ]]; then
+        if [[ ${package_type} == deb ]]; then
+            dpkg -i "${download_to}"
+        else
+            rpm -ivh "${download_to}"
+        fi
+    else
+        command -v sudo >/dev/null 2>&1 || {
+            log_error "sudo is required for package installation"
+            return 5
+        }
+        if [[ ${package_type} == deb ]]; then
+            sudo dpkg -i "${download_to}"
+        else
+            sudo rpm -ivh "${download_to}"
+        fi
+    fi
+}
+
+install_pigsty_source() {
+    local version source_filename download_to install_to install_parent
+    version=${1:-${PIGSTY_VERSION:-v4.4.0}}
+    valid_version "${version}" || {
+        log_error "invalid Pigsty version"
+        return 64
+    }
+    source_filename="pigsty-${version}.tgz"
+    download_to="${TMPDIR:-/tmp}/${source_filename}"
+    install_to="${HOME}/pigsty"
+    install_parent=$(dirname "${install_to}")
+
+    download_from_mirrors "src/${source_filename}" "${download_to}" || {
+        log_error "Pigsty source download failed on both reviewed mirrors"
+        return 2
+    }
+    print_sha256 "${download_to}"
+    if [[ ! -d ${install_to} ]]; then
+        mkdir -p "${install_parent}" || return 1
+        tar -xf "${download_to}" -C "${install_parent}" || return 1
+    else
+        log_warn "${install_to} already exists; source extraction skipped"
+    fi
+    [[ -d ${install_to} ]] || {
+        log_error "source archive did not create ${install_to}"
+        return 1
+    }
+
+    if [[ ${ASSET_KIND} == pkg ]]; then
+        if [[ ${SELECTED_REPO_URL} == "${CHINA_REPO_URL}" ]]; then
+            (cd "${install_to}" && bin/get-pkg -c) || log_warn "offline package download failed"
+        else
+            (cd "${install_to}" && bin/get-pkg) || log_warn "offline package download failed"
+        fi
+    fi
+
+    if command -v ansible-playbook >/dev/null 2>&1; then
+        log_info "ansible is ready; bootstrap skipped"
+    else
+        (cd "${install_to}" && ./bootstrap) || return 1
+    fi
+    log_info "Pigsty ${version} is available at ${install_to}"
+}
+
+main() {
+    select_mirrors || return $?
+    case ${ASSET_KIND} in
+        pig) install_pig_cli "${1:-}" ;;
+        get|pkg|beta) install_pigsty_source "${1:-}" ;;
+        *) log_error "invalid canonical asset kind"; return 70 ;;
+    esac
+}
+
+main "$@"

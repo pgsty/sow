@@ -1,0 +1,111 @@
+# Synthetic 12-repository Pigsty-v1 subset retained for the legacy adoption
+# and selector-generalization tests. It is not the complete physical topology
+# and must never be cited as 74 APT / 131 YUM migration evidence.
+schema: sow/v1
+
+state:
+  snapshot_materialization_months: 6
+  apt_by_hash_retention: 2
+  yum_generation_retention: 2
+  cas_history_commits: 32
+
+gpg: {public_key: keys/pigsty.asc}
+pools: {public: {}, gated: {}}
+
+repos:
+  - id: pkg-pig
+    type: asset
+    path: pkg/pig
+    default_pool: public
+    asset: {kind: release, mutable_paths: [latest]}
+
+  - id: apt-pgsql-focal
+    type: apt
+    path: apt/pgsql/focal
+    os: {family: ubuntu, major: 20, suite: focal, lifecycle: frozen}
+    arches: [amd64, arm64]
+    default_pool: public
+    apt: {suites: [focal], components: [main]}
+  - id: apt-pgsql-jammy
+    type: apt
+    path: apt/pgsql/jammy
+    os: {family: ubuntu, major: 22, suite: jammy, lifecycle: active}
+    arches: [amd64, arm64]
+    default_pool: public
+    apt: {suites: [jammy], components: [main]}
+  - id: apt-pgsql-noble
+    type: apt
+    path: apt/pgsql/noble
+    os: {family: ubuntu, major: 24, suite: noble, lifecycle: active}
+    arches: [amd64, arm64]
+    default_pool: public
+    apt: {suites: [noble], components: [main]}
+  - id: apt-pgsql-resolute
+    type: apt
+    path: apt/pgsql/resolute
+    os: {family: ubuntu, major: 26, suite: resolute, lifecycle: active}
+    arches: [amd64, arm64]
+    default_pool: public
+    apt: {suites: [resolute], components: [main]}
+  - id: apt-pgsql-bullseye
+    type: apt
+    path: apt/pgsql/bullseye
+    os: {family: debian, major: 11, suite: bullseye, lifecycle: frozen}
+    arches: [amd64, arm64]
+    default_pool: public
+    apt: {suites: [bullseye], components: [main]}
+  - id: apt-pgsql-bookworm
+    type: apt
+    path: apt/pgsql/bookworm
+    os: {family: debian, major: 12, suite: bookworm, lifecycle: active}
+    arches: [amd64, arm64]
+    default_pool: public
+    apt: {suites: [bookworm], components: [main]}
+  - id: apt-pgsql-trixie
+    type: apt
+    path: apt/pgsql/trixie
+    os: {family: debian, major: 13, suite: trixie, lifecycle: active}
+    arches: [amd64, arm64]
+    default_pool: public
+    apt: {suites: [trixie], components: [main]}
+
+  - id: yum-pgsql-el7
+    type: yum
+    path: yum/pgsql/el7.{arch}
+    os: {family: el, major: 7, lifecycle: frozen}
+    arches: [x86_64]
+    default_pool: public
+    yum: {compression: gzip}
+  - id: yum-pgsql-el8
+    type: yum
+    path: yum/pgsql/el8.{arch}
+    os: {family: el, major: 8, lifecycle: frozen}
+    arches: [x86_64, aarch64]
+    default_pool: public
+    yum: {compression: gzip}
+  - id: yum-pgsql-el9
+    type: yum
+    path: yum/pgsql/el9.{arch}
+    os: {family: el, major: 9, lifecycle: active}
+    arches: [x86_64, aarch64]
+    default_pool: public
+    yum: {compression: zstd}
+  - id: yum-pgsql-el10
+    type: yum
+    path: yum/pgsql/el10.{arch}
+    os: {family: el, major: 10, lifecycle: active}
+    arches: [x86_64, aarch64]
+    default_pool: public
+    yum: {compression: zstd}
+
+upstreams: []
+views:
+  beta: {access: public, allowed_pools: [public], append_only: false}
+  latest: {access: public, allowed_pools: [public], append_only: false}
+  stable: {access: pro, allowed_pools: [public, gated], append_only: true}
+serving:
+  latest: {base_url: "https://repo.pigsty.io"}
+  beta: {base_url: "https://beta.pigsty.io"}
+  stable: {base_url: "https://repo.pigsty.io/pro/v1/basic"}
+targets: {}
+edge: {token_verifier: provider://migration-fixture}

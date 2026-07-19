@@ -17,8 +17,10 @@ The current Pigsty configuration uses raw YUM base URLs such as **https://repo.p
 - The repository root contains **.sow**, **.pool**, and the directly hostable APT/YUM/asset tree.
 - **.sow/state** is the canonical non-bare Git worktree, accessed by an embedded Go library. The host need not contain a git executable.
 - Manifests, refs, object security labels, provenance and configuration hashes are canonical Git content. SQLite is a disposable read-only projection.
+- Legacy missing-body repair is negative provenance, never an ignore flag: only an exact reviewed YUM blocker-set digest may authorize omissions, and canonical admission rebinds every receipt to the ancestor M0 manifest. [ADR-0030](0030-audit-bound-legacy-yum-missing-body-prune.md) freezes the exception.
 - Package bytes live once in the SHA-256 CAS. Published files are hardlinks. A filesystem without hardlink support is rejected.
-- Static hosting requires an explicit deny rule for **/.sow/** and **/.pool/**. “Nginx can point at the root” means no SOW application server, not that sensitive dot directories may be exposed.
+- All conforming local writers hold the SOW state lock. Generation install binds the validated target-root inode and revalidates it around every mutation phase; stage creation, final rename and failure cleanup use the bound `os.Root`, so an operator rename/replacement between phases fails closed. A hostile same-UID process racing within a multi-syscall pathname helper is outside the single-local-writer contract and requires OS-level ownership isolation.
+- Static hosting requires a default-deny allowlist containing only configured repository leaves, exact mirrorlist files, generation routes constrained to a literal repository root, bounded asset prefixes/exact keys, and the public trust anchor. A broad **/apt/**, **/yum/**, or **/_sow/** alias is not an allowlist. A denylist for **/.sow/** and **/.pool/** alone is also insufficient: **sow.yaml** and operator-owned files beside the serving tree are control data too. “Nginx can point at the root” means no SOW application server, not that arbitrary root files may be exposed.
 - The legacy-root tree is the anonymous public projection. Gated local bytes are materialized only below **.sow/origin/gated/**; remote gated keys live below private **.sow/gated/**. Buckets are private and only the edge may read gated/control keys. A direct bucket URL or anonymous Nginx path must never bypass token authorization.
 
 ### D2 — Refs and preservation
@@ -34,7 +36,7 @@ The current Pigsty configuration uses raw YUM base URLs such as **https://repo.p
 - The external Pro prefix is **/pro/v1/{token}/**, followed by the same relative repository path.
 - Snapshot IDs are **<suite>-YYYYMMDD** in UTC. Conflicting second snapshots for the same suite/day are rejected.
 - Stable plus the most recent six calendar months of snapshots are materialized by default; the positive month count is configurable.
-- EL8 is frozen. Existing bytes remain publishable and repairable, new content is rejected, and repodata remains gzip.
+- EL8 is frozen beginning with Pigsty v5.0.0. Existing bytes remain publishable and repairable, new content is rejected, and repodata remains gzip. [ADR-0029](0029-client-support-floor-and-el8-freeze-version.md) records the owner decision.
 
 ### D4 — Publication model
 
@@ -113,6 +115,14 @@ Therefore:
 - Cloudflare Worker and EdgeOne must also implement the generation-aware public route: metadata resolves to the selected immutable generation while package hrefs resolve to the common legacy root. This behavior is covered by the same cross-vendor contract suite.
 - The legacy raw-baseurl path may remain during migration, but it cannot be claimed to satisfy the strong pair-atomicity acceptance gate until a real dnf-compatible generation-pinning mechanism is proven.
 - Enabling repo_gpgcheck publication requires an executable migration/rollback map for existing Pigsty baseurl consumers. This is a verification gate, not permission to weaken FR-08/FR-26.
+
+The local mechanism is `docs/migration/migrate-pigsty-yum-consumers.sh`, driven
+by `yum-consumer-map.tsv` and `yum-consumer-files.tsv`. It stages an exact
+hash-reviewed Pigsty renderer/config change outside that checkout, applies only
+after explicit plan-digest confirmation, and restores byte-identical originals
+while rejecting foreign drift. Its existence does not authorize cutover:
+mapped physical generations, the reviewed RPM public-key bundle, dual-origin
+HTTP probes, and real dnf acceptance must all pass first.
 
 The v1 routes are fixed:
 

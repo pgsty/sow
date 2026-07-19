@@ -1,0 +1,39 @@
+# Non-secret deployment fragment for edge/dist/cloudflare-worker.mjs.
+# Replace service names with deployed Worker services. Put env:// entitlement
+# documents and SOW_BASIC_ENTITLEMENTS with `wrangler secret put`, never here.
+# The allowlists below illustrate shape only. Generate the real pair with
+# `sow materialize latest --edge-contract cf`; never hand-author or widen exact
+# pkg into a public prefix.
+
+name = "sow-repository-edge"
+main = "../dist/cloudflare-worker.mjs"
+compatibility_date = "2026-07-11"
+workers_dev = false
+preview_urls = false
+
+[vars]
+SOW_EDGE_SCHEMA = "sow-edge-runtime/v2"
+SOW_PRO_PREFIX = "/pro/v1/{token}/"
+SOW_PUBLIC_BASE_URL = "https://repo.example"
+SOW_BETA_BASE_URL = "https://beta.example"
+SOW_TOKEN_VERIFIER = "provider://pigsty-entitlements"
+SOW_PUBLIC_PREFIXES = '["apt","pkg/pig","yum"]'
+SOW_PUBLIC_KEYS = '["keys/pigsty.asc","pkg"]'
+SOW_COMPATIBILITY_ADMISSION = '{"apt_roots":[],"yum_repos":[],"yum_roots":[],"yum_channels":[],"asset_roots":[],"asset_keys":[],"projections":[],"snapshots":[],"raw":[],"active":[]}'
+SOW_ORIGIN_MODE = "r2-service"
+
+[[routes]]
+pattern = "repo.example/*"
+zone_name = "example"
+
+[[routes]]
+pattern = "beta.example/*"
+zone_name = "example"
+
+[[services]]
+binding = "ORIGIN"
+service = "sow-private-repository-origin"
+
+[[services]]
+binding = "TOKEN_VERIFIER"
+service = "pigsty-entitlements"

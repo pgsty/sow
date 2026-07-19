@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -8,6 +9,13 @@ import (
 )
 
 func AtomicCopy(dst string, src io.Reader, mode os.FileMode) error {
+	return atomicCopyWithDirectorySync(dst, src, mode, syncManifestDirectory)
+}
+
+func atomicCopyWithDirectorySync(dst string, src io.Reader, mode os.FileMode, syncDirectory func(string) error) error {
+	if syncDirectory == nil {
+		return errors.New("manifest directory sync is unavailable")
+	}
 	dir := filepath.Dir(dst)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create manifest directory: %w", err)
@@ -40,9 +48,16 @@ func AtomicCopy(dst string, src io.Reader, mode os.FileMode) error {
 		return fmt.Errorf("replace manifest: %w", err)
 	}
 	committed = true
-	if dirHandle, err := os.Open(dir); err == nil {
-		_ = dirHandle.Sync()
-		_ = dirHandle.Close()
+	if err := syncDirectory(dir); err != nil {
+		return fmt.Errorf("sync manifest directory: %w", err)
 	}
 	return nil
+}
+
+func syncManifestDirectory(dir string) error {
+	handle, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	return errors.Join(handle.Sync(), handle.Close())
 }

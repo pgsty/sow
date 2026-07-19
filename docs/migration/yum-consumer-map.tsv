@@ -1,0 +1,6 @@
+# schema=sow-pigsty-yum-consumer-map/v1
+# pigsty_name	sow_repo_template	expected_definitions
+pigsty-infra	yum-infra-el$releasever	9
+pigsty-pgsql	yum-pgsql-el$releasever	9
+percona	yum-percona-el$releasever	8
+wiltondb	yum-mssql-el$releasever	2

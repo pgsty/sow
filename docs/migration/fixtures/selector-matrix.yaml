@@ -1,0 +1,62 @@
+# Synthetic local-only configuration used to resolve every repository selector
+# named by make-target-map.md and to build the all-selector physical CLI fixture.
+# Paths and .invalid URLs are intentionally disjoint and are not production
+# claims; Pigsty-v1 physical-layout proof remains separate in pigsty-v1.yaml.
+schema: sow/v1
+state: {}
+gpg: {public_key: keys/pigsty.asc}
+pools: {public: {}, gated: {}}
+repos:
+  - {id: asset-bin, type: asset, path: selectors/asset-bin, default_pool: public, asset: {kind: bin}}
+  - {id: asset-bootstrap, type: asset, path: selectors/asset-bootstrap, default_pool: public, asset: {kind: bin}}
+  - {id: asset-ext, type: asset, path: selectors/asset-ext, default_pool: public, asset: {kind: release}}
+  - {id: asset-img, type: asset, path: selectors/asset-img, default_pool: public, asset: {kind: image}}
+  - {id: asset-src, type: asset, path: selectors/asset-src, default_pool: public, asset: {kind: source}}
+  - {id: dba, type: asset, path: selectors/dba, default_pool: public, asset: {kind: dba}}
+  - {id: etc, type: asset, path: selectors/etc, default_pool: public, asset: {kind: etc}}
+  - {id: ext, type: asset, path: selectors/ext, default_pool: public, asset: {kind: extension}}
+  - {id: pkg-claude, type: asset, path: selectors/pkg-claude, default_pool: public, asset: {kind: release}}
+  - {id: pkg-pig, type: asset, path: selectors/pkg-pig, default_pool: public, asset: {kind: release}}
+  - {id: pkg-ray, type: asset, path: selectors/pkg-ray, default_pool: public, asset: {kind: release}}
+  - {id: src, type: asset, path: selectors/src, default_pool: public, asset: {kind: source}}
+
+  - {id: apt-infra, type: apt, path: apt/selector-infra, os: {suite: generic, lifecycle: active}, arches: [amd64, arm64], default_pool: public, apt: {suites: [generic], components: [main]}}
+  - {id: apt-mssql, type: apt, path: apt/selector-mssql, os: {lifecycle: active}, arches: [amd64, arm64], default_pool: public, apt: {suites: [focal, jammy, noble], components: [main]}}
+  - {id: apt-percona, type: apt, path: apt/selector-percona, os: {lifecycle: active}, arches: [amd64, arm64], default_pool: public, apt: {suites: [bullseye, bookworm, jammy, noble, resolute, trixie], components: [main]}}
+  - {id: apt-pgdg, type: apt, path: apt/selector-pgdg, os: {lifecycle: active}, arches: [amd64, arm64], default_pool: public, apt: {suites: [bookworm-pgdg, jammy-pgdg, noble-pgdg, trixie-pgdg], components: [main]}}
+  - {id: apt-pgsql-focal, type: apt, path: apt/selector-pgsql/focal, os: {suite: focal, lifecycle: frozen}, arches: [amd64, arm64], default_pool: public, apt: {suites: [focal], components: [main]}}
+  - {id: apt-pgsql-jammy, type: apt, path: apt/selector-pgsql/jammy, os: {suite: jammy, lifecycle: active}, arches: [amd64, arm64], default_pool: public, apt: {suites: [jammy], components: [main]}}
+  - {id: apt-pgsql-noble, type: apt, path: apt/selector-pgsql/noble, os: {suite: noble, lifecycle: active}, arches: [amd64, arm64], default_pool: public, apt: {suites: [noble], components: [main]}}
+  - {id: apt-pgsql-resolute, type: apt, path: apt/selector-pgsql/resolute, os: {suite: resolute, lifecycle: active}, arches: [amd64, arm64], default_pool: public, apt: {suites: [resolute], components: [main]}}
+  - {id: apt-pgsql-bullseye, type: apt, path: apt/selector-pgsql/bullseye, os: {suite: bullseye, lifecycle: frozen}, arches: [amd64, arm64], default_pool: public, apt: {suites: [bullseye], components: [main]}}
+  - {id: apt-pgsql-bookworm, type: apt, path: apt/selector-pgsql/bookworm, os: {suite: bookworm, lifecycle: active}, arches: [amd64, arm64], default_pool: public, apt: {suites: [bookworm], components: [main]}}
+  - {id: apt-pgsql-trixie, type: apt, path: apt/selector-pgsql/trixie, os: {suite: trixie, lifecycle: active}, arches: [amd64, arm64], default_pool: public, apt: {suites: [trixie], components: [main]}}
+
+  - {id: yum-infra, type: yum, path: "yum/selector-infra/{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64, aarch64], default_pool: public, yum: {compression: zstd, package_keyring: package-trust.asc}}
+  - {id: yum-pgdg, type: yum, path: "yum/selector-pgdg/{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64, aarch64], default_pool: public, yum: {compression: zstd, package_keyring: package-trust.asc}}
+  - {id: yum-percona, type: yum, path: "yum/selector-percona/{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64, aarch64], default_pool: public, yum: {compression: zstd, package_keyring: package-trust.asc}}
+  - {id: yum-mssql, type: yum, path: "yum/selector-mssql/{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64, aarch64], default_pool: public, yum: {compression: zstd, package_keyring: package-trust.asc}}
+  - {id: yum-ivory, type: yum, path: "yum/selector-ivory/{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64, aarch64], default_pool: public, yum: {compression: zstd, package_keyring: package-trust.asc}}
+  - {id: yum-gpsql, type: yum, path: "yum/selector-gpsql/{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64, aarch64], default_pool: public, yum: {compression: zstd, package_keyring: package-trust.asc}}
+  - {id: yum-pgsql-el7, type: yum, path: "yum/selector-pgsql/el7.{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [x86_64], default_pool: public, yum: {compression: gzip, package_keyring: package-trust.asc}}
+  - {id: yum-pgsql-el8, type: yum, path: "yum/selector-pgsql/el8.{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [x86_64, aarch64], default_pool: public, yum: {compression: gzip, package_keyring: package-trust.asc}}
+  - {id: yum-pgsql-el9, type: yum, path: "yum/selector-pgsql/el9.{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64, aarch64], default_pool: public, yum: {compression: zstd, package_keyring: package-trust.asc}}
+  - {id: yum-pgsql-el10, type: yum, path: "yum/selector-pgsql/el10.{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [x86_64, aarch64], default_pool: public, yum: {compression: zstd, package_keyring: package-trust.asc}}
+
+upstreams: []
+views:
+  beta: {access: public, allowed_pools: [public], append_only: false}
+  latest: {access: public, allowed_pools: [public], append_only: false}
+  stable: {access: pro, allowed_pools: [public, gated], append_only: true}
+serving:
+  latest: {base_url: "https://repo.example.invalid"}
+  beta: {base_url: "https://beta.example.invalid"}
+  stable: {base_url: "https://repo.example.invalid/pro/v1/basic"}
+targets:
+  cf:
+    storage: {kind: r2, bucket: selector-cf, endpoint: "https://selector.r2.example.invalid", region: auto, credential: env://SOW_SELECTOR_CF_STORAGE}
+    cdn: {kind: cloudflare, base_url: "https://repo.example.invalid", beta_base_url: "https://beta.example.invalid", zone_id: selector-zone, credential: env://SOW_SELECTOR_CF_CDN}
+  cos:
+    storage: {kind: cos, bucket: selector-cos-1250000000, endpoint: "https://selector.cos.example.invalid", region: ap-selector, credential: env://SOW_SELECTOR_COS_STORAGE, unversioned_bucket_confirmed: true}
+    cdn: {kind: edgeone, base_url: "https://repo-cn.example.invalid", beta_base_url: "https://beta-cn.example.invalid", distribution: selector-zone, credential: env://SOW_SELECTOR_COS_CDN}
+edge: {token_verifier: provider://selector-fixture}

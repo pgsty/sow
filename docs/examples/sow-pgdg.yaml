@@ -1,0 +1,122 @@
+schema: sow/v1
+
+state:
+  snapshot_materialization_months: 6
+  apt_by_hash_retention: 2
+  yum_generation_retention: 2
+  cas_history_commits: 32
+
+# repository.asc is the SOW metadata trust anchor. Inject the matching private
+# half at runtime; the two pgdg keyrings below must contain public keys only.
+gpg:
+  public_key: keys/repository.asc
+  private_key: env://SOW_GPG_PRIVATE_KEY
+  passphrase: env://SOW_GPG_PASSPHRASE
+
+pools:
+  public: {}
+  gated: {}
+
+repos:
+  - id: apt-pgdg
+    type: apt
+    path: apt/pgdg
+    default_pool: public
+    arches: [amd64, arm64]
+    os: {family: debian, lifecycle: active}
+    apt:
+      suites:
+        - bookworm-pgdg
+        - bookworm-pgdg-testing
+        - bullseye-pgdg
+        - bullseye-pgdg-testing
+        - jammy-pgdg
+        - jammy-pgdg-testing
+        - noble-pgdg
+        - noble-pgdg-testing
+        - trixie-pgdg
+        - trixie-pgdg-testing
+      components: [main, "18", "19"]
+      suite_components:
+        bookworm-pgdg: [main]
+        bookworm-pgdg-testing: [main, "18", "19"]
+        bullseye-pgdg: [main]
+        bullseye-pgdg-testing: [main, "18", "19"]
+        jammy-pgdg: [main]
+        jammy-pgdg-testing: [main, "18", "19"]
+        noble-pgdg: [main]
+        noble-pgdg-testing: [main, "18", "19"]
+        trixie-pgdg: [main]
+        trixie-pgdg-testing: [main, "18", "19"]
+      suite_lifecycle:
+        bookworm-pgdg: active
+        bookworm-pgdg-testing: active
+        bullseye-pgdg: frozen
+        bullseye-pgdg-testing: frozen
+        jammy-pgdg: active
+        jammy-pgdg-testing: active
+        noble-pgdg: active
+        noble-pgdg-testing: active
+        trixie-pgdg: active
+        trixie-pgdg-testing: active
+
+  - id: yum-pgdg
+    type: yum
+    path: yum/pgdg/9/x86_64
+    default_pool: public
+    arches: [x86_64]
+    os: {family: el, major: 9, lifecycle: active}
+    yum: {compression: zstd, package_keyring: keys/pgdg-yum.asc}
+
+upstreams:
+  - id: pgdg-apt
+    type: apt
+    repo: apt-pgdg
+    url: https://apt.postgresql.org/pub/repos/apt/
+    suite: bookworm-pgdg
+    components: [main]
+    arches: [amd64]
+    allow: [pgbadger]
+    debuginfo: drop
+    keyring: keys/pgdg-apt.asc
+
+  - id: pgdg-yum
+    type: yum
+    repo: yum-pgdg
+    url: https://download.postgresql.org/pub/repos/yum/common/redhat/rhel-9-x86_64/
+    arches: [x86_64]
+    allow: [pgdg-redhat-repo]
+    debuginfo: drop
+    keyring: keys/pgdg-yum.asc
+
+views:
+  beta:
+    access: public
+    debuginfo: drop
+    allowed_pools: [public]
+    append_only: false
+  latest:
+    access: public
+    debuginfo: drop
+    allowed_pools: [public]
+    append_only: false
+  stable:
+    access: pro
+    debuginfo: keep
+    allowed_pools: [public, gated]
+    append_only: true
+
+serving:
+  latest: {base_url: "https://repo.example"}
+  beta: {base_url: "https://beta.example"}
+  stable: {base_url: "https://repo.example/pro/v1/basic"}
+
+# Local sync does not require cloud targets. Add the strict provider-specific
+# blocks from README only when publish/fsck is enabled. storage.delete_mode
+# defaults to conditional; checkpoint-fenced requires revoked legacy writers
+# and the explicit single-operator contract in ADR-0036.
+targets: {}
+
+edge:
+  pro_prefix: /pro/v1/{token}/
+  token_verifier: provider://pigsty-entitlements

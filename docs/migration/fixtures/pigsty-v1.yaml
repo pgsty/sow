@@ -1,0 +1,198 @@
+# Complete, non-secret, local-only Pigsty-v1 physical migration contract.
+#
+# This fixture is bound to legacy-physical-topology.tsv by
+# TestPigstyV1PhysicalMigrationContract. It declares no cloud endpoint,
+# credential, entitlement, private key, or verified signer claim. The public
+# key paths are deliberately named "unverified": an operator must replace them
+# with reviewed public-only bundles before adoption/materialization.
+#
+# yum/infra/{arch} is an inactive inventory carrier only. Its cross-EL legacy
+# projection is not frozen, it is absent from every repo_group, and the machine
+# ledger requires quarantine-compat until a later ADR supplies the real ref and
+# consumer contract. The nested PGDG rhel-10.0-aarch64 child is not a repo at
+# all; the parent excludes it and the ledger quarantines it fail closed.
+schema: sow/v1
+
+state:
+  snapshot_materialization_months: 6
+  apt_by_hash_retention: 2
+  yum_generation_retention: 2
+  cas_history_commits: 32
+
+gpg: {public_key: keys/migration-unverified-repository-key.asc}
+pools: {public: {}, gated: {}}
+
+repos:
+  # APT: 11 physical archives expand to exactly 74 Packages indices.
+  # stash is an external-builder handoff, not a served repository pool. The two
+  # rustfs a94 bodies are unreferenced reprepro orphans; b8 is the indexed
+  # version. Preserve all 22 source bytes in place but quarantine them from the
+  # canonical APT owner instead of guessing membership.
+  - {id: apt-infra, type: apt, path: apt/infra, os: {family: generic, major: 1, suite: generic, lifecycle: frozen}, arches: [amd64, arm64], default_pool: public, exclude: [stash/**, pool/main/r/rustfs/rustfs_1.0.0-a94_*.deb], publish_targets: [cf, cos], apt: {suites: [generic], components: [main], suite_components: {generic: [main]}, suite_lifecycle: {generic: frozen}}}
+  - {id: apt-mssql, type: apt, path: apt/mssql, os: {family: mixed, major: 1, lifecycle: active}, arches: [amd64, arm64], default_pool: public, publish_targets: [cf, cos], apt: {suites: [focal, jammy, noble], components: [main], suite_components: {focal: [main], jammy: [main], noble: [main]}, suite_lifecycle: {focal: frozen, jammy: active, noble: active}}}
+  - {id: apt-percona, type: apt, path: apt/percona, os: {family: mixed, major: 1, lifecycle: active}, arches: [amd64, arm64], default_pool: public, publish_targets: [cf, cos], apt: {suites: [bookworm, bullseye, jammy, noble, resolute, trixie], components: [main], suite_components: {bookworm: [main], bullseye: [main], jammy: [main], noble: [main], resolute: [main], trixie: [main]}, suite_lifecycle: {bookworm: active, bullseye: frozen, jammy: active, noble: active, resolute: active, trixie: active}}}
+  - id: apt-pgdg
+    type: apt
+    path: apt/pgdg
+    os: {family: mixed, major: 1, lifecycle: active}
+    arches: [amd64, arm64]
+    default_pool: public
+    publish_targets: [cf, cos]
+    apt:
+      suites: [bookworm-pgdg, bookworm-pgdg-testing, bullseye-pgdg, bullseye-pgdg-testing, jammy-pgdg, jammy-pgdg-testing, noble-pgdg, noble-pgdg-testing, trixie-pgdg, trixie-pgdg-testing]
+      components: [main, "18", "19"]
+      suite_components:
+        bookworm-pgdg: [main]
+        bookworm-pgdg-testing: [main, "18", "19"]
+        bullseye-pgdg: [main]
+        bullseye-pgdg-testing: [main, "18", "19"]
+        jammy-pgdg: [main]
+        jammy-pgdg-testing: [main, "18", "19"]
+        noble-pgdg: [main]
+        noble-pgdg-testing: [main, "18", "19"]
+        trixie-pgdg: [main]
+        trixie-pgdg-testing: [main, "18", "19"]
+      suite_lifecycle:
+        bookworm-pgdg: active
+        bookworm-pgdg-testing: active
+        bullseye-pgdg: frozen
+        bullseye-pgdg-testing: frozen
+        jammy-pgdg: active
+        jammy-pgdg-testing: active
+        noble-pgdg: active
+        noble-pgdg-testing: active
+        trixie-pgdg: active
+        trixie-pgdg-testing: active
+  - {id: apt-pgsql-focal, type: apt, path: apt/pgsql/focal, os: {family: ubuntu, major: 20, suite: focal, lifecycle: frozen}, arches: [amd64, arm64], default_pool: public, publish_targets: [cf, cos], apt: {suites: [focal], components: [main], suite_components: {focal: [main]}, suite_lifecycle: {focal: frozen}}}
+  - {id: apt-pgsql-jammy, type: apt, path: apt/pgsql/jammy, os: {family: ubuntu, major: 22, suite: jammy, lifecycle: active}, arches: [amd64, arm64], default_pool: public, publish_targets: [cf, cos], apt: {suites: [jammy], components: [main], suite_components: {jammy: [main]}, suite_lifecycle: {jammy: active}}}
+  - {id: apt-pgsql-noble, type: apt, path: apt/pgsql/noble, os: {family: ubuntu, major: 24, suite: noble, lifecycle: active}, arches: [amd64, arm64], default_pool: public, publish_targets: [cf, cos], apt: {suites: [noble], components: [main], suite_components: {noble: [main]}, suite_lifecycle: {noble: active}}}
+  - {id: apt-pgsql-resolute, type: apt, path: apt/pgsql/resolute, os: {family: ubuntu, major: 26, suite: resolute, lifecycle: active}, arches: [amd64, arm64], default_pool: public, publish_targets: [cf, cos], apt: {suites: [resolute], components: [main], suite_components: {resolute: [main]}, suite_lifecycle: {resolute: active}}}
+  - {id: apt-pgsql-bullseye, type: apt, path: apt/pgsql/bullseye, os: {family: debian, major: 11, suite: bullseye, lifecycle: frozen}, arches: [amd64, arm64], default_pool: public, publish_targets: [cf, cos], apt: {suites: [bullseye], components: [main], suite_components: {bullseye: [main]}, suite_lifecycle: {bullseye: frozen}}}
+  - {id: apt-pgsql-bookworm, type: apt, path: apt/pgsql/bookworm, os: {family: debian, major: 12, suite: bookworm, lifecycle: active}, arches: [amd64, arm64], default_pool: public, publish_targets: [cf, cos], apt: {suites: [bookworm], components: [main], suite_components: {bookworm: [main]}, suite_lifecycle: {bookworm: active}}}
+  - {id: apt-pgsql-trixie, type: apt, path: apt/pgsql/trixie, os: {family: debian, major: 13, suite: trixie, lifecycle: active}, arches: [amd64, arm64], default_pool: public, publish_targets: [cf, cos], apt: {suites: [trixie], components: [main], suite_components: {trixie: [main]}, suite_lifecycle: {trixie: active}}}
+
+  # YUM: 74 path templates expand to 130 ordinary legacy repodata leaves.
+  # Every metadata signer remains not-claimed and every RPM signer remains
+  # unverified in the adjacent ledger; these paths are trust inputs, not proof.
+  - {id: yum-gpsql-el7, type: yum, path: "yum/gpsql/el7.{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-gpsql-el8, type: yum, path: "yum/gpsql/el8.{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-gpsql-el9, type: yum, path: "yum/gpsql/el9.{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-infra-legacy-compat, type: yum, path: "yum/infra/{arch}", os: {family: cross-el, major: 0, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, active: false, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate, compatibility_carrier: true}}
+  - {id: yum-mssql-el7, type: yum, path: "yum/mssql/el7.{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-mssql-el8, type: yum, path: "yum/mssql/el8.{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-mssql-el9, type: yum, path: "yum/mssql/el9.{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-percona-el10, type: yum, path: "yum/percona/el10.{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, noarch, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: separate}}
+  - {id: yum-percona-el8, type: yum, path: "yum/percona/el8.{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, noarch, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: separate}}
+  - {id: yum-percona-el9, type: yum, path: "yum/percona/el9.{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, noarch, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: separate}}
+  - {id: yum-pgdg-13-el10, type: yum, path: "yum/pgdg/13/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-13-el7, type: yum, path: "yum/pgdg/13/redhat/rhel-7-{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-13-el8, type: yum, path: "yum/pgdg/13/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-13-el9, type: yum, path: "yum/pgdg/13/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-14-el10, type: yum, path: "yum/pgdg/14/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-14-el7, type: yum, path: "yum/pgdg/14/redhat/rhel-7-{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-14-el8, type: yum, path: "yum/pgdg/14/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-14-el9, type: yum, path: "yum/pgdg/14/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-15-el10, type: yum, path: "yum/pgdg/15/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-15-el7, type: yum, path: "yum/pgdg/15/redhat/rhel-7-{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-15-el8, type: yum, path: "yum/pgdg/15/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-15-el9, type: yum, path: "yum/pgdg/15/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-16-el10, type: yum, path: "yum/pgdg/16/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-16-el8, type: yum, path: "yum/pgdg/16/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-16-el9, type: yum, path: "yum/pgdg/16/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-17-el10, type: yum, path: "yum/pgdg/17/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, exclude: [rhel-10.0-aarch64/**], publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-17-el8, type: yum, path: "yum/pgdg/17/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-17-el9, type: yum, path: "yum/pgdg/17/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-18-el10, type: yum, path: "yum/pgdg/18/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-18-el8, type: yum, path: "yum/pgdg/18/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-18-el9, type: yum, path: "yum/pgdg/18/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-common-pgdg-centos8-sysupdates-el8, type: yum, path: "yum/pgdg/common/pgdg-centos8-sysupdates/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-common-pgdg-rhel10-sysupdates-el10, type: yum, path: "yum/pgdg/common/pgdg-rhel10-sysupdates/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-common-pgdg-rocky10-sysupdates-el10, type: yum, path: "yum/pgdg/common/pgdg-rocky10-sysupdates/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-common-pgdg-rocky9-sysupdates-el9, type: yum, path: "yum/pgdg/common/pgdg-rocky9-sysupdates/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-common-el10, type: yum, path: "yum/pgdg/common/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-common-el7, type: yum, path: "yum/pgdg/common/redhat/rhel-7-{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-common-el8, type: yum, path: "yum/pgdg/common/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-common-el9, type: yum, path: "yum/pgdg/common/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-extras-el10, type: yum, path: "yum/pgdg/extras/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-extras-el7, type: yum, path: "yum/pgdg/extras/redhat/rhel-7-{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-extras-el8, type: yum, path: "yum/pgdg/extras/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-extras-el9, type: yum, path: "yum/pgdg/extras/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-13-el10, type: yum, path: "yum/pgdg/non-free/13/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-13-el7, type: yum, path: "yum/pgdg/non-free/13/redhat/rhel-7-{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-13-el8, type: yum, path: "yum/pgdg/non-free/13/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-13-el9, type: yum, path: "yum/pgdg/non-free/13/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-14-el10, type: yum, path: "yum/pgdg/non-free/14/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-14-el7, type: yum, path: "yum/pgdg/non-free/14/redhat/rhel-7-{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-14-el8, type: yum, path: "yum/pgdg/non-free/14/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-14-el9, type: yum, path: "yum/pgdg/non-free/14/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-15-el10, type: yum, path: "yum/pgdg/non-free/15/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-15-el7, type: yum, path: "yum/pgdg/non-free/15/redhat/rhel-7-{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-15-el8, type: yum, path: "yum/pgdg/non-free/15/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-15-el9, type: yum, path: "yum/pgdg/non-free/15/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-16-el10, type: yum, path: "yum/pgdg/non-free/16/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-16-el8, type: yum, path: "yum/pgdg/non-free/16/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-16-el9, type: yum, path: "yum/pgdg/non-free/16/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-17-el10, type: yum, path: "yum/pgdg/non-free/17/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-17-el8, type: yum, path: "yum/pgdg/non-free/17/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-17-el9, type: yum, path: "yum/pgdg/non-free/17/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-18-el10, type: yum, path: "yum/pgdg/non-free/18/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-18-el8, type: yum, path: "yum/pgdg/non-free/18/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-non-free-18-el9, type: yum, path: "yum/pgdg/non-free/18/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-testing-18-el10, type: yum, path: "yum/pgdg/testing/18/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, ppc64le, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-testing-18-el8, type: yum, path: "yum/pgdg/testing/18/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, ppc64le, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-testing-18-el9, type: yum, path: "yum/pgdg/testing/18/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, ppc64le, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-testing-19-el10, type: yum, path: "yum/pgdg/testing/19/redhat/rhel-10-{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, ppc64le, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-testing-19-el8, type: yum, path: "yum/pgdg/testing/19/redhat/rhel-8-{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgdg-testing-19-el9, type: yum, path: "yum/pgdg/testing/19/redhat/rhel-9-{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, ppc64le, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgsql-el10, type: yum, path: "yum/pgsql/el10.{arch}", os: {family: el, major: 10, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgsql-el7, type: yum, path: "yum/pgsql/el7.{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgsql-el8, type: yum, path: "yum/pgsql/el8.{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+  - {id: yum-pgsql-el9, type: yum, path: "yum/pgsql/el9.{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
+
+  # Asset source paths are canonicalized before publication. Target-specific
+  # .io/.cc root bodies are never represented as equivalent bytes. The
+  # reviewed external builder pins all eight source bodies and emits four
+  # deterministic mirror-aware canonical scripts; the shared owner is active
+  # after its digest-bound local CLI handoff. The bin inventory carrier lets M0
+  # bind the untouched legacy bytes without making them selectable or
+  # publishable. The Pro owner
+  # is active after exact-copy gated adoption: its zero-byte legacy checksums
+  # file is excluded and replaced through an ordinary gated `sow add` using the
+  # reviewed deterministic checksum fixture.
+  - {id: asset-root-both, type: asset, path: assets/root-both, default_pool: public, publish_targets: [cf, cos], asset: {kind: bootstrap, mutable_paths: [beta, get, pig, pkg], public_path: ".", root_keys: [beta, get, pig, pkg]}}
+  - {id: asset-root-cos, type: asset, path: assets/root-cos, default_pool: public, publish_targets: [cos], asset: {kind: bootstrap, mutable_paths: [cc, claude, ray], public_path: ".", root_keys: [cc, claude, ray]}}
+  - {id: asset-legacy-bin-inventory, type: asset, path: bin, active: false, exclude: [fileauth.txt], default_pool: public, asset: {kind: inventory, public_path: migration/bin, inventory_carrier: true}}
+  - {id: asset-dba, type: asset, path: dba, default_pool: public, publish_targets: [cf, cos], asset: {kind: generic, public_path: dba}}
+  - {id: asset-etc, type: asset, path: etc, default_pool: public, publish_targets: [cf, cos], asset: {kind: config, public_path: etc}}
+  - {id: asset-ext, type: asset, path: ext, default_pool: public, publish_targets: [cf, cos], asset: {kind: release, public_path: ext}}
+  - {id: asset-img, type: asset, path: img, default_pool: public, publish_targets: [cos], asset: {kind: image, public_path: img}}
+  - {id: asset-pkg-claude, type: asset, path: pkg/claude, default_pool: public, publish_targets: [cos], asset: {kind: release, public_path: pkg/claude}}
+  - {id: asset-pkg-pig, type: asset, path: pkg/pig, default_pool: public, publish_targets: [cf, cos], asset: {kind: release, mutable_paths: [latest], public_path: pkg/pig}}
+  - {id: asset-pkg-ray, type: asset, path: pkg/ray, default_pool: public, publish_targets: [cos], asset: {kind: release, public_path: pkg/ray}}
+  - {id: asset-src, type: asset, path: src, default_pool: public, publish_targets: [cf, cos], asset: {kind: source, public_path: src}}
+  - {id: asset-pro-gated, type: asset, path: pro, exclude: [checksums], default_pool: gated, publish_targets: [cf, cos], asset: {kind: offline, public_path: gated/pro}}
+
+# Groups contain only operable, non-quarantined physical repos. In particular,
+# yum-infra-legacy-compat is intentionally absent from every group.
+repo_groups:
+  apt-all: [apt-infra, apt-mssql, apt-percona, apt-pgdg, apt-pgsql-bookworm, apt-pgsql-bullseye, apt-pgsql-focal, apt-pgsql-jammy, apt-pgsql-noble, apt-pgsql-resolute, apt-pgsql-trixie]
+  apt-pgsql: [apt-pgsql-bookworm, apt-pgsql-bullseye, apt-pgsql-focal, apt-pgsql-jammy, apt-pgsql-noble, apt-pgsql-resolute, apt-pgsql-trixie]
+  yum-gpsql: [yum-gpsql-el7, yum-gpsql-el8, yum-gpsql-el9]
+  yum-mssql: [yum-mssql-el7, yum-mssql-el8, yum-mssql-el9]
+  yum-percona: [yum-percona-el10, yum-percona-el8, yum-percona-el9]
+  yum-pgdg: [yum-pgdg-13-el10, yum-pgdg-13-el7, yum-pgdg-13-el8, yum-pgdg-13-el9, yum-pgdg-14-el10, yum-pgdg-14-el7, yum-pgdg-14-el8, yum-pgdg-14-el9, yum-pgdg-15-el10, yum-pgdg-15-el7, yum-pgdg-15-el8, yum-pgdg-15-el9, yum-pgdg-16-el10, yum-pgdg-16-el8, yum-pgdg-16-el9, yum-pgdg-17-el10, yum-pgdg-17-el8, yum-pgdg-17-el9, yum-pgdg-18-el10, yum-pgdg-18-el8, yum-pgdg-18-el9, yum-pgdg-common-el10, yum-pgdg-common-el7, yum-pgdg-common-el8, yum-pgdg-common-el9, yum-pgdg-common-pgdg-centos8-sysupdates-el8, yum-pgdg-common-pgdg-rhel10-sysupdates-el10, yum-pgdg-common-pgdg-rocky10-sysupdates-el10, yum-pgdg-common-pgdg-rocky9-sysupdates-el9, yum-pgdg-extras-el10, yum-pgdg-extras-el7, yum-pgdg-extras-el8, yum-pgdg-extras-el9, yum-pgdg-non-free-13-el10, yum-pgdg-non-free-13-el7, yum-pgdg-non-free-13-el8, yum-pgdg-non-free-13-el9, yum-pgdg-non-free-14-el10, yum-pgdg-non-free-14-el7, yum-pgdg-non-free-14-el8, yum-pgdg-non-free-14-el9, yum-pgdg-non-free-15-el10, yum-pgdg-non-free-15-el7, yum-pgdg-non-free-15-el8, yum-pgdg-non-free-15-el9, yum-pgdg-non-free-16-el10, yum-pgdg-non-free-16-el8, yum-pgdg-non-free-16-el9, yum-pgdg-non-free-17-el10, yum-pgdg-non-free-17-el8, yum-pgdg-non-free-17-el9, yum-pgdg-non-free-18-el10, yum-pgdg-non-free-18-el8, yum-pgdg-non-free-18-el9, yum-pgdg-testing-18-el10, yum-pgdg-testing-18-el8, yum-pgdg-testing-18-el9, yum-pgdg-testing-19-el10, yum-pgdg-testing-19-el8, yum-pgdg-testing-19-el9]
+  yum-pgsql: [yum-pgsql-el10, yum-pgsql-el7, yum-pgsql-el8, yum-pgsql-el9]
+  asset-public: [asset-dba, asset-etc, asset-ext, asset-img, asset-pkg-claude, asset-pkg-pig, asset-pkg-ray, asset-root-both, asset-root-cos, asset-src]
+  asset-gated: [asset-pro-gated]
+
+upstreams: []
+views:
+  beta: {access: public, allowed_pools: [public], append_only: false}
+  latest: {access: public, allowed_pools: [public], append_only: false}
+  stable: {access: pro, allowed_pools: [public, gated], append_only: true}
+serving:
+  latest: {base_url: "https://repo.pigsty.io"}
+  beta: {base_url: "https://beta.pigsty.io"}
+  stable: {base_url: "https://repo.pigsty.io/pro/v1/basic"}
+targets: {}
+edge: {token_verifier: provider://migration-fixture}

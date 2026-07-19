@@ -1,315 +1,356 @@
 # SOW 需求可追踪矩阵
 
-> 状态：初始化执行账本  
-> 建立日期：2026-07-11  
-> 适用范围：SOW 全量产品实现，不以 M0–M4 任一局部里程碑替代最终验收。
+> 状态：持续执行账本（非完成声明）
+> 更新：2026-07-19
+> 范围：G1–G6、FR-01–FR-42、NFR-01–NFR-09、冻结/兼容/技术/范围外契约、迁移、风险、PoC 和开放问题。
 
-## 1. 用途与权威来源
+## 1. 权威来源与证据纪律
 
-本文件是实现和验收的持续账本，不是设计完成证明。每次实现、测试、迁移或 PoC 后，应在同一变更中更新对应条目的状态、实现位置与可复现证据。
+权威输入依次为 [PRD](../_bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/prd.md)、[Addendum](../_bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/addendum.md)、[technical research](../_bmad-output/planning-artifacts/research/technical-sow-repo-cli-tech-validation-research-2026-07-11.md) 和 [brainstorm intent](../_bmad-output/brainstorming/brainstorm-sow-repo-cli-2026-07-11/brainstorm-intent.md)。PRD 是范围与验收合同；Addendum 是更具体的技术定案。
 
-权威来源缩写：
-
-- `PRD`：`_bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/prd.md`
-- `ADD`：`_bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/addendum.md`
-- `GOAL`：`SOW-GOAL-PROMPT.md`
-- 解释优先级：PRD 是范围与验收合同，Addendum 是更具体的技术定案；冲突按更新、更具体且已冻结的决策解释，并记录 ADR（GOAL:L13-L20）。
-
-计划实现位置是当前代码布局假设，不是冻结合同。架构调整目录时必须同步更新本矩阵，需求 ID 不得丢失。
-
-## 2. 状态枚举与证据规则
+状态解释：
 
 | 状态 | 含义 |
 |---|---|
-| `未实现` | 没有可由真实 CLI 调用的完整实现；设计稿、接口、骨架、TODO、空函数或 Mock 演示均属于此状态。 |
-| `实现中` | 已有部分代码，但仍有路径、错误处理、恢复语义或真实适配器未完成。 |
-| `已实现/未验证` | 实现已接入真实 CLI，但尚无足够的可复现验收证据。 |
-| `未验证` | 指标、兼容性、风险或 PoC 尚无当前环境的有效测量结果。 |
-| `已验证` | 有可复现命令、环境说明、测试输出或产物，并覆盖真实协议/文件系统/供应商路径。 |
-| `已冻结` | 仅用于开放问题：具体值已由 ADR 与配置默认值定案；不表示依赖它的功能已实现。 |
-| `未决` | 仅供开放问题使用；尚未由 ADR 和配置默认值冻结。 |
-| `受阻` | 已穷尽本地可行工作，明确记录所缺凭据、真实资源或不可逆业务决定。 |
-| `范围外` | 仅用于 PRD 明确排除项，不得用于隐藏未完成范围内工作。 |
+| `已验证` | 实现已进入真实 CLI/产品路径，且当前要求有可复现的文件系统、协议、真客户端或性能证据。 |
+| `已实现/未验证` | 产品路径完整，但该条依赖的真实云、生产树、运营数据或外部资源未实跑。 |
+| `实现中` | 已有实现，但语义或迁移契约仍有明确 GAP；不能靠文档或 Mock 升级。 |
+| `未实现` | 仍缺真实可调用能力。 |
+| `未验证` | 指标或外部兼容性尚无有效测量。 |
+| `受阻` | 本地可做工作已穷尽，明确缺真实凭据/资源或不可逆业务决策。 |
+| `已冻结` | 只用于开放问题；值已由 ADR 和 schema 锁定，不等于所有依赖功能都通过。 |
+| `条件未触发` | PRD 明确的未来条件能力尚未进入启动条件，不伪报 PoC。 |
+| `范围外已验证` | 负向审计证明未把 PRD 排除项引入产品。 |
 
-证据纪律：
+本矩阵严格区分四层：内存 fake 不算协议证据；签名 HTTP/S3 协议夹具不算真实供应商；MinIO 不算 R2/COS；Docker 中的真 apt/dnf 不算穿 Cloudflare/EdgeOne。
 
-1. 设计文档、技术调研、类型定义、编译成功和 Mock-only 测试不能单独将条目标为 `已验证`。
-2. `已验证` 的证据列必须包含可复现命令、执行环境、结果摘要，并优先链接保存的日志、报告或测试产物。
-3. apt/dnf、真实文件系统、本地 S3 兼容服务、真实云/CDN 各是不同证据层，不得相互冒充。
-4. 真实云凭据缺失时，先完成本地 S3 与供应商契约测试；相应云 PoC 仍保持 `未验证`（GOAL:L51）。
-5. 最终完成前所有范围内条目必须没有 `未实现`、`实现中`、`已实现/未验证`、`未验证`、`未决` 或无依据的通过（GOAL:L55-L62）。
+安全冻结（2026-07-14）：任何测试、PoC、探测或 purge 都不得使用 CO/COS 或
+Cloudflare 生产仓库、bucket、Zone、domain。V-12 仅是已经发生的历史只读迁移前记录，
+不得重跑。未来 POC-01/06 只能使用经独立评审、精确写入编译期 SHA-256 固定 registry 的
+专用非生产资源。provider-readiness registry 当前且仅钉住 owner 授权的 Cloudflare
+`pro`/main/beta tuple；它开放单供应商只读预检，另有 owner 明确授权、exact bucket 确认、
+空桶前置与 run-owned digest allowlist 共同保护的 storage-only R2 协议测试。完整双云 resource、
+Worker/CDN、provider-deployment 与 bootstrap registry 仍关闭，其他写入式真实云入口继续在联网前失败关闭。
 
-## 3. 当前总览
+## 2. 当前总览
 
-| 类别 | 总数 | 当前结果 |
+| 类别 | 总数 | 状态计数 |
 |---|---:|---|
-| 成功指标 G1–G6 | 6 | 0 已验证，6 未验证 |
-| 功能需求 FR-01–FR-42 | 42 | 6 实现中，36 未实现 |
-| 非功能需求 NFR-01–NFR-09 | 9 | 4 实现中，5 未验证 |
-| 冻结契约 FZ-01–FZ-08 | 8 | 0 已实现，8 未实现 |
-| 开放问题 OQ-1–OQ-5 | 5 | 3 已冻结，2 未决 |
-| 上线 PoC | 7 | 0 已验证，7 未验证 |
+| G1–G6 | 6 | 3 `已验证`，1 `实现中`，1 `未验证`，1 `受阻` |
+| 反指标 | 3 | 3 `未验证` |
+| FR-01–FR-42 | 42 | 23 `已验证`，3 `实现中`，16 `已实现/未验证` |
+| NFR-01–NFR-09 | 9 | 5 `已验证`，3 `已实现/未验证`，1 `未验证` |
+| FZ-01–FZ-09 | 9 | 6 `已验证`，2 `实现中`，1 `已实现/未验证` |
+| COMP-01–COMP-05 | 5 | 5 `已验证` |
+| TECH-01–TECH-10 | 10 | 9 `已验证`，1 `实现中` |
+| OUT-01–OUT-05 | 5 | 5 `范围外已验证` |
+| MIG-01–MIG-08 | 8 | 1 `已验证`，4 `实现中`，2 `已实现/未验证`，1 `未验证` |
+| RISK-01–RISK-06 | 6 | 3 `已验证`，1 `已实现/未验证`，2 `受阻` |
+| POC-01–POC-07 | 7 | 4 `已验证`，2 `受阻`，1 `条件未触发` |
+| OQ-1–OQ-5 | 5 | 4 `已冻结`，1 `受阻` |
+
+当前结论：产品主体已可运行，但仍有范围内 GAP 和真实环境门禁；Goal **不能完成**。
+
+## 3. 本轮可复现验证基线
+
+> **V-01–V-23 按实际运行日期和证据边界对账。** 2026-07-16 在完整副本采用、archive
+> scanner 与最终测试契约收尾后，以六个穷尽 CLI shard 重跑 ordinary/race、全部 non-CLI
+> ordinary/race、静态/依赖/provenance、四平台构建、真 apt/dnf、MinIO、Linux archive、
+> 七套迁移脚本与 50k ordinary/race。所有 provider 凭据清空，生产隔离门禁显式通过；
+> 本地/协议证据不替代真非生产云。详见
+> [current-source validation](evidence/2026-07-16-current-source-validation.md)。
+> V-07 是本地迁移闭环与只读副本重跑，V-12 只是已经发生的迁移前生产只读基线，禁止重跑。
+> 为避免交付摘要自引用，V-14 的 post-document product/delivery/archive 身份只记录在交付根
+> 之外的 `_bmad-output/implementation-artifacts/validation-selected-set-materialization-2026-07-13.md`。
+> 所有旧 329/330/347/349/456-file identity 均为历史观察，不能再支持当前交付身份或 Goal 完成。
+
+| ID | 实跑命令/环境 | 结果与边界 |
+|---|---|---|
+| V-01 | 六个穷尽 CLI shard 的 `go test -count=1`/`go test -race -count=1`；全部 non-CLI ordinary/race；perf focused closure | 2026-07-19 final current source 的 679 个 default CLI tests 全部 PASS。ordinary A-F/G-M/N-O/P-Q/R-V/W-Z 为 540.426/776.669/246.807/887.017/563.162/123.294s；race 为 567.808/830.500/246.498/1023.397/585.309/140.420s，无 race report；两批各六进程并发造成的本地 CPU/fsync 争用如实计入时间，仍全部低于 ordinary 20m/race 25m 包门禁。全部 non-CLI ordinary/race package 以真实云/上游/perf opt-in 强制关闭同轮通过，ordinary 最长 compat 28.595s、race 最长 upstream 36.100s。单一未分片 `internal/cli` 的累计 I/O 曾命中 10m package alarm，明确不是通过也不是当前测试失败；正式 exhaustive 入口保持 CI 同构六分片。perf 组合与 strong-YUM ordinary/race 另有 V-08；本轮细节见 [V-23 evidence](evidence/2026-07-19-confidential-edge-preflight.md)，历史规模基线见 [current-source validation](evidence/2026-07-16-current-source-validation.md)。 |
+| V-02 | `go vet ./...`；`go vet -tags perf ./internal/cli ./test/perf`；两个模块 `go mod tidy -diff`/`go mod verify`；provenance；`git diff --check` | 2026-07-19 current-source 全部 PASS：两个 vet 无输出，tidy diff 为空，两个 module verify 为 `all modules verified`；嵌套 RPM 模块 test/vet 与 v1.3.0 byte provenance PASS；产品/批准 patch 文件 gofmt clean；非测试产品文件无 TODO/stub/panic/`os/exec`。final edge rebuild 三个 dist SHA 不变、syntax/import 与 42/42 contract PASS（142.981375ms）。post-document diff/policy/clean-delivery 由 V-14 收口。 |
+| V-03 | `CGO_ENABLED=0 GOOS=<linux\|darwin> GOARCH=<amd64\|arm64> go build -trimpath ./cmd/sow` | 2026-07-19 final current-source 四组 PASS：linux/amd64 `b54d9a49…0cfd`、linux/arm64 `9b2f24e8…21cd`，darwin/amd64 `5ae8bfa4…e119`、darwin/arm64 `77999900…ca35`；Linux 为静态 ELF、Darwin 为目标架构 Mach-O。Linux/arm64 archive 测试二进制此前在固定本地镜像 `--network none` 真实运行通过，且 CLI 在同一断网容器输出 `linux/arm64`；交叉构建本身仍不冒充四平台全烟测。 |
+| V-04 | 清空云凭据并关闭 real-cloud/edge/upstream；公开镜像 + Nginx，`SOW_RUN_DOCKER_COMPAT=1 SOW_COMPAT_NGINX=1 ... go test -timeout 25m -count=1 ./test/compat` | 2026-07-19 当前源码 package `139.249s` PASS。digest 固定的 Ubuntu 16.04 真 apt 1.2.35 与 Ubuntu 22.04 apt 2.4 均消费 InRelease/by-hash 并精确安装；support-floor 子路径 race `42.166s` PASS。digest 固定的 CentOS 7 真 YUM 3.4.3 以 gzip、`repo_gpgcheck=1`、三类 repodata、精确 signed-RPM downgrade/install 与 `rpm -K` 通过，聚焦 ordinary/race 为 `43.612s`/`44.439s`；EL8/9/10 DNF 则以 gzip/zstd、`repo_gpgcheck=1`/`gpgcheck=1` 安装且缺 key 负控失败。覆盖 latest/history/snapshot、Basic fallback、生产 Cloudflare Worker bundle 的本地 token path、generation-pinned、retained package/in-flight flip/空 successor、Nginx exact allowlist 和 detached-signature bridge 负例。APT sources 只指临时 loopback，YUM/DNF 强制禁用全部外部 repo；real-cloud、real-edge、real-upstream、legacy-APT 等显式 opt-in 均关闭/SKIP。无生产仓库或云写访问。另以只读复制的 Pigsty public key 和可写副本 RPM 跑 current `yum/infra` exact-copy package trust 与六组双架构 strong DNF；216/216 RPM 验签，生产 234-file manifest 前后不变。 |
+| V-05 | `SOW_MINIO_TEST=1 go test ./internal/publish -run '^TestMinIOS3Compatibility$' -count=1 -v` | current-source 固定 digest MinIO PASS：test 1.05s/package 1.861s；真 S3-compatible/SigV4、conditional mutation、事务/重放、List/HEAD/GET、server-side Copy 与删除闭合。仅本地 disposable container，不代替 R2/COS。 |
+| V-06 | `cd edge && npm run build && npm test`；build 前后 dist SHA 对比 | 2026-07-19 final current source 独立重跑，三个 dist byte-identical（`db3361b6…d06`、`54f9dfe5…923`、`b58a1d80…3af`），三个 `node --check`、无源码 import 加载与 42/42 PASS（142.981375ms test duration）。共同覆盖 service-only R2 origin、COS SigV4、固定供应商 host、redirect/SSRF/凭据剥离、public allowlist、Go→JS exact deployment contract、entitlement 去重、gated→public fallback、direct `BYPASS`、beta fallback、精确 compatibility trust/route ownership、动态 ordinary/compatibility mirrorlist、Basic 回退，以及两个供应商对匿名 pre-upload confidentiality canary 的 exact v2 private 404/零 origin call。`https-bearer` 和默认 multi-PoP validator 只证明本地观测/关联合同，不代替真 Worker/EdgeOne HIT/purge；见 [edge verifier evidence](evidence/2026-07-12-edge-token-verifier-wiring.md)、[V-23 evidence](evidence/2026-07-19-confidential-edge-preflight.md) 与 [real-cloud harness](evidence/2026-07-12-real-cloud-acceptance-harness.md)。 |
+| V-07 | 七个 `docs/migration/test-*.sh`（physical config/topology、legacy targets、family E2E、local rollback、writer fence、Pigsty YUM consumer）；完整存量树副本 `sow init/fsck/init --adopt-content`；迁移定向 ordinary/race Go tests | 2026-07-17 七套 hermetic 脚本全绿且进入 CI；28 个 Pigsty consumer 定义只在临时副本 stage/apply/replay/rollback，源 hash 未变。current config/ledger 以 97 repo/134 row 闭合 74 APT index、130 ordinary YUM leaf、1 nested quarantine、7 root key、8 root prefix、16 gated Pro file；仅 `bin` inventory 与两个 `yum/infra` carrier 保持 inactive。Pro、COS-only ROOT 与 V-20 shared ROOT owner 均在各自本地 handoff 后按 exact affinity 激活。target audit 仍为 176 targets/44 families（52/70/14/40；处置 115/33/18/8/2），规范 TSV 177 行、SHA-256 `e29ceea9facb5a63bbce9fcfb2d17f80d01720c0d47a931101c65adcd3655e52`；只改变 ROOT-02/03 replacement 证据，不改变 target、处置、命令或回滚码。V-17 的全量纳管/PGDG recovery/current `yum/infra` DNF、V-19/V-20 ROOT handoff 及全部审计负例通过；原树未写，本地 provider protocol 不代替真双云或生产 IAM/ACL。 |
+| V-08 | perf-tag/规模命令见 [current-source report](evidence/2026-07-16-current-source-validation.md) 与 [legacy adoption 50k](evidence/2026-07-18-legacy-adoption-50k-performance.md) | current-source 50k 全部重跑：upstream spool ordinary/race retained growth 0/0B、disk 29,265,920B；APT 3.986/12.760s、4 workers、chunk 256；materialize ordinary 17.286s+2.545s、race 21.290s+4.276s，8/8 workers；50k→1 publish 12.242/120.153ms；preflight 100 次 20.857/69.323ms；YUM 6.282/48.182s，均无 race。50k full-change plan 85.244/785.289ms；CDN verify 68.920/266.326ms、8/8 workers。strong-YUM 4×12.5k 两代/replay/L1/GC ordinary 317.21s、race 384.15s，worker combined peak 8，ordinary/race max RSS 133,382,144/413,138,944B。2026-07-18 当前专项版又以 50,000 个唯一 asset 真 `cli.Main init --adopt-content` 闭合本命令专项：首次/replay 12m09s/6m12s，实际 import peak 8/8，CAS/view/receipt/cache/provenance 均精确 50,000；baseline/view/receipt/cache 的 `path/size/SHA256/pool` closure 摘要一致并逐对象验证全部 CAS；canonical receipt 与 SQLite provenance 的九字段 closure 摘要同为 `1577eccd…ce57`；5ms sampled peak/retained heap growth 125,097,504/553,888B，OS max RSS growth 138,985,472B；serving manifest 三次相同且 replay `changed=false`。另在 inode 74638033 的存量树独立副本上重跑 72,310 files/89,862,495,508B/12.459s、18 workers（package 13.189s）；所有写入式规模测试仅使用临时目录，原树与生产云未成为测试目标。 |
+| V-09 | `SOW_RUN_REAL_UPSTREAM=1 go test -count=1 -v ./test/compat -run '^TestOfficialPGDGUpstreamSyncCompatibility$'` | post-ADR-0030 current-source 官方 PGDG 运行 180.91s PASS：APT 4,010 candidates，首轮 download=1/present=0/filter=4,009，重放 download=0/present=1；YUM 1,344，首轮 download=12/present=0/filter=1,332，重放 download=0/present=12；最终 1 DEB+12 RPM receipts、536,434 CAS bytes、5 evidence，L1 PASS，物化 13 entries/45 files/709,521 repository bytes。只读公开 PGDG origins，未访问生产云写接口。见 [current-source report](evidence/2026-07-16-current-source-validation.md)、[PGDG evidence](evidence/2026-07-12-real-pgdg-upstream-sync.md)和[RPM trust closure](evidence/2026-07-13-rpm-package-trust-closure.md)。 |
+| V-10 | 固定 `govulncheck@v1.6.0` 扫主模块与 `third_party/cavaliergopher-rpm`；nested test/vet | current-source PASS。主模块可达漏洞 0、vulnerable imported packages 0，1 条 required-module advisory 不在调用图；嵌套模块报告 `No vulnerabilities found`。工具源码来自本机只读 module download cache，漏洞数据库只读访问 `vuln.go.dev`，所有云凭据清空；未访问生产仓库/云。 |
+| V-11 | 两个 upstream fuzz 5s；RPM OpenPGP 与 patched binary-header fuzz 各 10s | current-source 全部 PASS，18 workers：HTTPS-relative 75,990 execs/6.923s package；APT Release path 65,094/6.611s；OpenPGP packet 989,790/11.482s；binary RPM header 2,897,788/11.894s。execution 数仅为调度观察，不是阈值；workspace 无新增 crash corpus。 |
+| V-12 | 冻结的历史生产 URL/bucket 只读基线；禁止重跑 | 全球/国内 `/pkg/pig/latest` 的历史 200/ETag/body/checksum 与 R2/COS 历史对象数/逻辑字节已保存。见 [URL baseline](evidence/2026-07-12-live-latest-url-baseline.md) 和 [bucket baseline](evidence/2026-07-12-live-bucket-inventory-baseline.md)；仅是过去的迁移前记录。按 2026-07-14 安全冻结，任何后续测试不得访问 CO/COS/Cloudflare 生产资源。 |
+| V-13 | ordinary/race `internal/publish` 与 SDK provider 协议夹具；`go mod verify`；V-05 | current-source ordinary/race 覆盖 SDK/unit protocol paths，module verify 通过；固定 digest 真 MinIO current run 为 test 1.05s/package 1.861s。[ADR-0016](adr/0016-frozen-vendor-sdk-boundary.md) 与 [SDK evidence](evidence/2026-07-12-vendor-sdk-contract.md)覆盖 R2/COS AWS S3 SDK、Cloudflare/EdgeOne 具体 SDK、条件头签名、临时凭据、CopyObject 内嵌 Error、provider error envelope、精确 purge/JobId 轮询；仍不代替真供应商 POC-06。 |
+| V-14 | 交付文件冻结后，在 repo 外 fresh HOME/GOMODCACHE/GOCACHE 重建 clean delivery | V-23 confidentiality patch 后两个独立输出目录均 PASS，当前 allowlist 为 536 个 product source file、682 个 delivery file，archive `cmp` 为 0；此前身份均是已被后续补丁取代的历史快照。本交付根不内嵌 post-document digest 以避免自引用，最终 product/delivery/archive SHA-256 与 archive path 只记录在外部 `_bmad-output/implementation-artifacts/validation-selected-set-materialization-2026-07-13.md`。脚本从 allowlist 重组源码、fresh module cache 以 go.sum/sumdb 验证依赖、执行秘密/链接审计、构建/测试并生成确定性归档；最终两个 fresh run 显式使用只读 `SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download` 并通过 `go mod tidy -diff`、download、verify、测试和构建。归档不替代尚缺 Git release revision。 |
+| V-15 | V-04 完整 current-source Docker/Nginx 矩阵；另见 exact-route focused evidence | V-04 已在当前源码重跑 exact-leaf Nginx 与真 apt/dnf：公开/Basic 响应正文闭合，匿名 Basic 401，授权响应 `private, no-store`，operator/state/CAS/foreign/unowned route 404；generation route 约束精确 ID 与 repo root。仅临时目录、loopback 与 Docker bridge，无对象存储/CDN/公共软件源或生产资源；不代替生产切换或真非生产云。详见 [Nginx exact route evidence](evidence/2026-07-14-nginx-asset-exact-prefix.md) 与 [current-source report](evidence/2026-07-16-current-source-validation.md)。 |
+| V-16 | 清空 AWS/Cloudflare/Tencent 凭据，`AWS_CONFIG_FILE=/dev/null AWS_SHARED_CREDENTIALS_FILE=/dev/null SOW_RUN_REAL_CLOUD=0 SOW_RUN_REAL_EDGE_EVIDENCE=0 SOW_RUN_REAL_UPSTREAM=0 GOPROXY=off`，运行 physical-owner/route-receipt/historical-alias/offline-archive/retired-lifecycle 7 项聚焦 CLI 集合 | 2026-07-15 current source 严格离线 PASS，`internal/cli` 126.863s；partial YUM receipt/repair 与 historical alias restore 的独立 race 分别 18.347s/30.168s，后者 focused ordinary 19.627s；五项 publish/restore P0 集 119.263s；`internal/publish` 7.709s，聚焦 vet PASS。证明本地 APT repo-wide、YUM repo+arch alias owner 闭包不扩大远端逻辑 selector，缺 receipt 禁止 no-op/Nginx 并可零远端副作用修复，历史双 alias 一份物理 generation+双 channel 可恢复重放，APT/frozen-YUM 离线归档保持逻辑 selector，以及 retired generation 只进入 exact read capability、不成为 payload GC root。`cf` target 仅用内存 transport；未访问 CO/COS/Cloudflare/EdgeOne/生产资源，不替代真实云、old APT、完整 apt/dnf 矩阵或生产迁移。详见 [physical-owner route evidence](evidence/2026-07-15-physical-owner-route-restoration.md)。 |
+| V-17 | 新鲜可写副本的当前二进制 `init --adopt-content`、幂等重放、PGDG official recovery、materialize、真 DNF、full `fsck` 与 GC dry-run | [fresh-copy evidence](evidence/2026-07-16-fresh-full-content-adoption.md)关闭完整存量内容：40,659 APT、44,372 PGDG YUM、16,582 其他 YUM、958 public asset。PGDG 原 30,274 missing path 中 29,499 从官方 current/archive 按 size/SHA-256 原字节恢复，775 个稳定 404 path 仅经 complete-set digest `5d953c…866a` 与 775 条 immutable negative provenance 排除；同 selector 重放 `changed=false`。断网 AlmaLinux 10、禁用全部外部 repo、`repo_gpgcheck=1`/`gpgcheck=1` 真实安装 `postgresql18-docs-18.1-1PGDG.rhel10.x86_64`。最终 95 repo fsck、10 prune ledger、物化 receipt 均零 drift；GC 为 102,343 reachable、0 orphan/missing/delete。后续 [current `yum/infra` exact-copy evidence](evidence/2026-07-17-yum-infra-current-compatibility-cutover.md)确认 216/216 RPM 均由 Pigsty key 签名，并完成 S0→S3、EL8/9/10 × 双架构 strong DNF、L1、fsck 与幂等 replay；生产 234-file manifest 在测试前后均为 `b44a86b7…49c7`。Cloudflare `pro` bucket/`pro.pigsty.io` 未探测或使用。仍缺真非生产双云/边缘和生产切换/撤权。 |
+| V-18 | `go test -timeout 10m -count=1 -run '^TestBuilderHandoff' ./internal/cli` | current source `4.237s` PASS。[digest-bound handoff](evidence/2026-07-17-builder-handoff.md)以生产 `sow add` dispatcher 逐输入验证 `sha256:<digest>:<size>`：严格 count/order/canonical syntax/duplicate 负例；错误 asset 摘要退出 4 且 canonical HEAD/CAS 不变；正确 asset hardlink；真实 DEB 进入 APT metadata/signing；真实 embedded-signature RPM 经过 package keyring、YUM metadata/signing；成功后才打印不泄露 builder 目录的 receipt SHA-256。只用临时目录，无 builder、外部 GPG、生产仓库或云。V-20 已用同一边界接收历史 `.io/.cc` 的 canonical builder 输出。 |
+| V-19 | `SOW_RUN_PIGSTY_ROOT_COS_HANDOFF=1 SOW_PIGSTY_REPO_ROOT=/Users/vonng/pgsty/repo go test [-race] ./test/compat -run '^TestPigstyRootCOSBuilderHandoff$' -count=1` | ordinary `5.196s`、race `8.341s` PASS。[ROOT COS-only handoff](evidence/2026-07-17-root-cos-builder-handoff.md)从只读源精确绑定 `/cc`=`bin/get.cc`、`/claude`=`bin/claude`、`/ray`=`bin/ray`，共 20,775 字节；测试先锁死三个已审计 SHA-256/长度，再由真实 CLI 完成 init、逐对象 expected SHA/size add、promote、working-tree hardlink materialize、default-deny Nginx include、L1、fsck、GC dry-run与幂等重放，逐字节回读且源 file identity/mtime/body 前后不变。physical migration fixture 随后激活 exact COS-affinity owner，production cutover 仍 pending；全部测试写入临时目录，无云访问。 |
+| V-20 | `SOW_RUN_PIGSTY_ROOT_BOTH_HANDOFF=1 SOW_PIGSTY_REPO_ROOT=/Users/vonng/pgsty/repo go test [-race] ./test/compat -run '^TestPigstyRootBothBuilderHandoff$' -count=1 -v` | ordinary `10.500s`、race `11.574s` PASS。[shared ROOT evidence](evidence/2026-07-17-root-shared-canonical-builder-handoff.md)钉住八个 `.io/.cc` 源文件，拒绝 direct/symlink source-tree output，两个独立目录确定性生成 `/beta`、`/get`、`/pig`、`/pkg` 共 25,677 字节。fake runtime 覆盖 global→China fallback、China-first、`get-pkg -c`、DEB install、非法 host 与 path-like version 下载前退出 64；真实 SOW CLI 完成 expected-object add、promote、hardlink materialize、exact Nginx、L1、fsck、GC 与 replay。源 inode/mtime/body 未变、云访问为零；fixture 激活 exact `[cf,cos]` owner，生产 URL/cutover 仍 pending。 |
+| V-21 | exact non-production confirmations + env-only credential，`go test ./test/compat -run '^TestRealCloudR2StorageProtocol$' -count=1 -v -timeout=5m`；退出后 `rclone lsf cf:pro --recursive --max-depth -1` | 2026-07-19 当前源码在 owner 授权的空非生产 `pro` 桶真实 PASS（最终 test `31.19s`、package `31.708s`）：create-only、stale Put CAS、并发 1 success/1 conflict、HEAD/streamed GET、Copy source CAS 均通过；故意 stale Delete ETag 返回成功且对象消失，证明 R2 不支持条件 DeleteObject。新增的 exact-registry 匿名 raw custom-domain 门证明 main/beta 当前对象均为 FRA `MISS` 且 body/length/ETag 与 CAS winner 完全一致；bucket 删除并清空后两域仍返回 exact run-owned `HIT`、`max-age=1800`，证明请求端 no-cache 与对象删除不能替代 purge。测试只把该结果记为有界 stale-cache 负能力证据：任何 foreign bytes、redirect、无界 TTL 或非授权 host 均失败关闭。run-owned key 仍以独立 cleanup context、连续两次 streamed identity、run lease 前后重验及删除后 absence 收敛，最终 `empty_before=true empty_after=true`，独立 rclone stdout 为空。该门没有 publication checkpoint/purge/commit，不冒充真实 Publisher fallback 或 CDN negative verify。见 [真实 R2/custom-domain 协议证据](evidence/2026-07-18-real-r2-storage-protocol.md)与[ADR-0036](adr/0036-provider-delete-capability-and-checkpoint-fenced-fallback.md)。未触碰生产仓库，不关闭 Worker、CDN purge/失效、COS/EdgeOne 或完整 POC-06。 |
+| V-22 | 本地 durability/teardown/output fault injection；六个 current CLI ordinary/race shard；静态/漏洞/交付门禁 | 2026-07-19 final current worktree 的 679 个 default CLI tests 在 teardown 修复与 V-23 confidential preflight 后，以 CI 同构六分片 ordinary/race 全部 PASS、无 race report；时间与 V-01 同组。FSCK final Git recheck、APT/upstream/publish/sync/compatibility lease/capability teardown、manifest/provenance/evidence directory fsync、canonical rollback backup、purge watcher lock、CLI short/write failure，以及 materialize retained descriptor/parent/binding、bound Git parent、APT/YUM package-body input/spool 均失败关闭；主业务错误身份和 go-git 所需 `os.IsNotExist` 分类保持不变。non-CLI 全包 ordinary/race、真 apt/dnf/Nginx 139.249s、专用非生产 R2/raw custom-domain 31.19s、patched RPM provenance、vet/Staticcheck v0.6.1、四平台静态构建、edge 42/42、两个 module integrity、两模块 govulncheck v1.6.0 与双份 clean-delivery 身份均通过。未分片整包累计 I/O timeout 明确非通过；正式 exhaustive 入口为六片。除 V-21 精确 run-owned `cf:pro` 前缀与 raw main/beta GET、V-23 最终匿名 canary GET 外均只用本地临时目录；两者结束后独立 `rclone lsf cf:pro` 仍为空。当前 exact raw hosts 被 confidential publish 安全拒绝，不改变 Worker/purge、COS/EdgeOne、生产迁移或运营指标状态。见 [durability audit](evidence/2026-07-18-durability-teardown-audit.md)与[V-23 evidence](evidence/2026-07-19-confidential-edge-preflight.md)。 |
+| V-23 | confidential plan 的匿名 edge denial attestation；真实 provider/CLI 零 mutation 负例；共享边缘合同；owner 授权 raw-domain 只读负例 | 2026-07-19 当前源码把 `sow-edge-runtime/v2` 的精确私有 404 作为 gated publish 在 journal、checkpoint、PUT/Copy/Delete/purge 前不可绕过的门禁；public-only plan 不发 canary。检测闭包覆盖 gated object/delete 与 Basic CDNPath、purge、Verify、Probe、VerifyAbsent；canary 无 Basic/token/Cookie、拒绝 redirect、旧 runtime、公开缓存、origin marker、编码、challenge、trailer、超长/错 body 和 close/cancel failure。两个真实供应商 provider、真实 CLI 协议客户端及共享 Cloudflare/EdgeOne edge contract 同构通过；owner 授权的 `pro.pigsty.io`/`beta.pro.pigsty.io` 当前 generic raw R2 404 均被产品 helper 拒绝，且观测到 preflight=1、PUT/Copy/Delete/purge=0。见 [ADR-0037](adr/0037-pre-upload-confidential-edge-denial-attestation.md) 与 [V-23 evidence](evidence/2026-07-19-confidential-edge-preflight.md)。这是防止错误前门先上传机密字节的真实负能力门，不冒充 Worker 部署、private origin、purge/negative verify、COS/EdgeOne 或 POC-06 通过。 |
 
 ## 4. 成功指标与反指标
 
-### 4.1 G1–G6
+| ID | 要求 | 状态 | 实现/证据 | 未闭合项 |
+|---|---|---|---|---|
+| G1 | 元数据不匹配/漏 purge 类事故归零 | `未验证` | [publish saga](../internal/publish/saga.go)、逐阶段故障注入 [saga_test.go](../internal/publish/saga_test.go)、V-16 的物理 owner 闭包/receipt 缺失修复/历史 alias purge 后重放 | 这些是事故预防机制；仍需真实双云上线后的运行周期和事故记录，测试通过不能证明运营事故数为 0。 |
+| G2 | 单命令 add，`[ASSUMPTION] <1 min` | `已验证` | V-04 真 CLI：DEB x2 427ms，RPM x3 310ms，EL9 RPM 272ms；[add](../internal/cli/add.go) | 实测远低于 1 min。 |
+| G3 | 日常发布 API 调用 O(变更集) | `已验证` | [50k/1-change](evidence/2026-07-12-publish-plan-50k-performance.md)、[current trust/delta closure](evidence/2026-07-13-rpm-package-trust-closure.md)、[provider call-count tests](../internal/cli/publish_cli_test.go)、V-16：同 publication identity 的 exact inherited ref 不读 manifest/package，changed ref 只验 additions/replacements；partial APT/YUM 可在本地关闭完整物理 owner 而远端 manifest/ref 保持逻辑 selector，receipt-only 修复为零远端副作用；post-fix 隔离 50k→1 change plan 为 16.316ms、仅 1 object。 | 真云时延不在此渐进性结论内，由 ANTI-01/POC-06 单列。 |
+| G4 | 公开闭包违规 100% 机器拦截 | `已验证` | [views tests](../internal/views/views_test.go) 的 `TestPublicClosureCannotBeSkipped`；[publish negative E2E](../internal/cli/publish_cli_test.go) | add/adopt/promote/publish/L1 均 fail closed，无 force/skip 面。 |
+| G5 | 约 40 个 Make 业务能力全部替代退役 | `实现中` | [176-target map](migration/make-target-map.md)、[44-family executable contract](migration/fixtures/family-e2e.tsv)、[builder handoff](migration/builder-handoff.md)、V-07/V-18/V-19/V-20 | 44 操作族已精确分区 176 行；每个 `sow-cli` family 都由真实 CLI/FS/parser E2E 覆盖其 verb × repo-type 能力，publish 另需 provider-protocol，非 CLI 项必须显式处置；help/selector 不得充当业务等价。外部 builder 到 asset/DEB/RPM `sow add` 的 digest-bound 本地机制已闭合；COS-only `/cc`、`/claude`、`/ray` 已 exact-copy，shared `/get`、`/pig`、`/pkg`、`/beta` 已从八个 `.io/.cc` 源确定性收敛为 mirror-aware canonical 正文，两类 owner 都在只读源/临时仓的真实 SOW CLI 闭环后按 exact target affinity 激活。仍缺逐生产 target 的旧/新结果对比、真实权限撤销、URL/双云切换与回滚，故不能退役。 |
+| G6 | M0 后本地↔cf/cos 漂移清零并保持 | `受阻` | [remote audit](../internal/cli/remote_audit.go) 和 [protocol evidence](evidence/2026-07-12-remote-inventory-adoption.md) | 缺真 R2/COS 存量 bucket、凭据、公开 URL 基线与冻结窗口。 |
 
-| ID | 要求 | 来源 | 初始状态 | 计划实现/测量位置 | 当前证据 |
-|---|---|---|---|---|---|
-| G1 | 元数据不匹配、漏 purge 类发布事故归零 | PRD:L35 | 未验证 | `internal/publish/`、`internal/verify/`；故障注入和发布恢复 E2E | 无；待事务故障矩阵与运行记录 |
-| G2 | 加包由单命令完成；`[ASSUMPTION] <1 分钟` | PRD:L36 | 未验证 | `cmd/sow/`、`internal/app/add/`；`test/bench/add/` | 无；待真实 deb/rpm 加包计时 |
-| G3 | 日常发布远端 API 调用量为 O(变更集) | PRD:L37 | 未验证 | `internal/publish/diff/`、provider 调用计数器 | 无；待不同仓库规模、固定变更集的调用数报告 |
-| G4 | 公开索引机密性违规由机器门禁 100% 拦截 | PRD:L38 | 未验证 | `internal/verify/confidentiality/`；负例 E2E | 无；待 gated 包公开闭包泄漏负例 |
-| G5 | 约 40 个 Makefile 目标全部由 sow 命令替代并退役 | PRD:L39 | 未验证 | 本文第 11 节、`docs/migration/`、CLI E2E | 无；待逐目标清点、映射和执行证据 |
-| G6 | M0 后本地与 cf/cos 漂移清零并保持 | PRD:L40 | 未验证 | `internal/fsck/`、`internal/publish/checkpoint/` | 无；待基线、修复后及重复对账报告 |
+| ID | 反指标 | 状态 | 当前证据/缺口 |
+|---|---|---|---|
+| ANTI-01 | 常规增量发布相对旧流程不得显著变慢，且 `[ASSUMPTION] <10 min` | `未验证` | 本地协议与 MinIO 快速通过；迁移前仍须从旧 Make/rclone 发布日志保存同仓库、同变更集、同网络窗口基线，再与真双云+CDN SOW 事务比较。当前两侧同口径时间均未实测。 |
+| ANTI-02 | 存储成本不升，预计每云省 60GB | `未验证` | [live bucket baseline](evidence/2026-07-12-live-bucket-inventory-baseline.md) 已保存迁移前真实对象数/逻辑字节；尚无迁移后同口径、账单或 60GB 假设实测。 |
+| ANTI-03 | OSS latest 旧 URL 契约不破坏 | `未验证` | [live latest baseline](evidence/2026-07-12-live-latest-url-baseline.md) 已保存全球/国内 200、ETag、cache、body/checksum；真域名切换后的同口径回归未执行。 |
 
-### 4.2 反指标
-
-| ID | 不得恶化的指标 | 来源 | 初始状态 | 计划证据 | 当前证据 |
-|---|---|---|---|---|---|
-| ANTI-01 | 常规增量发布不得显著变慢；`[ASSUMPTION] <10 分钟` | PRD:L42-L44 | 未验证 | 固定变更集的双目标发布计时及 API 计数 | 无 |
-| ANTI-02 | 存储成本不升；合一仓库预计每云节省约 60GB | PRD:L45；ADD:L71-L75 | 未验证 | 迁移前后对象数、逻辑/物理字节及账单估算 | 无 |
-| ANTI-03 | OSS `latest` 现有 URL 契约不破坏 | PRD:L46；PRD:L175 | 未验证 | 旧 URL 清单、迁移前后 HTTP/apt/dnf 回归 | 无 |
-
-## 5. 功能需求
+## 5. 功能需求 FR-01–FR-42
 
 ### 5.1 状态模型与纳管
 
-| ID | 要求摘要 | 来源 | 初始状态 | 计划实现位置 | 当前证据 |
-|---|---|---|---|---|---|
-| FR-01 | 每仓库维护排序 TSV manifest，字段为 path/size/sha256；Git 承载正典与历史 | PRD:L92 | 实现中 | `internal/manifest/`、`internal/state/`、`.sow/state/manifests/` | `go test ./internal/manifest ./internal/state`；真实 72,310 包确定性外部排序见 `docs/evidence/2026-07-11-manifest-72k-performance.md`；完整 ref 模型待实现 |
-| FR-02 | SQLite 是 gitignored、可由 manifest 重建的只读缓存 | PRD:L93 | 实现中 | `internal/catalog/`、`.sow/cache/state.db` | `go test ./internal/catalog` 真实创建 SQLite、删除并由 canonical manifest 重建同一 2 行结果；依赖/包查询投影待扩展 |
-| FR-03 | cf/cos 独立已发布 ref，可各自滞后；算差异无需远端 API | PRD:L94 | 未实现 | `internal/publish/refs/`、`.sow/refs/remotes/` | 无；待双目标独立 ref 与零调用 diff 测试 |
-| FR-04 | bucket checkpoint 为 `.sow/manifest.json` 加代际号；GET 检漂移，CAS 兼发布锁 | PRD:L95 | 未实现 | `internal/publish/checkpoint/`、`internal/cloudflare/`、`internal/tencent/` | 无；待真实条件写、漂移和竞争测试 |
-| FR-05 | `sow init` 扫描现有树，实现零字节纳管 | PRD:L96 | 实现中 | `internal/cli/app.go`、`internal/manifest/`、`internal/state/` | `go test ./internal/cli -run TestInitAndFSCKEndToEnd` 证明现有发布文件字节不变、幂等 Git baseline；真实存量树正式纳管与远端基线仍待执行 |
-| FR-06 | 默认增量检查变更；显式 fsck 才全量审计 | PRD:L97 | 实现中 | `internal/manifest.Diff`、`sow fsck` | 流式本地 diff 与退出码 4 已由 CLI E2E 覆盖；add/rm 增量提交和远端 ListObjects 审计未实现 |
+| ID | 要求 | 状态 | 实现与可复现证据 |
+|---|---|---|---|
+| FR-01 | 排序 TSV manifest，Git 正典与历史 | `已验证` | [manifest](../internal/manifest/entry.go)、[embedded Git state](../internal/state/store.go)；`go test ./internal/manifest ./internal/state`；V-08 的 72,310 真文件外排/并行 hash；V-16 的 route receipt/exact/payload 三元组也以排序 manifest 和 canonical Git commit 作为唯一读能力，孤儿/缺项不从 live tree 反向 canonize。 |
+| FR-02 | SQLite 为 gitignored、可重建、只读查询缓存 | `已验证` | [catalog rebuild/head CAS](../internal/catalog/query.go)、[canonical mutation wrapper](../internal/cli/catalog.go)；`go test ./internal/catalog ./internal/cli -run 'Catalog|Cache|PendingCatalogProjection'`；覆盖删除/损坏后重建、DEB/RPM 关系、alternative/provides/arch/cycle/version，以及 Git commit 后进程退出的 durable pending marker。projection-neutral commit 只 CAS 推进 exact canonical HEAD，相关 blob/ref 变化全量重建；普通 restart 与 `--recover` 都闭合 marker，未标记的任意漂移仍由 L1 拒绝。 |
+| FR-03 | cf/cos 独立 remote refs，纯本地算差异 | `已验证` | [publish state](../internal/cli/publish_remote.go)、[independent-target saga tests](../internal/publish/saga_test.go)、G3/V-16：历史/partial YUM 的共享物理 owner 仍保存每 alias 独立 ref/channel，且本地 route receipt 修复不改 remote tracking。 |
+| FR-04 | `.sow/manifest.json`+代际，GET 漂移检测，CAS 发布锁 | `已实现/未验证` | [R2/COS concrete clients](../internal/publish/provider.go)、[HTTP protocol tests](../internal/publish/http_provider_test.go)、V-05/V-21。真 R2 create-only、stale Put If-Match 与并发 CAS 已实跑且恰有一个赢家；R2 DeleteObject 条件缺失也已如实收敛到 ADR-0036。COS create-only/unversioned generation lock 与完整双云 checkpoint saga 仍未实跑，故总体不升级。 |
+| FR-05 | `init` 零字节基线纳管 | `已验证` | [init/adoption](../internal/cli/adopt_content.go)、[full-copy adoption evidence](evidence/2026-07-16-legacy-tree-full-adoption-copy.md)、V-07；首次 partial baseline 显式 `scope_full=false`，full fsck 报 uncovered，full init 后闭合。完整存量树可写副本实测 95 active repo、74,943 entries，M0 后 `.pool` 为 0 byte、full local fsck clean；inactive inventory carrier 只进入 manifest，不得进入 CAS/view/publish。生产源保持只读，切换状态单列 MIG-05。 |
+| FR-06 | 默认增量，显式 fsck 全量审计 | `已实现/未验证` | [current trust/delta closure](evidence/2026-07-13-rpm-package-trust-closure.md)、[incremental preflight](evidence/2026-07-12-incremental-publish-preflight.md)、[remote fsck](../internal/cli/remote_audit.go)、[adoption evidence](evidence/2026-07-12-remote-inventory-adoption.md)、V-16：generation `config_sha256` 绑定 canonical YAML 与 ref-vector 可达 keyring；exact inherited ref+same identity 不读 manifest/package，changed ref 只验新增/替换，首次发布或 trust-policy/keyring 变化才全闭包重验。ref-vector no-op 还要求 current physical-owner route receipt；缺 receipt 只重建本地 capability，不产生远端副作用。sync 对新下载/未证 present body 流式绑定 SHA/size；仅复用 unchanged first-valid DEB receipt，或相同 package-keyring SHA 的 RPM v3 receipt，rotation/legacy 强制重验；新进入 view 仍先 `pool.Verify`。全池/全 receipt structural 扫描只属于显式 fsck。V-21 已真实覆盖 R2 List/HEAD/streamed GET，但没有执行完整 remote fsck/manifest reconcile；COS 也未实跑。 |
 
-### 5.2 仓库引擎
+### 5.2 仓库引擎与包生命周期
 
-| ID | 要求摘要 | 来源 | 初始状态 | 计划实现位置 | 当前证据 |
-|---|---|---|---|---|---|
-| FR-07 | 自研 APT Packages/Release/InRelease；Day 1 by-hash、SHA256 路径、保留 N 版清理 | PRD:L101；ADD:L14,L29 | 未实现 | `internal/repo/apt/` | 无；待真实 apt update/install、快照、by-hash 测试 |
-| FR-08 | 自研 YUM primary/filelists/other/repomd；EL9/10 zstd、EL8 gz；repomd 与 asc 成对翻转 | PRD:L102；ADD:L15 | 未实现 | `internal/repo/yum/`、`internal/publish/yumflip/` | 无；待真实 dnf、压缩矩阵及中断翻转测试 |
-| FR-09 | asset 仓库无索引，只参与 manifest/publish，覆盖 bin/src/pkg/etc/img | PRD:L103 | 未实现 | `internal/repo/asset/` | 无；待 asset CLI 与发布 E2E |
-| FR-10 | 单 GPG key，env/CLI 注入，纯 Go OpenPGP，Linux/macOS，不执行 gpg | PRD:L104；ADD:L13 | 未实现 | `internal/signing/`、`internal/secret/` | 无；待 apt/dnf 签名验证与依赖/进程审计 |
+| ID | 要求 | 状态 | 实现与可复现证据 |
+|---|---|---|---|
+| FR-07 | APT Packages/Release/InRelease/by-hash，保留 N 代并清理 | `已验证` | [APT engine](../internal/aptrepo/build.go)、[retention ledger](../internal/aptrepo/byhash_ledger.go)、[retention evidence](evidence/2026-07-12-apt-by-hash-retention.md)、[selected-set/direct replay evidence](evidence/2026-07-13-selected-set-materialization-recovery.md)、[remote deletion evidence](evidence/2026-07-12-evidence-bound-remote-deletion.md)、V-16；真实 APT 制品的三代错峰在 cf/cos 产品 target code path 的签名 HTTP/S3 协议夹具上各删旧 3 key、保留后两代；direct beta/stable 也复用 canonical retention ledger。partial suite/arch publish 会重建含全部 ref-backed suites/arches 的本地 APT owner 和 route receipt，同时远端 manifest/ref 与 selected tgz 仍保持逻辑 suite selector；不冒充真云，V-04/V-08。 |
+| FR-08 | YUM 三类 XML/repomd，EL9/10 zstd、EL8 gz，签名对强翻转 | `实现中` | [YUM engine](../internal/yumrepo/generation.go)、[local immutable serving](../internal/serving/install.go)、[recoverable activation](../internal/cli/materialize_serving.go)、[YUM atomicity evidence](evidence/2026-07-12-yum-generation-atomicity.md)、[Pigsty consumer migration](evidence/2026-07-14-pigsty-yum-consumer-migration.md)、V-04/V-16。本地与远端 generation-pinned mirrorlist 均以单文件选择完整 repomd 签名闭包；一个 repo+arch 物理 owner 的所有 OS alias 由一份 repodata/package union 构建，partial publish、no-op、receipt 修复和历史 restore 都保持完整 alias vector；current/Previous、install-intent、target partition/topology、物理 GC 和 L1/fsck 已有故障负例。V-04 以真 CentOS 7 YUM 3.4.3 验证 frozen EL7 gzip/旧 OpenPGP parser，并以 EL8/9/10 真 DNF 验证 gzip/zstd；DNF 4.20 还证明 G1 metadata 跨 flip 后从 G2 retained closure 下载 G1 RPM，并以 fresh G2 空索引反证泄漏。存量 28 个 raw latest `baseurl` 定义已有可恢复迁移机制，但 mapped endpoints/trust bundle/双 origin/生产 cutover 未执行，故仍为实现中。 |
+| FR-09 | asset 无索引仓库参与 manifest/publish | `已验证` | [asset add/rm](../internal/cli/publish_delete.go)、`TestAssetAddIsCASBackedMaterializedAndReplayable`、`TestPublishCLIAssetOnlyChangeDoesNotTouchYUMClosures`；[offline tgz](evidence/2026-07-12-offline-tgz-asset-loop.md)、[asset no-key selected-set/add/adoption recovery](evidence/2026-07-13-selected-set-materialization-recovery.md)证明恢复不依赖原输入路径，并在当前 asset/RPM/DEB subtype 分派前完成；package journal 下的新 asset 输入在 importer/CAS 前拒绝；[cf/cos target code path 的协议夹具删除/恢复](evidence/2026-07-12-evidence-bound-remote-deletion.md)。 |
+| FR-10 | 单 GPG key，安全注入，纯 Go OpenPGP，Linux/macOS | `已验证` | [APT signer](../internal/aptrepo/sign.go)、[YUM signer](../internal/yumrepo/sign.go)、[secret resolution](../internal/cli/secrets.go)、[ADR-0010](adr/0010-repository-signing-identity-and-rotation-boundary.md)、[RPM trust closure](evidence/2026-07-13-rpm-package-trust-closure.md)；所有 metadata signing 入口强制唯一 public trust anchor，并拒绝无锚、错配 private override、私钥误置、过期/撤销、多 entity/usable signing key；generation/checkpoint/COS lock 绑定 packet identity，在线换钥在任何本地/远端写入前闭锁。Day-1 保留签名 RPM 的 public package trust bundle 与 metadata signing identity 分离；V-04 已用 `gpgcheck=1`/`repo_gpgcheck=1` 正例和缺 upstream key 负例验证；产品包无 `os/exec`。 |
+| FR-11 | `add/rm` 识别 DEB/RPM/asset，推断归属、入 CAS、签名建索引 | `已验证` | [DEB add](../internal/cli/add_deb.go)、[RPM add](../internal/cli/add_rpm.go)、[digest-bound builder admission](../internal/cli/add_handoff.go)、[package recovery admission](../internal/cli/add_package_recovery.go)、[rm](../internal/cli/remove.go)、[authorized remote delete](../internal/cli/publish_delete.go)；RPM/DEB 都先复制到 private `0700` snapshot，并以 inspected expected object 身份在安装前重新流式比较，拒绝 caller-path/snapshot 替换而不留下 novel CAS object；RPM 验签结果与该 expected SHA/size 绑定。V-18 进一步让外部 builder 用重复 `--expected-object sha256:<digest>:<size>` 逐输入绑定 asset/DEB/RPM，错误摘要在 novel CAS/view 前失败，成功后打印 receipt。active add journal 下还需 family、trust/config/HEAD、精确 unit vector 与 frozen Entry path/size/SHA 全部匹配；跨族、同族 novel entry 与 package→asset 真实 CLI 负例均不安装 CAS object 且保留 journal，精确 RPM/DEB 可补回缺失 CAS 后收敛。[RPM trust closure](evidence/2026-07-13-rpm-package-trust-closure.md)覆盖 packet-preserving package trust；V-04 真 CLI/包和历史保护；asset `rm→publish` 的直达 URL 404、immutable/mutable class、CAS/历史恢复见 [remote deletion evidence](evidence/2026-07-12-evidence-bound-remote-deletion.md)。 |
+| FR-12 | SHA256 CAS + hardlink 物化，点目录遮蔽，Nginx 直托 | `已验证` | [CAS](../internal/repository/cas.go)、[materialize](../internal/repository/materialize.go)、[direct/asset exact recovery](evidence/2026-07-13-selected-set-materialization-recovery.md)、[route capability ADR](adr/0024-materialized-route-read-capabilities.md)、V-16；asset canonical upsert 与 physical relink 都逐 repo-relative path 复用 `asset.mutable_paths`，可变项可重链而 immutable sibling fail closed，无 whole-manifest replace。APT/YUM Nginx route 只有在 canonical receipt 重放 exact tree、hostable mode 与 CAS payload hardlink 后才生成；缺 receipt 零 include bytes。V-04 使用独立 Nginx 直指树根并以 prefix allowlist 让真实 apt/dnf 安装，同时拒绝真实存在的 `.pool`、canonical state、`sow.yaml` 与 operator canary；V-08 50k hardlink。 |
+| FR-13 | 引用计数、无引用回收、孤儿审计 | `已验证` | [reference/GC](../internal/repository/references.go)、[CLI gc](../internal/cli/gc.go)、[GC policy ADR](adr/0008-gc-reachability-and-confirmation.md)、[safety evidence](evidence/2026-07-12-cas-gc-safety.md)、V-16。自动计算 root/refcount/orphan，删除须绑定精确 plan hash 确认；stale plan、missing root、重放均 fail closed。Local YUM generation TSV 使用严格 `ReferenceSet.AddManifest`；已安装 retired generation 的 canonical deletion witness 只进入 route exact capability，不进入 payload manifest，因此不会把退休包复活为 CAS roots；缺失 metadata CAS 会进入 missing 证据而不是被静默跳过。 |
 
-### 5.3 包生命周期
+### 5.3 上游同步与 provenance
 
-| ID | 要求摘要 | 来源 | 初始状态 | 计划实现位置 | 当前证据 |
-|---|---|---|---|---|---|
-| FR-11 | `add/rm` 自动识别 deb/rpm、推断 repo/OS/arch、入池、签名并建索引 | PRD:L108 | 未实现 | `internal/app/add/`、`internal/app/remove/`、CLI | 无；待多格式、多架构、歧义和错误路径 E2E |
-| FR-12 | `.pool/` SHA256 CAS + hardlink 物化；`.sow/`/`.pool/` 遮蔽；树根可由 Nginx 直接托管 | PRD:L109 | 未实现 | `internal/pool/`、`internal/materialize/` | 无；待 inode、跨文件系统降级及 Nginx 消费测试 |
-| FR-13 | 引用计数、自动 GC、孤儿审计 | PRD:L110 | 未实现 | `internal/pool/refs/`、`internal/pool/gc/` | 无；待属性测试、崩溃恢复和孤儿夹具 |
+| ID | 要求 | 状态 | 实现与可复现证据 |
+|---|---|---|---|
+| FR-14 | 纯 Go sync，只加不删，断点/重试 | `已验证` | [upstream](../internal/upstream/execute.go)、[sync CLI](../internal/cli/sync.go)、[official PGDG evidence](evidence/2026-07-12-real-pgdg-upstream-sync.md)、[current-source closure](evidence/2026-07-13-rpm-package-trust-closure.md)：官方 APT/YUM 签名源下载 1 DEB+12 RPM，筛选/校验/CAS/receipt/L1/hardlink 通过，第二轮 APT/YUM 均 `download=0`。present 快路径仍以稳定句柄绑定 exact body，RPM trust rotation/legacy receipt 强制重验；APT 已存在项只有在 exact repo-path-relative component、name、version、size（及已选 view/arch）一致时才能抑制新 placement，`repo.path` 内的 `pool/main` 子串或 main→contrib 同 digest 移动均有负例。[durable sync recovery](evidence/2026-07-12-sync-durable-recovery.md) 进一步覆盖 provenance 后、APT component 间、APT/YUM view commit 后真实物化失败、SIGKILL lock/orphan 与普通重试收敛。 |
+| FR-15 | name+arch glob/regex，debuginfo 独立，不自动补依赖 | `已验证` | [filter](../internal/syncer/filter.go)；[debug routing E2E](../internal/cli/add_test.go)；public beta/latest drop，stable keep。 |
+| FR-16 | RPM/DEB 不对称 provenance 双条目 | `已验证` | [v3 receipt schema](../internal/provenance/receipt.go)、[packet-preserving package keyring](../internal/yumrepo/package_keyring.go)、[pure-Go RPM verifier](../internal/yumrepo/rpm_signature.go)、[ADR-0014](adr/0014-rpm-provenance-signature-evidence-boundary.md)、[ADR-0017](adr/0017-rpm-package-keyring-and-cryptographic-verification.md)、[current trust evidence](evidence/2026-07-13-rpm-package-trust-closure.md)、[executor rotation tests](../internal/upstream/upstream_test.go)、[production CLI sync E2E](../internal/cli/sync_test.go)。新 RPM receipt 在原 URL/index/original-byte/packet 证据外绑定 exact package-keyring SHA、受哈希签名时间、coverage/signed bytes、signer/primary fingerprint，并只允许 `signature_verification=verified`。primary self-cert 与 subkey binding/cross-cert 历史逐 packet 保留；binary keyring 逐字节解析，不得 trim 合法末字节，只有 armored text 接受 outer whitespace。签名时刻先选最新已认证 policy，再验 flags/lifetime/outer/self/cross expiry 与 revocation，失败不可回退旧宽松 policy。`KeySuperseded`/`KeyRetired` 前向生效，compromise/no-reason 追溯失效。1333-byte trailing-`0x0b`、armored whitespace、CentOS4/5/7、renewal/revocation/cross-cert 及 header/payload/wrong-key/future-time 负例通过。artifact-keyed ledger 保留 first-valid-observation；v1/v2 仍严格 canonical 解码，当前重放先用当前 keyring 验原字节再保留旧 receipt。 |
+| FR-17 | Day 1 镜像 RPM 不重签；未来重签有前置门禁 | `已验证` | [receipt rejects resign/false verification](../internal/provenance/receipt_test.go)、[package-signature positives/negatives](../internal/yumrepo/rpm_signature_test.go)、[ADR-0017](adr/0017-rpm-package-keyring-and-cryptographic-verification.md)、[current trust closure](evidence/2026-07-13-rpm-package-trust-closure.md)；sync 仍按原字节 SHA256 保留、不重签，但现在用受信 package keyring 验证原签名。V-04 在 EL8/9/10 用预置 PGDG public package key、`gpgcheck=1` 真 DNF 安装并 `rpm -K` 验原签名；[builder trust gate](../test/compat/pigsty_package_trust_test.go) 用真实 `pev2-1.22.0-1.noarch.rpm`/Pigsty public key 完成正负安装。商业全量重签条件未触发，见 POC-04。 |
 
-### 5.4 上游同步与 provenance
+### 5.4 视图、快照与物化
 
-| ID | 要求摘要 | 来源 | 初始状态 | 计划实现位置 | 当前证据 |
-|---|---|---|---|---|---|
-| FR-14 | 自研 Go 同步器，只加不删，永久保留上游旧版本 | PRD:L114；ADD:L16,L21 | 未实现 | `internal/sync/` | 无；待上游删包后本地仍保留的集成测试 |
-| FR-15 | 包名+架构 glob/正则黑白名单；debuginfo 独立过滤；不做依赖自动补全 | PRD:L115 | 未实现 | `internal/sync/filter/` | 无；待组合、边界、非法正则和 public/pro 过滤测试 |
-| FR-16 | RPM/DEB 不对称 provenance，保存上游 URL、校验信息和签名根证据 | PRD:L116；ADD:L49-L56 | 未实现 | `internal/provenance/` | 无；待真实 RPM/DEB 上游夹具与证据链验证 |
-| FR-17 | Day 1 不重签镜像 rpm；自建包构建时签；全量重签须商业需求和 EL9/10 真机前置验证 | PRD:L117；ADD:L17,L82-L83 | 未实现 | `internal/policy/rpmsign/`、`docs/operations/signing.md` | 无；待“不重签字节保持”及自建包 `rpm -K` 证据 |
+| ID | 要求 | 状态 | 实现与可复现证据 |
+|---|---|---|---|
+| FR-18 | beta/latest/stable 视图，promote 为清单代数，stable 自动包含 | `已验证` | [views](../internal/views/algebra.go)、[promote](../internal/cli/promote.go)、[promote tests](../internal/cli/promote_test.go)；覆盖幂等、首 leaf 无变更、门控、快照。 |
+| FR-19 | stable 不丢包，apt/dnf 全历史原生钉版 | `已验证` | [append-only view](../internal/views/mutate.go)；V-04 真 apt 在新版存在时安装旧版，真 dnf 从两个 NEVRA 中精确下载旧版。 |
+| FR-20 | 快照 Git ref；APT 共享 pool/suite；YUM 独立树+服务端 copy | `已实现/未验证` | [snapshot publish](../internal/cli/publish_snapshot.go)、[materialize tests](../internal/cli/materialize_snapshot_test.go)、[snapshot selector closure](evidence/2026-07-12-apt-selector-transaction-closure.md)、[R2/COS copy protocol](../internal/publish/http_provider_test.go)、[snapshot verification](evidence/2026-07-12-snapshot-verification.md)、[adversarial review](evidence/2026-07-12-publish-recovery-adversarial-review.md)；route body 绑定 exact intent/generation，payload create-only，每个 YUM Packages leaf 反向要求完整五件 repodata；真云 copy 未执行。 |
+| FR-21 | APT suite 别名；YUM mirrorlist/metalink 单指针；不复制包体 | `已实现/未验证` | [publish plan](../internal/cli/publish_plan.go)、[YUM atomicity evidence](evidence/2026-07-12-yum-generation-atomicity.md) 的真 DNF generation mirrorlist、[adversarial review](evidence/2026-07-12-publish-recovery-adversarial-review.md) 的 generation↔alias↔ChannelState↔pointer 双向 O(N) 闭包、V-16；两个内容不同的历史 YUM alias 以前向新代恢复为一个物理 generation+两个独立 mirrorlist/channel，移除单 alias 的 sealed planner 只删其 pointer 而保留 sibling 与共享 root。真 CDN 指针/purge 未验。 |
+| FR-22 | stable+最近 N 月远端物化，老快照可重建 | `已实现/未验证` | [retention](../internal/cli/publish_retention.go)、[retention tests](../internal/cli/publish_retention_test.go)；自然月、未来 ID、partial inventory、丢响应重放已覆盖；真云删除未验。 |
+| FR-23 | 任意 ref hardlink 物化，离线 tgz 进 asset 闭环 | `已验证` | [materialize CLI](../internal/cli/materialize.go)、[archive visibility intent](../internal/cli/offline_archive_projection_intent.go)、[ADR-0026](adr/0026-offline-archive-projection-intent.md)、[current durable recovery evidence](evidence/2026-07-15-offline-archive-durable-recovery.md)、[offline tgz evidence](evidence/2026-07-12-offline-tgz-asset-loop.md)、[selected-set/direct/adoption closure](evidence/2026-07-13-selected-set-materialization-recovery.md)、V-16；确定 tar/gzip、字节复核、CAS/view/hardlink、self-exclusion、scoped adoption failure/recovery 与字节级重放幂等。当前 Darwin normal/race 与 Linux `--network none` 运行还证明 receipt 前私有 inode+intent fsync、post-receipt/post-link 恢复、长合法 gzip header、member/tar-tail/opaque-prefix 负例，以及 mutable ref 推进后仍只按 frozen refs 收敛旧事务。live APT/YUM physical owner 关闭完整 sibling 集时，selected tgz 仍在独立临时树只生成原逻辑 suite/alias；APT 与 frozen-YUM archive 均 L1 PASS、重放 byte-identical 且 HEAD 不前进。 |
+| FR-24 | EOL 冻结归档，EL8 只读/gz | `已实现/未验证` | [config lifecycle](../internal/config/config.go)、[ADR-0029](adr/0029-client-support-floor-and-el8-freeze-version.md)、[legacy adoption test](../internal/cli/adopt_content_test.go)、V-16；owner 已冻结 EL8 自 Pigsty v5.0.0 起进入只读/gzip 生命周期，配置诊断和迁移合同均携带该版本。V-04 真 EL8 DNF gz，add/sync 拒绝 frozen；frozen cross-EL compatibility archive 含 exact raw gzip+strong generation、mirrorlist 与冻结 trust bytes，L1/replay 通过。生产 EOL archive/cutover 尚未执行，故不升级。 |
 
-### 5.5 通道、视图与快照
+### 5.5 发布事务与校验
 
-| ID | 要求摘要 | 来源 | 初始状态 | 计划实现位置 | 当前证据 |
-|---|---|---|---|---|---|
-| FR-18 | beta/latest/stable 为 manifest 视图；入池进 beta，promote 为清单运算 | PRD:L121 | 未实现 | `internal/view/`、`internal/app/promote/` | 无；待通道代数、幂等 promote 与 CLI E2E |
-| FR-19 | stable 包永不消失并支持 apt/dnf 全历史原生钉版 | PRD:L122 | 未实现 | `internal/view/stable/` | 无；待多代包、rm/GC 负例和真实钉版安装 |
-| FR-20 | 快照是 manifest Git ref；APT 共享 pool+suite；YUM 独立 hardlink 树并支持远端 copy | PRD:L123 | 未实现 | `internal/snapshot/`、APT/YUM materializer | 无；待多快照及历史消费测试 |
-| FR-21 | APT dists 别名；YUM mirrorlist/metalink 指针；通道切换不复制包体 | PRD:L124 | 未实现 | `internal/channel/` | 无；待指针翻转、purge 和客户端回归 |
-| FR-22 | bucket 只物化 stable 与最近 N 月，老快照按需重建 | PRD:L125 | 未实现 | `internal/materialize/retention/` | 无；N 未冻结，待保留窗口/重建测试 |
-| FR-23 | `materialize` 从任意 ref 生成 hardlink 树；离线 tgz 经 asset 发布闭环 | PRD:L126 | 未实现 | `internal/materialize/`、`internal/artifact/tar/` | 无；待 tgz 内容、校验和及离线消费 E2E |
-| FR-24 | EOL OS 冻结归档；EL8 停止新构建并固定 gz repodata | PRD:L127 | 未实现 | `internal/view/eol/`、配置策略 | 无；冻结版本未决，待 EOL 工作流测试 |
+| ID | 要求 | 状态 | 实现与可复现证据 |
+|---|---|---|---|
+| FR-25 | upload→flip→minimal purge→verify 为不可忘记的整体事务 | `已实现/未验证` | [saga](../internal/publish/saga.go)、[durable purge evidence](../internal/publish/purge_evidence.go)、[historical ledger/repair](../internal/cli/purge_history_audit.go)、[purge runtime](../internal/publish/purge_runtime.go)、[saga/evidence faults](../internal/publish/saga_test.go)、[真实夹具边界](evidence/2026-07-12-real-cloud-acceptance-harness.md)与 V-16：每次非空 purge 先把 generation/plan/checkpoint SHA、排序 URL 闭包和供应商批次状态原子写入 sidecar；未完整 `completed` 不得进入 `purged`，成功后复制为 `remotes/<target>/purges/<generation>-<transaction>.json` canonical Git receipt。ordinary publish 还必须在 selected-set cleanup 前提交完整 physical-owner local route receipt；缺失 capability 不能以 remote unchanged 冒充完成。历史双 alias restore 在 purge 后失败会重 purge 后收敛。所有 publish、L2、full fsck 与 adoption 入口在首个远端请求前流式证明 1..N 全历史、publication-anchor DAG 祖先链、global triplet + content + intent-local triplet、原子 anchor receipt、provider-time config、同代 blob 永久性及 4 MiB receipt 上限；单命令只按 target+HEAD 缓存成功审计。COS L2 另验证 exact create-only generation lock，adoption 拒绝计划删除对象复活与保留控制命名空间。显式 local-only `fsck --repair-purge-ledger` 仅恢复 anchor 原字节及 v1 plan attestation，重建 SQLite 后全史重验，测试证明网络调用为 0。already-committed replay 也追加一次完整 purge attempt 后才 L3。V-23 进一步把 confidential edge denial attestation 放在 journal、checkpoint 和首个 payload mutation 之前，provider/CLI 负例对 raw domain 断言 PUT/Copy/Delete/purge 均为 0。V-21 已执行专用非生产 R2 storage 与 raw custom-domain 当前对象子集，并真实证明 bucket delete 后两个域仍有 1800s exact stale HIT，因而 purge 绝不能退化为可选记忆；真实 CF purge/negative verify、COS/EdgeOne 与完整事务仍未执行，生产资源禁止测试。 |
+| FR-26 | 内容先上传，APT InRelease 单翻转，YUM 签名对成对翻转 | `实现中` | [plan ordering](../internal/publish/plan.go)、[YUM fail-closed validator](../internal/publish/saga.go)、[atomicity evidence](evidence/2026-07-12-yum-generation-atomicity.md)、[Pigsty consumer migration](evidence/2026-07-14-pigsty-yum-consumer-migration.md)、[adversarial review](evidence/2026-07-12-publish-recovery-adversarial-review.md)、V-16。受支持的 apt>=1.2 以 by-hash + InRelease 单翻转闭合；apt<1.2 已由 ADR-0029 明确排除而非伪造原子实现。强 YUM generation route 的五件 metadata、byte-identical alias、ChannelState 和 pointer 为双向闭包；同一物理 owner 的多 OS alias 可合法共享完全相同 generation root，但跨 repo/arch/view/generation 共享仍拒绝。历史 restore 的 raw `repomd.xml`/`.asc` 与 strong generation 字节一致。28 个现有 Pigsty 定义已有 digest-confirmed stage/apply/rollback、混合中断恢复和真实 Ansible renderer 证据。raw YUM aliases 仍不可多键原子，且 mapped physical generations、RPM trust bundle、双 origin 与真 dnf cutover 尚未通过，所以不升级。 |
+| FR-27 | purge 仅翻转点/指针与被删 asset serving URL，旧代仍自洽 | `已实现/未验证` | [minimal plan tests](../internal/publish/model_plan_test.go)、[durable purge evidence](../internal/publish/purge_evidence.go)、[Cloudflare SDK client](../internal/publish/http_cloudflare.go)、[Tencent TEO client](../internal/publish/http_tencent.go)、[remote deletion evidence](evidence/2026-07-12-evidence-bound-remote-deletion.md)与 V-16；公开 latest 保持单 URL，routed pointer/delete 强制 client CDNPath + exact clean-cache key，sidecar/canonical receipt 绑定该排序集合的摘要和逐批闭包；缺失、重复、额外 arbitrary URL 均 fail closed，没有 Purge Everything 路径。shared-owner 单 alias removal 只授权该 mirrorlist pointer，保留 sibling channel、repodata、Packages 与 immutable generation；retired installed generation 由 exact witness 保持自洽而不成为 payload root。真 CDN audit log 未验。 |
+| FR-28 | 远端锁、中断检测、安全重放、幂等 | `已实现/未验证` | 远端部分见 [journal](../internal/publish/journal.go)、[saga test matrix](../internal/publish/saga_test.go)、[stale CDN/delete replay](evidence/2026-07-12-evidence-bound-remote-deletion.md)、V-05/V-16；[selected-set recovery closure](evidence/2026-07-13-selected-set-materialization-recovery.md) 证明 active exact mutable/multi-snapshot/asset/adoption journal 在任何 HTTP 前收敛，historical mismatch 为零 HTTP；publication recovery 额外拒绝未关闭的 physical-owner durable vector，完整 owner 与 route receipt 在 selected-set cleanup 前可安全重放。历史 alias restore 的 purge 后故障不推进本地 generation，重放重 purge 后完成，再次重放无 PUT/Copy/DELETE/purge/GET。无 active journal 的普通 publish 允许 O(change-set) GET/HEAD preflight，但 immutable local conflict 之后远端 mutation 必为 0。本地 package add 另在 CAS 前精确准入，本地 sync 由 [durable recovery evidence](evidence/2026-07-12-sync-durable-recovery.md) 覆盖 descriptor lock、阶段/commit 报告、SIGKILL residue 与幂等重放。真云并发写者/丢响应演练未做，故总状态不升级。 |
+| FR-29 | L1 索引↔包双向闭包+签名 | `已验证` | [verify engine](../internal/verify/apt.go)、[YUM verifier](../internal/verify/yum.go)、[real repository tests](../internal/verify/engine_test.go)、[publish package-trust preflight](../internal/cli/publish_rpm_trust.go)、[current trust closure](evidence/2026-07-13-rpm-package-trust-closure.md)、V-16；YUM L1 除 repomd 签名与双向 hash/size 闭包外，以 bounded workers 对每个 indexed RPM 做 packet-preserving、signature-time-aware package-keyring 密码学验签；route admission 还从完整 alias ref union 验 metadata package identity，伪造 retired generation payload/mirrorlist/target identity 均失败。latest policy 的 flags/lifetime/outer/self/cross expiry、missing cross-cert 或 retroactive revocation 任一失败都不可回退旧 binding。wrong key 报 `YUM_PACKAGE_SIGNATURE_INVALID`。publish 在同一 CAS FD 上 hash+验 embedded signature，随后复核 path/inode/type/size/mtime；add/sync/materialize 各自还有不可绕过的同构门禁。 |
+| FR-30 | L2 本地↔远端 manifest 对账 | `已实现/未验证` | [remote verify/fsck](../internal/cli/remote_audit.go)、[protocol evidence](evidence/2026-07-12-remote-inventory-adoption.md)；V-21 只验证真 R2 对象协议，不是 manifest reconcile；真 R2/COS L2 仍未验。 |
+| FR-31 | L3 发布后穿 CDN 验证 | `已实现/未验证` | [remote verifier](../internal/cli/verify_remote.go)、[protocol evidence](evidence/2026-07-12-verify-l3-l4-protocol.md)、[50k bounded publisher L3](evidence/2026-07-12-l3-bounded-concurrency.md)；每对象流式 size/SHA/close，1..64 worker/target、失败取消且按 plan 顺序报错。正向请求也拒绝所有 3xx 并保留首响应，不会把 Basic/token、ambient Cookie 转发到 Location 或普通 read-back；同源 redirect 目标端零请求负例通过。V-23 还要求任何 confidential plan 在首个远端 mutation 前从同一 CDN base 得到匿名 `sow-edge-runtime/v2` 私有 404，否则失败关闭。V-21 已真验 Cloudflare raw R2 main/beta 当前对象 GET，并观测删除后 exact stale HIT；当前两 raw host 也由 V-23 精确拒绝。它们仍没有 Worker/token、purge、post-purge negative verify 或多 PoP，因此不能升级 L3，EdgeOne 也未验。 |
+| FR-32 | L4 apt/dnf 客户端端到端 | `已验证` | [pure-Go probes](../internal/verify/client_apt.go)、[client_yum.go](../internal/verify/client_yum.go)、[current trust closure](evidence/2026-07-13-rpm-package-trust-closure.md)；V-04 真 apt/dnf 安装，含 generation mirrorlist、历史钉版、Basic 与生产 Cloudflare Worker token-in-path bundle。YUM L4 不仅验 repomd/primary/package checksum，还下载 sample RPM 并以 repo package keyring 验 embedded signature；wrong/missing key 失败。mirrorlist URL 逐字节绑定 canonical ChannelState 的 exact generation+LegacyRoot+public/Basic/token route；wrong generation、stable auth route 指向 public、同源 credential redirect 均失败。 |
+| FR-33 | public 引用闭包⊆public pool，不可跳过 | `已验证` | [confidentiality verifier](../internal/verify/view.go)、[views tests](../internal/views/views_test.go)、[ADR-0037](adr/0037-pre-upload-confidential-edge-denial-attestation.md)、V-23；本地 public closure、gated adoption/promote/add 负例之外，真实 provider 和 CLI 现于 journal/checkpoint/首个 PUT 前证明 front door 为匿名私有拒绝的 v2 edge runtime，raw public custom domain、旧 runtime 或可缓存 404 均以远端 mutation=0 失败。 |
+| FR-34 | `verify` 可选 L1–L4；`fsck` 全量 ListObjects 与垃圾报告 | `已实现/未验证` | [verify CLI](../internal/cli/verify.go)、[fsck](../internal/cli/remote_audit.go)、[local strong-serving audit](../internal/cli/verify_serving.go)、[snapshot L1-L4](evidence/2026-07-12-snapshot-verification.md)、V-16；本地 L1/fsck 从 target/channel/route ledgers 验 current+Previous+installed retired 物理树、CAS hardlink、hostable mode、pointer、desired ref/config/key 与 exact channel coverage；全 canonical route namespace 的 orphan/incomplete triple 也审计。删除 channel、旧代破坏、receipt 缺失、forged historical lifecycle、pointer 篡改、过期 desired/topology 和未完成 transaction 均负例失败。真云 fsck/L3/L4 未运行。 |
 
-### 5.6 发布事务
+### 5.6 商业访问控制、边缘与配置
 
-| ID | 要求摘要 | 来源 | 初始状态 | 计划实现位置 | 当前证据 |
-|---|---|---|---|---|---|
-| FR-25 | publish 将差异上传、索引翻转、最小 purge、发布后验证收为整体动作；任一步失败返回失败 | PRD:L131 | 未实现 | `internal/publish/transaction/` | 无；待逐阶段故障注入与 CLI 非零退出测试 |
-| FR-26 | 内容寻址先上传，最后翻转；APT 为 InRelease，YUM 为 repomd+xml.asc 对 | PRD:L132 | 未实现 | `internal/publish/flip/` | 无；待客户端并发读取和中断点测试 |
-| FR-27 | 仅 purge 翻转点和通道指针；旧索引仍始终自洽 | PRD:L133 | 未实现 | `internal/cloudflare/purge/`、`internal/tencent/purge/` | 无；待精确 URL 集与旧代际消费测试 |
-| FR-28 | CAS checkpoint 兼发布锁；中断可检测、报告、安全重放、幂等 | PRD:L134 | 未实现 | `internal/publish/journal/`、`checkpoint/` | 无；待进程 kill、网络失败和重复 publish 测试 |
-
-### 5.7 校验体系
-
-| ID | 要求摘要 | 来源 | 初始状态 | 计划实现位置 | 当前证据 |
-|---|---|---|---|---|---|
-| FR-29 | L1 索引与包双向一致且签名有效 | PRD:L138 | 未实现 | `internal/verify/l1/` | 无；待缺包、多余包、篡改签名负例 |
-| FR-30 | L2 本地与远端 manifest 对账 | PRD:L139 | 未实现 | `internal/verify/l2/` | 无；待缺失/多余/摘要漂移夹具 |
-| FR-31 | L3 发布后穿 CDN 验证 | PRD:L140 | 未实现 | `internal/verify/l3/` | 无；待本地代理及真实 CDN 证据 |
-| FR-32 | L4 模拟真实 apt/dnf 客户端端到端验证 | PRD:L141 | 未实现 | `internal/verify/l4/`、`test/compat/` | 无；待真实 apt/dnf 容器或 VM 运行日志 |
-| FR-33 | public 视图闭包必须是 public pool 子集；门禁不可跳过 | PRD:L142 | 未实现 | `internal/verify/confidentiality/` | 无；待 gated 泄漏负例和所有发布入口绕过测试 |
-| FR-34 | `verify` 可跑 L1-L4 全部或子集；`fsck` 全量 ListObjects 并报告遗留垃圾 | PRD:L143 | 未实现 | CLI、`internal/fsck/` | 无；待选择器、漂移分类和真实对象列表测试 |
-
-### 5.8 商业访问控制与边缘组件
-
-| ID | 要求摘要 | 来源 | 初始状态 | 计划实现位置 | 当前证据 |
-|---|---|---|---|---|---|
-| FR-35 | 每云一个合一仓库；OSS/Pro 为元数据视图，避免追加同步/裁剪导出 | PRD:L147；ADD:L69-L75 | 未实现 | `internal/view/access/`、布局 ADR | 无；待同池双视图与存储比较 |
-| FR-36 | public/gated 按机密性分池；闭源包必须在真实门控前缀 | PRD:L148 | 未实现 | `internal/pool/security/`、配置校验 | 无；待错误分池和公开引用负例 |
-| FR-37 | token-in-path；全部元数据使用相对 href | PRD:L149；ADD:L47 | 未实现 | `edge/contract/`、APT/YUM URL 生成器 | 无；待 apt/dnf token 路径消费测试 |
-| FR-38 | Cloudflare Worker 与 EdgeOne 同构、共享测试；验 token、剥离、干净 URL 子请求、模板回填 | PRD:L150；ADD:L41-L47 | 未实现 | `edge/contract/`、`edge/cloudflare/`、`edge/edgeone/` | 无；待供应商运行时契约测试及真实 PoC |
-| FR-39 | Pro mirrorlist 动态读取指针并回填 token；OSS mirrorlist 静态 | PRD:L151 | 未实现 | `edge/contract/mirrorlist/` | 无；待 token 隔离和模板边界测试 |
-| FR-40 | Basic Auth 为唯一回退；query token 和自定义 header 排除 | PRD:L152 | 未实现 | 两家边缘实现、`docs/operations/access.md` | 无；待 apt auth.conf、dnf 凭据真实测试 |
-
-### 5.9 配置与命令面
-
-| ID | 要求摘要 | 来源 | 初始状态 | 计划实现位置 | 当前证据 |
-|---|---|---|---|---|---|
-| FR-41 | `sow.yaml` 声明 gpg/pools/repos/upstreams/views/targets | PRD:L156；ADD:L58-L67 | 实现中 | `internal/config/`、`sow.example.yaml` | `go test ./internal/config` 覆盖 `sow/v1`、unknown field、引用、秘密引用、冻结值、EL8/9 压缩；供应商操作时的延迟 secret 解析与 schema 迁移待实现 |
-| FR-42 | 所有命令采用动词 × repo/OS/arch/view 选择器 | PRD:L157 | 实现中 | `internal/cli/app.go` | init/fsck 已支持重复或逗号分隔 repo/OS/arch 选择器、空匹配失败；view 与其余动词尚未实现 |
+| ID | 要求 | 状态 | 实现与可复现证据 |
+|---|---|---|---|
+| FR-35 | 每云一个合一仓，OSS/Pro 是元数据视图 | `已实现/未验证` | [unified-repository ADR](adr/0007-pro-oss-unified-repository.md)、[publish classifier](../internal/cli/publish_plan.go)；本地/协议测试同池不复制包体。真两云 bucket 布局/存储对比未验。 |
+| FR-36 | public/gated 按机密性分池，闭源字节必须真门控 | `已实现/未验证` | [views](../internal/views/entry.go)、[gated remote classification](../internal/cli/publish_plan.go)、[pre-upload denial gate](../internal/publish/http_object.go)、FR-33/V-23。confidential plan 对两个供应商共享不可绕过的匿名 denial attestation，当前 raw R2 main/beta 会在任何 mutation 前被拒绝；这只证明错误前门不能先上传闭源字节，真 bucket private ACL、Worker service binding、旁路枚举与跨 origin 访问仍未验，故不升级。 |
+| FR-37 | token-in-path，元数据 href 相对 | `已验证` | [edge contract](../edge/shared/contract.mjs)、[stable runtime token verification](../internal/cli/verify_remote_test.go)、[real client evidence](evidence/2026-07-11-client-compat.md)；生产 Cloudflare Worker dist bundle 由真 apt/dnf 经 `/pro/v1/{token}/` 消费 InRelease/by-hash、repomd/asc/三类 metadata 和精确包，Worker origin evidence 只含干净路径；token 不落客户端日志、plan、origin key 或 evidence。供应商 CDN/缓存仍由 FR-38/POC-06 单独跟踪。 |
+| FR-38 | Worker/EdgeOne 同构、共享测试，验 token→剥离→干净子请求 | `实现中` | [Cloudflare auth adapter](../edge/cloudflare/worker.mjs)、[service-only R2 origin](../edge/cloudflare/origin.mjs)、[EdgeOne/COS adapter](../edge/edgeone/function.mjs)、[ADR-0012](adr/0012-private-origin-deployment-contract.md)、[ADR-0034](adr/0034-cloudflare-nonproduction-worker-bootstrap.md)、[ADR-0035](adr/0035-cloudflare-provider-attestation-and-log-sink-lease.md)、[ADR-0037](adr/0037-pre-upload-confidential-edge-denial-attestation.md)、V-04/V-06/V-23；生产 Cloudflare Worker bundle 已由真 apt/dnf 证明 token→剥离→干净 origin 路径，两个供应商共享 42 项合同仍同构通过；新增合同锁定匿名 canary 的 v2 私有 404、无 origin call 与 ambient Cookie 不授权，Go provider 在任何 gated mutation 前强制同一合同。direct R2/COS 路径明确 `BYPASS`，`https-bearer` 保留 main/beta 同 host 干净请求、paired clean-key purge 与 cache-status/digest 观测接口。first-deployment bootstrap 已以 run-bound ownership、create-only Worker、R2 CAS lease、双观察 closure、atomic receipt 与 verifier 全 settings/runtime 合同关闭本地隐藏部署步骤，[bootstrap 离线证据](evidence/2026-07-17-cloudflare-bootstrap-offline-validation.md)普通/race/SDK 协议路径通过；[rollback hardening](evidence/2026-07-18-cloudflare-bootstrap-rollback-hardening.md)进一步把 receipt exact probe、附件/完整版本闭包、租约时间预算、响应丢失重放、pre-credential readiness 与 R2-only recovery 纳入官方 SDK/故障注入证据，并明确供应商无 CAS/外部管理员竞态边界。provider attestation v3 进一步把三个 Worker 的 exact compatibility/runtime/settings/schedule/exposure、完整 account route/domain/Worker inventory、TLS 1.2+ policy 与 EdgeOne realtime-log 不可变 area 纳入 deployment/task/raw-ledger 双读摘要，[attestation 离线证据](evidence/2026-07-17-cloudflare-provider-attestation-offline-validation.md)通过。[真实夹具](evidence/2026-07-12-real-cloud-acceptance-harness.md)已把 generation 4/5 双 token、2–8 个独立出口、active artifact 与 Cloudflare/EdgeOne main+subrequest joined-log 关联接入同一发布事务，并以独立只读门验证不同 provider geography/node 和 purge 后新字节；默认负例覆盖同 geography/PoP、缺日志、秘密泄漏、错 generation/cache/time。当前 exact raw main/beta 会被 V-23 安全拒绝；尚无真实 Worker/zone/purge/日志运行，故仍不能升级。 |
+| FR-39 | Pro mirrorlist 动态模板，OSS 静态 | `已实现/未验证` | [edge contract](../edge/shared/contract.mjs)、[publish plan](../internal/cli/publish_plan.go)、V-06/YUM 真 mirrorlist；真 CDN 模板/缓存未验。 |
+| FR-40 | Basic Auth 为唯一回退，Authorization 不入共享缓存键 | `已实现/未验证` | [Nginx fallback](../edge/basic/nginx.conf.example)、V-04 真 apt `auth.conf`/dnf credentialed baseurl、V-15 的 root exact `/pkg` + child prefix `/pkg/pig/` 与真实默认拒绝、V-06 的边缘先鉴权再剥离认证。standalone Nginx 仅允许 `private,no-store` 且禁止共享缓存，避免 origin-only Basic 与不含 Authorization 的 cache key 组合泄漏；真 CDN 配置未验。 |
+| FR-41 | `sow.yaml` 完整声明 schema | `已验证` | [schema](../internal/config/config.go)、[example](../sow.example.yaml)、[ADR-0015](adr/0015-target-identity-and-published-ref-state.md)、[ADR-0017](adr/0017-rpm-package-keyring-and-cryptographic-verification.md)、[current config/trust identity evidence](evidence/2026-07-13-rpm-package-trust-closure.md)、[config tests](../internal/config/config_test.go)；YUM `package_keyring` 为 repo 级 public-only bundle，缺失时仅向后兼容默认 Pigsty `gpg.public_key`，路径逃逸/反斜杠拒绝；binary keyring byte-exact、armored 才允许 outer whitespace。generation publication identity 域分离地绑定 canonical YAML 和仅 ref-vector 可达的 keyring bytes，同一次 immutable snapshot 同时提供 identity 与 packet-preserving 内存 keyring。rotation 必须保留仍可达历史 signer，且更新 policy 不得因 older binding fallback 而失效。其余 unknown field/literal secret/引用/EL8、retention、provider union 皆 fail closed。 |
+| FR-42 | 动词 × repo/OS/arch/view/target 选择器 | `已验证` | [CLI dispatch/help](../internal/cli/app.go) 的参数表由每个真实 FlagSet 生成；`TestHelpPrinterIncludesEveryRegisteredFlag` 以 `VisitAll` 锁定完整注册面，`TestHelpDoesNotEchoSensitiveFlagValues` 锁定敏感参数值不回显，`TestHelpAfterPositionalsShortCircuitsBeforeConfigurationOrMutation` 锁定 flags→positional→help 的零读取/零副作用，另区分真正 `--` delimiter 与 value-taking flag 的 `--` 值；`go run ./cmd/sow <verb> --help`；[selector tests](../internal/cli/app_test.go)、[APT publish/verify selector evidence](evidence/2026-07-12-apt-selector-transaction-closure.md)、[sync tests](../internal/cli/sync_test.go)、[migration CLI audit](migration/audit-legacy-targets.sh)、V-16。APT `--arch` 与 YUM `--os` 是逻辑 selector；mutable live/publish journal 关闭其完整物理 owner，但 remote intent 与 `--tgz` export 不被扩大。 |
 
 ## 6. 非功能需求
 
-| ID | 要求摘要 | 来源 | 初始状态 | 计划实现/验证位置 | 当前证据 |
-|---|---|---|---|---|---|
-| NFR-01 | repo/component/arch 并行；5 万包级不得单线程卡死 | PRD:L161；ADD:L35 | 实现中 | `internal/manifest/scan.go`、`test/perf/manifest_large_test.go` | 72,310 包使用 18 worker、7.91s、CPU time > wall time；见 `docs/evidence/2026-07-11-manifest-72k-performance.md`；索引/link/publish 调度未实现，不能整体通过 |
-| NFR-02 | manifest/index 流式或惰性处理，不整库入内存 | PRD:L162；ADD:L36 | 实现中 | 外部 run sort+k-way merge、流式 reader/diff/catalog | 72,310 包/89.86GB 最大 RSS 92,094,464 bytes；见性能证据；APT/YUM XML/index 尚未实现，不能整体通过 |
-| NFR-03 | 日常远端 API O(变更集)，只在 fsck 全扫 | PRD:L163 | 未验证 | provider 调用计数、规模不变量测试 | 无 |
-| NFR-04 | 单 Go 二进制，Linux/macOS，零 Python/Perl/gpg/createrepo_c 等运行时依赖 | PRD:L164 | 实现中 | Go module、build matrix、干净主机 E2E、进程审计 | 当前 init/fsck 为纯 Go 且 `CGO_ENABLED=0` linux/amd64、darwin/arm64 构建通过；完整命令面与干净主机证据待补 |
-| NFR-05 | apt >=1.2 by-hash；老客户端原子翻转兜底；EL9/10 zstd、EL8 gz | PRD:L165 | 未验证 | `test/compat/apt/`、`test/compat/dnf/` | 无 |
-| NFR-06 | 签名链完整；秘密不落镜像/明文配置；token 不进公开缓存键；真机签名用例进 CI | PRD:L166 | 未验证 | signing E2E、secret/log 扫描、edge cache-key 测试 | 无 |
-| NFR-07 | 存储少量重复可接受；APT 共享 pool；CDN 零客户碎片；CF 无需 Enterprise | PRD:L167 | 未验证 | 存储统计、不同 token cache hit PoC、成本报告 | 无 |
-| NFR-08 | 全部变更有 Git 历史；镜像有 provenance；漂移可检测报告 | PRD:L168 | 实现中 | `internal/state/`、`internal/provenance/`、fsck | baseline 内嵌 Git 与本地漂移报告有真实 CLI E2E；refs/provenance/远端漂移未实现 |
-| NFR-09 | 发布中断可恢复重放；两云可独立滞后且互不阻塞 | PRD:L169 | 未验证 | 双目标状态机和逐阶段故障注入 | 无 |
-
-## 7. 冻结兼容契约
-
-PRD 中已经写下决策不等于产品已经实现；以下初始状态均保持 `未实现`。
-
-| ID | 冻结项 | 来源 | 初始状态 | 计划 ADR/实现位置 | 当前证据 |
-|---|---|---|---|---|---|
-| FZ-01 | `.sow/`、`.pool/` 加现有发布树；本地树即 bucket 镜像；latest URL 不变 | PRD:L175 | 未实现 | `docs/adr/0001-local-layout.md`、manifest/materialize | 无 |
-| FZ-02 | YUM `Packages/<首字母>/`；禁止跨仓库 `../` href；迁移绑定结构调整阶段 | PRD:L176 | 未实现 | `docs/adr/0002-yum-layout.md`、YUM engine | 无 |
-| FZ-03 | 通道名 beta/latest/stable，加后续 snapshot | PRD:L177 | 未实现 | `docs/adr/0003-channel-naming.md`、config validation | 无 |
-| FZ-04 | token URL 与快照 ID 命名空间冻结；具体格式须架构阶段定案 | PRD:L178 | 未实现 | `docs/adr/0004-url-and-snapshot-naming.md` | 无；OQ-1/OQ-3 未决 |
-| FZ-05 | 单 GPG key | PRD:L179 | 未实现 | `docs/adr/0005-signing.md`、config/signing | 无 |
-| FZ-06 | repomd.xml 与 `.asc` 成对原子翻转语义 | PRD:L180 | 未实现 | `docs/adr/0006-yum-paired-flip.md` | 无 |
-| FZ-07 | RPM/DEB provenance 不对称双条目 schema | PRD:L181；ADD:L49-L56 | 未实现 | `docs/adr/0007-provenance.md`、provenance package | 无 |
-| FZ-08 | Cloudflare/EdgeOne 边缘鉴权组件同构接口 | PRD:L182 | 未实现 | `docs/adr/0008-edge-contract.md`、`edge/contract/` | 无 |
-
-### 7.1 其他兼容合同
-
-| ID | 合同 | 来源 | 初始状态 | 计划证据 | 当前证据 |
-|---|---|---|---|---|---|
-| COMP-01 | 本地树根直接由 Nginx 托管，无 sow 运行时 | PRD:L53,L109 | 未验证 | Nginx 指向物化根并由 apt/dnf/HTTP 消费 | 无 |
-| COMP-02 | apt >=1.2 使用 by-hash，老客户端仍由翻转语义兜底 | PRD:L165 | 未验证 | apt 版本矩阵 | 无 |
-| COMP-03 | EL9/10 zstd、EL8 gz | PRD:L102,L165 | 未验证 | dnf 版本/OS 矩阵 | 无 |
-| COMP-04 | APT 快照为标准 suite，YUM 通道为标准 mirrorlist/metalink | PRD:L123-L124 | 未验证 | 原生客户端无插件消费 | 无 |
-| COMP-05 | `dnf module disable postgresql` 等行为仅由安装文档处理 | PRD:L165 | 未验证 | 安装文档与真实客户端步骤 | 无 |
-
-## 8. Addendum 技术边界
-
-| ID | 技术定案 | 来源 | 初始状态 | 计划位置/检查 | 当前证据 |
-|---|---|---|---|---|---|
-| TECH-01 | deb/control/version/dependency 解析采用 `pault.ag/go/debian` | ADD:L11 | 未实现 | `go.mod`、APT parser；依赖审计 | 无 |
-| TECH-02 | RPM 全字段头解析采用 `cavaliergopher/rpm` | ADD:L12 | 未实现 | `go.mod`、RPM parser；真实包夹具 | 无 |
-| TECH-03 | OpenPGP 采用 ProtonMail go-crypto，不执行 gpg | ADD:L13 | 未实现 | signing package；进程/依赖审计 | 无 |
-| TECH-04 | APT 索引装配、压缩、checksum、by-hash 自研 | ADD:L14 | 未实现 | `internal/repo/apt/` | 无 |
-| TECH-05 | YUM XML、压缩和 SHA256 命名自研 | ADD:L15 | 未实现 | `internal/repo/yum/` | 无 |
-| TECH-06 | 同步器自研并包含下载校验、验签和 provenance | ADD:L16 | 未实现 | `internal/sync/` | 无 |
-| TECH-07 | RPM 重签延后并受真机验证门禁 | ADD:L17 | 未实现 | 策略门禁；不得默认开启 | 无 |
-| TECH-08 | 不做 sqlite primary_db/modulemd/zchunk | ADD:L18 | 未验证 | 依赖、产物和命令面负向审计 | 无 |
-| TECH-09 | 不 import aptly，只允许参考源码 | ADD:L20 | 未验证 | `go list -deps` 与许可证审计 | 无 |
-| TECH-10 | 不采用 Workers Cache API；鉴权后以干净 URL 子请求归一缓存 | ADD:L43-L47 | 未实现 | edge implementations/contract tests | 无 |
-
-## 9. 明确范围外项
-
-这些条目用于防止范围蔓延；初始保持 `未验证`，直至依赖、命令面和产物审计证明没有误实现或运行时依赖。
-
-| ID | 排除项 | 来源 | 初始状态 | 计划负向证据 | 当前证据 |
-|---|---|---|---|---|---|
-| OUT-01 | PostgreSQL 不是核心依赖，仅可选导出目标 | PRD:L67 | 未验证 | `go list -deps`、干净运行环境 | 无 |
-| OUT-02 | 不做通用云抽象，使用 Cloudflare/腾讯具体客户端 | PRD:L68 | 未验证 | 架构与依赖审计 | 无 |
-| OUT-03 | 不做 modulemd、zchunk、sqlite repodata | PRD:L69 | 未验证 | 产物扫描与 CLI 帮助审计 | 无 |
-| OUT-04 | 不做多 GPG key 体系 | PRD:L70 | 未验证 | config schema 负例 | 无 |
-| OUT-05 | 不造 deb/rpm，只管理既有制品 | PRD:L71 | 未验证 | CLI/依赖/文档审计 | 无 |
-
-## 10. 迁移账本
-
-### 10.1 迁移合同
-
-| ID | 迁移要求 | 来源 | 初始状态 | 计划位置/证据 | 当前证据 |
-|---|---|---|---|---|---|
-| MIG-01 | 先 `sow init` 建基线，再对 cf/cos 做首次 fsck 和遗留垃圾报告 | PRD:L192 | 未实现 | `docs/migration/zero-byte-onboarding.md`、真实存量树报告 | 无 |
-| MIG-02 | 四个 Makefile 约 40 个业务目标逐项映射到 sow 命令 | PRD:L15,L39；GOAL:L49 | 未实现 | `docs/migration/make-target-map.md`、每行 E2E 证据 | 无；不得按命令族笼统宣称覆盖 |
-| MIG-03 | latest 旧 URL 全部保持兼容 | PRD:L46,L175 | 未验证 | 迁移前 URL 基线与迁移后回归 | 无；具体 URL 清单尚未建立 |
-| MIG-04 | YUM 首字母拆分、by-hash、快照/指针、合一布局按结构调整阶段迁移 | PRD:L176,L194 | 未实现 | `docs/migration/layout-migration.md` | 无 |
-| MIG-05 | 存量仓库先零字节纳管，再分阶段结构迁移 | PRD:L186,L192 | 未实现 | 每阶段 checksum、manifest diff 和停止/恢复点 | 无 |
-| MIG-06 | 提供可执行回滚说明，不隐藏人工发布/purge 步骤 | GOAL:L49,L59-L61 | 未实现 | `docs/migration/rollback.md`、回滚演练日志 | 无 |
-| MIG-07 | 回写旧 Pro 设计，正式废止双云双独立 pro bucket | PRD:L184；ADD:L69-L77 | 未实现 | 旧设计文档变更链接及迁移说明 | 无 |
-| MIG-08 | 仅当全部旧目标映射、存量数据验收和回滚演练通过后退役 Makefile | PRD:L39,L186 | 未验证 | 退役门禁清单 | 无 |
-
-### 10.2 旧 Makefile 清点入口
-
-以下只是发现入口，不是覆盖证明。精确目标数、别名、依赖关系和副作用必须落入 `MIG-02` 的逐目标映射。
-
-| 旧文件 | 当前已观察的目标族 | 初始状态 | 新命令目标 | 当前证据 |
-|---|---|---|---|---|
-| `/Users/vonng/pgsty/repo/Makefile` | copy、co/cf 上传、infra/pgsql/pgdg/percona、pro、asset 类目标 | 未实现 | `add/sync/publish/fsck` 加选择器 | 仅发现文件与 target 名；未做语义/副作用审计 |
-| `/Users/vonng/pgsty/repo/apt/Makefile` | init/add/rm/list/trim、suite、cf/cos upload、上游获取 | 未实现 | `init/add/rm/sync/publish/verify` | 仅发现；未逐目标映射 |
-| `/Users/vonng/pgsty/repo/yum/Makefile` | build/sign、infra/pgsql/percona | 未实现 | `add/sync/publish/verify` | 仅发现；未逐目标映射 |
-| `/Users/vonng/pgsty/repo/docker/Makefile` | 容器生命周期以及 sign/build 包装目标 | 未实现 | 原生 Go CLI；容器包装目标退役 | 仅发现；未证明零外部运行时替代 |
-
-## 11. 风险账本
-
-| ID | 风险 | 来源 | 初始状态 | 缓解/验证计划 | 当前证据 |
-|---|---|---|---|---|---|
-| RISK-01 | go-crypto 签名产物客户端兼容性 | PRD:L202 | 未验证 | apt/dnf 真机矩阵常驻 CI | 无 |
-| RISK-02 | EdgeOne 缓存是 per-node 还是共享/tiered 尚未证实 | PRD:L203；ADD:L81 | 未验证 | 真实 EdgeOne PoC；失败启用 Basic Auth | 无 |
-| RISK-03 | RPM 重签可能破坏 EL9/10 SHA256 摘要 | PRD:L204；ADD:L83 | 未验证 | Day 1 禁用；启用前真机 rpm -K | 无；风险通过策略规避但 PoC 未通过 |
-| RISK-04 | 对象存储上的半残 by-hash | PRD:L205；ADD:L37 | 未验证 | 与发布路径统一实现；中断/旧客户端测试 | 无 |
-| RISK-05 | 5 万包单线程或 OOM | PRD:L206；ADD:L35-L36 | 未验证 | 并行、流式实现及性能/内存 profile | 无 |
-| RISK-06 | R2/COS、CDN SDK、EdgeOne 是外部依赖且真实验证需资源 | PRD:L208 | 未验证 | 本地 S3、供应商契约、随后真实云最小验证 | 无 |
-
-## 12. PoC 与强制验证面
-
-| ID | PoC/验证 | 来源 | 初始状态 | 计划环境与通过标准 | 当前证据 |
-|---|---|---|---|---|---|
-| POC-01 | EdgeOne 不同 token 请求归一到同一干净 URL 缓存，并确认 tiered cache 行为 | ADD:L81 | 未验证 | 真实 EdgeOne；可观测 HIT/缓存层级；失败记录并切 Basic Auth | 无 |
-| POC-02 | go-crypto InRelease 被真实 `apt update/install` 接受 | ADD:L82；GOAL:L40 | 未验证 | 受支持 apt 版本矩阵，签名与 by-hash 同时开启 | 无 |
-| POC-03 | repomd.xml.asc 被真实 `dnf --setopt=repo_gpgcheck=1` 接受 | ADD:L82；GOAL:L41 | 未验证 | EL8/9/10 压缩矩阵与签名验证 | 无 |
-| POC-04 | 若未来启用 RPM 重签，go-rpmutils/go-crypto 产物通过 EL9/10 `rpm -K` | ADD:L82-L83 | 未验证 | 条件 PoC；未满足商业启动条件前不得冒充范围内已通过 | 无 |
-| POC-05 | 本地 S3 兼容环境验证 checkpoint CAS、差异发布、失败重放和幂等 | GOAL:L44,L51 | 未验证 | 可重复本地服务与故障注入夹具 | 无 |
-| POC-06 | Cloudflare R2/Worker/CDN 与腾讯 COS/EdgeOne/CDN 的真实目标验证 | GOAL:L47,L51 | 未验证 | 两个真实目标独立发布、purge、穿 CDN 校验 | 无；凭据/资源条件尚未登记 |
-| POC-07 | 约 5 万包并行和流式内存行为 | PRD:L161-L163,L206；GOAL:L48 | 未验证 | 记录硬件、包数、耗时、峰值 RSS、并行度和 API 数 | manifest 子系统部分证据：72,310 包、89.86GB、18 worker、7.91s、峰值 RSS 92.1MB，见 `docs/evidence/2026-07-11-manifest-72k-performance.md`；索引/materialize/publish 未实现，故保持未验证 |
-
-强制测试层级还必须覆盖（GOAL:L37-L49）：单元、属性/边界、集成、故障注入、中断恢复、CLI E2E、asset/CAS/GC、sync/provenance、L1-L4、机密性负例、通道/钉版/快照/EOL/tgz、边缘共享契约、Linux/macOS 构建以及迁移/回滚。实现后应将每项拆成可链接的证据记录。
-
-## 13. 开放问题
-
-| ID | 问题 | 来源 | 初始状态 | 计划决策位置 | 当前证据/阻塞条件 |
-|---|---|---|---|---|---|
-| OQ-1 | token URL 前缀具体格式 | PRD:L212 | 已冻结 | `docs/adr/0001-core-contracts.md`、`internal/config/` | `/pro/v1/{token}/`；schema v1 拒绝其他值；边缘实现与真实验证仍未完成 |
-| OQ-2 | EdgeOne 缓存层级是否满足要求 | PRD:L213 | 未决 | PoC 报告与 access ADR | 无；真实 EdgeOne 验证，失败回退 Basic Auth |
-| OQ-3 | 快照 ID 最终格式；候选 `<suite>-YYYYMMDD` | PRD:L214 | 已冻结 | `docs/adr/0001-core-contracts.md`、`config.SnapshotIDFormat` | UTC `<suite>-YYYYMMDD`，同 suite/日不同 commit 冲突；实现待补 |
-| OQ-4 | bucket 物化最近 N 个月中的 N | PRD:L215 | 已冻结 | ADR、`state.snapshot_materialization_months` | 默认 6 个自然月、正整数可配；存储测算与保留实现待补 |
-| OQ-5 | 从哪个 Pigsty 版本开始冻结 EL8 | PRD:L216 | 未决 | EOL ADR、配置默认值、迁移说明 | 无；不可逆业务决定，实施前需 owner 决策 |
-
-开放问题不得阻断其他可逆、本地可完成工作；先依据协议、存量仓库和可逆默认值推进，只有真实资源、付费或不可逆业务选择才升级询问（GOAL:L31）。
-
-## 14. 已知合同张力（必须以 ADR 消歧）
-
-| ID | 张力 | 初始状态 | 必须保持的不变量 |
+| ID | 要求 | 状态 | 证据与缺口 |
 |---|---|---|---|
-| ADR-T01 | FR-25 整体 publish 失败语义 vs NFR-09 双云独立滞后 | 未实现 | 每目标独立 checkpoint/journal；任一失败 CLI 非零；已成功目标不伪回滚；失败目标可安全重放 |
-| ADR-T02 | YUM 两对象“成对原子” vs S3 单对象原子能力 | 未实现 | 客户端任何可观察状态都不得组合不匹配的 repomd.xml 与 asc |
-| ADR-T03 | `sow rm` vs stable 包永不消失 | 未实现 | rm 不得破坏 stable/history 引用；GC 仅回收所有 ref 均未引用对象 |
-| ADR-T04 | Git 承载正典 vs 零外部运行时依赖 | 未实现 | 不依赖系统 git 可执行文件，同时保留可审计 Git 历史 |
-| ADR-T05 | FR-03 差异计算零远端 API vs checkpoint GET/CAS | 未实现 | diff 纯本地；远端调用仅用于漂移/事务控制且有计数证据 |
-| ADR-T06 | beta/latest 都是公开视图 vs FR-35 的“OSS=latest”简写 | 未实现 | beta 与 latest 均受不可跳过的 public 闭包门禁 |
-| ADR-T07 | 单 Go CLI vs 两家边缘函数运行时 | 未实现 | CLI 保持单 Go 二进制；边缘共享行为契约但不制造通用云抽象 |
-| ADR-T08 | FZ-04 称命名空间冻结，但 OQ-1/OQ-3 的具体值未定 | 未实现 | 在依赖实现扩散前冻结字符串格式并建立兼容测试 |
+| NFR-01 | repo/component/arch 并行，50k 不单线程卡死 | `已验证` | V-08 post-fix 隔离重跑覆盖 72k scan 18 workers、50k APT 4 workers、materialize 8/peak 8；2026-07-18 adoption 专项又由生产原子计数器实测 50,000 唯一 asset 的 import peak 8/8，而非回显请求值。[current-source scale evidence](evidence/2026-07-13-rpm-package-trust-closure.md)。当前 full ordinary/race 同时覆盖 strong-YUM 与 upstream spool；CLI/publisher 双层拒绝 >64。 |
+| NFR-02 | manifest/index 流式/惰性，不整库入内存 | `已验证` | V-08 post-fix 隔离重跑记录 72,310 真文件/89.862GB、APT50k max RSS 300,498,944B、spool 32,126,600B/chunk peak 256，以及 materialize/YUM retained growth 69,328/30,648B；adoption 50k 真 CLI 的 5ms sampled peak/retained heap growth 为 124,347,360/538,040B，OS max RSS growth 167,116,800B，CAS/view/receipt/cache/provenance 各精确 50,000、四路 tuple closure 一致且重放 HEAD 不变。缺体负例也改用 SQLite spool、精确磁盘报告和固定 20 项内存预览，100 项回归证明错误字符串不随全集增长。当前 full ordinary/race 覆盖 present-body stability、receipt reuse、strong-YUM 与 spool 边界。 |
+| NFR-03 | 日常远端 API O(变更集)，仅 fsck List | `已验证` | G3/V-16；publish/L2 测试断言 0 List，fsck 才分页 List/HEAD；post-fix 隔离 50k/1-change plan 16.316ms 且只产生 1 object。exact inherited ref 在相同 config/trust identity 下不读 manifest/package，changed ref 只流式验证 additions/replacements；本地完整 physical-owner rebuild 不扩大 remote manifest/ref，receipt-only repair 的 PUT/purge/GET 均为 0。[sync recovery evidence](evidence/2026-07-12-sync-durable-recovery.md) 与日期化 full ordinary/race 证明 present candidate receipt reuse 不进入全池审计；新 view placement 仅 `pool.Verify` 该对象。 |
+| NFR-04 | 单 Go 二进制，Linux/macOS，零外部运行时 | `已验证` | V-03/V-10/V-13 与 [portability evidence](evidence/2026-07-12-portability-and-static-builds.md)；对象存储和 purge 均为固定 Go SDK，无外部进程或脚本 fallback；`go list -deps ./cmd/sow` 无 aptly/PostgreSQL/createrepo/modulemd/zchunk；`cmd/`+`internal/` 产品文件无 `os/exec`；Go 1.26.5 下可达漏洞 0。 |
+| NFR-05 | apt>=1.2 by-hash；apt<1.2 不支持；EL9/10 zstd、EL8 gz | `已验证` | [ADR-0029](adr/0029-client-support-floor-and-el8-freeze-version.md) 冻结支持矩阵。[real client evidence](evidence/2026-07-11-client-compat.md) 以 digest 固定的 Ubuntu 16.04 真 `apt 1.2.35` 验证 InRelease、SHA-256 by-hash 与精确安装，V-04 另以真 apt 2.4 验证当前客户端；真 EL9/10 验证 zstd、真 EL8 验证 gzip。[YUM atomicity evidence](evidence/2026-07-12-yum-generation-atomicity.md) 覆盖签名对。[legacy apt negative PoC](evidence/2026-07-12-apt-legacy-fixed-alias-negative-poc.md) 以真 Debian Jessie apt 1.0 稳定复现跨代 `Hash Sum mismatch`，作为不支持路径的协议负控而非兜底实现。 |
+| NFR-06 | 签名链、密钥/令牌保密、token 不进缓存键，真客户端 CI | `已实现/未验证` | [ADR-0017](adr/0017-rpm-package-keyring-and-cryptographic-verification.md)、[current RPM trust closure](evidence/2026-07-13-rpm-package-trust-closure.md) 与 add/sync/L1/materialize/publish/L4 负例关闭本地 RPM signer-trust、historical-policy fallback 与 path/keyring/CAS TOCTOU 缺口；V-04 真 InRelease、CentOS 7 YUM 3.4.3 与 EL8/9/10 DNF 的 `repo_gpgcheck=1` repomd、`gpgcheck=1` RPM install/rpm-K 及缺 package key 负例均通过。YUM metadata 签名保持 SHA-256/固定 identity，并以无随机 salt、non-critical legacy subpacket 实现 byte-identical replay；private key/public trust anchor 配对、token clean URL/redirect 零转发均有测试。真两家 CDN cache/log 仍未验，因此状态不升级。 |
+| NFR-07 | 存储/缓存/成本不恶化 | `未验证` | CAS/共享 pool 和干净 URL 实现存在，但无真 bucket 字节、账单、多 token/PoP cache-hit 测量。 |
+| NFR-08 | Git 审计、provenance、远端漂移报告 | `已实现/未验证` | FR-01/16/30 与 V-16；materialized route receipt/exact/payload、完整 ref vector、config anchor、target identity 和 retired deletion witness 均为 canonical Git 历史，fsck 对全 route namespace 审计 orphan/incomplete/forged triple。[sync durable progress](evidence/2026-07-12-sync-durable-recovery.md) 将 post-provenance 错误绑定 canonical commit/phase/retry action，且 progress 不保存 secret/error。真云对象篡改演练和运维报告未做。 |
+| NFR-09 | 中断恢复/重放，两云可独立滞后 | `已实现/未验证` | [saga matrix](../internal/publish/saga_test.go)、[purge runtime](../internal/publish/purge_runtime.go)、[purge ledger repair](../internal/cli/purge_ledger_repair.go)、[selected-set recovery](evidence/2026-07-13-selected-set-materialization-recovery.md)、[target-major protocol evidence](evidence/2026-07-15-dual-target-independent-pipelines.md)、[stale-CDN replay](evidence/2026-07-12-evidence-bound-remote-deletion.md)、[real-cloud harness](evidence/2026-07-12-real-cloud-acceptance-harness.md)、[cloud safety entrypoints](evidence/2026-07-17-real-cloud-safety-entrypoints.md)、[bootstrap offline evidence](evidence/2026-07-17-cloudflare-bootstrap-offline-validation.md)、[provider attestation evidence](evidence/2026-07-17-cloudflare-provider-attestation-offline-validation.md)与 V-16；target 各自持有 checkpoint/journal/purge sidecar，且同一调用内各自按恢复→beta/latest/stable→retained snapshots 顺序推进，不存在跨 target 的 inspection/view/snapshot barrier；本地协议阻塞测试证明 `--workers 1` 时 CF 停在 checkpoint GET，COS 仍可走到多视图 generation 6、显式第二快照 generation 2 和默认 retained-snapshot generation 4。publication recovery 要求 durable vector 已关闭物理 owner，并在 selected-set cleanup 前重放 route receipt。历史双 alias restore 的 purge 后失败不推进本地 generation，恢复重 purge 后提交，再次重放 effect-free。Cloudflare first-deployment 另以 R2 CAS lease 串行 executor、每次 mutation 前续租、outcome envelope 原子落盘后按 ETag 解锁；崩溃租约保留五分钟并可由单独动态授权的 `recover-lease` 精确回收，不允许另一 run 接管。provider log-sink setup 另用独立 control identity 在两家 mutation 前取得 R2 CAS lease；每次 mutation 前续租，跨供应商部分失败保留租约，五分钟后下一 run 才能 CAS 接管并幂等重放。EdgeOne Create 接受后先保存 JobId/RequestId，恢复轮询同一 JobId，committed replay 追加新 attempt，兄弟 target 可独立滞后。完整 50 步 harness 已有 durable phase ledger、逐 CLI 子日志、运行/源码/二进制/资源身份与 crash recovery；provider raw-sink 只有在第一步 durable ledger 与 reservation 已持有后才能幂等配置，completed ledger 禁止 mutation。snapshot ref 提交后的恢复强制重建并验证 SQLite canonical HEAD/membership。generation 5 另在 provider 请求前启动独立 watcher，只有 exact armed receipt + 当前 liveness lock 同时成立才发布；本地 SIGKILL/loopback fake-HTTP 测试证明父测试进程死亡后仍在旧 TTL 内原子保存 run/resource/generation/transaction/observer/request/time/cache/body/clean-URL evidence 与 durable completion seal，恢复只消费 evidence+seal 闭包并拒绝缺失、过期、篡改或不同绑定。provider API raw-export/deployed-bundle attestation collector 与专用非生产真双云部分失败/重放仍未闭合；生产资源禁止测试。 |
 
-## 15. 更新与最终审计规则
+## 7. 冻结契约与兼容合同
 
-每次更新条目时：
+### 7.1 FZ-01–FZ-09
 
-1. 保留来源行号；填写真实实现文件和测试文件。
-2. 在证据列写入可复现命令、环境、日期、结果与日志/报告路径。
-3. 若只完成 Mock、接口或 happy path，最高只能标为 `实现中`。
-4. 真实云未运行时，供应商相关条目必须保持 `未验证`，除非用户书面接受替代证据或豁免。
-5. `[ASSUMPTION]` 指标必须记录实测值，不得因测试“通过”而默认满足。
-6. 最终独立怀疑式审计必须检查 TODO/空实现/永真校验、秘密泄漏、迁移债、人工 purge、真实 apt/dnf、双云/边缘 PoC、性能与跨平台构建。
-7. 只有本矩阵所有范围内要求均有实现位置和可复现证据，且没有未处理阻断项时，Goal 才可完成。
+| ID | 冻结项 | 状态 | 实现/证据或 GAP |
+|---|---|---|---|
+| FZ-01 | `.sow/`+`.pool/`+直托树，latest URL 不变 | `已实现/未验证` | [ADR-0001](adr/0001-core-contracts.md)、[ADR-0020](adr/0020-legacy-physical-topology-and-route-ownership.md)、[ADR-0024](adr/0024-materialized-route-read-capabilities.md)、FR-12、V-15/V-16；直接 Nginx 使用配置 repo leaf、精确 mirrorlist、受 repo root 约束的 generation route、公钥及 asset exact/prefix 白名单；每个 route 还须 canonical exact/payload receipt 重放当前 physical owner，缺失时零 include bytes。`sow.yaml`、CAS、state、泛化 parent namespace 与真实 namespace 内 canary 均 404。真 latest 全 URL 切换未验。 |
+| FZ-02 | YUM `Packages/<首字母>/`，禁止 `../` href | `已验证` | [YUM package layout](../internal/yumrepo/generation.go)、`TestPackageLocation/ValidatePackageHref`、V-07/V-17：repomd→primary 的 flat href 在零 serving-tree 改写 adoption 后 canonicalize，receipt 同时绑定 source/canonical；escape/nested/collision/unlisted/tamper fail closed。fresh copy 已实测 44,372 个 PGDG RPM/58.264GB 与 16,582 个其他 YUM RPM/18.100GB；PGDG 原 30,274 缺体 path 闭合为 29,499 个官方原字节恢复和 775 个 exact negative-provenance 排除，未放宽 canonical layout，重复执行 `changed=false`。生产 cutover 仍单列 MIG-04。 |
+| FZ-03 | beta/latest/stable(+snapshot) 命名 | `已验证` | [config validation](../internal/config/config.go)、[refs](../internal/state/ref.go)、views/publish/materialize/verify E2E。 |
+| FZ-04 | `/pro/v1/{token}/` 与 `<suite>-YYYYMMDD` | `已验证` | [ADR-0001](adr/0001-core-contracts.md)、[config constants](../internal/config/config.go)、snapshot naming/tamper tests。 |
+| FZ-05 | 单 GPG key | `已验证` | FR-10/ADR-0010；SOW metadata signing 无配置 public anchor、错配 private override、公钥文件含私钥、过期/撤销、多 private entity 和多 usable key 均拒绝；有 package ref 的 target 冻结 `repository_key_sha256`，asset-only 真无 package ref 时无需 key。Day-1 上游 RPM 的 public package trust bundle 不成为第二个 SOW signing identity；全量单 package signer 仍仅由 FR-17 延后重签提供。 |
+| FZ-06 | YUM repomd.xml + asc 成对原子语义 | `实现中` | [atomicity evidence](evidence/2026-07-12-yum-generation-atomicity.md)、[Pigsty consumer migration](evidence/2026-07-14-pigsty-yum-consumer-migration.md)、V-04/V-16；本地 exchange/generation mirrorlist PASS，同一 physical owner 的多个 OS alias 共享一份完整 generation，历史 restore 的 raw pair 与 strong generation byte-identical；跨 repo/arch/view/generation 共享 root 拒绝。冻结 EL7 YUM 3 与 EL8/9/10 DNF 已真实消费各自 gzip/zstd 签名闭包。11 个 allow-listed Pigsty 文件中的 28 个定义已有字节级可回滚迁移机制。raw baseurl 仍是兼容 GAP；生产 endpoint/trust/origin/client 切换未闭合。 |
+| FZ-07 | RPM/DEB provenance 不对称 schema | `已验证` | FR-16；[schema tests](../internal/provenance/receipt_test.go)。 |
+| FZ-08 | Worker/EdgeOne 同构边缘接口 | `实现中` | [edge ADR](adr/0004-edge-token-verifier-deployment-contract.md)、[private-origin boundary](adr/0012-private-origin-deployment-contract.md)、[provider attestation ADR](adr/0035-cloudflare-provider-attestation-and-log-sink-lease.md)、V-06 与 [real edge harness](../test/compat/real_edge_multipop_test.go)；同构路由/鉴权/传输和 paired client+clean purge 已实现，双出口 evidence 固定为 `sow-real-edge-active/v5`、异步关联固定为 `sow-real-edge-provider-joined/v3`，两者均要求 run-bound seal。Cloudflare runtime/settings/inventory 与 provider log setup lease 有离线 SDK/CAS 证据；direct 模式仍为 `BYPASS`，真 cache candidate 部署、HIT 与 purge/provider log 尚未闭合。 |
+| FZ-09 | populated APT/YUM repo 的永久物理所有权与历史连续性 | `已验证` | [ADR-0022](adr/0022-package-repository-history-continuity.md)、[ADR-0024](adr/0024-materialized-route-read-capabilities.md)、[implementation](../internal/cli/package_repository_contract.go)、[history evidence](evidence/2026-07-14-package-repository-history-continuity.md)与 V-16：HEAD + 全部 `refs/sow/*` 可达 DAG 中任一非空 manifest/view/snapshot/YUM generation 冻结 ID/type/path/pool/filter/OS/leaf/target affinity；route receipt 进一步把 logical refs 关闭到 APT repo-wide/YUM repo+arch physical owner，历史多 alias restore 保持各 ref/channel，retired installed generation 只凭 canonical witness 进入 exact capability。空仓可变，只允许 active -> frozen、package keyring rotation 与 upstream filter 变化。load、staged config、各 mutation 持锁边界和 GC pre-CAS/pre-delete 均失败关闭。ordinary/race/32 MiB allocation 及本轮 focused ordinary/race 已实跑；不外推为真 apt/dnf、云/CDN 或生产迁移验证。 |
+
+### 7.2 COMP-01–COMP-05
+
+| ID | 兼容合同 | 状态 | 证据/GAP |
+|---|---|---|---|
+| COMP-01 | 本地树根直接由 Nginx 托管，无 SOW 运行时 | `已验证` | V-04/V-15 current-source Nginx 1.31.2 + 真 apt/dnf 完整矩阵证明 exact repo leaf/mirrorlist/generation 与 asset exact/prefix 可直接托管，并拒绝 namespace 内真实存在的 unowned/operator/state/CAS canary；V-16 证明 route receipt 缺失时 Nginx fail closed、publish 修复后才重新 admission，完整 alias/ref owner 与 retired exact lifecycle 均受审计。无 SOW daemon 参与消费。 |
+| COMP-02 | apt>=1.2 by-hash；apt<1.2 不受支持 | `已验证` | [ADR-0029](adr/0029-client-support-floor-and-el8-freeze-version.md) 冻结最低支持版本。现代 apt 真客户端 PASS；[legacy apt negative PoC](evidence/2026-07-12-apt-legacy-fixed-alias-negative-poc.md) 以真 Jessie apt 1.0 证明 coherent 单代可消费而跨代 fixed alias 与 redirect/no-store/cookie 候选按预期 checksum 失败，支持“迁移前升级”的 fail-closed 政策，未把单代可读误报为 mutable 原子性。 |
+| COMP-03 | EL9/10 zstd，EL8 gz | `已验证` | V-04 真 AlmaLinux 8/9/10 DNF 矩阵，`repo_gpgcheck=1`。 |
+| COMP-04 | APT 快照为标准 suite，YUM 通道为标准 mirrorlist | `已验证` | [real client evidence](evidence/2026-07-11-client-compat.md)：生产 CLI 创建/物化 `jammy-20260712`，真实 apt 2.4.14 以其为 suite 验 InRelease、请求 snapshot by-hash 并安装历史精确版本；真实 DNF 4.20.0 通过 generation-pinned mirrorlist 消费三类 repodata 与包体。 |
+| COMP-05 | `dnf module disable postgresql` 只进安装文档 | `已验证` | [client installation guide](client-installation.md) 将其限定为系统 module stream 冲突时的客户端前置操作；生成器/配置/repodata 均不含 modulemd，TECH-08 负向审计保持通过。 |
+
+## 8. Addendum 技术边界与范围外负向审计
+
+| ID | 技术定案 | 状态 | 实现/证据 |
+|---|---|---|---|
+| TECH-01 | DEB/control/version/dependency 用 `pault.ag/go/debian` | `已验证` | [go.mod](../go.mod)、[package parser](../internal/aptrepo/package.go)、[catalog](../internal/aptrepo/catalog.go)。 |
+| TECH-02 | RPM 全头解析用 `cavaliergopher/rpm` | `已验证` | [go.mod](../go.mod)、[RPM parser](../internal/yumrepo/rpm.go)、[package verifier](../internal/yumrepo/rpm_signature.go)、[packet-preserving keyring](../internal/yumrepo/package_keyring.go)、[parser patch rationale](../third_party/cavaliergopher-rpm/SOW-PATCHES.md)；cavaliergopher 负责 bounded header/layout，ProtonMail keyring 加 SOW 的 v3 RSA/DSA 与 historical-policy verifier 完成真实 PGDG/CentOS 历史包验签，不恢复有漏洞的旧 x/crypto GPGCheck。 |
+| TECH-03 | OpenPGP 用 ProtonMail go-crypto，不执行 gpg | `已验证` | FR-10/NFR-04；双 parser 保留 library current entity 与原始 primary/subkey policy packets，最新已认证 policy 先选择、后验证且不可 fallback；binary packet stream 不经 `TrimSpace`，armored text 才接受 outer whitespace。 |
+| TECH-04 | APT 装配/压缩/checksum/by-hash 自研 | `已验证` | [internal/aptrepo](../internal/aptrepo)，FR-07/V-08。 |
+| TECH-05 | YUM XML/压缩/SHA256 命名自研 | `已验证` | [internal/yumrepo](../internal/yumrepo)，FR-08 引擎与 50k 证据；不因兼容 alias GAP 否定引擎技术选型。 |
+| TECH-06 | sync 自研：元数据、校验、验签、provenance | `已验证` | [internal/upstream](../internal/upstream)、[sync E2E](../internal/cli/sync_test.go)、[ADR-0017](adr/0017-rpm-package-keyring-and-cryptographic-verification.md)、[current PGDG evidence](evidence/2026-07-13-rpm-package-trust-closure.md)；APT Release/YUM repomd 做元数据密码学验签，RPM body 按 primary SHA/size 下载后再用 repo packet-preserving package keyring 验嵌入签名与 payload coverage，只有成功后才写 v3 provenance。present 状态不绕过 body hash；只有证据匹配的 DEB/RPM receipt 可复用，trust rotation/legacy 强制重验；APT exact coordinate 防止 component 移动漏 ingest。不可信 RPM 无 receipt/canonical commit。 |
+| TECH-07 | RPM 重签延后且受真机门禁 | `已验证` | FR-17；当前代码无重签路径。 |
+| TECH-08 | 不做 sqlite repodata/modulemd/zchunk | `已验证` | [YUM validator](../internal/yumrepo/validate.go) 拒绝额外产物；`go list -deps` 负向审计。 |
+| TECH-09 | 不 import aptly | `已验证` | `go list -deps ./cmd/sow` 无 aptly；[go.mod](../go.mod)无依赖。 |
+| TECH-10 | 不用 Workers Cache API；干净子请求归一缓存 | `实现中` | V-06 负例禁止 manual Cache API，两 adapter 的 main/beta same-host clean URL 和两-token digest/status interface 一致；publication plan/replay 强制 paired client+clean exact purge，真实夹具含 post-warm anonymous 404，并把两个以上出口的 token-A prime/token-B cross-PoP HIT 与两代 purge transition 写入仓库外 artifact，再由只读 joined provider log 门归因。direct transports 明确 `BYPASS`；尚缺真 EdgeOne/CF cache-hit 与 purge log 实跑。 |
+
+| ID | PRD 明确排除项 | 状态 | 负向证据 |
+|---|---|---|---|
+| OUT-01 | PostgreSQL 不是核心依赖 | `范围外已验证` | [go.mod](../go.mod)/`go list -deps` 无 PostgreSQL client/server；空环境 CLI 可运行。 |
+| OUT-02 | 不做通用云插件层 | `范围外已验证` | [provider.go](../internal/publish/provider.go) 暴露 R2Cloudflare/COSEdgeOne 供应商具体原语，[ADR-0016](adr/0016-frozen-vendor-sdk-boundary.md) 固定一个 S3 SDK + 两个 CDN 具体 SDK，无公开 generic plugin ABI 或 fallback registry。 |
+| OUT-03 | 不做 modulemd/zchunk/sqlite repodata | `范围外已验证` | TECH-08。 |
+| OUT-04 | 不做多 GPG key | `范围外已验证` | FZ-05 的 schema/signer 负例。 |
+| OUT-05 | 不造 DEB/RPM | `范围外已验证` | CLI help 无 build/package 动词；add/sync 只验证已有制品。测试夹具 builder 不进产品二进制。 |
+
+## 9. 迁移账本
+
+| ID | 迁移要求 | 状态 | 实现/证据与缺口 |
+|---|---|---|---|
+| MIG-01 | `init`→cf/cos 首次 fsck/遗留垃圾报告 | `已实现/未验证` | [runbook](migration/runbook.md)、[remote inventory evidence](evidence/2026-07-12-remote-inventory-adoption.md)；真存量 cf/cos 未执行。 |
+| MIG-02 | 四 Makefile 逐 target 映射 | `实现中` | V-07/V-17/V-18/V-19/V-20；176=52+70+14+40，44 个操作族无重叠/遗漏，处置 115 sow-cli/33 retire/18 policy-reject/8 handoff/2 migration-only，规范 TSV SHA-256 `e29ceea9…5e52`。33-repo selector universe 与 12-repo parser fixture 均明确为 synthetic；current config/ledger 双向闭合 97 repo/134 row、74 APT、130 ordinary YUM、nested/root/pro disposition。fresh copy/current `yum/infra`/gated Pro、digest-bound asset/DEB/RPM handoff、COS-only ROOT exact-copy 与 shared ROOT canonical builder 全部本地闭合并按 exact target affinity 激活；APT `push` 明确是外部 transport，不伪装成 add。Docker `default/help` 明确 retire，help/selector 不伪装业务等价。仍未闭合逐获批生产 target 的迁移对账及权限/双云切换。 |
+| MIG-03 | latest 旧 URL 全部保持 | `未验证` | [static map](migration/make-target-map.md#32-latest-url-基线) 已列 URL；[live baseline](evidence/2026-07-12-live-latest-url-baseline.md) 已保存全球/国内 HTTP/ETag/cache/body/checksum。尚缺切换后同口径比对，因此不升级。 |
+| MIG-04 | YUM split/by-hash/快照指针/合一布局结构迁移 | `实现中` | [runbook Phase 2–3](migration/runbook.md)、[Pigsty consumer migration](evidence/2026-07-14-pigsty-yum-consumer-migration.md)和引擎已具备；V-17 在完整 fresh copy 将 44,372 个 PGDG 与 16,582 个其他 YUM RPM canonicalize 为 `Packages/<首字母>/`，receipt 同时绑定 source/canonical，幂等重放不改 serving tree；选定 PGDG 18 EL10 leaf 已物化 zstd 三类 metadata/签名对并由真 DNF 断网安装。当前 `yum/infra` exact copy 又以 216 个 Pigsty-signed RPM 完成双架构 gzip candidate、S2 raw 六组 DNF、S3 generation-pinned 六组 strong DNF、回滚/re-cutover 状态机证据；V-04 额外闭合冻结 EL7 YUM 3 与 EL8/9/10 DNF 的本地生成/验签/安装矩阵。consumer 侧 audit/stage/apply/rollback 精确覆盖 28 个定义且拒绝 foreign drift。仍缺全部 mapped physical endpoints 的生产执行、双 origin 探测及生产 switch/rollback。 |
+| MIG-05 | 先零字节纳管，再分阶段迁移 | `实现中` | [fresh-copy evidence](evidence/2026-07-16-fresh-full-content-adoption.md)、[50k asset adoption](evidence/2026-07-18-legacy-adoption-50k-performance.md)、[current `yum/infra` exact-copy evidence](evidence/2026-07-17-yum-infra-current-compatibility-cutover.md)、[gated Pro exact-copy evidence](evidence/2026-07-17-gated-pro-exact-copy-adoption.md)、[ROOT COS-only evidence](evidence/2026-07-17-root-cos-builder-handoff.md)、[shared ROOT evidence](evidence/2026-07-17-root-shared-canonical-builder-handoff.md)、[ADR-0030](adr/0030-audit-bound-legacy-yum-missing-body-prune.md)、V-08/V-17/V-19/V-20；fresh copy 已真实完成 95 active repo 的零字节基线、40,659 APT、44,372 PGDG YUM、16,582 其他 YUM 与 958 active public asset 的 CAS/ref/provenance 纳管和幂等重放，源 serving tree 未改写；独立 50k 唯一 asset 真 CLI 又闭合实际并发、heap、精确计数与零改写/幂等专项。`apt-infra` 22 个 unindexed body 已 quarantine；PGDG 30,274 missing path 已闭合为 29,499 个官方恢复和 775 个 complete-set negative receipt，并以真 DNF 与 full fsck/GC 复核。当前 `yum/infra` 216 个 RPM 已全部签名并完成 fresh S0/S1/S2/S3、六组 strong DNF、L1/fsck/replay；gated Pro、COS-only ROOT 与 shared ROOT canonical body 均已完成本地 SOW 闭环并激活 owner。nested child 继续 quarantine；生产 Nginx/客户端/双云切换与 writer 撤权未演练，故状态仍为实现中。 |
+| MIG-06 | 可执行回滚，不隐藏 purge/验证 | `已实现/未验证` | [runbook](migration/runbook.md)、[forward-only restore](../internal/cli/publish_restore.go)、[restore evidence](evidence/2026-07-12-forward-only-remote-restore.md)、V-16/V-21：`publish --restore-generation N` 从 canonical Git/CAS 以前向新 generation 执行完整 upload/flip/purge/L3/checkpoint/ref saga，覆盖 APT/YUM 签名、双 target、崩溃恢复和篡改/缺 CAS/config/plan 负例；两个内容不同但共享 repo+arch 的历史 YUM alias 被恢复为一份 signed physical generation+两个 channel，purge 后故障可重放，再次重放 effect-free；sealed removal planner 只删单 alias pointer。历史 adopted payload 只有在成功 publication closure、当代 content.tsv 与当前 complete inventory 精确一致时才免 PUT，合法删除会重新上传；beta/latest asset path/leaf 及 APT/YUM topology 以 parent committed config + content proof + 默认条件 DELETE 或显式 ADR-0036 checkpoint-fenced DELETE + purge + 404 收敛，包体/immutable generation 保留，remote ref/channel 精确收敛；snapshot/stable topology 仍 fail closed。真实 R2 已证明条件 Delete 不可用，并用双次 streamed identity + run lease 安全收敛 storage-only 测试 key；未执行真实 Publisher checkpoint-fenced restore 事务。isolated-alias removal 未伪报为合法 config-change CLI E2E，真 Nginx/CDN/R2 全事务、COS 回滚与生产 writer 撤权仍未演练。 |
+| MIG-07 | 回写并废止旧 Pro 双独立 bucket 设计 | `已验证` | [ADR-0007](adr/0007-pro-oss-unified-repository.md) 冻结每云单合一 bucket；`/Users/vonng/pgsty/pigsty-pro-repo-design-20260710.md` 顶部已实写 superseded 标记并指向 ADR。这不验证 ANTI-02 的 60GB 假设。 |
+| MIG-08 | 门禁全过后才退役 Makefile | `实现中` | [runbook Phase 5](migration/runbook.md) 有 10 项退役门禁；44-family 合同与 writer-revoke preflight 已 fail-closed，Docker `default/help` 明确退役而非以 `sow --help` 冒充等价，V-07 正负例通过。生产 scheduler/ACL/cloud IAM 撤权、逐 target handoff/双云回滚仍未完成，Makefile 不得退役。 |
+
+## 10. 风险与 PoC
+
+| ID | 风险 | 状态 | 缓解证据/未闭合项 |
+|---|---|---|---|
+| RISK-01 | go-crypto 签名产物客户端兼容 | `已验证` | V-04 真 apt InRelease、DNF repomd asc、`rpm -K`。 |
+| RISK-02 | EdgeOne cache 是 per-node 还是 shared/tiered | `受阻` | [POC-01 harness](evidence/2026-07-12-real-cloud-acceptance-harness.md)要求 generation 5 在发布前由同 observer/node 取得旧字节 fresh `HIT` 并绑定 Age/max-age/剩余 TTL；sealed provider v3 evidence 只接受大写 ISO 3166-1 alpha-2 country，且必须同时出现不同 country、`EdgeServerID` 与公开 `EdgeServerIP`。不同代理或仅不同节点不能冒充地理证据；仍需真 EdgeOne zone/凭据/provider logs 才能回答。 |
+| RISK-03 | 重签破坏 EL9/10 SHA256 digest | `已验证` | Day 1 路径不重签且 receipt 拒绝 resign；未来启动单列 POC-04。 |
+| RISK-04 | 对象存储 by-hash 半残 | `已实现/未验证` | [by-hash retention](evidence/2026-07-12-apt-by-hash-retention.md)、[双 target 协议夹具清理](evidence/2026-07-12-evidence-bound-remote-deletion.md)、V-05/V-21；真 R2 Put/GET/Copy/Delete 能力已验，并把不支持条件 Delete 的事实收敛到显式 checkpoint-fenced 模式。真实 R2 by-hash 完整发布/中断/retention、COS 与 CDN 仍未验。 |
+| RISK-05 | 50k 单线程/OOM | `已验证` | V-08 七个独立规模证据，含 adoption 真 CLI 的 8/8 import 峰值、124,347,360B sampled peak heap growth、538,040B retained growth、167,116,800B OS max RSS growth、精确 50k canonical/provenance/CAS tuple closure 和耗时；缺体负例全集落 SQLite/磁盘报告而非 Go slice/string。 |
+| RISK-06 | R2/COS/CDN/EdgeOne 真实外部依赖 | `受阻` | V-21 已验证 owner 授权的非生产 R2 storage data-plane、main/beta raw custom-domain 当前对象读取，并实测删除后 1800s stale HIT；V-23 已把该 raw front door 作为 confidential publish 的零 mutation 失败门，并证明两域当前确实不具备 v2 edge denial contract。仍缺 Cloudflare Worker/control token、真实 purge/negative verify/multi-PoP/cache-log、COS/EdgeOne、隔离日志/观测资源与完整双云事务。 |
+
+| ID | PoC/强制验证 | 状态 | 实跑证据/边界 |
+|---|---|---|---|
+| POC-01 | EdgeOne 不同 token 干净 URL 共享/tiered cache | `受阻` | 双 token/双出口合同要求 token A prime 后 token B clean-key `HIT`，generation 5 另保存 pre-purge fresh HIT/TTL；发布前独立 watcher 持有 liveness lock，父进程 SIGKILL 后仍经同 observer/proxy 路径在旧 TTL 内持久化新 body/cache/request/time 证据。sealed active v5 与 provider v3 逐 request/parent 关联，并以 country-only + 不同公开 node IP/node ID 证明地理差异。缺真 same-host `https-bearer` 部署、token provider、独立出口和 provider logs，故保持受阻。 |
+| POC-02 | go-crypto InRelease 被真 apt update/install 接受 | `已验证` | V-04 与 [support-floor evidence](evidence/2026-07-11-client-compat.md)；apt 1.2.35、2.4.14 均须观测 by-hash GET 并完成精确安装才通过。 |
+| POC-03 | repomd asc 被真 yum/dnf `repo_gpgcheck=1` 接受 | `已验证` | V-04 的冻结 EL7 YUM 3.4.3 与 EL8/9/10 DNF；[atomicity evidence](evidence/2026-07-12-yum-generation-atomicity.md) 的真 generation mirrorlist。 |
+| POC-04 | 若未来启用 RPM 重签，EL9/10 `rpm -K` | `条件未触发` | FR-17 的商业启动条件尚未出现；不将原签名 `rpm -K` 伪报成重签 PoC。 |
+| POC-05 | 本地 S3：CAS/checkpoint/差异/重放/幂等 | `已验证` | V-05 真 MinIO 进程和 SigV4；覆盖 conditional PUT、HEAD/GET/List/Copy 及非破坏性完整 saga/重放。pinned MinIO 会忽略 DELETE `If-Match`，默认产品 probe 在 live key 前 fail closed；V-21 证明真实 R2 行为相同，并验证 identity-bound run-owned 无条件清理，但没有实跑 Publisher checkpoint-fenced 全事务。POC-05 仍只代表本地完整 saga；真实 R2 子集单列 V-21/POC-06。 |
+| POC-06 | 专用非生产 R2/Worker/CF CDN + COS/EdgeOne/CDN；生产资源禁止测试 | `受阻` | opt-in 夹具已接入 durable purge sidecar/canonical Git receipt、双 target pointer-flipped 恢复、active v5/provider v3 + seals、pre-purge freshness 与 country-only EdgeOne evidence；direct origin 仍只算 `BYPASS`。完整 50 步程序已有 durable phase ledger、逐 CLI 子日志、运行/源码/二进制/资源身份与 crash recovery，snapshot 恢复验证 SQLite canonical HEAD/membership；独立 HMAC-bound watcher已关闭本地 purge→post-probe TTL 持久化窗口。provider API raw-export/deployed-bundle collector 已通过 loopback 官方 SDK/签名协议测试；provider raw-sink mutation 现在必须位于 durable ledger/reservation 之后。离线 registry candidate generator 与单供应商 read-only readiness receipt 已实现，[harness](evidence/2026-07-12-real-cloud-acceptance-harness.md)、[本地证据](evidence/2026-07-17-real-cloud-safety-entrypoints.md)、[ADR-0032](adr/0032-owner-designated-cloudflare-test-resource-exception.md)与[ADR-0033](adr/0033-provider-scoped-readiness-registry.md)保留精确边界。[Cloudflare `pro` 历史只读盘点](evidence/2026-07-17-cloudflare-pro-readonly-inventory.md)保留变更前状态；[2026-07-18 非生产域 readiness 收口](evidence/2026-07-18-cloudflare-pro-domain-readiness.md)随后在 owner 授权内把 exact main+beta custom domain 配成 TLS 1.2、active/access-enabled，权威/公共 DNS 与 TLS 1.0/1.1 拒绝、1.2/1.3 成功均实测，认证 R2 List 返回 `count=0`，SOW Go SigV4 List 也已通过并在下一步的故意无效 API token zone query 处失败。V-21 又真实证明 main/beta raw custom-domain 当前对象读取一致，并在 bucket 删除后同时观测 exact 1800s stale HIT；该结果只关闭 raw data plane，同时直接证明 purge/negative verify 仍不可缺。V-23 随后用产品 provider/CLI 对两个 exact raw host 执行匿名只读 canary，二者都因缺 `sow-edge-runtime/v2` 私有拒绝合同而在远端 mutation=0 处按设计失败；因此错误 raw front door 已不能被 gated publish 误用，但这仍是 POC-06 的负门禁而非 Worker/purge 成功证据。独立 SHA-pinned provider-readiness registry 现在且仅包含这个 Cloudflare tuple，不再等待 COS/EdgeOne 或 deployment identity；readiness seal 已升级为 Ed25519 v2，私钥 seed 仅由环境注入，bootstrap plan/registry 钉住公钥，重算 SHA/size 或攻击者换钥的负例均失败。官方 R2 control API 仍须用真实 scoped token签出 exact two-domain/ownership/SSL/TLS/Modern-cipher digest。完整 mutation/evidence 仍须命中双云 resource、provider-deployment 与 bootstrap registries。shared-zone route 与 Logpush 都按 reviewed-host/raw-bucket 相关闭包审计，任一未知重叠失败关闭；provider attestation v3 连续双读三个 Worker 的 runtime/security、完整 route/domain/Worker inventory 与 EdgeOne realtime-log 不可变 area，双云日志 setup 由独立 R2 CAS lease 串行。任一 tuple 子集、其他 Pigsty 资源和全部生产仓库继续拒绝。Cloudflare signed readiness 当前唯一外部缺口是具备 exact-account Workers R2 Storage Read 与 exact-zone Zone Read 的 API token；完整 POC 另缺隔离 IAM/日志 writer-reader、独立 log-control identity、same-host `https-bearer` verifier、entitlement、独立出口、COS/EdgeOne topology 与真实 purge/negative verify/multi-PoP/cache/provider logs，故保持受阻；任何 CO/COS/Cloudflare 生产仓库永久禁止用于补证据。 |
+| POC-07 | 约 50k 包并行/流式/发布调用数 | `已验证` | V-08 和 G3；最终版 50k adoption 使用唯一小正文而非重复对象，生产 worker 原子计数实际达到 8/8，并以四路 tuple closure、SQLite provenance、逐 CAS verify、5ms sampled heap 与 OS RSS 高水位避免 count-only/HeapAlloc-only 自证。证据明确注明小正文/网络带宽边界，不代替真云时延。 |
+
+POC-06 的 R2 storage/raw custom-domain data-plane 子集已由 V-21 真实执行：条件 PUT/CAS、读取与
+Copy 成立，DeleteObject `If-Match` 不成立；run-owned 双正文/lease 绑定的无条件测试清理后
+bucket 为空。main/beta 当前对象读取一致，但删除后仍同时返回 exact 1800s stale HIT，直接证明
+真实 Publisher checkpoint-fenced delete/purge/negative-verify/commit 缺一不可。该步骤没有
+Worker、purge API、provider logs、COS/EdgeOne、multi-PoP 或跨 target saga，因此 POC-06 仍为
+`受阻`，也没有使用任何生产仓库。
+
+POC-06 的 Cloudflare first-deployment bootstrap 已进一步以 fresh same-run readiness、动态
+mode/run/plan/account/zone 授权、run-bound ownership、create-only upload、R2 CAS lease、双次
+closure、atomic receipt、过期租约恢复及 verifier 全 runtime/settings 合同关闭本地人工部署与并发/
+中断缺口；见 [bootstrap offline evidence](evidence/2026-07-17-cloudflare-bootstrap-offline-validation.md)
+与 [ADR-0034](adr/0034-cloudflare-nonproduction-worker-bootstrap.md)。这不改变 POC-06 的 `受阻` 状态：
+尚未取得真实 signed readiness、deployment/provider evidence，且尚未执行 Worker、route、purge、
+CDN purge 或 provider-log mutation。V-21 只是在 owner 单独授权的空 `pro` bucket 中执行隔离的
+R2 storage 与匿名 raw custom-domain 读取/删除后 stale-cache 观测，不能冒充 bootstrap、
+post-purge negative verify 或完整 POC。
+
+2026-07-18 的怀疑式复核又关闭 readiness→bootstrap 的 TOCTOU：lease create/CAS 后与每次
+mutation 前续租后，完整分页 inventory 必须证明桶内只有当前 exact lease，随后 GET 绑定
+canonical bytes/ETag；同一写边界还会把 exact zone 与 active main/beta R2 custom-domain/TLS
+digest 重新和 readiness receipt 比较。外来对象、缺失/替换租约、分页循环或 provider-control
+漂移的负例都证明内层 Worker/route mutation 调用为 0。该证据补强 FR-38、NFR-09 与 POC-06
+本地门禁，但未执行真实 Worker/route/control-plane mutation，因此三者状态不升级；V-21 的
+隔离 R2 storage 写入属于另一条独立授权、独立 allowlist 的窄化证据。
+
+同日的 [rollback hardening](evidence/2026-07-18-cloudflare-bootstrap-rollback-hardening.md)
+又把 route/Worker receipt identity 收进单个 checked-delete adapter：即使 provider inventory
+漏项仍精确探测，Worker 删除前要求附件闭包和唯一 sealed version，exact 404 与 provider 已成功/
+客户端丢响应均可重放；每次 mutation 还要求剩余租约预算并设置 TTL/3 deadline。rollback 的
+fresh readiness 已移到凭据前，`recover-lease` 仅持有 R2 SigV4 authority。官方 SDK loopback、
+ordinary/race、clean-delivery 与 `go test ./... -timeout=30m` 全部通过；Cloudflare 无条件删除、
+外部管理员并发及本地时钟偏移仍不被伪称为原子 CAS，且没有执行任何云写入。
+
+随后 [provider attestation v3 离线证据](evidence/2026-07-17-cloudflare-provider-attestation-offline-validation.md)
+与 [ADR-0035](adr/0035-cloudflare-provider-attestation-and-log-sink-lease.md)补齐 active runtime/settings/
+schedule/exposure、完整 inventory 双读、R2 custom-domain TLS policy 与 provider-log setup CAS lease；
+这些仍只有官方 SDK loopback/fake-store ordinary/race 证据，不改变 POC-06 的 `受阻` 状态。
+
+## 11. 开放问题
+
+| ID | 问题 | 状态 | 当前决定/阻断条件 |
+|---|---|---|---|
+| OQ-1 | token URL 前缀 | `已冻结` | `/pro/v1/{token}/`；[ADR-0001](adr/0001-core-contracts.md) 和 schema 拒绝其他值。 |
+| OQ-2 | EdgeOne cache 层级 | `受阻` | 与 POC-01 同一真环境门禁；若不满足则执行 Basic fallback，不伪报。 |
+| OQ-3 | 快照 ID | `已冻结` | UTC `<suite>-YYYYMMDD`；同 suite/日不同 commit 冲突拒绝。 |
+| OQ-4 | 远端物化月数 N | `已冻结` | 默认 6 个自然月，正整数可配；[retention tests](../internal/cli/publish_retention_test.go)。成本实测仍属 ANTI-02。 |
+| OQ-5 | 从哪个 Pigsty 版本起冻结 EL8 | `已冻结` | Owner 于 2026-07-16 明确决定 **Pigsty v5.0.0**；[ADR-0029](adr/0029-client-support-floor-and-el8-freeze-version.md)、配置错误信息与迁移合同同步冻结。 |
+
+## 12. 合同张力处置
+
+| ID | 张力 | 当前处置 |
+|---|---|---|
+| ADR-T01 | publish 整体失败 vs 两云独立滞后 | [ADR-0001](adr/0001-core-contracts.md) 冻结为 per-target saga；任一失败 CLI 非零，已成功目标不伪回滚。真云未验。 |
+| ADR-T02 | YUM 两对象 vs S3 单键原子 | generation mirrorlist 解决强路径；raw alias 明确为 GAP，见 FR-26/FZ-06。 |
+| ADR-T03 | `rm` vs stable 不丢包 | stable/snapshot append-only，GC 只删全 ref 不可达字节；负例已验。 |
+| ADR-T04 | Git 正典 vs 零外部 git | [go-git state](../internal/state/store.go) 已解决，无系统 git 运行时。 |
+| ADR-T05 | 差异零 API vs checkpoint GET/CAS | diff 纯本地；有界 GET/CAS 仅做事务/漂移，已在计数测试分开。 |
+| ADR-T06 | beta/latest 均公开 vs `OSS=latest` 简写 | 两 public view 均强制 FR-33，无跳过面。 |
+| ADR-T07 | 单 Go CLI vs 两边缘 JS 运行时 | CLI 仍单 Go 二进制；边缘仅共享行为契约，不引入通用云层。 |
+| ADR-T08 | FZ-04 冻结 vs OQ-1/OQ-3 当时未定 | 已由 ADR/schema 冻结，见 OQ-1/OQ-3。 |
+| ADR-T09 | PRD 配置雏形称 target 含 published ref | [ADR-0015](adr/0015-target-identity-and-published-ref-state.md) 冻结为 YAML 声明稳定目标身份、动态 ref/checkpoint/content 属 embedded-Git canonical state；generation `config_sha256` 是 canonical YAML 加 exact ref-vector 可达 YUM package-keyring identities 的域分离 publication identity，并由同一 immutable trust snapshot 提供内存 keyring；保留每目标独立跟踪语义且避免发布写回操作者配置。 |
+| ADR-T10 | Addendum 提到 aptly snapshot filter/merge/pull | 该段标题为“借鉴清单（自研引擎设计输入）”，不是 PRD 命令面；v1 范围由 FR-18 的 beta/latest/stable、`promote` 清单代数与 immutable snapshot ref 闭合，不新增 aptly 兼容 CLI。 |
+| ADR-T11 | 严格协议夹具 vs 冻结的厂商 SDK 契约 | [ADR-0016](adr/0016-frozen-vendor-sdk-boundary.md) 用 AWS S3/Cloudflare v7/Tencent TEO 官方 SDK 替换手写 SigV4/TC3/purge；R2/COS 条件 Put/Copy 等厂商扩展只在官方签名前做闭集投影；Delete 能力与显式 checkpoint-fenced fallback 由 [ADR-0036](adr/0036-provider-delete-capability-and-checkpoint-fenced-fallback.md) 单列，整体保留 fail-closed 且不形成通用云抽象。 |
+| ADR-T12 | PRD 要求 apt<1.2 mutable 原子兜底 vs 真 apt 1.0 负 PoC | [ADR-0029](adr/0029-client-support-floor-and-el8-freeze-version.md) 依据 2026-07-16 owner 决议把产品支持下限冻结为 apt 1.2；旧客户端必须迁移升级，负 PoC 保留为协议反证，不能被改写为成功。 |
+| ADR-T13 | ADR-0027 默认拒绝 YUM 缺体 vs 官方归档已移除部分历史 testing RPM | [ADR-0030](adr/0030-audit-bound-legacy-yum-missing-body-prune.md) 保留默认 fail-closed，仅允许 exact current blocker digest、两次解析集合稳定性和逐条负向 provenance 绑定的窄化修复；present-but-unindexed body 不适用。owner 于 2026-07-16 授权自行恢复/修复并明确说明，但完整副本 corpus 仍须实跑。 |
+
+## 13. 阻断项与下一轮门禁
+
+1. **真实云/边缘**：owner 已提供并授权 Cloudflare 测试 bucket `pro`、`pro.pigsty.io` 与冻结的 `beta.pro.pigsty.io`。2026-07-18 已确认 exact account/zone、认证空桶、main+beta DNS/HTTPS、TLS 1.0/1.1 拒绝与 1.2/1.3 成功；两个 custom domain 都是 TLS 1.2、active/access-enabled，exact tuple 已进入独立 provider-readiness registry，SOW Go SigV4 List 已通过。V-21 又在该空桶真实通过 R2 create-only/CAS/HEAD/stream GET/source-conditioned Copy，并证明 DeleteObject 忽略 `If-Match`；本次 run-owned key 已由双 streamed identity + lease 绑定的无条件 cleanup 删除，独立清单确认桶仍为空。main/beta raw custom-domain 当前对象均精确命中，但 bucket 删除后仍有相同正文/ETag 的 1800s stale HIT；这是 purge 不可省略的真实负能力证据，不是 purge/negative verify 通过。V-23 已把这两个 raw host 的 generic 404 固化为 gated publish 在任何 mutation 前的预期失败，并以真实 provider/CLI 证明失败时 PUT/Copy/Delete/purge 为 0；因此当前不会因为缺 Worker 而把闭源字节先写进公开前门。单 Cloudflare signed readiness 不再依赖另一云或 deployment registry；当前 control-plane 外部缺口是同时具备 exact-zone Zone Read 与 exact-account Workers R2 Storage Read 的 Cloudflare API token，用于签出 zone/custom-domain control digest 与 receipt/seal。完整 POC-06 仍缺真实 Publisher fallback、Worker/purge/negative verify、双云 deployment identity、隔离日志 IAM、COS（从未 versioned）/EdgeOne、private origin、entitlement、multi-PoP/cache-log 和独立观测资源；FR-04/20–22/25/27–28/30–31/34–40 与 NFR-06/08/09 因此不能最终通过。
+2. **兼容 alias**：apt<1.2 已按 ADR-0029 排除在支持矩阵之外；raw YUM baseurl 签名对仍有混代窗口。强 generation mirrorlist、冻结 EL7 YUM 3 + EL8/9/10 DNF 本地验收，以及 28-definition Pigsty consumer 的 audit/stage/apply/rollback 已通过；仍须在专用非生产双 origin 发布全部 mapped physical generations 和 `rpm-trust.asc`，探测真实 endpoint，再执行经授权的生产切换/回滚。
+3. **生产迁移**：176-target 处置闭合不等于 G5；迁移前 URL/ETag/cache/bucket 基线已保存，且远端历史 generation 的前向 restore 操作面已覆盖 beta/latest asset 与 APT/YUM topology。真旧树 staging、builder handoff、COS delete 能力/显式 fallback、双云 purge/回滚、切换后对比与旧写权撤销均未做；V-21 的隔离 R2 storage 测试不是生产迁移。
+4. **Builder/handoff 边界**：V-17 已关闭 `apt-infra` quarantine、PGDG 30,274 条 missing-body corpus和 `yum/infra` 216-RPM package trust；V-18 已实跑外部 builder 到 asset/DEB/RPM `sow add` 的逐对象摘要/长度绑定；V-19 已关闭 COS-only `/cc`、`/claude`、`/ray` exact-copy；V-20 又把 shared `/get`、`/pig`、`/pkg`、`/beta` 的八个 `.io/.cc` 源收敛为四个 deterministic mirror-aware body，并激活 exact target-affinity owner。当前 exact copy 已完成双架构 S0→S3 与 EL7/8/9/10 真客户端，历史 22-path unsigned inventory 只保留发现链。两个 root `modules.yaml` 已精确 quarantine，SOW 未生成 modulemd 或隐式重签。此边界剩余的是生产 builder receipt 归档、真实 URL/cutover/rollback，不是缺包或 EL8 v5.0.0 lifecycle 决策本身。
+5. **运营数据**：G1、ANTI-01/02/03、NFR-07 需真实上线或迁移测量，不能从本地测试推导通过。
+6. **当前 product identity/clean delivery**：ordinary/race、静态、四平台构建、真 apt/dnf/Nginx、MinIO 与 50k ordinary/race 已按 current source 重跑；post-document clean-delivery 的最终 file count/digest 只写入 V-14 所指 external handoff以避免自引用。它关闭本地交付身份，不产生 Git release revision，也不关闭真云、生产迁移或运营指标。
+
+最终 Goal 审计前必须重跑所有受最终源码直接影响的门禁；保留的日期化历史证据须继续标明日期与边界，不能冒充当前重跑。V-14 已由交付根外的双份一致身份关闭；还必须完成真 POC-01/06、生产迁移/回滚和老客户端处置，并保证本矩阵不再出现 `实现中`、`已实现/未验证`、`未实现`、`未验证` 或未经豁免的 `受阻`。

@@ -1,0 +1,13 @@
+# schema=sow-pigsty-yum-consumer-files/v1
+# relative_path	expected_definitions	kind
+roles/node/tasks/pkg.yml	0	renderer
+roles/repo/tasks/build.yml	0	renderer
+conf/build/dev.yml	3	consumer
+conf/demo/el.yml	4	consumer
+roles/node_id/vars/el7.x86_64.yml	3	consumer
+roles/node_id/vars/el8.aarch64.yml	3	consumer
+roles/node_id/vars/el8.x86_64.yml	3	consumer
+roles/node_id/vars/el9.aarch64.yml	3	consumer
+roles/node_id/vars/el9.x86_64.yml	3	consumer
+roles/node_id/vars/el10.aarch64.yml	3	consumer
+roles/node_id/vars/el10.x86_64.yml	3	consumer

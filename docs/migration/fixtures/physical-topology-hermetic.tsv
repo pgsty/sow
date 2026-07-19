@@ -1,0 +1,28 @@
+# sow hermetic physical topology fixture v1
+# scope: synthetic local-only fixture; no legacy checkout and no cloud
+# security: synthetic bin/fileauth.txt must be excluded; pro contents are metadata-only
+# columns: kind logical_path physical_path scope_or_family bytes sha256
+# count apt-index 2
+# count yum-repomd-total 2
+# count yum-repomd-nested 1
+# count root-exact-key 2
+# count root-directory-prefix 2
+# count pro-file 2
+apt-index	apt/demo/dists/stable/main/binary-amd64	apt/demo/dists/stable/main/binary-amd64/Packages	demo	19	eaa79fb237d231bac7d88e958a8d2d3cc9230edbdec9219ce56f92747651ae7f
+apt-index	apt/demo/dists/testing/main/binary-arm64	apt/demo/dists/testing/main/binary-arm64/Packages	demo	20	aeb8892ee543746df810de518027f4474f0554126f18842395232176ecce39bf
+pro-file	/pro/a.tgz	pro/a.tgz	gated-metadata-only	8	-
+pro-file	/pro/b.tgz	pro/b.tgz	gated-metadata-only	9	-
+root-key-source	/get	bin/get.cc	co	15	c427d8c80ba42e923082143f6d32ca9c181e6c8bbbc9462ba3389efdd887dd06
+root-key-source	/get	bin/get.io	cf	15	49f4696be0bbd2c4a53820fe2ab07f21b2dc842775bfa500bb978cdb4afe1a60
+root-key-source	/ray	bin/ray	co	12	284cc7b5aac1aa984a2554c50227654fdba6126cd3b584f3b17f944033fba584
+root-prefix-source	/pkg/pig/	pkg/pig/	co	-	-
+root-prefix-source	/src/	src/	cf	-	-
+source	Makefile	Makefile	reviewed-public-source	237	15984e2f9a097118abb95b8a597cc32bcbad1b31405e1956f0babb21a3b2bf25
+source	apt/Makefile	apt/Makefile	reviewed-public-source	20	e80a92f3eee7a1947a93dff400f4b6d51175a80b35b4791eccf58b8f9254846a
+source	apt/list/gen	apt/list/gen	reviewed-public-source	24	1f2d06621d645e19935eafcaacc86f8a369896bc1014bb94b58da2c240ab2549
+source	docker/Dockerfile	docker/Dockerfile	reviewed-public-source	22	5fa4753b133a887654c3d6be85ff8dd3ba5f7f38796d7fefa0be82c4c850421a
+source	docker/Makefile	docker/Makefile	reviewed-public-source	23	c1a60f17fbb0371d3858bbf78c78c4405417b83f0b4327b6005c2eb27181238f
+source	yum/Makefile	yum/Makefile	reviewed-public-source	20	66ee9dd974e4d5599ec438b0a22e02ea3d193dc3423ba9aa934bea5a78f2d377
+source	yum/build	yum/build	reviewed-public-source	21	c2549892306dddba1fb6dc6484a7b099da9675cf89252756d4279bd940099ae2
+yum-repomd	yum/pgdg/17/redhat/rhel-10-aarch64	yum/pgdg/17/redhat/rhel-10-aarch64/repodata/repomd.xml	pgdg	24	5e96c51554962ca5cda9a27cd52e74954c13934d75c35b75e4a401a44fd19b28
+yum-repomd-nested	yum/pgdg/17/redhat/rhel-10-aarch64/rhel-10.0-aarch64	yum/pgdg/17/redhat/rhel-10-aarch64/rhel-10.0-aarch64/repodata/repomd.xml	pgdg	24	e6bbf5b10c8ecd0468b0d556b9cd2ed4df34a25fb9898cb6fefcd0f3caad9cee

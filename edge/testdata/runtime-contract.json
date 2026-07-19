@@ -1,0 +1,11 @@
+{
+  "schema": "sow-edge-runtime/v2",
+  "pro_prefix": "/pro/v1/{token}/",
+  "token_verifier": "provider://pigsty-entitlements",
+  "runtime_variables": {
+    "SOW_EDGE_SCHEMA": "sow-edge-runtime/v2",
+    "SOW_PRO_PREFIX": "/pro/v1/{token}/",
+    "SOW_TOKEN_VERIFIER": "provider://pigsty-entitlements",
+    "SOW_COMPATIBILITY_ADMISSION": "{\"apt_roots\":[\"apt/infra\"],\"yum_repos\":[\"infra\"],\"yum_roots\":[\"yum/infra/x86_64\"],\"yum_channels\":[{\"view\":\"beta\",\"repo\":\"infra\",\"os\":\"el9\",\"arch\":\"x86_64\",\"root\":\"yum/infra/x86_64\"},{\"view\":\"latest\",\"repo\":\"infra\",\"os\":\"el9\",\"arch\":\"x86_64\",\"root\":\"yum/infra/x86_64\"},{\"view\":\"stable\",\"repo\":\"infra\",\"os\":\"el9\",\"arch\":\"x86_64\",\"root\":\"yum/infra/x86_64\"}],\"asset_roots\":[\"pkg\"],\"asset_keys\":[],\"projections\":[],\"snapshots\":[{\"id\":\"jammy-20260712\",\"apt_roots\":[\"apt/infra\"],\"yum_roots\":[\"yum/infra/x86_64\"],\"asset_roots\":[\"pkg\"],\"asset_keys\":[]}],\"raw\":[],\"active\":[]}"
+  }
+}

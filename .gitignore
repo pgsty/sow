@@ -8,7 +8,7 @@
 .idea/
 *.iml
 .DS_Store
-sow
+/sow
 *.test
 coverage.out
 .sow/

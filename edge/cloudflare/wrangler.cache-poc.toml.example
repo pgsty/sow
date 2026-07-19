@@ -1,0 +1,40 @@
+# POC-06 candidate only. This is not the default private-origin deployment.
+# The exact same-host clean URL must be blocked from anonymous public access,
+# and the zone origin must independently validate SOW_ORIGIN_BEARER: the pinned
+# same-zone Fetch behavior bypasses mapped Workers and security rules. Inject
+# SOW_ORIGIN_BEARER and verifier secrets with `wrangler secret put`.
+# The allowlists below illustrate shape only. Generate the real pair with
+# `sow materialize latest --edge-contract cf`; never hand-author or widen exact
+# pkg into a public prefix.
+
+name = "sow-repository-edge-cache-poc"
+main = "../dist/cloudflare-worker.mjs"
+compatibility_date = "2026-07-11"
+compatibility_flags = ["global_fetch_private_origin"]
+workers_dev = false
+preview_urls = false
+
+[vars]
+SOW_EDGE_SCHEMA = "sow-edge-runtime/v2"
+SOW_PRO_PREFIX = "/pro/v1/{token}/"
+SOW_PUBLIC_BASE_URL = "https://repo.example"
+SOW_BETA_BASE_URL = "https://beta.example"
+SOW_TOKEN_VERIFIER = "provider://pigsty-entitlements"
+SOW_PUBLIC_PREFIXES = '["apt","pkg/pig","yum"]'
+SOW_PUBLIC_KEYS = '["keys/pigsty.asc","pkg"]'
+SOW_COMPATIBILITY_ADMISSION = '{"apt_roots":[],"yum_repos":[],"yum_roots":[],"yum_channels":[],"asset_roots":[],"asset_keys":[],"projections":[],"snapshots":[],"raw":[],"active":[]}'
+SOW_ORIGIN_MODE = "https-bearer"
+SOW_ORIGIN_BASE_URL = "https://repo.example"
+SOW_BETA_ORIGIN_BASE_URL = "https://beta.example"
+
+[[routes]]
+pattern = "repo.example/*"
+zone_name = "example"
+
+[[routes]]
+pattern = "beta.example/*"
+zone_name = "example"
+
+[[services]]
+binding = "TOKEN_VERIFIER"
+service = "pigsty-entitlements"

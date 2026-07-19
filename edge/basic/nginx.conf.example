@@ -1,0 +1,37 @@
+# Standalone FR-40 fallback. This server is independent of Worker/EdgeOne.
+# Point the generated include at the exact stable serving tree produced by
+# `sow materialize stable` (or an explicit stable export). The include is the
+# canonical route projection; do not hand-maintain repository locations here.
+#
+# Generate the route include atomically from the validated sow.yaml:
+#
+#   sow materialize stable --config /etc/sow/sow.yaml \
+#     --nginx-include /etc/nginx/sow-stable.locations.conf \
+#     --nginx-auth-user-file /etc/nginx/sow.htpasswd
+#
+# The generated file contains one exact/prefix route for every selected stable
+# repository projection, exact public trust bundles, bounded YUM mirrorlist and
+# generation routes, GET/HEAD-only policy, symlink denial, Basic Auth and
+# `private, no-store`. It ends with `location / { return 404; }`; therefore the
+# enclosing server must not add a broader root, try_files, /apt/, /yum/, or
+# /_sow/ fallback.
+#
+# Generate the password file with an RFC2307, bcrypt, or crypt hash supported
+# by your Nginx build. Never put plaintext production credentials in config.
+# Publish this origin only through a CDN behavior that forwards Authorization
+# to origin and does NOT cache these private,no-store responses. Excluding
+# Authorization from a cache key while authentication happens only at Nginx is
+# unsafe: an anonymous request could reuse an object populated by an earlier
+# authenticated request. Shared caching is allowed only when Worker/EdgeOne/WAF
+# authenticates before cache lookup and emits a separate clean subrequest; this
+# standalone fallback intentionally provides no such shared-cache claim.
+
+server {
+    listen 443 ssl;
+    server_name pro-basic.example.com;
+
+    ssl_certificate /etc/nginx/tls/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/private.key;
+
+    include /etc/nginx/sow-stable.locations.conf;
+}

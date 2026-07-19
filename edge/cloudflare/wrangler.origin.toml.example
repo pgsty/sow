@@ -1,0 +1,13 @@
+# Deploy this Worker before edge/dist/cloudflare-worker.mjs. It is reachable
+# only through the auth Worker's ORIGIN service binding: no workers.dev,
+# preview URL or public route is enabled.
+
+name = "sow-private-repository-origin"
+main = "../dist/cloudflare-origin-worker.mjs"
+compatibility_date = "2026-07-11"
+workers_dev = false
+preview_urls = false
+
+[[r2_buckets]]
+binding = "REPOSITORY"
+bucket_name = "replace-with-dedicated-sow-r2-bucket"

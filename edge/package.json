@@ -1,0 +1,9 @@
+{
+  "name": "@pgsty/sow-edge-contract",
+  "private": true,
+  "type": "module",
+  "scripts": {
+	"build": "node build.mjs",
+	"test": "node build.mjs --check && node --check dist/cloudflare-worker.mjs && node --check dist/cloudflare-origin-worker.mjs && node --check dist/edgeone.js && node --test test/*.test.mjs"
+  }
+}
