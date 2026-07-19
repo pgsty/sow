@@ -47,6 +47,66 @@ type publishTargetClient struct {
 	deleteMode string
 	r2         *publish.R2CloudflareHTTP
 	cos        *publish.COSEdgeOneHTTP
+	r2Control  *publish.R2CloudflareControlHTTP
+	cosControl *publish.COSControlHTTP
+}
+
+// newRemoteAuditTargetClient constructs the least-authority provider surface
+// used by fsck. It resolves only object-storage credentials and therefore
+// cannot purge a CDN or mutate Worker/EdgeOne configuration.
+func newRemoteAuditTargetClient(cfg *config.Config, targetName string) (*publishTargetClient, error) {
+	target, exists := cfg.Targets[targetName]
+	if !exists {
+		return nil, fmt.Errorf("publish target %q is not configured", targetName)
+	}
+	storageRaw, err := resolveSecret(target.Storage.Credential, "", false)
+	if err != nil {
+		return nil, err
+	}
+	defer clearSecret(storageRaw)
+	var storage objectStorageSecret
+	if err := decodeSecretJSON(storageRaw, &storage); err != nil {
+		return nil, errors.New("decode target storage credential JSON")
+	}
+	objectBase, err := providerBucketBaseURL(target.Storage.Endpoint, target.Storage.Bucket)
+	if err != nil {
+		return nil, err
+	}
+	region := target.Storage.Region
+	credentials := publish.S3Credentials{
+		AccessKeyID: storage.AccessKeyID, SecretAccessKey: storage.SecretAccessKey,
+		SessionToken: storage.SessionToken, Region: region,
+	}
+	switch targetName {
+	case string(publish.TargetCloudflare):
+		if region == "" {
+			region = "auto"
+			credentials.Region = region
+		}
+		if region != "auto" {
+			return nil, errors.New("Cloudflare R2 signing region must be auto")
+		}
+		provider, err := publish.NewR2CloudflareControlHTTP(publish.R2CloudflareControlHTTPConfig{
+			Bucket: target.Storage.Bucket, ObjectBaseURL: objectBase, Credentials: credentials, Client: publishProviderHTTPClient,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &publishTargetClient{name: publish.TargetCloudflare, deleteMode: target.Storage.DeleteMode, r2Control: provider}, nil
+	case string(publish.TargetTencent):
+		if region == "" {
+			return nil, errors.New("Tencent COS storage.region is required")
+		}
+		provider, err := publish.NewCOSControlHTTP(publish.COSControlHTTPConfig{
+			Bucket: target.Storage.Bucket, ObjectBaseURL: objectBase, Credentials: credentials, Client: publishProviderHTTPClient,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &publishTargetClient{name: publish.TargetTencent, deleteMode: target.Storage.DeleteMode, cosControl: provider}, nil
+	default:
+		return nil, fmt.Errorf("unsupported publish target %q", targetName)
+	}
 }
 
 func newPublishTargetClient(cfg *config.Config, targetName, viewName string, requireBasic bool) (*publishTargetClient, error) {

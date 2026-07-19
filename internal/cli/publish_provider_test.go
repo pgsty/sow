@@ -103,3 +103,51 @@ func TestPublishTargetClientCarriesExplicitCheckpointFencedDeleteMode(t *testing
 		t.Fatalf("construct checkpoint-fenced publisher: publisher=%#v err=%v", publisher, err)
 	}
 }
+
+func TestRemoteAuditTargetClientUsesOnlyStorageAuthority(t *testing.T) {
+	t.Setenv("SOW_TEST_AUDIT_R2_STORAGE", `{"access_key_id":"r2-access","secret_access_key":"r2-secret"}`)
+	t.Setenv("SOW_TEST_AUDIT_COS_STORAGE", `{"access_key_id":"cos-access","secret_access_key":"cos-secret"}`)
+	t.Setenv("SOW_TEST_AUDIT_COS_CDN", `this-is-deliberately-not-json`)
+	cfg := &config.Config{Targets: map[string]config.Target{
+		"cf": {
+			Storage: config.Storage{
+				Kind: "r2", Endpoint: "https://account.r2.cloudflarestorage.com", Bucket: "test-bucket", Region: "auto",
+				Credential: "env://SOW_TEST_AUDIT_R2_STORAGE", DeleteMode: config.StorageDeleteCheckpointFenced,
+			},
+			CDN: config.CDN{
+				Kind: "cloudflare", BaseURL: "https://repo.example.invalid", BetaBaseURL: "https://beta.example.invalid",
+				ZoneID: "test-zone", Credential: "env://SOW_TEST_AUDIT_CF_CDN_DOES_NOT_EXIST",
+			},
+		},
+		"cos": {
+			Storage: config.Storage{
+				Kind: "cos", Endpoint: "https://cos.ap-shanghai.myqcloud.com", Bucket: "repo-1250000000", Region: "ap-shanghai",
+				Credential: "env://SOW_TEST_AUDIT_COS_STORAGE", DeleteMode: config.StorageDeleteCheckpointFenced,
+			},
+			CDN: config.CDN{
+				Kind: "edgeone", BaseURL: "https://repo-cn.example.invalid", BetaBaseURL: "https://beta-cn.example.invalid",
+				Distribution: "test-zone", Credential: "env://SOW_TEST_AUDIT_COS_CDN",
+			},
+		},
+	}}
+	for _, target := range []string{"cf", "cos"} {
+		t.Run(target, func(t *testing.T) {
+			client, err := newRemoteAuditTargetClient(cfg, target)
+			if err != nil {
+				t.Fatalf("construct storage-only %s audit client: %v", target, err)
+			}
+			if client.r2 != nil || client.cos != nil {
+				t.Fatalf("storage-only %s client acquired a publication provider: %#v", target, client)
+			}
+			if target == "cf" && (client.r2Control == nil || client.cosControl != nil) {
+				t.Fatalf("Cloudflare audit provider mismatch: %#v", client)
+			}
+			if target == "cos" && (client.cosControl == nil || client.r2Control != nil) {
+				t.Fatalf("Tencent audit provider mismatch: %#v", client)
+			}
+			if publisher, err := client.publisher(t.TempDir(), filepath.Join(t.TempDir(), "journal")); err == nil || publisher != nil {
+				t.Fatalf("storage-only %s client escalated into a publisher: publisher=%#v err=%v", target, publisher, err)
+			}
+		})
+	}
+}

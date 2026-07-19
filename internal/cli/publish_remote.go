@@ -34,8 +34,14 @@ func (client *publishTargetClient) getControl(ctx context.Context, key string) (
 	if client.r2 != nil {
 		return client.r2.R2GetControl(ctx, key)
 	}
+	if client.r2Control != nil {
+		return client.r2Control.R2GetControl(ctx, key)
+	}
 	if client.cos != nil {
 		return client.cos.COSGetControl(ctx, key)
+	}
+	if client.cosControl != nil {
+		return client.cosControl.COSGetControl(ctx, key)
 	}
 	return pub.ControlObject{}, errors.New("publish target client has no provider")
 }

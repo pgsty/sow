@@ -476,6 +476,7 @@ test/compat/real_cloud_provider_attestation_test.go
 test/compat/real_cloud_provider_readiness_registry_test.go
 test/compat/real_cloud_provider_readiness_test.go
 test/compat/real_cloud_purge_watcher_test.go
+test/compat/real_cloud_r2_fsck_test.go
 test/compat/real_cloud_r2_storage_test.go
 test/compat/real_cloud_registry_onboarding_test.go
 test/compat/real_cloud_test.go

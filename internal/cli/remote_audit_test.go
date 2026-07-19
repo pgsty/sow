@@ -951,6 +951,8 @@ func TestFSCKAdoptRemoteInventoryIsStableIdempotentAndAvoidsPayloadRetransfer(t 
 		t.Fatal(err)
 	}
 
+	// Remote fsck must not parse or otherwise consume the CDN credential.
+	t.Setenv("SOW_TEST_CF", `this-is-deliberately-not-json`)
 	code, stdout, stderr := run("fsck", "--adopt-remote-inventory", "--target", "cf", "--config", configPath, "--repo", "assets", "--workers", "3", "--limit", "20")
 	if code != ExitOK || !strings.Contains(stdout, "inventory_coverage=complete") || !strings.Contains(stdout, "streamed_get=2") || !strings.Contains(stdout, "retained_extra=1") || !strings.Contains(stdout, "changed=true") {
 		t.Fatalf("adopt code=%d stdout=%s stderr=%s", code, stdout, stderr)
@@ -973,6 +975,7 @@ func TestFSCKAdoptRemoteInventoryIsStableIdempotentAndAvoidsPayloadRetransfer(t 
 		t.Fatalf("idempotent adopt code=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}
 
+	t.Setenv("SOW_TEST_CF", `{"api_token":"cf-api-token"}`)
 	transport.mutex.Lock()
 	putStart := len(transport.putKeys)
 	listStart := transport.listCalls
@@ -1011,6 +1014,7 @@ func TestFSCKAdoptRemoteInventoryIsStableIdempotentAndAvoidsPayloadRetransfer(t 
 	if err != nil || string(coverage) != remoteInventoryComplete {
 		t.Fatalf("publish regressed adopted coverage=%q err=%v", coverage, err)
 	}
+	t.Setenv("SOW_TEST_CF", "")
 	code, stdout, stderr = run("fsck", "--adopt-remote-inventory", "--target", "cf", "--config", configPath, "--repo", "assets", "--workers", "2")
 	if code != ExitOK || !strings.Contains(stdout, "changed=false") {
 		t.Fatalf("post-generation adopt code=%d stdout=%s stderr=%s", code, stdout, stderr)
@@ -1735,6 +1739,7 @@ func TestFSCKAdoptRemoteInventoryUsesCOSProtocol(t *testing.T) {
 	transport.mutex.Lock()
 	transport.cosObjects["pkg/release.bin"] = protocolObject{body: payload, sha: "", etag: `"cos-adopt"`}
 	transport.mutex.Unlock()
+	t.Setenv("SOW_TEST_COS_CDN", "")
 	code, stdout, stderr := run("fsck", "--adopt-remote-inventory", "--target", "cos", "--config", configPath, "--repo", "assets", "--workers", "2")
 	if code != ExitOK || !strings.Contains(stdout, "target=cos") || !strings.Contains(stdout, "streamed_get=1") {
 		t.Fatalf("COS adopt code=%d stdout=%s stderr=%s", code, stdout, stderr)

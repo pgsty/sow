@@ -159,6 +159,11 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   run lease 前后重验与 absence 证明收敛，测试前后及独立 `rclone` 清单均为空。
   它只关闭 R2 storage data-plane 子集，没有实跑 Publisher checkpoint/purge/commit，也不关闭
   Worker/CDN/COS/EdgeOne 或完整 POC-06。
+- `2026-07-19-r2-fsck-storage-only-authority.md`：`sow fsck --target` 改为 R2/COS
+  concrete storage-only client，CDN secret 缺失或非法仍可完成真实协议路径，且不能转换为
+  publisher。owner 授权的空非生产 `pro` 桶真实完成首次采纳、幂等重放、CAS 漂移拒绝且
+  Git HEAD 不变、精确恢复与身份绑定清理；测试后独立 `rclone` 清单为空。没有 CDN token、
+  control-plane/custom-domain 请求或生产写；不关闭 COS/EdgeOne、purge 或完整 POC-06。
 - `2026-07-17-builder-handoff.md`：`sow add --expected-object` 把外部 builder
   的 SHA-256/size 声明逐输入绑定到 asset、DEB 与 RPM 的真实 CLI/CAS/Git
   路径；摘要错误在新 CAS/view 写入前拒绝，聚焦 E2E `4.237s` PASS。后续 shared

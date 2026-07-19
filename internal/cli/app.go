@@ -821,7 +821,7 @@ func runFSCK(ctx context.Context, args []string, stdout, stderr io.Writer) (resu
 	targetNames := targetFlags.values()
 	targetNames = uniqueSorted(targetNames)
 	for _, target := range targetNames {
-		client, err := newPublishTargetClient(cfg, target, "latest", false)
+		client, err := newRemoteAuditTargetClient(cfg, target)
 		if err != nil {
 			return withExitCode(ExitConfig, "prepare remote fsck target %s: %v", target, err)
 		}

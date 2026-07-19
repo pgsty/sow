@@ -262,8 +262,14 @@ func (client *publishTargetClient) headObject(ctx context.Context, key string) (
 	if client.r2 != nil {
 		return client.r2.R2Head(ctx, key)
 	}
+	if client.r2Control != nil {
+		return client.r2Control.R2Head(ctx, key)
+	}
 	if client.cos != nil {
 		return client.cos.COSHead(ctx, key)
+	}
+	if client.cosControl != nil {
+		return client.cosControl.COSHead(ctx, key)
 	}
 	return pub.ObjectInfo{}, errors.New("remote audit client has no provider")
 }
@@ -275,8 +281,14 @@ func (client *publishTargetClient) listObjectsV2(ctx context.Context, continuati
 	if client.r2 != nil {
 		return client.r2.R2ListObjectsV2(ctx, continuationToken)
 	}
+	if client.r2Control != nil {
+		return client.r2Control.R2ListObjectsV2(ctx, continuationToken)
+	}
 	if client.cos != nil {
 		return client.cos.COSListObjectsV2(ctx, continuationToken)
+	}
+	if client.cosControl != nil {
+		return client.cosControl.COSListObjectsV2(ctx, continuationToken)
 	}
 	return pub.ObjectListPage{}, errors.New("remote audit client has no provider")
 }
@@ -288,8 +300,14 @@ func (client *publishTargetClient) openObject(ctx context.Context, key string) (
 	if client.r2 != nil {
 		return client.r2.R2OpenObject(ctx, key)
 	}
+	if client.r2Control != nil {
+		return client.r2Control.R2OpenObject(ctx, key)
+	}
 	if client.cos != nil {
 		return client.cos.COSOpenObject(ctx, key)
+	}
+	if client.cosControl != nil {
+		return client.cosControl.COSOpenObject(ctx, key)
 	}
 	return pub.ObjectContent{}, errors.New("remote audit client has no provider")
 }

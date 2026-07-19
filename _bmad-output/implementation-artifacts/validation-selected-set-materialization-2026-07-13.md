@@ -1581,3 +1581,53 @@ archive digest above. This is the current V-14/V-34 delivery identity. It does
 not upgrade real Worker/CDN/purge/provider-log evidence, COS/EdgeOne access,
 production migration, or operational metrics; the long-term Goal remains
 active.
+
+## 2026-07-19 V-35 remote fsck storage-only authority delivery identity
+
+This section supersedes V-34 after `sow fsck --target` was separated from CDN
+authority. R2 and COS remote audit now construct explicit storage-only clients
+and resolve only the selected target's object-storage credential; full publish,
+purge and post-publish CDN verification retain the existing full provider
+clients. Unit, protocol and CLI tests passed with the Cloudflare CDN credential
+absent and the COS CDN credential deliberately malformed, and a storage-only
+client cannot be converted into a publisher.
+
+The owner-designated empty non-production Cloudflare `pro` bucket was used by
+the exact-registry opt-in test only. Run `sow-r2-fsck-20260719-02` completed
+remote-inventory adoption, idempotent replay, run-owned CAS drift rejection,
+canonical Git HEAD preservation, exact CAS restore and identity-bound cleanup
+in 29.600s package time. Independent `rclone lsf cf:pro --recursive --max-depth
+-1` returned exit 0 and empty stdout after the test. The Cloudflare API/CDN
+credential was explicitly absent, and there was no Worker, Zone, purge,
+custom-domain, COS/EdgeOne or production request.
+
+The frozen source also passed all 692 default CLI tests in six ordinary and six
+race shards, all non-CLI packages ordinary/race, both vet profiles, repository
+Staticcheck profiles, module integrity, fixed govulncheck, four static
+Linux/macOS builds and the real apt/YUM/DNF/Nginx Docker compatibility matrix.
+The detailed timings, hashes and evidence boundaries are recorded in
+`docs/evidence/2026-07-19-r2-fsck-storage-only-authority.md` and V-01 through
+V-04/V-10/V-33 of the traceability matrix.
+
+After delivery content was frozen, two independent fresh HOME/GOMODCACHE/
+GOCACHE reconstructions used only the local read-only Go module download cache
+and returned exactly:
+
+```text
+PRODUCT_SOURCE_SHA256=cc8cc83e52a137bfba3e06482b61093d25f156bdd24d43b6bd4cfd99fbd22c13
+PRODUCT_SOURCE_FILES=539
+DELIVERY_CONTENT_SHA256=0e5a7b39db077f4485944b352d2c7d8a61108d429251361b1e4e60e32195ba6d
+DELIVERY_FILES=702
+ARCHIVE_SHA256=4d7065c1a099fe733a4d8dd8b9fa2746130ce409130ee85616ddabaa8780c905
+```
+
+Archives:
+
+- `/tmp/sow-clean-delivery-r2-fsck-v35-reviewed-a/sow-delivery-0e5a7b39db077f44.tgz`
+- `/tmp/sow-clean-delivery-r2-fsck-v35-reviewed-b/sow-delivery-0e5a7b39db077f44.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This is the current V-14/V-35 delivery identity. It does
+not upgrade real Worker/CDN/purge/provider-log evidence, real COS/EdgeOne,
+production migration or operational metrics; the long-term Goal remains
+active.

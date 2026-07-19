@@ -76,6 +76,22 @@ when `CachePurgeResponseEnvelope` says `success=true`, has no errors, and
 contains a non-empty result ID. This is response validation around the concrete
 SDK, not a second REST client.
 
+### Remote audit capability separation
+
+`sow fsck --target` is an object-storage audit, not a publication. It therefore
+constructs provider-specific R2 or COS storage-only clients and resolves only
+the selected target's storage secret. The fsck client exposes the required
+Get/List/Head/Open dispatch and cannot be converted into a Publisher. It never
+resolves a Cloudflare API token or Tencent EdgeOne credential and never
+constructs either CDN SDK client. Publication, purge, CDN verification and
+recovery continue to use the distinct full provider constructors.
+
+R2 and COS remain separate concrete types; this capability split does not add
+a generic cloud abstraction. Protocol fixtures must prove both providers work
+when the CDN secret is absent or malformed. Real-cloud fsck evidence must use
+an exact reviewed non-production resource and storage-only credential path; it
+cannot upgrade Worker, CDN, purge, COS/EdgeOne or POC-06 status.
+
 ## Consequences
 
 - The source-level vendor SDK contract is now reproducible through `go.mod`,
@@ -88,6 +104,9 @@ SDK, not a second REST client.
   EdgeOne acceptance remains required before production status can advance.
 - Tencent and Cloudflare SDK upgrades are reviewed changes because generated
   request/response behavior can change even within a stable major module.
+- A read-only remote audit cannot acquire unrelated CDN control authority by
+  construction; callers needing purge or publication must explicitly request
+  the stronger full provider type.
 
 ## Verification
 
@@ -95,6 +114,7 @@ SDK, not a second REST client.
 - `go test -count=1 ./internal/cli`
 - `go vet ./internal/publish ./internal/cli`
 - `go mod verify`
+- `go test ./test/compat -run '^TestRealCloudR2FSCKStorageOnly$' -count=1 -v`
 
 Focused fixtures assert the official SDK client types, exact R2/COS signed
 headers, absence of optional checksum/trailer framing, exact CDN requests,

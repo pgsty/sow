@@ -43,6 +43,48 @@ type COSEdgeOneHTTPConfig struct {
 	VerificationBasic          *BasicAuthCredentials
 }
 
+// COSControlHTTPConfig configures the COS object-only surface used by remote
+// audit and recovery paths. It intentionally has no EdgeOne identity, zone, or
+// credential, so callers cannot accidentally acquire CDN control authority.
+type COSControlHTTPConfig struct {
+	Bucket        string
+	ObjectBaseURL string
+	Credentials   S3Credentials
+	Client        *http.Client
+	AllowInsecure bool
+}
+
+// COSControlHTTP exposes only the signed COS object operations required by
+// remote audits. Publication continues to use COSEdgeOneHTTP, whose distinct
+// type makes the stronger CDN capability explicit at construction time.
+type COSControlHTTP struct {
+	objects *signedObjectHTTP
+}
+
+func NewCOSControlHTTP(config COSControlHTTPConfig) (*COSControlHTTP, error) {
+	objects, err := newSignedObjectHTTP(config.ObjectBaseURL, config.Bucket, config.Credentials, config.Client, config.AllowInsecure, s3VendorCOS)
+	if err != nil {
+		return nil, err
+	}
+	return &COSControlHTTP{objects: objects}, nil
+}
+
+func (c *COSControlHTTP) COSGetControl(ctx context.Context, key string) (ControlObject, error) {
+	return c.objects.getControl(ctx, key)
+}
+
+func (c *COSControlHTTP) COSHead(ctx context.Context, key string) (ObjectInfo, error) {
+	return c.objects.head(ctx, key)
+}
+
+func (c *COSControlHTTP) COSListObjectsV2(ctx context.Context, continuationToken string) (ObjectListPage, error) {
+	return c.objects.listObjectsV2(ctx, continuationToken)
+}
+
+func (c *COSControlHTTP) COSOpenObject(ctx context.Context, key string) (ObjectContent, error) {
+	return c.objects.openObject(ctx, key)
+}
+
 type COSEdgeOneHTTP struct {
 	objects           *signedObjectHTTP
 	client            *http.Client

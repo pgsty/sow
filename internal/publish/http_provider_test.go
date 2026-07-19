@@ -138,6 +138,39 @@ func TestR2CloudflareControlHTTPNeedsNoCDNAuthority(t *testing.T) {
 	}
 }
 
+func TestCOSControlHTTPNeedsNoEdgeOneAuthority(t *testing.T) {
+	t.Parallel()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if request.Method != http.MethodGet || request.URL.Path != "/bucket/.sow/bootstrap/leases/plan.json" {
+			t.Errorf("COS-only control client reached a non-object endpoint: %s %s", request.Method, request.URL.String())
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if !strings.HasPrefix(request.Header.Get("Authorization"), "AWS4-HMAC-SHA256 ") {
+			t.Error("COS-only control request was not SigV4 signed")
+		}
+		writer.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	provider, err := NewCOSControlHTTP(COSControlHTTPConfig{
+		ObjectBaseURL: server.URL + "/bucket",
+		Credentials:   S3Credentials{AccessKeyID: "control-access", SecretAccessKey: "control-secret", Region: "ap-shanghai"},
+		Client:        server.Client(), AllowInsecure: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed, err := provider.COSGetControl(context.Background(), ".sow/bootstrap/leases/plan.json")
+	if err != nil || observed.Exists {
+		t.Fatalf("COS-only control GET result=%+v err=%v", observed, err)
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("COS-only control request count=%d want=1", requests.Load())
+	}
+}
+
 func TestR2CheckpointFencedDeleteIsExplicitlyUnconditionalAndSigned(t *testing.T) {
 	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
