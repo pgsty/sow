@@ -157,18 +157,19 @@ PRD 是范围合同，Addendum 是更具体技术裁决；研究报告只证明�
   [`state_lock_release.go:15`](../../internal/cli/state_lock_release.go#L15)
 
 - Bootstrap 每次写前复核 lease-only 桶与 provider 闭包。
-  [`real_cloud_cloudflare_bootstrap_test.go:592`](../../test/compat/real_cloud_cloudflare_bootstrap_test.go#L592)
+  [`real_cloud_cloudflare_bootstrap_test.go:656`](../../test/compat/real_cloud_cloudflare_bootstrap_test.go#L656)
 
 - Readiness loader 只返回同一次 Ed25519 校验的 receipt 字节。
-  [`real_cloud_provider_readiness_test.go:588`](../../test/compat/real_cloud_provider_readiness_test.go#L588)
+  [`real_cloud_provider_readiness_test.go:701`](../../test/compat/real_cloud_provider_readiness_test.go#L701)
 
 **迁移与验收证据**
 
 - 需求账本明确区分已验证、未验证和外部受阻。
   [`requirements-traceability.md:32`](../../docs/requirements-traceability.md#L32)
 
-- R2 不支持 compare-delete 的 bootstrap 租约风险保持显式开放。
-  [`deferred-work.md:8`](deferred-work.md#L8)
+- Bootstrap 与 provider log-sink 的可复用 R2 租约只以 conditional Put CAS 为 idle marker，
+  接口不再授予 DeleteObject，stale holder 无法删除新持有者。
+  [`real_cloud_cloudflare_bootstrap_test.go:824`](../../test/compat/real_cloud_cloudflare_bootstrap_test.go#L824)
 
 - 旧 Makefile 目标映射提供可执行替代与回滚门禁。
   [`make-target-map.md:239`](../../docs/migration/make-target-map.md#L239)

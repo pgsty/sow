@@ -1300,3 +1300,37 @@ above for both files. This is the current V-14/V-23 delivery identity. It does
 not upgrade real Worker/private-origin/purge/negative-verification,
 COS/EdgeOne, production migration/revocation or operational metrics; the
 long-term Goal remains active.
+
+## 2026-07-19 V-24 R2 lease CAS-retirement delivery identity
+
+This section supersedes the preceding V-23 identity. Cloudflare bootstrap and
+provider log-sink reusable R2 lease paths no longer expose DeleteObject. Exact
+live leases are conditionally Put/CAS-retired to canonical idle markers, and
+the next holder can only replace the marker by ETag CAS. Cloudflare readiness
+receipt/seal v3 binds either an empty bucket or one exact idle marker, including
+its key/size/ETag/body digest; bootstrap additionally binds that marker to the
+selected plan before acquisition.
+
+Complete compat ordinary/race, focused vet, the pinned Staticcheck profile and
+all new stale-holder, idle-takeover, recovery-replay and foreign-closure tests
+passed. No cloud write occurred. Two independent delivery reconstructions used
+the local read-only module download cache and returned exactly:
+
+```text
+PRODUCT_SOURCE_SHA256=7879693559e74b6c7b6b4396ae6898e4fd4f985d3317143951151889215421b0
+PRODUCT_SOURCE_FILES=536
+DELIVERY_CONTENT_SHA256=a586a7e7cc377224c93bb985163a5a0339d40b1a8a96d5c08ec758324b3dc1c6
+DELIVERY_FILES=683
+ARCHIVE_SHA256=de463b317050b519959d20ec06b090924b83b601871433acaf96d5f5c2e37112
+```
+
+Archives:
+
+- `/tmp/sow-clean-delivery-v24-a/sow-delivery-a586a7e7cc377224.tgz`
+- `/tmp/sow-clean-delivery-v24-b/sow-delivery-a586a7e7cc377224.tgz`
+
+Independent `cmp` returned 0 and `shasum -a 256` returned the archive digest
+above for both files. This is the current V-14/V-24 delivery identity. It does
+not upgrade real Worker/private-origin/purge/negative verification,
+COS/EdgeOne, production migration/revocation or operational metrics; the
+long-term Goal remains active.

@@ -49,6 +49,11 @@ ADR-0011 原先要求所有 live DELETE 都携带刚证明的 ETag，并由供�
    继续 purge/verify，不发第二次无条件 DELETE。候选或围栏任一漂移均失败闭锁。
 6. R2 真实协议已经验证。COS 的 create-only generation fence 有协议/故障注入测试，但
    DeleteObject 真实供应商行为仍未 PoC；在取得专用非生产 COS 资源前不得把 COS 标为通过。
+7. 可复用的协调 key（Cloudflare bootstrap 与 provider log-sink lease）不得使用本降级执行
+   DELETE。持有者只能把 exact live ETag 通过条件 PutObject 转为 canonical idle marker；下一
+   持有者再以该 marker ETag 做 CAS。这样 stale holder 没有任何无条件删除新租约的路径，且
+   readiness 可只读接受“空桶或唯一 exact idle bootstrap marker”，仍拒绝 payload、live lease、
+   foreign marker 与多对象闭包。
 
 ## 安全边界
 

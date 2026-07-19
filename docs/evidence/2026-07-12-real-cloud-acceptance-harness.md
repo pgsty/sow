@@ -15,8 +15,9 @@ registry 已且仅已钉住 owner 指定的 Cloudflare `pro` tuple。因而仍�
 canonical registry 候选与 digest 回执，不读取凭据或构造 HTTP client；
 `TestRealCloudProviderReadinessRegistryOnboardingCandidate` 只为一个供应商生成第三个 registry 的
 离线候选；`TestRealCloudProviderScopedReadiness` 每次只读取 Cloudflare 或 EdgeOne 一家的
-publisher storage/API 凭据，执行一次空桶 ListObjectsV2 和只读 zone/domain identity 查询并生成
-封口回执。它们不能绕过独立评审与编译期 digest。ADR-0032 只允许 owner 指定的 `pro` bucket、
+publisher storage/API 凭据，执行一次 bucket-closure ListObjectsV2 和只读 zone/domain identity
+查询并生成封口回执；Cloudflare 复跑也可只读接受一个 exact CAS-retired bootstrap idle marker，
+EdgeOne 仍要求空桶。它们不能绕过独立评审与编译期 digest。ADR-0032 只允许 owner 指定的 `pro` bucket、
 `pro.pigsty.io`、`beta.pro.pigsty.io` exact tuple；其他 Pigsty 资源和全部生产仓库仍被拒绝。
 Cloudflare first-deployment 另由 [ADR-0034](../adr/0034-cloudflare-nonproduction-worker-bootstrap.md)
 定义独立 bootstrap registry、fresh same-run readiness、动态授权、run-bound create-only Worker、
@@ -303,8 +304,8 @@ digest receipt。管理员独立核对 account、endpoint、bucket、zone、main
 readiness entry 评审入库后可只检查一家。下例只读取 Cloudflare 的
 `SOW_REAL_CF_STORAGE_JSON` 与 `SOW_REAL_CF_CDN_JSON`；选 `edgeone` 时只读取对应 COS/EdgeOne
 两项，不需要另一供应商、完整 deployment config 或 destructive confirmation。它只做 signed
-empty-bucket ListObjectsV2 与 zone/domain identity 查询，不做 upload、purge、exporter mutation
-或 delete。Cloudflare 还必须从官方 R2 control API 读到该桶恰好两个 enabled、ownership/SSL
+ListObjectsV2（空桶，或 Cloudflare 上唯一 exact idle bootstrap marker 时再做 signed GET）与
+zone/domain identity 查询，不做 upload、purge、exporter mutation 或 delete。Cloudflare 还必须从官方 R2 control API 读到该桶恰好两个 enabled、ownership/SSL
 均为 active、zone ID/name 精确匹配的 main/beta custom domains；缺 beta 或任何额外 domain 都失败。
 readiness 使用的 `SOW_REAL_CF_CDN_JSON` bearer token 因而至少需要 exact account 的
 `Workers R2 Storage Read` 与 exact zone 的 `Zone Read`；它不需要写、部署或 purge 权限：
@@ -319,8 +320,8 @@ export SOW_REAL_CLOUD_PROVIDER_READINESS_RECEIPT=/var/tmp/sow-provider-readiness
 go test -count=1 ./test/compat -run '^TestRealCloudProviderScopedReadiness$' -v
 ```
 
-成功会原子写 `sow-real-cloud-provider-readiness/v2` 与同名 `.seal`；回执只含 readiness resource、
-bucket/control identity digest 和时间，不含 URL、deployment identity 或 credential。该预检不等于
+成功会原子写 `sow-real-cloud-provider-readiness/v3` 与同名 v3 `.seal`；回执只含 readiness resource、
+bucket/control identity、idle marker key/closure digest 和时间，不含 URL、deployment identity 或 credential。该预检不等于
 POC-06，也不代替后续双云故障、purge、cache 与 provider-log 验收。
 
 ## 环境合同
@@ -331,8 +332,8 @@ POC-06，也不代替后续双云故障、purge、cache 与 provider-log 验收�
 |---|---|
 | `SOW_REAL_CLOUD_NONPRODUCTION_CONFIRM` | 必须逐字等于固定 non-production 确认短语；与 destructive confirmation 相互独立 |
 | `SOW_REAL_CLOUD_PROVIDER_READINESS_RESOURCE_JSON` | 单行 canonical JSON，只含所选 Cloudflare 或 EdgeOne 的 endpoint/bucket/zone-name/main/beta；必须命中独立 provider-readiness registry，不能夹带另一供应商字段 |
-| `SOW_RUN_REAL_CLOUD_PROVIDER_READINESS` | 只允许 `cloudflare` 或 `edgeone`；启用所选供应商的 read-only empty-bucket + control-plane identity 预检 |
-| `SOW_REAL_CLOUD_PROVIDER_READINESS_RECEIPT` | readiness v2 回执的仓库外绝对路径；父目录预先存在且安全，成功时同时写 `.seal` |
+| `SOW_RUN_REAL_CLOUD_PROVIDER_READINESS` | 只允许 `cloudflare` 或 `edgeone`；启用所选供应商的 read-only empty-or-exact-idle-marker + control-plane identity 预检；EdgeOne 仍必须为空 |
+| `SOW_REAL_CLOUD_PROVIDER_READINESS_RECEIPT` | readiness v3 回执的仓库外绝对路径；父目录预先存在且安全，成功时同时写 v3 `.seal` |
 | `SOW_REAL_CLOUD_TEST_RESOURCE_ALLOWLIST_JSON` | 单行 canonical JSON，精确列出两个 account endpoint、region、两个测试桶、两个 zone 和四个测试 CDN base；还必须命中编译期 digest 钉住的仓库 registry，任一不一致即在联网前停止 |
 | `SOW_REAL_CF_R2_ENDPOINT` | R2 S3 服务根，例如账户级 `https://<account>.r2.cloudflarestorage.com`；不含桶名/路径 |
 | `SOW_REAL_CF_R2_BUCKET` | 专用空 R2 桶名 |
@@ -379,7 +380,7 @@ CF provider-log lease control 凭据的严格 JSON schema 为：
 | `SOW_REAL_COS_CDN_JSON` | `secret_id`, `secret_key`, 可选 `session_token`, 以及 `basic_username`, `basic_password` |
 | `SOW_REAL_CF_LOG_STORAGE_JSON` | provider-only R2 log bucket 的 read-only `access_key_id`, `secret_access_key`, 可选 `session_token`；仅允许 exact per-run prefix List/Get，不得具有 Put/Delete 或 publisher bucket 权限 |
 | `SOW_REAL_CF_LOG_WRITER_JSON` | Cloudflare Logpush 专用 write-only `access_key_id`, `secret_access_key`；exporter 配置不能安全携带 session token，因此该字段必须省略；不得 List/Get/Delete 或访问 publisher bucket |
-| `SOW_REAL_CF_LOG_CONTROL_JSON` | 独立 R2 lease-control `access_key_id`, `secret_access_key`, 可选 `session_token`；只允许 `<raw_root>.sow/provider-log-sink-lease.json` 的 Get、conditional Put 与 exact delete，不得访问日志正文、publisher bucket 或 CDN/Worker API |
+| `SOW_REAL_CF_LOG_CONTROL_JSON` | 独立 R2 lease-control `access_key_id`, `secret_access_key`, 可选 `session_token`；只允许 `<raw_root>.sow/provider-log-sink-lease.json` 的 Get 与 conditional Put，不得有 Delete、日志正文、publisher bucket 或 CDN/Worker API 权限 |
 | `SOW_REAL_COS_LOG_STORAGE_JSON` | provider-only COS log bucket 的 read-only `access_key_id`, `secret_access_key`, 可选 `session_token`；仅允许 exact per-run prefix List/Get，不得具有 Put/Delete 或 publisher bucket 权限 |
 | `SOW_REAL_COS_LOG_WRITER_JSON` | EdgeOne realtime-log 专用 write-only `access_key_id`, `secret_access_key`；TEO S3 task 不支持 session token，因此该字段必须省略；不得 List/Get/Delete 或访问 publisher bucket |
 
@@ -631,8 +632,10 @@ SOW auth Worker 不得有第三条 route。完整 inventory identity 会进入 p
 filter 可证明排除两个 reviewed host 时允许。未知、畸形或不支持的 filter 保守地视为重叠。
 无关 job 只有在上述不相交性可证时才允许；完整 Logpush inventory 仍进入 provider control digest。
 setup 在两个 provider safety read 都通过后、任何 Logpush/realtime-log mutation 前取得独立 R2
-conditional lease，每次 mutation 前续租，全部成功后 exact-ETag 删除。跨供应商部分失败保留租约
-至五分钟到期，再由下一次 run CAS 接管并幂等重放；write-only exporter credential 不承担此职责。
+conditional lease，每次 mutation 前续租，全部成功后把 exact live ETag CAS 为 canonical idle
+marker。跨供应商部分失败保留 live 租约至五分钟到期，再由下一次 run CAS 接管并幂等重放；
+下一次正常 run 也只能以 idle marker ETag 做 CAS。write-only exporter credential 不承担此职责，
+且 lease-control 身份不需要 DeleteObject 权限。
 
 ## 通过条件
 

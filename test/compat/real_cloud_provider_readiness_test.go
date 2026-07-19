@@ -35,8 +35,8 @@ const (
 	realCloudProviderReadinessOptInEnv      = "SOW_RUN_REAL_CLOUD_PROVIDER_READINESS"
 	realCloudProviderReadinessReceiptEnv    = "SOW_REAL_CLOUD_PROVIDER_READINESS_RECEIPT"
 	realCloudProviderReadinessSignerEnv     = "SOW_REAL_CLOUD_PROVIDER_READINESS_SIGNER_JSON"
-	realCloudProviderReadinessReceiptSchema = "sow-real-cloud-provider-readiness/v2"
-	realCloudProviderReadinessSealSchema    = "sow-real-cloud-provider-readiness-seal/v2"
+	realCloudProviderReadinessReceiptSchema = "sow-real-cloud-provider-readiness/v3"
+	realCloudProviderReadinessSealSchema    = "sow-real-cloud-provider-readiness-seal/v3"
 	realCloudProviderReadinessMaxAge        = 15 * time.Minute
 )
 
@@ -50,15 +50,33 @@ var realCloudCloudflareModernTLS12Ciphers = []string{
 }
 
 type realCloudProviderReadinessReceipt struct {
-	Schema                  string `json:"schema"`
-	RunID                   string `json:"run_id"`
-	Provider                string `json:"provider"`
-	ReadinessResourceSHA256 string `json:"readiness_resource_sha256"`
-	BucketIdentitySHA256    string `json:"bucket_identity_sha256"`
-	ProviderControlSHA256   string `json:"provider_control_sha256"`
-	BucketObservedEmpty     bool   `json:"bucket_observed_empty"`
-	ProviderOperations      string `json:"provider_operations"`
-	ObservedAt              string `json:"observed_at"`
+	Schema                     string `json:"schema"`
+	RunID                      string `json:"run_id"`
+	Provider                   string `json:"provider"`
+	ReadinessResourceSHA256    string `json:"readiness_resource_sha256"`
+	BucketIdentitySHA256       string `json:"bucket_identity_sha256"`
+	ProviderControlSHA256      string `json:"provider_control_sha256"`
+	BucketObservedEmpty        bool   `json:"bucket_observed_empty"`
+	BucketControlObjectCount   int    `json:"bucket_control_object_count"`
+	BucketControlObjectKey     string `json:"bucket_control_object_key"`
+	BucketControlClosureSHA256 string `json:"bucket_control_closure_sha256"`
+	ProviderOperations         string `json:"provider_operations"`
+	ObservedAt                 string `json:"observed_at"`
+}
+
+type realCloudProviderReadinessBucketObservation struct {
+	ObservedEmpty        bool
+	ControlObjectCount   int
+	ControlObjectKey     string
+	ControlClosureSHA256 string
+	Operations           string
+}
+
+type realCloudProviderReadinessControlObject struct {
+	Key    string `json:"key"`
+	Size   int64  `json:"size"`
+	ETag   string `json:"etag"`
+	SHA256 string `json:"sha256"`
 }
 
 type realCloudProviderReadinessSeal struct {
@@ -77,8 +95,9 @@ type realCloudProviderReadinessSignerSecret struct {
 
 // TestRealCloudProviderScopedReadiness checks exactly one administrator-pinned
 // provider without needing credentials for the other provider. It is strictly
-// read-only: one signed empty-bucket ListObjectsV2 and provider control-plane
-// identity reads. It never purges, uploads, reconfigures, or deletes.
+// read-only: a signed bucket-closure ListObjectsV2 and provider control-plane
+// identity reads. Cloudflare may also contain one exact CAS-retired bootstrap
+// lease marker. It never purges, uploads, reconfigures, or deletes.
 func TestRealCloudProviderScopedReadiness(t *testing.T) {
 	provider := strings.TrimSpace(os.Getenv(realCloudProviderReadinessOptInEnv))
 	if provider == "" || provider == "0" {
@@ -104,13 +123,14 @@ func TestRealCloudProviderScopedReadiness(t *testing.T) {
 	}
 	secretFragments := realCloudScopedSecretFragments(signerRaw, os.Getenv(storageName), os.Getenv(apiName))
 	var bucketSHA, controlSHA string
+	var bucketObservation realCloudProviderReadinessBucketObservation
 	switch provider {
 	case "cloudflare":
 		identity := resource.Cloudflare
-		bucketSHA, controlSHA, err = checkRealCloudCloudflareReadiness(t.Context(), environment, *identity, os.Getenv)
+		bucketSHA, controlSHA, bucketObservation, err = checkRealCloudCloudflareReadiness(t.Context(), environment, *identity, os.Getenv)
 	case "edgeone":
 		identity := resource.EdgeOne
-		bucketSHA, controlSHA, err = checkRealCloudEdgeOneReadiness(t.Context(), environment, *identity, os.Getenv)
+		bucketSHA, controlSHA, bucketObservation, err = checkRealCloudEdgeOneReadiness(t.Context(), environment, *identity, os.Getenv)
 	}
 	if err != nil {
 		assertNoRealCloudSecret(t, "provider-scoped readiness error", []byte(err.Error()), secretFragments)
@@ -119,9 +139,11 @@ func TestRealCloudProviderScopedReadiness(t *testing.T) {
 	receipt := realCloudProviderReadinessReceipt{
 		Schema: realCloudProviderReadinessReceiptSchema, RunID: runID, Provider: provider,
 		ReadinessResourceSHA256: realCloudProviderReadinessResourceSHA(resource), BucketIdentitySHA256: bucketSHA,
-		ProviderControlSHA256: controlSHA, BucketObservedEmpty: true,
-		ProviderOperations: "read-only:list-objects-v2+zone-and-domain-identity",
-		ObservedAt:         time.Now().UTC().Format(time.RFC3339Nano),
+		ProviderControlSHA256: controlSHA, BucketObservedEmpty: bucketObservation.ObservedEmpty,
+		BucketControlObjectCount: bucketObservation.ControlObjectCount, BucketControlObjectKey: bucketObservation.ControlObjectKey,
+		BucketControlClosureSHA256: bucketObservation.ControlClosureSHA256,
+		ProviderOperations:         bucketObservation.Operations,
+		ObservedAt:                 time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	writeRealCloudProviderReadinessReceipt(t, strings.TrimSpace(os.Getenv(realCloudProviderReadinessReceiptEnv)), receipt, signer)
 }
@@ -150,19 +172,103 @@ func realCloudCloudflareReadinessDomainFixture(identity realCloudCloudflareReadi
 	}}
 }
 
+type realCloudProviderReadinessBucketReader interface {
+	R2GetControl(context.Context, string) (publish.ControlObject, error)
+	R2ListObjectsV2(context.Context, string) (publish.ObjectListPage, error)
+}
+
+func realCloudProviderEmptyReadinessBucketObservation() realCloudProviderReadinessBucketObservation {
+	body, _ := json.Marshal([]realCloudProviderReadinessControlObject{})
+	return realCloudProviderReadinessBucketObservation{
+		ObservedEmpty:        true,
+		ControlClosureSHA256: realCloudLowerSHA256(body),
+		Operations:           "read-only:list-objects-v2+zone-and-domain-identity",
+	}
+}
+
+// collectRealCloudCloudflareReadinessBucketClosure admits either the pristine
+// empty bootstrap bucket or one exact CAS-retired bootstrap lease marker. The
+// marker is non-owning and cannot authorize a Worker mutation; acquisition
+// must replace it by ETag CAS and the post-acquisition closure must then contain
+// only the new live lease. Any payload, foreign control object, or second marker
+// still fails readiness.
+func collectRealCloudCloudflareReadinessBucketClosure(ctx context.Context, reader realCloudProviderReadinessBucketReader, identity realCloudCloudflareReadinessResource) (realCloudProviderReadinessBucketObservation, error) {
+	if reader == nil {
+		return realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare readiness bucket reader is absent")
+	}
+	continuation := ""
+	seen := map[string]struct{}{"": {}}
+	var objects []publish.ListedObject
+	for pages := 0; ; pages++ {
+		if pages >= realCloudProviderMaxInventoryItems {
+			return realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare readiness bucket inventory exceeds the safety bound")
+		}
+		page, err := reader.R2ListObjectsV2(ctx, continuation)
+		if err != nil {
+			return realCloudProviderReadinessBucketObservation{}, fmt.Errorf("Cloudflare R2 signed bucket-closure query failed: %w", err)
+		}
+		objects = append(objects, page.Objects...)
+		if len(objects) > 1 {
+			return realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare readiness bucket contains payload or multiple control objects")
+		}
+		next := page.NextContinuationToken
+		if next == "" {
+			break
+		}
+		if len(next) > 16<<10 || strings.ContainsAny(next, "\x00\r\n") {
+			return realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare readiness bucket returned an unsafe continuation token")
+		}
+		if _, duplicate := seen[next]; duplicate {
+			return realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare readiness bucket repeated a continuation token")
+		}
+		seen[next] = struct{}{}
+		continuation = next
+	}
+	if len(objects) == 0 {
+		return realCloudProviderEmptyReadinessBucketObservation(), nil
+	}
+	listed := objects[0]
+	const prefix = ".sow/bootstrap/leases/"
+	planSHA := strings.TrimSuffix(strings.TrimPrefix(listed.Key, prefix), ".json")
+	if !strings.HasPrefix(listed.Key, prefix) || listed.Key != prefix+planSHA+".json" || !validRealCloudLowerSHA256(planSHA) ||
+		listed.Size <= 0 || listed.Size > 64<<10 || !validRealCloudProviderETag(listed.ETag) {
+		return realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare readiness bucket contains a foreign object")
+	}
+	observed, err := reader.R2GetControl(ctx, listed.Key)
+	if err != nil || !observed.Exists || observed.ETag != listed.ETag || int64(len(observed.Body)) != listed.Size {
+		clearRealCloudBytes(observed.Body)
+		return realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare readiness idle marker identity changed between list and GET")
+	}
+	defer clearRealCloudBytes(observed.Body)
+	idle, err := decodeRealCloudCloudflareBootstrapIdleLease(observed.Body)
+	if err != nil || idle.PlanSHA256 != planSHA || idle.AccountID != identity.AccountID || idle.ZoneID != identity.ZoneID {
+		return realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare readiness bucket contains an invalid or foreign idle marker")
+	}
+	closure := []realCloudProviderReadinessControlObject{{
+		Key: listed.Key, Size: listed.Size, ETag: listed.ETag, SHA256: realCloudLowerSHA256(observed.Body),
+	}}
+	body, _ := json.Marshal(closure)
+	return realCloudProviderReadinessBucketObservation{
+		ControlObjectCount:   1,
+		ControlObjectKey:     listed.Key,
+		ControlClosureSHA256: realCloudLowerSHA256(body),
+		Operations:           "read-only:list-objects-v2+get-idle-bootstrap-lease+zone-and-domain-identity",
+	}, nil
+}
+
 func checkRealCloudCloudflareReadiness(
 	ctx context.Context,
 	environment realCloudEnvironment,
 	identity realCloudCloudflareReadinessResource,
 	getenv func(string) string,
-) (string, string, error) {
+) (string, string, realCloudProviderReadinessBucketObservation, error) {
 	storage, err := decodeRealCloudProviderSecret[realCloudStorageSecret](getenv(realCloudStorageCredentialCF))
 	if err != nil || strings.TrimSpace(storage.AccessKeyID) == "" || strings.TrimSpace(storage.SecretAccessKey) == "" {
-		return "", "", errors.New("Cloudflare storage credential is absent or invalid")
+		return "", "", realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare storage credential is absent or invalid")
 	}
 	api, err := decodeRealCloudProviderSecret[realCloudCloudflareSecret](getenv(realCloudCDNCredentialCF))
 	if err != nil || strings.TrimSpace(api.APIToken) == "" {
-		return "", "", errors.New("Cloudflare API credential is absent or invalid")
+		return "", "", realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare API credential is absent or invalid")
 	}
 	client := realCloudProviderHTTPClient()
 	objects, err := publish.NewR2CloudflareHTTP(publish.R2CloudflareHTTPConfig{
@@ -172,14 +278,11 @@ func checkRealCloudCloudflareReadiness(
 		CloudflareAPIURL: "https://api.cloudflare.com/client/v4", Client: client,
 	})
 	if err != nil {
-		return "", "", errors.New("construct read-only Cloudflare clients")
+		return "", "", realCloudProviderReadinessBucketObservation{}, errors.New("construct read-only Cloudflare clients")
 	}
-	page, err := objects.R2ListObjectsV2(ctx, "")
+	bucketObservation, err := collectRealCloudCloudflareReadinessBucketClosure(ctx, objects, identity)
 	if err != nil {
-		return "", "", fmt.Errorf("Cloudflare R2 signed empty-bucket query failed: %w", err)
-	}
-	if len(page.Objects) != 0 || page.NextContinuationToken != "" {
-		return "", "", errors.New("Cloudflare readiness bucket is not empty")
+		return "", "", realCloudProviderReadinessBucketObservation{}, err
 	}
 	cf := cloudflareapi.NewClient(
 		option.WithBaseURL("https://api.cloudflare.com/client/v4/"), option.WithAPIToken(api.APIToken),
@@ -187,10 +290,10 @@ func checkRealCloudCloudflareReadiness(
 	)
 	controlSHA, err := collectRealCloudCloudflareReadinessControl(ctx, environment, identity, cf)
 	if err != nil {
-		return "", "", err
+		return "", "", realCloudProviderReadinessBucketObservation{}, err
 	}
 	bucketIdentity, _ := json.Marshal([]string{"cloudflare", environment.CFR2Endpoint, environment.CFR2Bucket, environment.CFZoneID})
-	return realCloudLowerSHA256(bucketIdentity), controlSHA, nil
+	return realCloudLowerSHA256(bucketIdentity), controlSHA, bucketObservation, nil
 }
 
 func collectRealCloudCloudflareReadinessControl(ctx context.Context, environment realCloudEnvironment, identity realCloudCloudflareReadinessResource, cf *cloudflareapi.Client) (string, error) {
@@ -386,14 +489,14 @@ func checkRealCloudEdgeOneReadiness(
 	environment realCloudEnvironment,
 	identity realCloudEdgeOneReadinessResource,
 	getenv func(string) string,
-) (string, string, error) {
+) (string, string, realCloudProviderReadinessBucketObservation, error) {
 	storage, err := decodeRealCloudProviderSecret[realCloudStorageSecret](getenv(realCloudStorageCredentialCOS))
 	if err != nil || strings.TrimSpace(storage.AccessKeyID) == "" || strings.TrimSpace(storage.SecretAccessKey) == "" {
-		return "", "", errors.New("Tencent COS storage credential is absent or invalid")
+		return "", "", realCloudProviderReadinessBucketObservation{}, errors.New("Tencent COS storage credential is absent or invalid")
 	}
 	api, err := decodeRealCloudProviderSecret[realCloudTencentSecret](getenv(realCloudCDNCredentialCOS))
 	if err != nil || strings.TrimSpace(api.SecretID) == "" || strings.TrimSpace(api.SecretKey) == "" {
-		return "", "", errors.New("EdgeOne API credential is absent or invalid")
+		return "", "", realCloudProviderReadinessBucketObservation{}, errors.New("EdgeOne API credential is absent or invalid")
 	}
 	client := realCloudProviderHTTPClient()
 	objects, err := publish.NewCOSEdgeOneHTTP(publish.COSEdgeOneHTTPConfig{
@@ -404,14 +507,14 @@ func checkRealCloudEdgeOneReadiness(
 		ZoneID:             environment.EdgeOneZoneID, EdgeOneAPIURL: "https://teo.tencentcloudapi.com", Client: client, UnversionedBucketConfirmed: true,
 	})
 	if err != nil {
-		return "", "", errors.New("construct read-only Tencent clients")
+		return "", "", realCloudProviderReadinessBucketObservation{}, errors.New("construct read-only Tencent clients")
 	}
 	page, err := objects.COSListObjectsV2(ctx, "")
 	if err != nil {
-		return "", "", fmt.Errorf("Tencent COS signed empty-bucket query failed: %w", err)
+		return "", "", realCloudProviderReadinessBucketObservation{}, fmt.Errorf("Tencent COS signed empty-bucket query failed: %w", err)
 	}
 	if len(page.Objects) != 0 || page.NextContinuationToken != "" {
-		return "", "", errors.New("Tencent readiness bucket is not empty")
+		return "", "", realCloudProviderReadinessBucketObservation{}, errors.New("Tencent readiness bucket is not empty")
 	}
 	parsed, _ := url.Parse("https://teo.tencentcloudapi.com")
 	clientProfile := profile.NewClientProfile()
@@ -424,7 +527,7 @@ func checkRealCloudEdgeOneReadiness(
 	credential := common.NewTokenCredential(api.SecretID, api.SecretKey, api.SessionToken)
 	edgeOne, err := teo.NewClient(credential, "", clientProfile)
 	if err != nil {
-		return "", "", errors.New("construct read-only EdgeOne SDK")
+		return "", "", realCloudProviderReadinessBucketObservation{}, errors.New("construct read-only EdgeOne SDK")
 	}
 	transport := client.Transport
 	if transport == nil {
@@ -434,11 +537,11 @@ func checkRealCloudEdgeOneReadiness(
 	configuration := realCloudEdgeOneAttestationConfig{ZoneID: identity.ZoneID}
 	zoneSHA, domainsSHA, err := collectRealCloudEdgeOneZoneClosure(ctx, environment, configuration, identity.ZoneName, edgeOne)
 	if err != nil {
-		return "", "", err
+		return "", "", realCloudProviderReadinessBucketObservation{}, err
 	}
 	controlBody, _ := json.Marshal([]string{zoneSHA, domainsSHA})
 	bucketIdentity, _ := json.Marshal([]string{"edgeone", environment.COSEndpoint, environment.COSBucket, environment.COSRegion, environment.EdgeOneZoneID})
-	return realCloudLowerSHA256(bucketIdentity), realCloudLowerSHA256(controlBody), nil
+	return realCloudLowerSHA256(bucketIdentity), realCloudLowerSHA256(controlBody), realCloudProviderEmptyReadinessBucketObservation(), nil
 }
 
 func realCloudScopedSecretFragments(raw ...string) []string {
@@ -629,11 +732,15 @@ func loadAndValidateRealCloudCloudflareBootstrapReadinessReceiptWithHook(rawPath
 	if err := decodeRealCloudCanonicalJSONFile(sealBody, &seal); err != nil {
 		return realCloudProviderReadinessReceipt{}, fmt.Errorf("decode readiness receipt seal: %w", err)
 	}
+	empty := realCloudProviderEmptyReadinessBucketObservation()
+	markerPlanSHA := strings.TrimSuffix(strings.TrimPrefix(receipt.BucketControlObjectKey, ".sow/bootstrap/leases/"), ".json")
+	markerKeyValid := validRealCloudLowerSHA256(markerPlanSHA) && receipt.BucketControlObjectKey == ".sow/bootstrap/leases/"+markerPlanSHA+".json"
+	bucketClosureValid := validRealCloudLowerSHA256(receipt.BucketControlClosureSHA256) && (receipt.BucketObservedEmpty && receipt.BucketControlObjectCount == 0 && receipt.BucketControlObjectKey == "" && receipt.BucketControlClosureSHA256 == empty.ControlClosureSHA256 && receipt.ProviderOperations == empty.Operations ||
+		!receipt.BucketObservedEmpty && receipt.BucketControlObjectCount == 1 && markerKeyValid && receipt.ProviderOperations == "read-only:list-objects-v2+get-idle-bootstrap-lease+zone-and-domain-identity")
 	if receipt.Schema != realCloudProviderReadinessReceiptSchema || receipt.RunID != runID || receipt.Provider != "cloudflare" ||
 		receipt.ReadinessResourceSHA256 != realCloudProviderReadinessResourceSHA(resource) || !validRealCloudLowerSHA256(receipt.BucketIdentitySHA256) ||
-		!validRealCloudLowerSHA256(receipt.ProviderControlSHA256) || !receipt.BucketObservedEmpty ||
-		receipt.ProviderOperations != "read-only:list-objects-v2+zone-and-domain-identity" {
-		return realCloudProviderReadinessReceipt{}, errors.New("readiness receipt does not prove the exact empty Cloudflare resource closure")
+		!validRealCloudLowerSHA256(receipt.ProviderControlSHA256) || !bucketClosureValid {
+		return realCloudProviderReadinessReceipt{}, errors.New("readiness receipt does not prove the exact empty-or-idle Cloudflare resource closure")
 	}
 	observed, err := time.Parse(time.RFC3339Nano, receipt.ObservedAt)
 	if err != nil || observed.After(now.Add(time.Minute)) || now.Sub(observed) < 0 || now.Sub(observed) > realCloudProviderReadinessMaxAge {
@@ -744,7 +851,8 @@ func TestRealCloudProviderReadinessContractIsScopedAndRedacted(t *testing.T) {
 		Schema: realCloudProviderReadinessReceiptSchema, RunID: realCloudRegistryCandidateRunID, Provider: "cloudflare",
 		ReadinessResourceSHA256: strings.Repeat("a", 64),
 		BucketIdentitySHA256:    strings.Repeat("d", 64), ProviderControlSHA256: strings.Repeat("e", 64), BucketObservedEmpty: true,
-		ProviderOperations: "read-only:list-objects-v2+zone-and-domain-identity", ObservedAt: "2026-07-17T00:00:00Z",
+		BucketControlClosureSHA256: realCloudProviderEmptyReadinessBucketObservation().ControlClosureSHA256,
+		ProviderOperations:         "read-only:list-objects-v2+zone-and-domain-identity", ObservedAt: "2026-07-17T00:00:00Z",
 	}
 	body, err := json.Marshal(receipt)
 	if err != nil || containsRealEdgeURLLeak(body) || strings.Contains(string(body), "access_key") || strings.Contains(string(body), "token") {
@@ -799,6 +907,61 @@ func TestRealCloudProviderReadinessContractIsScopedAndRedacted(t *testing.T) {
 	}
 }
 
+func TestRealCloudCloudflareReadinessAdmitsOnlyOneExactIdleBootstrapLease(t *testing.T) {
+	resource, plan := realCloudCloudflareBootstrapPlanFixture(t)
+	identity := *resource.Cloudflare
+	planSHA := realCloudCloudflareBootstrapPlanSHA(plan)
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	store := &fakeRealCloudCloudflareBootstrapLeaseStore{}
+	held, err := acquireRealCloudCloudflareBootstrapLease(t.Context(), store, plan, planSHA,
+		"20260719T120000Z-readiness-idle", "apply", strings.Repeat("1", 64), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collectRealCloudCloudflareReadinessBucketClosure(t.Context(), store, identity); err == nil {
+		t.Fatal("Cloudflare readiness admitted a live bootstrap lease")
+	}
+	if err := held.release(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	observation, err := collectRealCloudCloudflareReadinessBucketClosure(t.Context(), store, identity)
+	if err != nil || observation.ObservedEmpty || observation.ControlObjectCount != 1 ||
+		observation.ControlObjectKey != held.key || !validRealCloudLowerSHA256(observation.ControlClosureSHA256) || !strings.Contains(observation.Operations, "get-idle-bootstrap-lease") {
+		t.Fatalf("exact idle bootstrap marker was not admitted observation=%+v err=%v", observation, err)
+	}
+	receipt := realCloudProviderReadinessReceipt{BucketControlObjectCount: 1, BucketControlObjectKey: observation.ControlObjectKey}
+	if err := validateRealCloudCloudflareBootstrapReadinessMarkerPlan(receipt, planSHA); err != nil {
+		t.Fatalf("same-plan readiness marker was rejected: %v", err)
+	}
+	if err := validateRealCloudCloudflareBootstrapReadinessMarkerPlan(receipt, strings.Repeat("2", 64)); err == nil {
+		t.Fatal("foreign-plan readiness marker was admitted before lease acquisition")
+	}
+	runID := "20260719T120000Z-readiness-idle"
+	receipt = realCloudProviderReadinessReceipt{
+		Schema: realCloudProviderReadinessReceiptSchema, RunID: runID, Provider: "cloudflare",
+		ReadinessResourceSHA256: realCloudProviderReadinessResourceSHA(resource),
+		BucketIdentitySHA256:    strings.Repeat("a", 64), ProviderControlSHA256: strings.Repeat("b", 64),
+		BucketControlObjectCount: 1, BucketControlObjectKey: observation.ControlObjectKey,
+		BucketControlClosureSHA256: observation.ControlClosureSHA256, ProviderOperations: observation.Operations,
+		ObservedAt: now.Format(time.RFC3339Nano),
+	}
+	private := t.TempDir()
+	if err := os.Chmod(private, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	signer, publicKey := newRealCloudProviderReadinessTestSigner(t)
+	defer clearRealCloudBytes(signer)
+	path := filepath.Join(private, "idle-readiness.json")
+	writeRealCloudProviderReadinessReceipt(t, path, receipt, signer)
+	if err := validateRealCloudCloudflareBootstrapReadinessReceipt(path, resource, runID, publicKey, now); err != nil {
+		t.Fatalf("signed idle-marker readiness receipt was rejected: %v", err)
+	}
+	store.extraObjects = []publish.ListedObject{{Key: "payload/foreign", Size: 1, ETag: `"foreign"`}}
+	if _, err := collectRealCloudCloudflareReadinessBucketClosure(t.Context(), store, identity); err == nil {
+		t.Fatal("Cloudflare readiness admitted an idle marker alongside a foreign payload")
+	}
+}
+
 func TestRealCloudCloudflareBootstrapReadinessSealRejectsLocalForgery(t *testing.T) {
 	resource := realCloudCloudflareReadinessFixture()
 	now := time.Now().UTC()
@@ -808,7 +971,8 @@ func TestRealCloudCloudflareBootstrapReadinessSealRejectsLocalForgery(t *testing
 		ReadinessResourceSHA256: realCloudProviderReadinessResourceSHA(resource),
 		BucketIdentitySHA256:    strings.Repeat("b", 64), ProviderControlSHA256: strings.Repeat("c", 64),
 		BucketObservedEmpty: true, ProviderOperations: "read-only:list-objects-v2+zone-and-domain-identity",
-		ObservedAt: now.Format(time.RFC3339Nano),
+		BucketControlClosureSHA256: realCloudProviderEmptyReadinessBucketObservation().ControlClosureSHA256,
+		ObservedAt:                 now.Format(time.RFC3339Nano),
 	}
 	private := t.TempDir()
 	if err := os.Chmod(private, 0o700); err != nil {
@@ -880,7 +1044,8 @@ func TestRealCloudCloudflareBootstrapReadinessReturnsTheValidatedPathRead(t *tes
 		ReadinessResourceSHA256: realCloudProviderReadinessResourceSHA(resource),
 		BucketIdentitySHA256:    strings.Repeat("b", 64), ProviderControlSHA256: strings.Repeat("c", 64),
 		BucketObservedEmpty: true, ProviderOperations: "read-only:list-objects-v2+zone-and-domain-identity",
-		ObservedAt: now.Format(time.RFC3339Nano),
+		BucketControlClosureSHA256: realCloudProviderEmptyReadinessBucketObservation().ControlClosureSHA256,
+		ObservedAt:                 now.Format(time.RFC3339Nano),
 	}
 	private := t.TempDir()
 	if err := os.Chmod(private, 0o700); err != nil {

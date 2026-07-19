@@ -18,9 +18,10 @@ Cloudflare/R2、COS/EdgeOne 未执行，POC-06 仍为受阻。没有读取云凭
 - account Worker、embedded route、zone route、custom domain 全量 canonical inventory 连续两次
   必须相同；缺 service/certificate/zone 的 domain、跨读取变化和 schedule/tail 负例均拒绝。
 - Logpush 按配置 ID 选择；可证明不覆盖 reviewed hosts/raw bucket 的无关 job 可以共存。
-- 双云日志 exporter 更新前取得 R2 conditional lease；每次 mutation 前续租，成功后 exact-ETag
-  删除，EdgeOne 注入失败后保留 lease。live conflict、renew、expired CAS takeover、stale holder
-  release 均有回归。
+- 双云日志 exporter 更新前取得 R2 conditional lease；每次 mutation 前续租，成功后把 exact
+  live ETag 以条件 Put CAS 为 canonical idle marker，EdgeOne 注入失败后保留 live lease。
+  live conflict、renew、expired/idle CAS takeover、stale holder release 均有回归；R2 DeleteObject
+  不再位于该可复用协调 key 的权限面或代码路径。
 - lease 使用新增的独立 `SOW_REAL_CF_LOG_CONTROL_JSON`，不扩大 write-only Logpush writer 权限。
 - R2 main/beta custom domain 必须显式 TLS 1.2/1.3，并使用 Cloudflare Modern 的六个 TLS 1.2
   cipher；空策略、TLS 1.0/1.1、legacy/unknown/duplicate cipher 全部拒绝。官方依据：

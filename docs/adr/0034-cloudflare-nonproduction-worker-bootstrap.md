@@ -33,8 +33,9 @@ independent gates, all evaluated before credentials or clients:
    two exact host routes;
 3. the plan hash is present in a second compiled-SHA bootstrap registry;
 4. apply and rollback consume a canonical readiness receipt for the same run
-   that is no more than 15 minutes old and proves the exact bucket was empty
-   and both custom domains were active. Its v2 seal is an Ed25519 signature
+   that is no more than 15 minutes old and proves the exact bucket was empty,
+   or contained only one canonical non-owning bootstrap lease marker, and both
+   custom domains were active. Its v3 seal is an Ed25519 signature
    over the exact canonical receipt bytes; the signer public key is part of the
    SHA-pinned bootstrap plan. Recomputing an unkeyed digest or substituting an
    attacker key cannot authorize mutation. Expired-lease recovery is
@@ -56,10 +57,11 @@ content, binding, compatibility-date/flags, closed telemetry, placement,
 limits, usage-model and exposure policy. It does not write repository payload
 objects, custom domains, DNS, Logpush, cache rules or unrelated routes. The
 only R2 mutation is a provider-visible conditional lease at
-`.sow/bootstrap/leases/<plan-sha>.json`; it is removed with its exact ETag only
-after the local outcome receipt is durable. The initial transport is the
-deployable `r2-service` correctness path; the later cache-normalization POC is a
-separate, explicitly attested deployment state.
+`.sow/bootstrap/leases/<plan-sha>.json`. After the local outcome receipt is
+durable, its exact live bytes are compare-and-set to a canonical idle marker;
+SOW never calls R2 DeleteObject for this reusable key. The initial transport is
+the deployable `r2-service` correctness path; the later cache-normalization POC
+is a separate, explicitly attested deployment state.
 
 The runtime constructs an R2-only signed control client for that lease. Apply
 and rollback additionally read the separately injected Cloudflare API token
@@ -134,11 +136,18 @@ the final version-closure page is adjacent to DELETE, while deployment,
 settings, exposure and attachment checks precede it. None of those request
 sequences is an atomic CAS. A new external-admin mutation can still race after
 the last relevant read, so no stronger claim is made about writes outside SOW.
+R2 has no conditional DeleteObject. Lease release and expired recovery therefore
+use only the provider-validated conditional PutObject primitive: the exact live
+ETag is CAS-replaced by a non-owning marker containing the digest and canonical
+body of the previous lease. Acquisition may CAS that marker to a new live lease.
+A stale holder can neither renew nor retire the replacement because its ETag no
+longer matches, and there is no unconditional delete that could erase a new holder.
+
 The lease expiration decision also uses the executing host's wall clock and
 therefore assumes bootstrap hosts have bounded clock skew; it is not a provider
 fencing token for a severely skewed host. A crashed executor leaves a
 five-minute lease rather than unlocking an uncertain mutation. The separately
-authorized `recover-lease` mode can remove only an expired, canonical,
+authorized `recover-lease` mode can retire only an expired, canonical,
 plan/account/zone-matching lease by matching ETag and emits a private durable
 recovery receipt.
 
@@ -152,7 +161,7 @@ recovery receipt.
   exposure, route creation/deletion, inventories and non-forced script deletion.
   Loopback protocol tests assert both auth and origin multipart bodies, create-only
   headers and exact route bodies. Failure-injection, cross-run takeover,
-  compare-and-set lease/recovery, lease-only bucket pagination/identity,
+  compare-and-set acquisition/renewal/idle retirement/recovery, lease-only bucket pagination/identity,
   post-readiness provider drift, stale inventory omission, checked-delete
   identity/version/attachment drift, bounded mutation lifetime, final-read to
   DELETE request adjacency, exact-404 replay and provider-success/client-error

@@ -26,12 +26,13 @@ import (
 )
 
 const (
-	realCloudCloudflareBootstrapReceiptSchema  = "sow-real-cloud-cloudflare-bootstrap-receipt/v1"
-	realCloudCloudflareBootstrapEnvelopeSchema = "sow-real-cloud-cloudflare-bootstrap-receipt-envelope/v1"
-	realCloudCloudflareBootstrapLeaseSchema    = "sow-real-cloud-cloudflare-bootstrap-lease/v1"
-	realCloudCloudflareLeaseRecoverySchema     = "sow-real-cloud-cloudflare-bootstrap-lease-recovery/v1"
-	realCloudCloudflareBootstrapLeaseTTL       = 5 * time.Minute
-	realCloudCloudflareMutationTimeout         = realCloudCloudflareBootstrapLeaseTTL / 3
+	realCloudCloudflareBootstrapReceiptSchema   = "sow-real-cloud-cloudflare-bootstrap-receipt/v1"
+	realCloudCloudflareBootstrapEnvelopeSchema  = "sow-real-cloud-cloudflare-bootstrap-receipt-envelope/v1"
+	realCloudCloudflareBootstrapLeaseSchema     = "sow-real-cloud-cloudflare-bootstrap-lease/v1"
+	realCloudCloudflareBootstrapIdleLeaseSchema = "sow-real-cloud-cloudflare-bootstrap-idle-lease/v1"
+	realCloudCloudflareLeaseRecoverySchema      = "sow-real-cloud-cloudflare-bootstrap-lease-recovery/v1"
+	realCloudCloudflareBootstrapLeaseTTL        = 5 * time.Minute
+	realCloudCloudflareMutationTimeout          = realCloudCloudflareBootstrapLeaseTTL / 3
 )
 
 type realCloudCloudflareBootstrapInventory struct {
@@ -132,11 +133,24 @@ type realCloudCloudflareBootstrapLease struct {
 	ExpiresAt  string `json:"expires_at"`
 }
 
+// realCloudCloudflareBootstrapIdleLease is the durable, non-owning state of
+// the bootstrap serialization key. R2 does not implement conditional DELETE,
+// so a holder releases ownership by compare-and-setting its exact live lease
+// to this marker. No SOW path deletes or renews an idle marker; the next holder
+// may only replace it with another compare-and-set PUT.
+type realCloudCloudflareBootstrapIdleLease struct {
+	Schema              string                            `json:"schema"`
+	PlanSHA256          string                            `json:"plan_sha256"`
+	AccountID           string                            `json:"account_id"`
+	ZoneID              string                            `json:"zone_id"`
+	PreviousLease       realCloudCloudflareBootstrapLease `json:"previous_lease"`
+	PreviousLeaseSHA256 string                            `json:"previous_lease_sha256"`
+}
+
 type realCloudCloudflareBootstrapLeaseStore interface {
 	R2GetControl(context.Context, string) (publish.ControlObject, error)
 	R2ListObjectsV2(context.Context, string) (publish.ObjectListPage, error)
 	R2Put(context.Context, string, io.Reader, int64, string, publish.R2PutCondition) (string, error)
-	R2Delete(context.Context, string, string) error
 }
 
 type realCloudCloudflareBootstrapHeldLease struct {
@@ -549,6 +563,20 @@ func realCloudCloudflareBootstrapLeaseKey(planSHA string) (string, error) {
 	return ".sow/bootstrap/leases/" + planSHA + ".json", nil
 }
 
+func validateRealCloudCloudflareBootstrapReadinessMarkerPlan(receipt realCloudProviderReadinessReceipt, planSHA string) error {
+	key, err := realCloudCloudflareBootstrapLeaseKey(planSHA)
+	if err != nil {
+		return err
+	}
+	if receipt.BucketControlObjectCount == 0 && receipt.BucketControlObjectKey == "" {
+		return nil
+	}
+	if receipt.BucketControlObjectCount == 1 && receipt.BucketControlObjectKey == key {
+		return nil
+	}
+	return errors.New("Cloudflare bootstrap readiness idle marker belongs to another plan")
+}
+
 func newRealCloudCloudflareBootstrapLeaseHolder() (string, error) {
 	var nonce [32]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
@@ -591,6 +619,54 @@ func decodeRealCloudCloudflareBootstrapLease(body []byte) (realCloudCloudflareBo
 	return lease, nil
 }
 
+func newRealCloudCloudflareBootstrapIdleLease(lease realCloudCloudflareBootstrapLease) (realCloudCloudflareBootstrapIdleLease, error) {
+	body, err := encodeRealCloudCloudflareBootstrapLease(lease)
+	if err != nil {
+		return realCloudCloudflareBootstrapIdleLease{}, err
+	}
+	return realCloudCloudflareBootstrapIdleLease{
+		Schema:              realCloudCloudflareBootstrapIdleLeaseSchema,
+		PlanSHA256:          lease.PlanSHA256,
+		AccountID:           lease.AccountID,
+		ZoneID:              lease.ZoneID,
+		PreviousLease:       lease,
+		PreviousLeaseSHA256: realCloudLowerSHA256(body),
+	}, nil
+}
+
+func encodeRealCloudCloudflareBootstrapIdleLease(idle realCloudCloudflareBootstrapIdleLease) ([]byte, error) {
+	previousBody, err := encodeRealCloudCloudflareBootstrapLease(idle.PreviousLease)
+	if err != nil || idle.Schema != realCloudCloudflareBootstrapIdleLeaseSchema ||
+		idle.PlanSHA256 != idle.PreviousLease.PlanSHA256 || idle.AccountID != idle.PreviousLease.AccountID ||
+		idle.ZoneID != idle.PreviousLease.ZoneID || idle.PreviousLeaseSHA256 != realCloudLowerSHA256(previousBody) {
+		return nil, errors.New("Cloudflare bootstrap idle lease identity is invalid")
+	}
+	body, err := json.Marshal(idle)
+	if err != nil {
+		return nil, errors.New("encode Cloudflare bootstrap idle lease")
+	}
+	return append(body, '\n'), nil
+}
+
+func decodeRealCloudCloudflareBootstrapIdleLease(body []byte) (realCloudCloudflareBootstrapIdleLease, error) {
+	var idle realCloudCloudflareBootstrapIdleLease
+	if err := decodeRealCloudCanonicalJSONFile(body, &idle); err != nil {
+		return idle, err
+	}
+	canonical, err := encodeRealCloudCloudflareBootstrapIdleLease(idle)
+	if err != nil || !bytes.Equal(canonical, body) {
+		return idle, errors.New("Cloudflare bootstrap idle lease is invalid or non-canonical")
+	}
+	return idle, nil
+}
+
+func validateRealCloudCloudflareBootstrapIdleLease(idle realCloudCloudflareBootstrapIdleLease, plan realCloudCloudflareBootstrapPlan, planSHA string) error {
+	if idle.PlanSHA256 != planSHA || idle.AccountID != plan.AccountID || idle.ZoneID != plan.ZoneID {
+		return errors.New("Cloudflare bootstrap idle lease belongs to a foreign plan or provider")
+	}
+	return nil
+}
+
 func acquireRealCloudCloudflareBootstrapLease(ctx context.Context, store realCloudCloudflareBootstrapLeaseStore, plan realCloudCloudflareBootstrapPlan, planSHA, runID, mode, holder string, now time.Time) (*realCloudCloudflareBootstrapHeldLease, error) {
 	if store == nil || planSHA != realCloudCloudflareBootstrapPlanSHA(plan) || !validRealCloudRunID(runID) ||
 		mode != "apply" && mode != "rollback" || !validRealCloudLowerSHA256(holder) {
@@ -624,14 +700,24 @@ func acquireRealCloudCloudflareBootstrapLease(ctx context.Context, store realClo
 	if err != nil || !observed.Exists || !validRealCloudProviderETag(observed.ETag) {
 		return nil, errors.New("inspect conflicting Cloudflare bootstrap lease")
 	}
-	existing, err := decodeRealCloudCloudflareBootstrapLease(observed.Body)
+	existing, activeErr := decodeRealCloudCloudflareBootstrapLease(observed.Body)
+	idle, idleErr := decodeRealCloudCloudflareBootstrapIdleLease(observed.Body)
 	clearRealCloudBytes(observed.Body)
-	if err != nil || existing.PlanSHA256 != planSHA || existing.AccountID != plan.AccountID || existing.ZoneID != plan.ZoneID {
+	switch {
+	case activeErr == nil:
+		if existing.PlanSHA256 != planSHA || existing.AccountID != plan.AccountID || existing.ZoneID != plan.ZoneID {
+			return nil, errors.New("Cloudflare bootstrap refuses an invalid or foreign lease")
+		}
+		expires, _ := time.Parse(time.RFC3339Nano, existing.ExpiresAt)
+		if !now.After(expires) {
+			return nil, errors.New("Cloudflare bootstrap is leased by another live execution")
+		}
+	case idleErr == nil:
+		if err := validateRealCloudCloudflareBootstrapIdleLease(idle, plan, planSHA); err != nil {
+			return nil, err
+		}
+	default:
 		return nil, errors.New("Cloudflare bootstrap refuses an invalid or foreign lease")
-	}
-	expires, _ := time.Parse(time.RFC3339Nano, existing.ExpiresAt)
-	if !now.After(expires) {
-		return nil, errors.New("Cloudflare bootstrap is leased by another live execution")
 	}
 	etag, err = store.R2Put(ctx, key, bytes.NewReader(body), int64(len(body)), realCloudLowerSHA256(body), publish.R2PutCondition{IfMatch: observed.ETag})
 	if err != nil || !validRealCloudProviderETag(etag) {
@@ -762,9 +848,24 @@ func (held *realCloudCloudflareBootstrapHeldLease) release(ctx context.Context) 
 	if err != nil || existing != held.lease {
 		return errors.New("Cloudflare bootstrap lease bytes changed before release")
 	}
-	if err := held.store.R2Delete(ctx, held.key, held.etag); err != nil {
-		return fmt.Errorf("release Cloudflare bootstrap lease: %w", err)
+	idle, err := newRealCloudCloudflareBootstrapIdleLease(held.lease)
+	if err != nil {
+		return err
 	}
+	body, err := encodeRealCloudCloudflareBootstrapIdleLease(idle)
+	if err != nil {
+		return err
+	}
+	etag, err := held.store.R2Put(ctx, held.key, bytes.NewReader(body), int64(len(body)), realCloudLowerSHA256(body), publish.R2PutCondition{IfMatch: held.etag})
+	if err != nil || !validRealCloudProviderETag(etag) {
+		return errors.New("release Cloudflare bootstrap lease by compare-and-set")
+	}
+	after, err := held.store.R2GetControl(ctx, held.key)
+	if err != nil || !after.Exists || after.ETag != etag || !bytes.Equal(after.Body, body) {
+		clearRealCloudBytes(after.Body)
+		return errors.New("Cloudflare bootstrap idle lease was not durably observed after release")
+	}
+	clearRealCloudBytes(after.Body)
 	held.etag = ""
 	return nil
 }
@@ -782,22 +883,43 @@ func recoverExpiredRealCloudCloudflareBootstrapLease(ctx context.Context, store 
 	if err != nil || !observed.Exists || !validRealCloudProviderETag(observed.ETag) {
 		return recovered, errors.New("Cloudflare bootstrap recovery found no exact lease entity")
 	}
-	recovered, err = decodeRealCloudCloudflareBootstrapLease(observed.Body)
+	recovered, activeErr := decodeRealCloudCloudflareBootstrapLease(observed.Body)
+	idle, idleErr := decodeRealCloudCloudflareBootstrapIdleLease(observed.Body)
 	clearRealCloudBytes(observed.Body)
-	if err != nil || recovered.PlanSHA256 != planSHA || recovered.AccountID != plan.AccountID || recovered.ZoneID != plan.ZoneID {
+	if activeErr != nil {
+		if idleErr != nil || validateRealCloudCloudflareBootstrapIdleLease(idle, plan, planSHA) != nil {
+			return realCloudCloudflareBootstrapLease{}, errors.New("Cloudflare bootstrap recovery refuses an invalid or foreign lease")
+		}
+		recovered = idle.PreviousLease
+		expires, _ := time.Parse(time.RFC3339Nano, recovered.ExpiresAt)
+		if !now.UTC().After(expires) {
+			return realCloudCloudflareBootstrapLease{}, errors.New("Cloudflare bootstrap recovery refuses a live lease")
+		}
+		return recovered, nil
+	}
+	if recovered.PlanSHA256 != planSHA || recovered.AccountID != plan.AccountID || recovered.ZoneID != plan.ZoneID {
 		return realCloudCloudflareBootstrapLease{}, errors.New("Cloudflare bootstrap recovery refuses an invalid or foreign lease")
 	}
 	expires, _ := time.Parse(time.RFC3339Nano, recovered.ExpiresAt)
 	if !now.UTC().After(expires) {
 		return realCloudCloudflareBootstrapLease{}, errors.New("Cloudflare bootstrap recovery refuses a live lease")
 	}
-	if err := store.R2Delete(ctx, key, observed.ETag); err != nil {
-		return realCloudCloudflareBootstrapLease{}, fmt.Errorf("delete expired Cloudflare bootstrap lease by compare-and-delete: %w", err)
+	idle, err = newRealCloudCloudflareBootstrapIdleLease(recovered)
+	if err != nil {
+		return realCloudCloudflareBootstrapLease{}, err
+	}
+	body, err := encodeRealCloudCloudflareBootstrapIdleLease(idle)
+	if err != nil {
+		return realCloudCloudflareBootstrapLease{}, err
+	}
+	etag, err := store.R2Put(ctx, key, bytes.NewReader(body), int64(len(body)), realCloudLowerSHA256(body), publish.R2PutCondition{IfMatch: observed.ETag})
+	if err != nil || !validRealCloudProviderETag(etag) {
+		return realCloudCloudflareBootstrapLease{}, errors.New("retire expired Cloudflare bootstrap lease by compare-and-set")
 	}
 	after, err := store.R2GetControl(ctx, key)
-	if err != nil && !errors.Is(err, publish.ErrNotFound) || err == nil && after.Exists {
+	if err != nil || !after.Exists || after.ETag != etag || !bytes.Equal(after.Body, body) {
 		clearRealCloudBytes(after.Body)
-		return realCloudCloudflareBootstrapLease{}, errors.New("expired Cloudflare bootstrap lease remains after recovery")
+		return realCloudCloudflareBootstrapLease{}, errors.New("retired Cloudflare bootstrap lease was not durably observed after recovery")
 	}
 	clearRealCloudBytes(after.Body)
 	return recovered, nil
@@ -1573,8 +1695,8 @@ func validateRealCloudCloudflareBootstrapRollbackClosure(ctx context.Context, co
 // first deployment of the reviewed Cloudflare auth/origin bundles. TestMain
 // admits it only after the independent readiness and bootstrap registries plus
 // the exact mutation phrase pass. Apply and rollback use one conditional R2
-// lease object under .sow/bootstrap/leases and remove it only after a durable
-// receipt. They never alter repository payload objects, DNS, custom domains,
+// lease object under .sow/bootstrap/leases and retire it by compare-and-set
+// only after a durable receipt. They never alter repository payload objects, DNS, custom domains,
 // the token-verifier deployment, or unrelated Worker routes.
 func TestRealCloudCloudflareBootstrap(t *testing.T) {
 	mode := strings.TrimSpace(os.Getenv(realCloudCloudflareBootstrapOptInEnv))
@@ -1622,9 +1744,12 @@ func TestRealCloudCloudflareBootstrap(t *testing.T) {
 			}
 			key, _ := realCloudCloudflareBootstrapLeaseKey(planSHA)
 			observed, getErr := leaseStore.R2GetControl(t.Context(), key)
-			if getErr != nil && !errors.Is(getErr, publish.ErrNotFound) || getErr == nil && observed.Exists {
+			idle, idleErr := decodeRealCloudCloudflareBootstrapIdleLease(observed.Body)
+			if getErr != nil || !observed.Exists || idleErr != nil || validateRealCloudCloudflareBootstrapIdleLease(idle, plan, planSHA) != nil ||
+				idle.PreviousLease.RunID != existing.RecoveredLeaseRun || idle.PreviousLease.Mode != existing.RecoveredMode ||
+				realCloudLowerSHA256([]byte(idle.PreviousLease.Holder)) != existing.LeaseHolderSHA256 || idle.PreviousLease.ExpiresAt != existing.LeaseExpiredAt {
 				clearRealCloudBytes(observed.Body)
-				t.Fatalf("recovered Cloudflare bootstrap lease reappeared: %v", getErr)
+				t.Fatalf("recovered Cloudflare bootstrap idle marker changed: get=%v decode=%v", getErr, idleErr)
 			}
 			clearRealCloudBytes(observed.Body)
 			t.Logf("Cloudflare bootstrap expired lease recovery is already durable receipt=%s", recoveryPath)
@@ -1659,6 +1784,9 @@ func TestRealCloudCloudflareBootstrap(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("load Cloudflare bootstrap readiness receipt for post-lease revalidation: %v", err)
+	}
+	if err := validateRealCloudCloudflareBootstrapReadinessMarkerPlan(readinessReceipt, planSHA); err != nil {
+		t.Fatal(err)
 	}
 	environment := realCloudProviderReadinessEnvironment(resource)
 	providerClosure := func(ctx context.Context) error {
@@ -1794,6 +1922,7 @@ type fakeRealCloudCloudflareBootstrapLeaseStore struct {
 	body         []byte
 	etag         string
 	version      int
+	deleteCalls  int
 	extraObjects []publish.ListedObject
 	listPages    map[string]publish.ObjectListPage
 }
@@ -1844,6 +1973,7 @@ func (store *fakeRealCloudCloudflareBootstrapLeaseStore) R2Put(_ context.Context
 }
 
 func (store *fakeRealCloudCloudflareBootstrapLeaseStore) R2Delete(_ context.Context, key, ifMatch string) error {
+	store.deleteCalls++
 	if store.key != key {
 		return publish.ErrNotFound
 	}
@@ -2112,8 +2242,11 @@ func TestRealCloudCloudflareBootstrapLeaseSerializesAndRecoversByCAS(t *testing.
 	if err := first.renew(t.Context(), now.Add(2*time.Minute)); err != nil || first.etag == oldETag {
 		t.Fatalf("lease renewal did not compare-and-set a new entity etag=%q err=%v", first.etag, err)
 	}
-	if err := first.release(t.Context()); err != nil || store.key != "" {
-		t.Fatalf("lease release did not conditionally remove the exact entity err=%v", err)
+	if err := first.release(t.Context()); err != nil || store.key == "" || store.deleteCalls != 0 {
+		t.Fatalf("lease release did not CAS the exact entity to an idle marker err=%v delete_calls=%d", err, store.deleteCalls)
+	}
+	if idle, err := decodeRealCloudCloudflareBootstrapIdleLease(store.body); err != nil || idle.PreviousLease != first.lease {
+		t.Fatalf("lease release idle marker is invalid idle=%+v err=%v", idle, err)
 	}
 
 	expired, err := acquireRealCloudCloudflareBootstrapLease(t.Context(), store, plan, planSHA, "20260717T120000Z-expired-lease", "apply", strings.Repeat("c", 64), now)
@@ -2130,7 +2263,7 @@ func TestRealCloudCloudflareBootstrapLeaseSerializesAndRecoversByCAS(t *testing.
 	if err := expired.release(t.Context()); err == nil {
 		t.Fatal("stale lease holder released the replacement lease")
 	}
-	if err := replacement.release(t.Context()); err != nil {
+	if err := replacement.release(t.Context()); err != nil || store.deleteCalls != 0 {
 		t.Fatal(err)
 	}
 }
@@ -2174,7 +2307,7 @@ func TestRealCloudCloudflareBootstrapPostLeaseClosureRejectsForeignMissingAndCyc
 		if err := validateRealCloudCloudflareBootstrapLeasedBucketClosure(t.Context(), held); err != nil {
 			t.Fatalf("exact lease-only closure was rejected: %v", err)
 		}
-		if err := held.release(t.Context()); err != nil || store.key != "" {
+		if err := held.release(t.Context()); err != nil || store.key == "" || store.deleteCalls != 0 {
 			t.Fatalf("release exact closure: %v", err)
 		}
 	})
@@ -2322,8 +2455,12 @@ func TestRealCloudCloudflareBootstrapExpiredLeaseRecoveryIsExactAndConditional(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovered != held.lease || store.key != "" {
-		t.Fatal("expired lease recovery did not remove exactly the observed lease")
+	idle, idleErr := decodeRealCloudCloudflareBootstrapIdleLease(store.body)
+	if recovered != held.lease || idleErr != nil || idle.PreviousLease != held.lease || store.deleteCalls != 0 {
+		t.Fatalf("expired lease recovery did not CAS exactly to the idle marker idle=%+v decode=%v delete_calls=%d", idle, idleErr, store.deleteCalls)
+	}
+	if replayed, err := recoverExpiredRealCloudCloudflareBootstrapLease(t.Context(), store, plan, planSHA, now.Add(realCloudCloudflareBootstrapLeaseTTL+2*time.Second)); err != nil || replayed != held.lease {
+		t.Fatalf("idle recovery replay failed recovered=%+v err=%v", replayed, err)
 	}
 }
 

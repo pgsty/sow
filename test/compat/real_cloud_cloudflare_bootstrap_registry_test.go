@@ -801,7 +801,8 @@ func TestRealCloudCloudflareBootstrapSelectionFailsBeforeCredentials(t *testing.
 		ReadinessResourceSHA256: realCloudProviderReadinessResourceSHA(resource),
 		BucketIdentitySHA256:    strings.Repeat("b", 64), ProviderControlSHA256: strings.Repeat("c", 64),
 		BucketObservedEmpty: true, ProviderOperations: "read-only:list-objects-v2+zone-and-domain-identity",
-		ObservedAt: now.Format(time.RFC3339Nano),
+		BucketControlClosureSHA256: realCloudProviderEmptyReadinessBucketObservation().ControlClosureSHA256,
+		ObservedAt:                 now.Format(time.RFC3339Nano),
 	}, signer)
 	values := map[string]string{
 		realCloudNonProductionEnv:                       realCloudNonProductionPhrase,

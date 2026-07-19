@@ -32,6 +32,10 @@ gate.
    credentials. Its permitted operation set is limited to a signed
    `ListObjectsV2` proving the exact publisher bucket empty and read-only
    control-plane identity queries for the pinned zone and domain closure.
+   After a Cloudflare bootstrap has run, readiness may instead List and GET
+   exactly one canonical CAS-retired bootstrap lease marker for the pinned
+   account/zone; any live lease, payload, foreign marker or second object fails.
+   EdgeOne still requires an empty bucket.
    Cloudflare must return exactly the enabled, ownership-active, SSL-active
    main/beta R2 custom domains bound to the pinned bucket/zone; EdgeOne must
    return exactly the online main/beta acceleration domains. It may not upload,
@@ -44,9 +48,10 @@ gate.
    outside the repository. It does not read credentials, contact a provider,
    modify the compiled registry, or approve its own candidate.
 6. A successful readiness receipt uses
-   `sow-real-cloud-provider-readiness/v2` and binds the run, selected provider,
-   reviewed readiness-resource digest, empty-bucket identity digest and
-   provider-control digest. It contains no URL or credential.
+   `sow-real-cloud-provider-readiness/v3` and binds the run, selected provider,
+   reviewed readiness-resource digest, bucket identity, exact empty-or-idle
+   control-object closure and provider-control digest. Its v3 Ed25519 seal binds
+   the same canonical bytes. It contains no URL or credential.
 7. The complete destructive and evidence-producing POC remains unchanged: it
    still requires the full dual-cloud resource registry, provider-deployment
    registry, destructive confirmation, durable ledger, isolated credentials,

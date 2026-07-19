@@ -556,11 +556,14 @@ fresh same-run readiness receipt whose exact canonical bytes carry an Ed25519
 seal, a separately SHA-pinned plan that fixes the signer public key, and a
 mode/run/plan/account/zone authorization. Auth/origin ownership annotations bind the
 run; uploads are create-only. A provider-visible R2 control lease serializes
-executors and is renewed before each Worker/route mutation, then conditionally
-deleted only after one atomic local outcome envelope is durable. The final
+executors and is renewed before each Worker/route mutation, then CAS-retired
+to a canonical non-owning marker only after one atomic local outcome envelope
+is durable. The final
 Worker/route/settings/exposure closure must match twice. A crash leaves a
 bounded lease that only the separately authorized, exact-plan `recover-lease`
-path may remove after expiry. This lease is the sole bootstrap R2 control object;
+path may retire after expiry. R2 lacks conditional DeleteObject, so SOW never
+deletes this reusable key; the next executor can only replace its idle marker
+by ETag CAS. This lease is the sole bootstrap R2 control object;
 it never grants permission to alter repository payloads or any production resource.
 After acquisition and every renewal, all bounded `ListObjectsV2` pages must
 prove that the lease is the bucket's only object; a matching GET binds its
@@ -584,6 +587,8 @@ configuration is serialized by another five-minute R2 CAS lease under the raw
 log namespace, using an identity distinct from both read-only collectors and
 write-only exporters; a partial cross-provider failure retains that lease for
 bounded recovery rather than allowing concurrent adoption of uncertain state.
+Success CAS-retires it to the same kind of non-owning marker; the control
+identity has Get/conditional-Put authority and no Delete requirement.
 
 The separate `https-bearer` candidate strips the customer credential and makes
 a same-host global Fetch carrying only an origin-service secret. Main requests

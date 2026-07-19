@@ -61,15 +61,18 @@ Per-run provider log-sink setup acquires one provider-visible R2 lease at
 `<raw_root>.sow/provider-log-sink-lease.json` after both provider zone safety
 checks and before either control-plane mutation. Creation is `If-None-Match`,
 expired takeover and renewal are ETag compare-and-set, and successful closure
-deletes only the exact ETag. The lease is renewed before both the Cloudflare
-and EdgeOne mutations. A partial cross-provider failure deliberately retains
+CAS-retires the exact live entity to a canonical non-owning marker. The lease
+is renewed before both the Cloudflare and EdgeOne mutations. A partial cross-provider failure deliberately retains
 the lease until its five-minute expiry, preventing another run from adopting
 uncertain state; the next run may then replace it by CAS and replay the
 idempotent configuration.
 
-The lease uses a separate `SOW_REAL_CF_LOG_CONTROL_JSON` identity, pinned by
-digest in config and scoped only to Get/conditional Put/Delete on the lease
-prefix. It is pairwise distinct from publisher, raw reader, Cloudflare Logpush
+R2 does not implement conditional DeleteObject, so this reusable serialization
+key is never deleted by SOW. The next run replaces the idle marker by ETag CAS;
+a stale holder cannot erase the replacement. The lease uses a separate
+`SOW_REAL_CF_LOG_CONTROL_JSON` identity, pinned by digest in config and scoped
+only to Get/conditional Put on the lease prefix. It is pairwise distinct from
+publisher, raw reader, Cloudflare Logpush
 writer and EdgeOne writer identities. Exporter writer credentials remain
 write-only and never receive List/Get/Delete.
 
