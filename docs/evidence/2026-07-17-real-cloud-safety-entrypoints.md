@@ -86,11 +86,13 @@ SOW job 仍必须唯一、启用、100% `http_requests`、精确过滤 main+beta
 7.549s/11.065s。全过程未加载凭据、未构造真实云客户端、未发起网络请求。
 
 Cloudflare first-deployment bootstrap 随后的怀疑式审计关闭了跨 run 接管、并发 executor、
-absent→upload 覆盖、双文件 receipt 崩溃窗、nested compatibility 逃逸、verifier settings 缺口与
+absent→upload 覆盖、outcome envelope 崩溃窗、nested compatibility 逃逸、verifier settings 缺口与
 trailing-dot production-domain 绕过。apply 现在必须消费同 run 的 fresh readiness receipt；所有权与
 动态授权绑定 mode/run/plan/account/zone；auth/origin create 使用 `If-None-Match: *`；R2 上只写一个
-`.sow/bootstrap/leases/<plan-sha>.json` CAS 租约并在 durable receipt 后按 ETag 删除；过期租约有单独
-授权的 `recover-lease`。完整 closure 与 settings/exposure 都要求连续两次观察一致。详细代码面、
+`.sow/bootstrap/leases/<readiness-resource-sha>.json` CAS 租约并在 durable receipt 后 CAS 退役为
+idle marker；同资源 plan 轮换继续复用该 key，过期租约有单独授权且绑定旧/新 plan 的
+`recover-lease`。完整 closure 与 settings/exposure 都要求连续两次观察一致。readiness receipt/seal
+各自从完整 inode 做 no-replace 发布，receipt-only 中断可精确续写，seal-only/漂移则失败关闭。详细代码面、
 普通/竞态/CLI 六分片实测及尚缺 live POC 见
 [Cloudflare bootstrap 离线安全验证](2026-07-17-cloudflare-bootstrap-offline-validation.md)。本轮仍未读取
 凭据或触云，registry 仍为空，POC-06 状态不变。

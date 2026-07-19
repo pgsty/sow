@@ -56,8 +56,8 @@ const (
 	realCloudProviderMaxRawBytes              = 8 << 20
 	realCloudProviderMaxContentBytes          = 2 << 20
 	realCloudProviderMaxInventoryItems        = 10_000
-	realCloudProviderLogSinkLeaseSchema       = "sow-real-cloud-provider-log-sink-lease/v1"
-	realCloudProviderLogSinkIdleLeaseSchema   = "sow-real-cloud-provider-log-sink-idle-lease/v1"
+	realCloudProviderLogSinkLeaseSchema       = "sow-real-cloud-provider-log-sink-lease/v2"
+	realCloudProviderLogSinkIdleLeaseSchema   = "sow-real-cloud-provider-log-sink-idle-lease/v2"
 	realCloudProviderLogSinkLeaseTTL          = 5 * time.Minute
 )
 
@@ -245,6 +245,7 @@ type realCloudProviderLogSinkLease struct {
 	ProviderDeploymentSHA256 string `json:"provider_deployment_sha256"`
 	AccountID                string `json:"account_id"`
 	ZoneID                   string `json:"zone_id"`
+	RawBucket                string `json:"raw_bucket"`
 	Holder                   string `json:"holder"`
 	AcquiredAt               string `json:"acquired_at"`
 	ExpiresAt                string `json:"expires_at"`
@@ -255,6 +256,7 @@ type realCloudProviderLogSinkIdleLease struct {
 	ProviderDeploymentSHA256 string                        `json:"provider_deployment_sha256"`
 	AccountID                string                        `json:"account_id"`
 	ZoneID                   string                        `json:"zone_id"`
+	RawBucket                string                        `json:"raw_bucket"`
 	PreviousLease            realCloudProviderLogSinkLease `json:"previous_lease"`
 	PreviousLeaseSHA256      string                        `json:"previous_lease_sha256"`
 }
@@ -440,8 +442,8 @@ func validateRealCloudProviderLogControlCredential(configuration realCloudProvid
 	return nil
 }
 
-func realCloudProviderLogSinkLeaseKey(configuration realCloudProviderAttestationConfig) (string, error) {
-	key := configuration.Cloudflare.RawRoot + ".sow/provider-log-sink-lease.json"
+func realCloudProviderLogSinkLeaseKey() (string, error) {
+	const key = ".sow/provider-log-sink-lease.json"
 	if !validRealCloudProviderObjectKey(key) {
 		return "", errors.New("provider log-sink lease key is invalid")
 	}
@@ -451,7 +453,7 @@ func realCloudProviderLogSinkLeaseKey(configuration realCloudProviderAttestation
 func encodeRealCloudProviderLogSinkLease(lease realCloudProviderLogSinkLease) ([]byte, error) {
 	if lease.Schema != realCloudProviderLogSinkLeaseSchema || !validRealCloudRunID(lease.RunID) ||
 		!validRealCloudLowerSHA256(lease.ProviderDeploymentSHA256) || !validRealCloudProviderIdentifier(lease.AccountID, 128) ||
-		!validRealCloudProviderIdentifier(lease.ZoneID, 128) || !validRealCloudLowerSHA256(lease.Holder) {
+		!validRealCloudProviderIdentifier(lease.ZoneID, 128) || !validDedicatedRealCloudBucket(lease.RawBucket) || !validRealCloudLowerSHA256(lease.Holder) {
 		return nil, errors.New("provider log-sink lease identity is invalid")
 	}
 	acquired, err := time.Parse(time.RFC3339Nano, lease.AcquiredAt)
@@ -491,6 +493,7 @@ func newRealCloudProviderLogSinkIdleLease(lease realCloudProviderLogSinkLease) (
 		ProviderDeploymentSHA256: lease.ProviderDeploymentSHA256,
 		AccountID:                lease.AccountID,
 		ZoneID:                   lease.ZoneID,
+		RawBucket:                lease.RawBucket,
 		PreviousLease:            lease,
 		PreviousLeaseSHA256:      realCloudLowerSHA256(body),
 	}, nil
@@ -500,7 +503,7 @@ func encodeRealCloudProviderLogSinkIdleLease(idle realCloudProviderLogSinkIdleLe
 	previousBody, err := encodeRealCloudProviderLogSinkLease(idle.PreviousLease)
 	if err != nil || idle.Schema != realCloudProviderLogSinkIdleLeaseSchema ||
 		idle.ProviderDeploymentSHA256 != idle.PreviousLease.ProviderDeploymentSHA256 || idle.AccountID != idle.PreviousLease.AccountID ||
-		idle.ZoneID != idle.PreviousLease.ZoneID || idle.PreviousLeaseSHA256 != realCloudLowerSHA256(previousBody) {
+		idle.ZoneID != idle.PreviousLease.ZoneID || idle.RawBucket != idle.PreviousLease.RawBucket || idle.PreviousLeaseSHA256 != realCloudLowerSHA256(previousBody) {
 		return nil, errors.New("provider log-sink idle lease identity is invalid")
 	}
 	body, err := json.Marshal(idle)
@@ -522,9 +525,9 @@ func decodeRealCloudProviderLogSinkIdleLease(body []byte) (realCloudProviderLogS
 	return idle, nil
 }
 
-func validateRealCloudProviderLogSinkIdleLease(idle realCloudProviderLogSinkIdleLease, deploymentSHA, accountID, zoneID string) error {
-	if idle.ProviderDeploymentSHA256 != deploymentSHA || idle.AccountID != accountID || idle.ZoneID != zoneID {
-		return errors.New("provider log-sink idle lease belongs to a foreign deployment or provider")
+func validateRealCloudProviderLogSinkIdleLease(idle realCloudProviderLogSinkIdleLease, accountID, zoneID, rawBucket string) error {
+	if idle.AccountID != accountID || idle.ZoneID != zoneID || idle.RawBucket != rawBucket {
+		return errors.New("provider log-sink idle lease belongs to a foreign provider resource")
 	}
 	return nil
 }
@@ -541,14 +544,14 @@ func acquireRealCloudProviderLogSinkLease(
 	if err != nil || store == nil || !validRealCloudRunID(runID) || !validRealCloudLowerSHA256(holder) {
 		return nil, errors.New("provider log-sink lease acquisition identity is invalid")
 	}
-	key, err := realCloudProviderLogSinkLeaseKey(configuration)
+	key, err := realCloudProviderLogSinkLeaseKey()
 	if err != nil {
 		return nil, err
 	}
 	now = now.UTC()
 	lease := realCloudProviderLogSinkLease{
 		Schema: realCloudProviderLogSinkLeaseSchema, RunID: runID, ProviderDeploymentSHA256: deploymentSHA,
-		AccountID: configuration.Cloudflare.AccountID, ZoneID: configuration.Cloudflare.ZoneID, Holder: holder,
+		AccountID: configuration.Cloudflare.AccountID, ZoneID: configuration.Cloudflare.ZoneID, RawBucket: configuration.Cloudflare.RawBucket, Holder: holder,
 		AcquiredAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(realCloudProviderLogSinkLeaseTTL).Format(time.RFC3339Nano),
 	}
 	body, err := encodeRealCloudProviderLogSinkLease(lease)
@@ -574,7 +577,7 @@ func acquireRealCloudProviderLogSinkLease(
 	clearRealCloudBytes(observed.Body)
 	switch {
 	case activeErr == nil:
-		if existing.ProviderDeploymentSHA256 != deploymentSHA || existing.AccountID != configuration.Cloudflare.AccountID || existing.ZoneID != configuration.Cloudflare.ZoneID {
+		if existing.AccountID != configuration.Cloudflare.AccountID || existing.ZoneID != configuration.Cloudflare.ZoneID || existing.RawBucket != configuration.Cloudflare.RawBucket {
 			return nil, errors.New("provider log-sink setup refuses an invalid or foreign lease")
 		}
 		expires, _ := time.Parse(time.RFC3339Nano, existing.ExpiresAt)
@@ -582,7 +585,7 @@ func acquireRealCloudProviderLogSinkLease(
 			return nil, errors.New("provider log-sink setup is leased by another live execution")
 		}
 	case idleErr == nil:
-		if err := validateRealCloudProviderLogSinkIdleLease(idle, deploymentSHA, configuration.Cloudflare.AccountID, configuration.Cloudflare.ZoneID); err != nil {
+		if err := validateRealCloudProviderLogSinkIdleLease(idle, configuration.Cloudflare.AccountID, configuration.Cloudflare.ZoneID, configuration.Cloudflare.RawBucket); err != nil {
 			return nil, err
 		}
 	default:
@@ -3838,6 +3841,58 @@ func TestRealCloudProviderLogSinkLeaseSerializesRunsAndRecoversExpiredHolder(t *
 	}
 	if idle, err := decodeRealCloudProviderLogSinkIdleLease(store.body); err != nil || idle.PreviousLease != replacement.lease {
 		t.Fatalf("provider log-sink idle marker is invalid idle=%+v err=%v", idle, err)
+	}
+	foreignBucket := configuration
+	foreignBucket.Cloudflare.RawBucket = "sow-test-cf-provider-logs-foreign"
+	if _, err := acquireRealCloudProviderLogSinkLease(t.Context(), store, environment, foreignBucket,
+		"real-edge-test-run-20260717-foreign-bucket", strings.Repeat("7", 64), base.Add(8*time.Minute+time.Second)); err == nil {
+		t.Fatal("provider log-sink accepted an idle body relocated from another raw bucket")
+	}
+	rotated := configuration
+	rotated.ProductConfigSHA256 = strings.Repeat("b", 64)
+	rotated.Cloudflare.RawRoot = "sow-provider-logs/cloudflare-v2/"
+	oldDeploymentSHA, err := realCloudProviderDeploymentIdentity(environment, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotatedDeploymentSHA, err := realCloudProviderDeploymentIdentity(environment, rotated)
+	if err != nil || rotatedDeploymentSHA == oldDeploymentSHA {
+		t.Fatalf("provider deployment rotation did not produce a distinct identity old=%q new=%q err=%v", oldDeploymentSHA, rotatedDeploymentSHA, err)
+	}
+	rotatedHeld, err := acquireRealCloudProviderLogSinkLease(t.Context(), store, environment, rotated,
+		"real-edge-test-run-20260717-rotated", strings.Repeat("3", 64), base.Add(9*time.Minute))
+	if err != nil {
+		t.Fatalf("rotated provider deployment did not CAS-take the historical idle marker: %v", err)
+	}
+	if rotatedHeld.key != replacement.key || rotatedHeld.lease.ProviderDeploymentSHA256 != rotatedDeploymentSHA {
+		t.Fatalf("provider deployment rotation forked its serialization key held=%+v prior_key=%q", rotatedHeld, replacement.key)
+	}
+	if _, err := acquireRealCloudProviderLogSinkLease(t.Context(), store, environment, configuration,
+		"real-edge-test-run-20260717-old-live", strings.Repeat("4", 64), base.Add(10*time.Minute)); err == nil || !strings.Contains(err.Error(), "live execution") {
+		t.Fatalf("old provider deployment took over a live rotated lease: %v", err)
+	}
+	if err := rotatedHeld.release(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	oldCrashed, err := acquireRealCloudProviderLogSinkLease(t.Context(), store, environment, configuration,
+		"real-edge-test-run-20260717-old-crash", strings.Repeat("5", 64), base.Add(11*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotatedReplacement, err := acquireRealCloudProviderLogSinkLease(t.Context(), store, environment, rotated,
+		"real-edge-test-run-20260717-rotated-replay", strings.Repeat("6", 64), base.Add(11*time.Minute+realCloudProviderLogSinkLeaseTTL+time.Second))
+	if err != nil {
+		t.Fatalf("rotated provider deployment did not CAS-take an expired prior deployment lease: %v", err)
+	}
+	if err := oldCrashed.release(t.Context()); err == nil {
+		t.Fatal("stale prior-deployment log-sink holder released the rotated replacement")
+	}
+	if err := rotatedReplacement.release(t.Context()); err != nil || store.deleteCalls != 0 {
+		t.Fatalf("rotated provider deployment did not retire to one idle marker err=%v deletes=%d", err, store.deleteCalls)
+	}
+	if idle, err := decodeRealCloudProviderLogSinkIdleLease(store.body); err != nil ||
+		idle.ProviderDeploymentSHA256 != rotatedDeploymentSHA || idle.PreviousLease != rotatedReplacement.lease {
+		t.Fatalf("rotated provider log-sink idle marker is invalid idle=%+v err=%v", idle, err)
 	}
 }
 

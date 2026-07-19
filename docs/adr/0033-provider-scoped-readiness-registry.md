@@ -51,7 +51,12 @@ gate.
    `sow-real-cloud-provider-readiness/v3` and binds the run, selected provider,
    reviewed readiness-resource digest, bucket identity, exact empty-or-idle
    control-object closure and provider-control digest. Its v3 Ed25519 seal binds
-   the same canonical bytes. It contains no URL or credential.
+   the same canonical bytes. It contains no URL or credential. Each final file
+   is installed from a fully written and synced inode with no-replace semantics.
+   If interruption occurs after the receipt link but before the seal link, the
+   next identical current observation signs those immutable receipt bytes and
+   completes the pair. A seal-only, unsafe, stale or divergent half-pair fails
+   closed; completed evidence is never overwritten.
 7. The complete destructive and evidence-producing POC remains unchanged: it
    still requires the full dual-cloud resource registry, provider-deployment
    registry, destructive confirmation, durable ledger, isolated credentials,
@@ -84,9 +89,12 @@ gate.
 `TestRealCloudProviderReadinessResourceRejectsPartialOwnerTupleAndCrossProviderFields`,
 `TestRealCloudProviderReadinessSelectionDoesNotRequireOtherProviderOrDeployment`,
 the process-gate tests, and
-`TestRealCloudProviderReadinessContractIsScopedAndRedacted` cover the independent
+`TestRealCloudProviderReadinessContractIsScopedAndRedacted`,
+`TestRealCloudProviderReadinessReceiptPairRecoversInterruptedSeal` and
+`TestRealCloudProviderReadinessReceiptPairRejectsUnsafeHalfPairs` cover the independent
 registry, exact provider selection, offline onboarding, pre-client rejection,
-read-only operation set and secret-free sealed receipt.
+read-only operation set, secret-free sealed receipt and interrupted local pair
+recovery.
 The live non-production tuple, candidate digests and remaining signed-receipt
 boundary are recorded in
 [`2026-07-18-cloudflare-pro-domain-readiness.md`](../evidence/2026-07-18-cloudflare-pro-domain-readiness.md).

@@ -186,6 +186,14 @@ func realCloudProviderEmptyReadinessBucketObservation() realCloudProviderReadine
 	}
 }
 
+func realCloudCloudflareReadinessResourceSHA(identity realCloudCloudflareReadinessResource) string {
+	resource := realCloudProviderReadinessResource{
+		Schema: realCloudProviderReadinessResourceSchema, Purpose: "dedicated-disposable-non-production-test",
+		Provider: "cloudflare", Cloudflare: &identity,
+	}
+	return realCloudProviderReadinessResourceSHA(resource)
+}
+
 // collectRealCloudCloudflareReadinessBucketClosure admits either the pristine
 // empty bootstrap bucket or one exact CAS-retired bootstrap lease marker. The
 // marker is non-owning and cannot authorize a Worker mutation; acquisition
@@ -228,9 +236,9 @@ func collectRealCloudCloudflareReadinessBucketClosure(ctx context.Context, reade
 		return realCloudProviderEmptyReadinessBucketObservation(), nil
 	}
 	listed := objects[0]
-	const prefix = ".sow/bootstrap/leases/"
-	planSHA := strings.TrimSuffix(strings.TrimPrefix(listed.Key, prefix), ".json")
-	if !strings.HasPrefix(listed.Key, prefix) || listed.Key != prefix+planSHA+".json" || !validRealCloudLowerSHA256(planSHA) ||
+	resourceSHA := realCloudCloudflareReadinessResourceSHA(identity)
+	expectedKey, err := realCloudCloudflareBootstrapLeaseKey(resourceSHA)
+	if err != nil || listed.Key != expectedKey ||
 		listed.Size <= 0 || listed.Size > 64<<10 || !validRealCloudProviderETag(listed.ETag) {
 		return realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare readiness bucket contains a foreign object")
 	}
@@ -241,7 +249,7 @@ func collectRealCloudCloudflareReadinessBucketClosure(ctx context.Context, reade
 	}
 	defer clearRealCloudBytes(observed.Body)
 	idle, err := decodeRealCloudCloudflareBootstrapIdleLease(observed.Body)
-	if err != nil || idle.PlanSHA256 != planSHA || idle.AccountID != identity.AccountID || idle.ZoneID != identity.ZoneID {
+	if err != nil || idle.ReadinessResourceSHA256 != resourceSHA || idle.AccountID != identity.AccountID || idle.ZoneID != identity.ZoneID {
 		return realCloudProviderReadinessBucketObservation{}, errors.New("Cloudflare readiness bucket contains an invalid or foreign idle marker")
 	}
 	closure := []realCloudProviderReadinessControlObject{{
@@ -628,35 +636,181 @@ func newRealCloudProviderReadinessTestSigner(t *testing.T) (ed25519.PrivateKey, 
 func writeRealCloudProviderReadinessReceipt(t *testing.T, rawPath string, receipt realCloudProviderReadinessReceipt, signer ed25519.PrivateKey) {
 	t.Helper()
 	path := validateRealCloudProviderReadinessReceiptPath(t, rawPath)
+	seal, err := persistRealCloudProviderReadinessReceiptPair(path, receipt, signer, nil)
+	if err != nil {
+		t.Fatalf("persist provider-scoped readiness receipt pair: %v", err)
+	}
+	t.Logf("%s readiness receipt=%s seal_sha256=%s", receipt.Provider, path, seal.ReceiptSHA256)
+}
+
+// persistRealCloudProviderReadinessReceiptPair publishes each final pathname
+// from a fully-written inode and resumes the only normal half-pair window: a
+// complete receipt whose seal was not linked before interruption. Existing
+// completed evidence is immutable and must match the same observation; a seal
+// without its receipt, an unsafe inode, or divergent bytes fails closed.
+func persistRealCloudProviderReadinessReceiptPair(path string, desired realCloudProviderReadinessReceipt, signer ed25519.PrivateKey, afterReceipt func() error) (realCloudProviderReadinessSeal, error) {
+	var zero realCloudProviderReadinessSeal
+	if len(signer) != ed25519.PrivateKeySize {
+		return zero, errors.New("provider readiness signer is invalid")
+	}
+	desiredBody, err := json.Marshal(desired)
+	if err != nil {
+		return zero, errors.New("encode provider-scoped readiness receipt")
+	}
+	desiredBody = append(desiredBody, '\n')
+	defer clearRealCloudBytes(desiredBody)
+	if containsRealEdgeURLLeak(desiredBody) {
+		return zero, errors.New("provider-scoped readiness receipt exposed a URL")
+	}
+
+	receiptBody, receiptExists, err := readOptionalRealCloudPrivateCanonicalFile(path, 64<<10)
+	if err != nil {
+		return zero, fmt.Errorf("inspect provider-scoped readiness receipt: %w", err)
+	}
+	defer clearRealCloudBytes(receiptBody)
+	_, sealExists, err := readOptionalRealCloudPrivateCanonicalFile(path+".seal", 16<<10)
+	if err != nil {
+		return zero, fmt.Errorf("inspect provider-scoped readiness receipt seal: %w", err)
+	}
+	if !receiptExists && sealExists {
+		return zero, errors.New("provider-scoped readiness seal exists without its receipt")
+	}
+
+	if receiptExists {
+		var existing realCloudProviderReadinessReceipt
+		if err := decodeRealCloudCanonicalJSONFile(receiptBody, &existing); err != nil {
+			return zero, fmt.Errorf("decode existing provider-scoped readiness receipt: %w", err)
+		}
+		if err := validateRealCloudProviderReadinessReceiptReplay(existing, desired); err != nil {
+			return zero, err
+		}
+		if containsRealEdgeURLLeak(receiptBody) {
+			return zero, errors.New("existing provider-scoped readiness receipt exposed a URL")
+		}
+	} else {
+		installed, err := installRealCloudPrivateFileExclusiveWithPattern(path, desiredBody, ".sow-provider-readiness-receipt-*")
+		if err != nil {
+			return zero, fmt.Errorf("atomically install provider-scoped readiness receipt: %w", err)
+		}
+		if installed {
+			receiptBody = append(receiptBody[:0], desiredBody...)
+		} else {
+			receiptBody, err = readRealCloudPrivateCanonicalFile(path, 64<<10)
+			if err != nil {
+				return zero, fmt.Errorf("read concurrently installed provider-scoped readiness receipt: %w", err)
+			}
+			var existing realCloudProviderReadinessReceipt
+			if err := decodeRealCloudCanonicalJSONFile(receiptBody, &existing); err != nil {
+				return zero, fmt.Errorf("decode concurrently installed provider-scoped readiness receipt: %w", err)
+			}
+			if err := validateRealCloudProviderReadinessReceiptReplay(existing, desired); err != nil {
+				return zero, err
+			}
+		}
+	}
+
+	seal, sealBody, err := buildRealCloudProviderReadinessSeal(receiptBody, signer)
+	if err != nil {
+		return zero, err
+	}
+	defer clearRealCloudBytes(sealBody)
+	if sealExists {
+		if err := validateRealCloudProviderReadinessSealFile(path+".seal", sealBody); err != nil {
+			return zero, err
+		}
+		return seal, nil
+	}
+	if afterReceipt != nil {
+		if err := afterReceipt(); err != nil {
+			return zero, fmt.Errorf("provider-scoped readiness interruption after receipt: %w", err)
+		}
+	}
+	installed, err := installRealCloudPrivateFileExclusiveWithPattern(path+".seal", sealBody, ".sow-provider-readiness-seal-*")
+	if err != nil {
+		return zero, fmt.Errorf("atomically install provider-scoped readiness seal: %w", err)
+	}
+	if !installed {
+		if err := validateRealCloudProviderReadinessSealFile(path+".seal", sealBody); err != nil {
+			return zero, err
+		}
+	}
+	return seal, nil
+}
+
+func readOptionalRealCloudPrivateCanonicalFile(path string, maxBytes int64) ([]byte, bool, error) {
+	_, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, errors.New("inspect private evidence file")
+	}
+	body, err := readRealCloudPrivateCanonicalFile(path, maxBytes)
+	if err != nil {
+		return nil, false, err
+	}
+	return body, true, nil
+}
+
+func validateRealCloudProviderReadinessReceiptReplay(existing, desired realCloudProviderReadinessReceipt) error {
+	existingObserved, existingErr := time.Parse(time.RFC3339Nano, existing.ObservedAt)
+	desiredObserved, desiredErr := time.Parse(time.RFC3339Nano, desired.ObservedAt)
+	existing.ObservedAt = ""
+	desired.ObservedAt = ""
+	if existingErr != nil || desiredErr != nil || existing != desired {
+		return errors.New("existing provider-scoped readiness receipt differs from the current observation")
+	}
+	delta := desiredObserved.Sub(existingObserved)
+	if delta < -time.Minute || delta > realCloudProviderReadinessMaxAge {
+		return errors.New("existing provider-scoped readiness receipt cannot be safely replayed")
+	}
+	return nil
+}
+
+func buildRealCloudProviderReadinessSeal(receiptBody []byte, signer ed25519.PrivateKey) (realCloudProviderReadinessSeal, []byte, error) {
+	var receipt realCloudProviderReadinessReceipt
+	if err := decodeRealCloudCanonicalJSONFile(receiptBody, &receipt); err != nil {
+		return realCloudProviderReadinessSeal{}, nil, fmt.Errorf("decode provider-scoped readiness receipt before sealing: %w", err)
+	}
 	publicKeyHex, err := realCloudProviderReadinessSignerPublicKey(signer)
 	if err != nil {
-		t.Fatal(err)
+		return realCloudProviderReadinessSeal{}, nil, err
 	}
 	publicKey, err := decodeRealCloudProviderReadinessPublicKey(publicKeyHex)
 	if err != nil {
-		t.Fatal(err)
+		return realCloudProviderReadinessSeal{}, nil, err
 	}
 	defer clearRealCloudBytes(publicKey)
-	body, err := json.Marshal(receipt)
-	if err != nil {
-		t.Fatal("encode provider-scoped readiness receipt")
-	}
-	body = append(body, '\n')
-	if containsRealEdgeURLLeak(body) {
-		t.Fatal("provider-scoped readiness receipt exposed a URL")
-	}
-	writeRealCloudRegistryCandidate(t, path, body)
-	message := realCloudProviderReadinessSealMessage(body)
+	message := realCloudProviderReadinessSealMessage(receiptBody)
 	signature := ed25519.Sign(signer, message)
 	clearRealCloudBytes(message)
 	seal := realCloudProviderReadinessSeal{
 		Schema: realCloudProviderReadinessSealSchema, RunID: receipt.RunID, Provider: receipt.Provider,
-		ReceiptSHA256: realCloudLowerSHA256(body), ReceiptSize: len(body),
+		ReceiptSHA256: realCloudLowerSHA256(receiptBody), ReceiptSize: len(receiptBody),
 		SignerPublicKeySHA256: realCloudLowerSHA256(publicKey), Signature: base64.RawStdEncoding.EncodeToString(signature),
 	}
 	clearRealCloudBytes(signature)
-	writeRealCloudExclusiveJSON(t, path+".seal", seal)
-	t.Logf("%s readiness receipt=%s seal_sha256=%s", receipt.Provider, path, seal.ReceiptSHA256)
+	sealBody, err := json.Marshal(seal)
+	if err != nil {
+		return realCloudProviderReadinessSeal{}, nil, errors.New("encode provider-scoped readiness seal")
+	}
+	return seal, append(sealBody, '\n'), nil
+}
+
+func validateRealCloudProviderReadinessSealFile(path string, expected []byte) error {
+	body, err := readRealCloudPrivateCanonicalFile(path, 16<<10)
+	if err != nil {
+		return fmt.Errorf("read provider-scoped readiness seal: %w", err)
+	}
+	defer clearRealCloudBytes(body)
+	var seal realCloudProviderReadinessSeal
+	if err := decodeRealCloudCanonicalJSONFile(body, &seal); err != nil {
+		return fmt.Errorf("decode provider-scoped readiness seal: %w", err)
+	}
+	if !bytes.Equal(body, expected) {
+		return errors.New("existing provider-scoped readiness seal differs from the exact receipt and signer")
+	}
+	return nil
 }
 
 func validateRealCloudProviderReadinessReceiptPath(t *testing.T, raw string) string {
@@ -733,8 +887,8 @@ func loadAndValidateRealCloudCloudflareBootstrapReadinessReceiptWithHook(rawPath
 		return realCloudProviderReadinessReceipt{}, fmt.Errorf("decode readiness receipt seal: %w", err)
 	}
 	empty := realCloudProviderEmptyReadinessBucketObservation()
-	markerPlanSHA := strings.TrimSuffix(strings.TrimPrefix(receipt.BucketControlObjectKey, ".sow/bootstrap/leases/"), ".json")
-	markerKeyValid := validRealCloudLowerSHA256(markerPlanSHA) && receipt.BucketControlObjectKey == ".sow/bootstrap/leases/"+markerPlanSHA+".json"
+	expectedMarkerKey, markerKeyErr := realCloudCloudflareBootstrapLeaseKey(realCloudProviderReadinessResourceSHA(resource))
+	markerKeyValid := markerKeyErr == nil && receipt.BucketControlObjectKey == expectedMarkerKey
 	bucketClosureValid := validRealCloudLowerSHA256(receipt.BucketControlClosureSHA256) && (receipt.BucketObservedEmpty && receipt.BucketControlObjectCount == 0 && receipt.BucketControlObjectKey == "" && receipt.BucketControlClosureSHA256 == empty.ControlClosureSHA256 && receipt.ProviderOperations == empty.Operations ||
 		!receipt.BucketObservedEmpty && receipt.BucketControlObjectCount == 1 && markerKeyValid && receipt.ProviderOperations == "read-only:list-objects-v2+get-idle-bootstrap-lease+zone-and-domain-identity")
 	if receipt.Schema != realCloudProviderReadinessReceiptSchema || receipt.RunID != runID || receipt.Provider != "cloudflare" ||
@@ -743,7 +897,8 @@ func loadAndValidateRealCloudCloudflareBootstrapReadinessReceiptWithHook(rawPath
 		return realCloudProviderReadinessReceipt{}, errors.New("readiness receipt does not prove the exact empty-or-idle Cloudflare resource closure")
 	}
 	observed, err := time.Parse(time.RFC3339Nano, receipt.ObservedAt)
-	if err != nil || observed.After(now.Add(time.Minute)) || now.Sub(observed) < 0 || now.Sub(observed) > realCloudProviderReadinessMaxAge {
+	age := now.Sub(observed)
+	if err != nil || age < -time.Minute || age > realCloudProviderReadinessMaxAge {
 		return realCloudProviderReadinessReceipt{}, errors.New("readiness receipt is invalid, from the future, or stale")
 	}
 	signature, err := base64.RawStdEncoding.DecodeString(seal.Signature)
@@ -907,6 +1062,129 @@ func TestRealCloudProviderReadinessContractIsScopedAndRedacted(t *testing.T) {
 	}
 }
 
+func TestRealCloudProviderReadinessReceiptPairRecoversInterruptedSeal(t *testing.T) {
+	resource := realCloudCloudflareReadinessFixture()
+	now := time.Date(2026, 7, 19, 14, 0, 0, 0, time.UTC)
+	runID := "20260719T140000Z-readiness-pair-recovery"
+	receipt := realCloudProviderReadinessReceipt{
+		Schema: realCloudProviderReadinessReceiptSchema, RunID: runID, Provider: "cloudflare",
+		ReadinessResourceSHA256: realCloudProviderReadinessResourceSHA(resource),
+		BucketIdentitySHA256:    strings.Repeat("a", 64), ProviderControlSHA256: strings.Repeat("b", 64),
+		BucketObservedEmpty: true, BucketControlClosureSHA256: realCloudProviderEmptyReadinessBucketObservation().ControlClosureSHA256,
+		ProviderOperations: "read-only:list-objects-v2+zone-and-domain-identity", ObservedAt: now.Format(time.RFC3339Nano),
+	}
+	private := t.TempDir()
+	if err := os.Chmod(private, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	signer, publicKey := newRealCloudProviderReadinessTestSigner(t)
+	defer clearRealCloudBytes(signer)
+	path := filepath.Join(private, "readiness.json")
+	injected := errors.New("injected stop")
+	if _, err := persistRealCloudProviderReadinessReceiptPair(path, receipt, signer, func() error { return injected }); !errors.Is(err, injected) {
+		t.Fatalf("receipt/seal interruption was not surfaced: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil || len(before) == 0 {
+		t.Fatalf("interruption did not leave one complete receipt: %v", err)
+	}
+	if _, err := os.Lstat(path + ".seal"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("interruption unexpectedly published a seal: %v", err)
+	}
+
+	replayed := receipt
+	replayed.ObservedAt = now.Add(time.Second).Format(time.RFC3339Nano)
+	seal, err := persistRealCloudProviderReadinessReceiptPair(path, replayed, signer, nil)
+	if err != nil {
+		t.Fatalf("resume exact half-pair: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) || seal.ReceiptSHA256 != realCloudLowerSHA256(before) {
+		t.Fatalf("resume replaced the receipt bytes or sealed another body: err=%v", err)
+	}
+	if err := validateRealCloudCloudflareBootstrapReadinessReceipt(path, resource, runID, publicKey, now.Add(time.Second)); err != nil {
+		t.Fatalf("resumed readiness pair did not validate: %v", err)
+	}
+	clockSteppedBack := receipt
+	clockSteppedBack.ObservedAt = now.Add(-30 * time.Second).Format(time.RFC3339Nano)
+	if _, err := persistRealCloudProviderReadinessReceiptPair(path, clockSteppedBack, signer, nil); err != nil {
+		t.Fatalf("bounded backward clock step blocked receipt-only replay: %v", err)
+	}
+	if err := validateRealCloudCloudflareBootstrapReadinessReceipt(path, resource, runID, publicKey, now.Add(-30*time.Second)); err != nil {
+		t.Fatalf("bounded future skew invalidated a signed readiness receipt: %v", err)
+	}
+	clockSteppedTooFar := receipt
+	clockSteppedTooFar.ObservedAt = now.Add(-time.Minute - time.Second).Format(time.RFC3339Nano)
+	if _, err := persistRealCloudProviderReadinessReceiptPair(path, clockSteppedTooFar, signer, nil); err == nil {
+		t.Fatal("excessive backward clock step replayed readiness evidence")
+	}
+	if err := validateRealCloudCloudflareBootstrapReadinessReceipt(path, resource, runID, publicKey, now.Add(-time.Minute-time.Second)); err == nil {
+		t.Fatal("readiness loader admitted excessive future skew")
+	}
+	if _, err := persistRealCloudProviderReadinessReceiptPair(path, replayed, signer, nil); err != nil {
+		t.Fatalf("completed readiness pair was not idempotent: %v", err)
+	}
+
+	divergent := replayed
+	divergent.ProviderControlSHA256 = strings.Repeat("c", 64)
+	if _, err := persistRealCloudProviderReadinessReceiptPair(path, divergent, signer, nil); err == nil {
+		t.Fatal("completed readiness evidence was overwritten by a divergent observation")
+	}
+	preserved, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, preserved) {
+		t.Fatalf("divergent replay changed immutable receipt evidence: %v", err)
+	}
+}
+
+func TestRealCloudProviderReadinessReceiptPairRejectsUnsafeHalfPairs(t *testing.T) {
+	now := time.Date(2026, 7, 19, 14, 30, 0, 0, time.UTC)
+	receipt := realCloudProviderReadinessReceipt{
+		Schema: realCloudProviderReadinessReceiptSchema, RunID: "20260719T143000Z-readiness-pair-unsafe", Provider: "cloudflare",
+		ReadinessResourceSHA256: strings.Repeat("a", 64), BucketIdentitySHA256: strings.Repeat("b", 64),
+		ProviderControlSHA256: strings.Repeat("c", 64), BucketObservedEmpty: true,
+		BucketControlClosureSHA256: realCloudProviderEmptyReadinessBucketObservation().ControlClosureSHA256,
+		ProviderOperations:         "read-only:list-objects-v2+zone-and-domain-identity", ObservedAt: now.Format(time.RFC3339Nano),
+	}
+	private := t.TempDir()
+	if err := os.Chmod(private, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	signer, _ := newRealCloudProviderReadinessTestSigner(t)
+	defer clearRealCloudBytes(signer)
+
+	sealOnly := filepath.Join(private, "seal-only.json")
+	if err := os.WriteFile(sealOnly+".seal", []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistRealCloudProviderReadinessReceiptPair(sealOnly, receipt, signer, nil); err == nil {
+		t.Fatal("seal-only half-pair was completed without its receipt")
+	}
+	if _, err := os.Lstat(sealOnly); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("seal-only failure created a receipt: %v", err)
+	}
+
+	symlinked := filepath.Join(private, "symlinked.json")
+	injected := errors.New("injected stop")
+	if _, err := persistRealCloudProviderReadinessReceiptPair(symlinked, receipt, signer, func() error { return injected }); !errors.Is(err, injected) {
+		t.Fatalf("prepare symlink half-pair: %v", err)
+	}
+	target := filepath.Join(private, "foreign-seal.json")
+	foreign := []byte("{}\n")
+	if err := os.WriteFile(target, foreign, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, symlinked+".seal"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := persistRealCloudProviderReadinessReceiptPair(symlinked, receipt, signer, nil); err == nil {
+		t.Fatal("symlinked readiness seal was followed")
+	}
+	preserved, err := os.ReadFile(target)
+	if err != nil || !bytes.Equal(preserved, foreign) {
+		t.Fatalf("unsafe seal target was changed: %v", err)
+	}
+}
+
 func TestRealCloudCloudflareReadinessAdmitsOnlyOneExactIdleBootstrapLease(t *testing.T) {
 	resource, plan := realCloudCloudflareBootstrapPlanFixture(t)
 	identity := *resource.Cloudflare
@@ -930,12 +1208,33 @@ func TestRealCloudCloudflareReadinessAdmitsOnlyOneExactIdleBootstrapLease(t *tes
 		t.Fatalf("exact idle bootstrap marker was not admitted observation=%+v err=%v", observation, err)
 	}
 	receipt := realCloudProviderReadinessReceipt{BucketControlObjectCount: 1, BucketControlObjectKey: observation.ControlObjectKey}
-	if err := validateRealCloudCloudflareBootstrapReadinessMarkerPlan(receipt, planSHA); err != nil {
-		t.Fatalf("same-plan readiness marker was rejected: %v", err)
+	if err := validateRealCloudCloudflareBootstrapReadinessMarkerResource(receipt, plan); err != nil {
+		t.Fatalf("same-resource readiness marker was rejected: %v", err)
 	}
-	if err := validateRealCloudCloudflareBootstrapReadinessMarkerPlan(receipt, strings.Repeat("2", 64)); err == nil {
-		t.Fatal("foreign-plan readiness marker was admitted before lease acquisition")
+	foreignPlan := plan
+	foreignPlan.ReadinessResourceSHA256 = strings.Repeat("2", 64)
+	if err := validateRealCloudCloudflareBootstrapReadinessMarkerResource(receipt, foreignPlan); err == nil {
+		t.Fatal("foreign-resource readiness marker was admitted before lease acquisition")
 	}
+	stableKey := store.key
+	store.key = ".sow/bootstrap/leases/" + planSHA + ".json"
+	if store.key == stableKey {
+		t.Fatal("bootstrap test fixture did not distinguish plan and readiness-resource lease keys")
+	}
+	if _, err := collectRealCloudCloudflareReadinessBucketClosure(t.Context(), store, identity); err == nil {
+		t.Fatal("Cloudflare readiness admitted the legacy plan-derived marker key")
+	}
+	relocatedIdentity := identity
+	relocatedIdentity.BetaBase = "https://rotated.pro.pigsty.io"
+	relocatedKey, err := realCloudCloudflareBootstrapLeaseKey(realCloudCloudflareReadinessResourceSHA(relocatedIdentity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.key = relocatedKey
+	if _, err := collectRealCloudCloudflareReadinessBucketClosure(t.Context(), store, relocatedIdentity); err == nil {
+		t.Fatal("Cloudflare readiness admitted an idle body relocated from another readiness resource")
+	}
+	store.key = stableKey
 	runID := "20260719T120000Z-readiness-idle"
 	receipt = realCloudProviderReadinessReceipt{
 		Schema: realCloudProviderReadinessReceiptSchema, RunID: runID, Provider: "cloudflare",
@@ -955,6 +1254,13 @@ func TestRealCloudCloudflareReadinessAdmitsOnlyOneExactIdleBootstrapLease(t *tes
 	writeRealCloudProviderReadinessReceipt(t, path, receipt, signer)
 	if err := validateRealCloudCloudflareBootstrapReadinessReceipt(path, resource, runID, publicKey, now); err != nil {
 		t.Fatalf("signed idle-marker readiness receipt was rejected: %v", err)
+	}
+	legacyKeyReceipt := receipt
+	legacyKeyReceipt.BucketControlObjectKey = ".sow/bootstrap/leases/" + planSHA + ".json"
+	legacyPath := filepath.Join(private, "legacy-plan-key-readiness.json")
+	writeRealCloudProviderReadinessReceipt(t, legacyPath, legacyKeyReceipt, signer)
+	if err := validateRealCloudCloudflareBootstrapReadinessReceipt(legacyPath, resource, runID, publicKey, now); err == nil {
+		t.Fatal("signed readiness receipt admitted a legacy plan-derived marker before credential construction")
 	}
 	store.extraObjects = []publish.ListedObject{{Key: "payload/foreign", Size: 1, ETag: `"foreign"`}}
 	if _, err := collectRealCloudCloudflareReadinessBucketClosure(t.Context(), store, identity); err == nil {

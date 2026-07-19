@@ -127,10 +127,10 @@ provider-deployment and bootstrap registries remain separate and closed.
 
 ## Remaining exact blocker
 
-The Cloudflare readiness receipt v2 still requires a bearer token with the
+The Cloudflare readiness receipt v3 still requires a bearer token with the
 harness's two read-only capabilities: exact-account Workers R2 Storage Read
 and exact-zone Zone Read. No such token is present in the process environment
-or the documented local token file. Its seal is now Ed25519 v2: a future
+or the documented local token file. Its seal is now Ed25519 v3: a future
 readiness run must inject a private seed through
 `SOW_REAL_CLOUD_PROVIDER_READINESS_SIGNER_JSON`, while the reviewed bootstrap
 plan pins only the corresponding public key. Until the token is securely

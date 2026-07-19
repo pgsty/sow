@@ -26,10 +26,13 @@ Both reusable coordination keys now have a two-state CAS protocol:
 Cloudflare readiness v3 remains read-only. It admits a pristine empty bucket or
 exactly one canonical idle bootstrap marker, records its key and complete
 key/size/ETag/body-digest closure in the Ed25519-sealed receipt, and requires
-the marker key to match the selected bootstrap plan before acquisition. Live
-leases, payloads, foreign markers, multiple objects, list/GET identity drift,
-continuation cycles and a marker for another plan fail before Worker authority
-can mutate anything. EdgeOne readiness still requires an empty bucket.
+the marker key to match the selected readiness resource before acquisition.
+Live leases, payloads, foreign markers, multiple objects, list/GET identity
+drift, continuation cycles and a marker for another resource fail before
+Worker authority can mutate anything. V-25 later made that resource-stable key
+survive plan rotation; see
+[`2026-07-19-r2-resource-stable-lease-rotation.md`](2026-07-19-r2-resource-stable-lease-rotation.md).
+EdgeOne readiness still requires an empty bucket.
 
 ## Executed validation
 
@@ -53,7 +56,7 @@ PASS (no output)
 The focused tests additionally assert live conflict rejection, renewal, stale
 holder rejection, expired takeover, idle takeover, recovery replay, durable
 idle read-back, zero lease-store delete calls, exact idle readiness admission,
-foreign payload rejection and same-plan marker binding.
+foreign payload rejection and same-resource marker binding.
 
 The installed Staticcheck binary initially reported that it had been built with
 Go 1.26.4 while the module requires Go 1.26.5. It was rebuilt from the already

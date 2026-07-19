@@ -3049,22 +3049,13 @@ func writeRealCloudExclusiveJSON(t *testing.T, path string, value any) {
 		t.Fatal("encode persistent real-cloud metadata")
 	}
 	body = append(body, '\n')
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	installed, err := installRealCloudPrivateFileExclusiveWithPattern(path, body, ".sow-real-cloud-metadata-*")
 	if err != nil {
-		t.Fatalf("create persistent real-cloud metadata: %v", err)
+		t.Fatalf("atomically install persistent real-cloud metadata: %v", err)
 	}
-	if _, err := file.Write(body); err != nil {
-		_ = file.Close()
-		t.Fatalf("write persistent real-cloud metadata: %v", err)
+	if !installed {
+		t.Fatal("persistent real-cloud metadata already exists")
 	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		t.Fatalf("sync persistent real-cloud metadata: %v", err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatalf("close persistent real-cloud metadata: %v", err)
-	}
-	syncRealCloudDirectory(t, filepath.Dir(path))
 }
 
 func readRealCloudStrictJSON(t *testing.T, path string, value any) {

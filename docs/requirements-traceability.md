@@ -285,6 +285,20 @@ bucket closure; bootstrap and provider log-sink reusable keys release/recover
 only by conditional Put CAS to a non-owning marker and require no DeleteObject
 authority. The row's external provider gaps and `受阻` status are unchanged.
 
+V-25 closes the version-rotation hole in that CAS protocol. Bootstrap now has
+exactly one key derived from the readiness-resource SHA rather than the plan
+SHA; historical same-resource idle leases are CAS-replayable, live holders
+still block, expired live holders require `recover-lease`, and recovery receipt
+v2 binds current/recovered plan digests plus the complete recovered lease
+digest. Lease/idle v2 bodies also bind the readiness-resource SHA, so canonical
+bytes cannot be relocated between resources. The provider log-sink has exactly one dedicated raw-bucket-root
+key independent of deployment SHA and raw-root rotation, with the same
+live-versus-idle/expired rule. Readiness accepts only that exact current-resource
+marker key. Its receipt/seal writer now installs complete inodes with
+no-replace semantics and fault-tested receipt-only recovery; seal-only, unsafe
+or divergent pairs fail closed. Focused ordinary/race evidence was local only;
+no cloud write occurred and POC-06 remains `受阻`.
+
 POC-06 的 R2 storage/raw custom-domain data-plane 子集已由 V-21 真实执行：条件 PUT/CAS、读取与
 Copy 成立，DeleteObject `If-Match` 不成立；run-owned 双正文/lease 绑定的无条件测试清理后
 bucket 为空。main/beta 当前对象读取一致，但删除后仍同时返回 exact 1800s stale HIT，直接证明
@@ -313,7 +327,10 @@ digest 重新和 readiness receipt 比较。外来对象、缺失/替换租约�
 2026-07-19 的 V-24 又依据 V-21 的真实负能力结果移除了两个可复用租约的 DeleteObject
 调用面：bootstrap release/recovery 与 provider log-sink success 都把 exact live ETag 通过
 conditional Put CAS 为 canonical idle marker；下一 run 只能 CAS 接管。readiness v3 可只读证明
-空桶或唯一 exact idle marker，并在 bootstrap acquisition 前绑定当前 plan。完整 compat
+空桶或唯一 exact readiness-resource marker，并在 bootstrap acquisition 前绑定当前资源。
+V-25 又把 key 从 plan/deployment namespace 提升为资源稳定 namespace，使 plan、bundle、signer、
+raw-root 或 deployment 轮换不会产生第二个协调对象；历史 idle/expired 可 CAS 接管而 live 仍阻塞。
+完整 compat
 ordinary/race、vet/Staticcheck 与 stale-holder/foreign-closure 负例通过；本轮没有云写入。
 
 同日的 [rollback hardening](evidence/2026-07-18-cloudflare-bootstrap-rollback-hardening.md)

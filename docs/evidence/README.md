@@ -10,6 +10,10 @@ Cloudflare 生产仓库、bucket、Zone、domain。既有生产只读基线仅�
 readiness；owner 另行明确授权了仅命中空 `pro` 桶、带 exact bucket 确认与 run-owned digest
 allowlist 的 storage-only 协议测试。destructive/full-POC、Worker/CDN、provider-deployment 与
 bootstrap registry 仍保持关闭。
+2026-07-19 的 V-25 又把 bootstrap 与 provider log-sink 的 reusable lease key
+从 plan/deployment 版本身份中分离：同一资源/专用 raw bucket 始终只有一个稳定 key，历史
+idle/expired 版本可 CAS 重放而 live holder 仍阻塞；readiness receipt/seal 的本地半对中断也可
+精确续写。该轮只运行本地协议与故障注入，没有写 `pro` 或任何云资源。
 2026-07-17 增加的离线 candidate generator 只在仓库外输出评审候选；完整 mutation
 仍须命中双云 resource 与 provider-deployment registries，单供应商 read-only readiness 则命中
 [ADR-0033](../adr/0033-provider-scoped-readiness-registry.md) 的独立第三 registry。owner 于
@@ -61,6 +65,10 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   public-only plan 不联网。raw 404/200/redirect/v1/cache/origin/teardown/cancel 负例、双
   provider HTTP、真实 CLI 零 mutation 和 owner 授权 main/beta raw-domain 只读负证据均
   已实跑。当前两个测试域按设计被拒绝；这不冒充 Worker/private-origin/purge/POC-06 通过。
+- `2026-07-19-r2-resource-stable-lease-rotation.md`：bootstrap key 改由 readiness-resource
+  SHA 稳定派生，provider log-sink 固定为 dedicated raw bucket 根 key；跨 plan/deployment 的
+  idle/expired CAS 接管、live/foreign/stale-holder 拒绝、recovery receipt v2 与 readiness
+  receipt/seal 中断续写均有 ordinary/race 故障注入证据。未触云，POC-06 不变。
 - `2026-07-17-yum-infra-current-compatibility-cutover.md`：当前生产
   `yum/infra` 只读 234-file 快照的精确可写副本；216/216 RPM 由 Pigsty key
   验签，两个 root `modules.yaml` 只在副本 quarantine，完成双架构

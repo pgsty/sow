@@ -796,14 +796,15 @@ func TestRealCloudCloudflareBootstrapSelectionFailsBeforeCredentials(t *testing.
 		t.Fatal(err)
 	}
 	readinessPath := filepath.Join(private, "bootstrap-readiness.json")
-	writeRealCloudProviderReadinessReceipt(t, readinessPath, realCloudProviderReadinessReceipt{
+	readinessReceipt := realCloudProviderReadinessReceipt{
 		Schema: realCloudProviderReadinessReceiptSchema, RunID: runID, Provider: "cloudflare",
 		ReadinessResourceSHA256: realCloudProviderReadinessResourceSHA(resource),
 		BucketIdentitySHA256:    strings.Repeat("b", 64), ProviderControlSHA256: strings.Repeat("c", 64),
 		BucketObservedEmpty: true, ProviderOperations: "read-only:list-objects-v2+zone-and-domain-identity",
 		BucketControlClosureSHA256: realCloudProviderEmptyReadinessBucketObservation().ControlClosureSHA256,
 		ObservedAt:                 now.Format(time.RFC3339Nano),
-	}, signer)
+	}
+	writeRealCloudProviderReadinessReceipt(t, readinessPath, readinessReceipt, signer)
 	values := map[string]string{
 		realCloudNonProductionEnv:                       realCloudNonProductionPhrase,
 		realCloudProviderReadinessResourceEnv:           string(resourceBody),
@@ -834,6 +835,22 @@ func TestRealCloudCloudflareBootstrapSelectionFailsBeforeCredentials(t *testing.
 	if credentialReads != 0 {
 		t.Fatalf("rollback selection read credentials before all safety gates reads=%d", credentialReads)
 	}
+	legacyMarkerReceipt := readinessReceipt
+	legacyMarkerReceipt.BucketObservedEmpty = false
+	legacyMarkerReceipt.BucketControlObjectCount = 1
+	legacyMarkerReceipt.BucketControlObjectKey = ".sow/bootstrap/leases/" + planSHA + ".json"
+	legacyMarkerReceipt.BucketControlClosureSHA256 = strings.Repeat("d", 64)
+	legacyMarkerReceipt.ProviderOperations = "read-only:list-objects-v2+get-idle-bootstrap-lease+zone-and-domain-identity"
+	legacyReadinessPath := filepath.Join(private, "legacy-plan-key-readiness.json")
+	writeRealCloudProviderReadinessReceipt(t, legacyReadinessPath, legacyMarkerReceipt, signer)
+	values[realCloudCloudflareBootstrapReadinessReceiptEnv] = legacyReadinessPath
+	if err := validateRealCloudCloudflareBootstrapSelectionAgainstRegistriesAt("rollback", getenv, readiness, bootstrap, now); err == nil || !strings.Contains(err.Error(), "resource closure") {
+		t.Fatalf("bootstrap selection accepted a signed legacy plan-key marker before credentials: %v", err)
+	}
+	if credentialReads != 0 {
+		t.Fatalf("legacy marker rejection read credentials reads=%d", credentialReads)
+	}
+	values[realCloudCloudflareBootstrapReadinessReceiptEnv] = readinessPath
 	delete(values, realCloudCloudflareBootstrapReadinessReceiptEnv)
 	if err := validateRealCloudCloudflareBootstrapSelectionAgainstRegistriesAt("rollback", getenv, readiness, bootstrap, now); err == nil || !strings.Contains(err.Error(), "live readiness receipt") {
 		t.Fatalf("rollback accepted a missing pre-credential readiness receipt: %v", err)

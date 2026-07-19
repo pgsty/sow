@@ -6,17 +6,18 @@
 
 ## 已关闭的安全缺口
 
-- readiness `.seal` 已从可由本地攻击者重算的 SHA/size envelope 升级为 Ed25519 v2：
+- readiness `.seal` 已从可由本地攻击者重算的 SHA/size envelope 升级为当前 Ed25519 v3：
   私钥 seed 只从环境注入，bootstrap plan/registry 钉住公钥。定向负例证明 receipt 篡改后
   重算 SHA/size，以及用攻击者自有密钥重签，均在读取云凭据前失败关闭。
 - apply 必须消费同一 run、15 分钟内、证明精确 R2 空桶及 main/beta custom-domain active 的
   readiness receipt；固定确认短语替换为绑定 mode/run/plan/account/zone 的动态授权。
 - auth/origin Worker annotation 同时绑定 plan 与 run；新 Worker 通过官方 SDK 发送
   `If-None-Match: *`，不同 run 不能接管已存在脚本。
-- 每次 apply/rollback 先在指定测试桶的 `.sow/bootstrap/leases/<plan-sha>.json` 取得
-  create-only/CAS 租约；每个控制面 mutation 前续租，durable outcome receipt 后按 ETag 删除。
-  崩溃遗留租约五分钟后才可接管；`recover-lease` 只能按 ETag 删除过期且精确匹配
-  plan/account/zone 的 canonical 租约，并写私有 recovery receipt。
+- 每次 apply/rollback 先在指定测试桶的 `.sow/bootstrap/leases/<readiness-resource-sha>.json`
+  取得 create-only/CAS 租约；每个控制面 mutation 前续租，durable outcome receipt 后把 exact
+  live ETag CAS 为 canonical idle marker，不调用 DeleteObject。plan/signer/bundle 轮换仍复用同一
+  资源 key；live holder 阻塞，历史 idle/expired holder 才可接管。`recover-lease` 同样只用 CAS，
+  recovery receipt v2 同时绑定当前 plan 与被恢复的旧 plan。
 - readiness 与 bootstrap 之间不再只靠时效窗口：取得租约后以及每次 mutation 前续租后，必须
   完整消费 bounded `ListObjectsV2`，证明桶内唯一对象就是当前 size/ETag 的租约，再以 GET 比对
   canonical lease bytes。同时重新读取 exact zone 与 active main/beta R2 custom-domain/TLS 闭包，
@@ -90,16 +91,18 @@ apply、真实 main/beta 请求与 provider attestation；执行 rollback 并证
 [ADR-0035](../adr/0035-cloudflare-provider-attestation-and-log-sink-lease.md) 与
 [provider attestation 离线验证](2026-07-17-cloudflare-provider-attestation-offline-validation.md)。
 
-## 2026-07-19 readiness seal 防伪 follow-up
+## 2026-07-19 readiness seal 与中断恢复 follow-up
 
 安全审计发现原 `sow-real-cloud-provider-readiness-seal/v1` 只包含 receipt SHA-256 与
 size，本地攻击者可在篡改 receipt 后重算整个 envelope。当前实现已废弃 v1：
 
-- seal v2 使用 Ed25519 对 `schema + newline + exact canonical receipt bytes` 签名；
+- 当前 seal v3 使用 Ed25519 对 `schema + newline + exact canonical receipt bytes` 签名；
 - signer seed 只接受环境变量中的严格 lower-hex 32-byte seed，不进入文件或日志；
 - bootstrap plan/descriptor 升级为 v2并包含 signer 公钥，plan SHA 再由独立 registry 钉住；
 - validator 不信任 seal 自报密钥，只接受 plan 公钥，并在 provider credential 读取前验签；
-- key rotation 必须产生新的 plan SHA 与管理员评审的 registry entry。
+- key rotation 必须产生新的 plan SHA 与管理员评审的 registry entry，但不产生第二个 R2 lease key；
+- receipt 与 `.seal` 的 final path 都从已完整 write/sync 的 inode 以 no-replace 方式发布；若只完成
+  receipt，下一次匹配观察对原字节补 seal，seal-only、symlink、stale 或 divergent 半对失败关闭。
 
 本地门禁实跑结果：聚焦 ordinary `0.921s`、race `2.087s`，完整 compat ordinary
 `8.691s`、race `11.986s`，`go vet ./test/compat` 与 `git diff --check` 通过。负例精确覆盖

@@ -554,14 +554,21 @@ The first Cloudflare deployment is itself a fail-closed transaction
 ([ADR-0034](adr/0034-cloudflare-nonproduction-worker-bootstrap.md)). Apply consumes a
 fresh same-run readiness receipt whose exact canonical bytes carry an Ed25519
 seal, a separately SHA-pinned plan that fixes the signer public key, and a
-mode/run/plan/account/zone authorization. Auth/origin ownership annotations bind the
-run; uploads are create-only. A provider-visible R2 control lease serializes
+mode/run/plan/account/zone authorization. The readiness receipt and seal are
+each no-replace installed from complete synced inodes; an interrupted
+receipt-only pair is resumed by sealing those exact bytes after a matching
+fresh observation, while seal-only or divergent evidence fails closed.
+Auth/origin ownership annotations bind the run; uploads are create-only. A
+provider-visible R2 control lease v2 at the readiness-resource-derived key serializes
 executors and is renewed before each Worker/route mutation, then CAS-retired
 to a canonical non-owning marker only after one atomic local outcome envelope
 is durable. The final
 Worker/route/settings/exposure closure must match twice. A crash leaves a
-bounded lease that only the separately authorized, exact-plan `recover-lease`
-path may retire after expiry. R2 lacks conditional DeleteObject, so SOW never
+bounded lease, whose body also binds that readiness-resource digest, that only
+the separately authorized `recover-lease` path for the
+same readiness resource may retire after expiry. Its v2 recovery receipt binds
+both current/recovered plan digests and the complete recovered lease digest.
+Ordinary apply/rollback cannot take over an expired live entity. R2 lacks conditional DeleteObject, so SOW never
 deletes this reusable key; the next executor can only replace its idle marker
 by ETag CAS. This lease is the sole bootstrap R2 control object;
 it never grants permission to alter repository payloads or any production resource.
@@ -583,8 +590,8 @@ minimum and the frozen Cloudflare Modern TLS 1.2 cipher set. EdgeOne's
 realtime-log task must report the exact immutable `mainland` or `overseas`
 area pinned by the deployment contract; that value is bound into the task,
 raw-attestation and acceptance-ledger digests. Provider log-sink
-configuration is serialized by another five-minute R2 CAS lease under the raw
-log namespace, using an identity distinct from both read-only collectors and
+configuration is serialized by another five-minute R2 CAS lease at the
+dedicated raw bucket's stable `.sow/provider-log-sink-lease.json` key, using an identity distinct from both read-only collectors and
 write-only exporters; a partial cross-provider failure retains that lease for
 bounded recovery rather than allowing concurrent adoption of uncertain state.
 Success CAS-retires it to the same kind of non-owning marker; the control

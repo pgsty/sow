@@ -57,7 +57,16 @@ content, binding, compatibility-date/flags, closed telemetry, placement,
 limits, usage-model and exposure policy. It does not write repository payload
 objects, custom domains, DNS, Logpush, cache rules or unrelated routes. The
 only R2 mutation is a provider-visible conditional lease at
-`.sow/bootstrap/leases/<plan-sha>.json`. After the local outcome receipt is
+`.sow/bootstrap/leases/<readiness-resource-sha>.json`. The resource-derived
+key remains the only coordination object when bundle bytes, signer key or
+other plan fields rotate. Lease/idle schema v2 binds the readiness-resource
+SHA inside the canonical body as well as in the key; plan SHA remains in each
+live/idle body for audit.
+An unexpired historical-plan live holder still blocks, while a same-resource
+idle marker may be replaced only by exact ETag CAS. An expired live holder
+must first pass the separately authorized `recover-lease` path; ordinary apply
+or rollback cannot overwrite it and bypass the durable recovery record.
+After the local outcome receipt is
 durable, its exact live bytes are compare-and-set to a canonical idle marker;
 SOW never calls R2 DeleteObject for this reusable key. The initial transport is
 the deployable `r2-service` correctness path; the later cache-normalization POC
@@ -75,6 +84,21 @@ receipt, seal, plan, registry, log or repository. Plan onboarding carries only
 the lower-hex Ed25519 public key. Key rotation therefore requires a new plan
 digest and administrator-reviewed bootstrap-registry entry; a receipt signed
 by any other key fails before provider credentials are read.
+
+`recover-lease` uses the same resource-stable key. Recovery receipt v2 records
+both the current recovery plan, the recovered historical lease plan and the
+SHA-256 of the complete recovered canonical lease bytes; replay
+requires that durable receipt to match the exact canonical idle marker. Thus a
+plan rotation neither forks the lock namespace nor erases the provenance of
+the crashed holder. The receipt final pathname is no-replace linked only from
+a fully written and synced inode, so interruption cannot leave a partial final
+recovery record.
+
+The preceding V-24 protocol was local-only evidence: bootstrap and provider
+deployment registries were closed and no real lease marker was created. V-25
+is therefore the first live-capable lease schema. A legacy plan-derived key is
+treated as a foreign object and fails closed; no unsafe automatic deletion or
+dual-key migration is attempted.
 
 Lease acquisition is not treated as proof that the earlier empty-bucket
 readiness observation is still current. Immediately after create/CAS, and

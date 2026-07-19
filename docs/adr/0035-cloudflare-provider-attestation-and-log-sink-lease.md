@@ -58,8 +58,14 @@ individual TLS 1.3 ciphers. This follows the official
 and [Cloudflare Modern cipher recommendation](https://developers.cloudflare.com/ssl/edge-certificates/additional-options/cipher-suites/recommendations/).
 
 Per-run provider log-sink setup acquires one provider-visible R2 lease at
-`<raw_root>.sow/provider-log-sink-lease.json` after both provider zone safety
-checks and before either control-plane mutation. Creation is `If-None-Match`,
+the dedicated raw bucket's stable `.sow/provider-log-sink-lease.json` key after
+both provider zone safety checks and before either control-plane mutation.
+Raw-prefix or deployment-contract rotation therefore cannot fork the lock
+namespace. The deployment SHA remains in every live/idle body for audit;
+lease/idle schema v2 also binds the dedicated raw bucket identity, preventing
+canonical marker bodies from being relocated between buckets;
+same account/zone idle or expired historical deployments may be taken over by
+exact ETag CAS, while every live holder still blocks. Creation is `If-None-Match`,
 expired takeover and renewal are ETag compare-and-set, and successful closure
 CAS-retires the exact live entity to a canonical non-owning marker. The lease
 is renewed before both the Cloudflare and EdgeOne mutations. A partial cross-provider failure deliberately retains
@@ -87,6 +93,9 @@ unrelated shared-zone job no longer causes a post-mutation false failure.
 - New Worker/runtime fields introduced by Cloudflare fail closed until reviewed
   and represented in the contract.
 - Log-sink setup needs one additional narrowly scoped R2 control credential.
+- That credential is scoped only to Get and conditional Put on the dedicated
+  raw bucket's exact `.sow/provider-log-sink-lease.json` key; it needs no
+  payload prefix or Delete authority.
 - The shipped resource, bootstrap and provider-deployment registries remain
   empty. These changes have only loopback/fake-store evidence and do not claim
   that POC-06 or any real Cloudflare/COS operation passed.
