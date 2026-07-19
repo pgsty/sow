@@ -2,7 +2,7 @@
 
 ## Deferred from: code review of prd.md (2026-07-12)
 
-- YUM raw-baseurl `repomd.xml` and `repomd.xml.asc` cannot be replaced atomically as two object keys. SOW orders the compatibility alias pair and requires an identical immutable generation plus a generation-pinned mirrorlist/channel in the same transaction, but the observable raw-alias window remains until production clients migrate to the strong mirrorlist route. This is an explicit compatibility/production-migration blocker, not evidence that the raw pair is atomic.
+- YUM raw-baseurl `repomd.xml` and `repomd.xml.asc` cannot be replaced atomically as two object keys. SOW orders the compatibility alias pair and requires an identical immutable generation plus a generation-pinned mirrorlist/channel in the same transaction, but the observable raw-alias window remains until production clients migrate to the strong mirrorlist route. V-27/ADR-0038 fixes the infra cross-EL route map and requires an expiring canonical endpoint/RPM/trust receipt before local source apply, but no production origin or consumer was changed. This remains an explicit compatibility/production-migration blocker, not evidence that the raw pair is atomic.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-r2-readiness-resource-stable-lease.md`
   summary: Bootstrap expired-lease recovery still has a pre-existing remote-idle-to-local-receipt interruption window that needs a dedicated two-phase recovery-marker protocol.

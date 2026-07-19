@@ -648,21 +648,66 @@ serving TSV 和随后真实隔离 client 三层验收。对所有已配置 suite
 ```bash
 export PIGSTY_SRC=/absolute/path/to/pigsty
 export YUM_CONSUMER_STAGE="$EVIDENCE/yum-consumer-stage"
-export YUM_CONSUMER_RECEIPT="$EVIDENCE/yum-consumer-receipt"
+export YUM_CONSUMER_EVIDENCE="$EVIDENCE/yum-consumer-apply"
+export YUM_ENDPOINT_RECEIPT="$EVIDENCE/yum-consumer-preflight-$(date -u +%Y%m%dT%H%M%SZ).json"
+export RPM_TRUST_BUNDLE=/absolute/path/to/reviewed-public-only-rpm-trust.asc
+export SOW_CONFIG=/absolute/path/to/sow.yaml
+export SOW_BIN=/absolute/path/to/sow
 
 docs/migration/migrate-pigsty-yum-consumers.sh audit \
   --pigsty-root "$PIGSTY_SRC"
 docs/migration/migrate-pigsty-yum-consumers.sh stage \
   --pigsty-root "$PIGSTY_SRC" --output "$YUM_CONSUMER_STAGE"
 
-# 人工审阅 manifest.tsv、全部 staged diff、repo ID/EL 映射和 key URL。
+# 人工审阅 manifest.tsv、全部 staged diff、repo/OS/arch 映射和 key URL。
 export YUM_CONSUMER_PLAN_SHA="$(sed -n '1p' "$YUM_CONSUMER_STAGE/plan.sha256")"
 ```
 
-此时只允许审阅，不允许 `apply`。必须先在两个 public origin 上证明每个 mapped
+map v2 对每个定义分别冻结 x86_64/aarch64 的 `repo/os/arch`。`pigsty-infra` 不再伪装成
+per-EL repo，而是分别指向 `infra-legacy-x86-64/cross-el/x86_64` 与
+`infra-legacy-aarch64/cross-el/aarch64`；renderer 用 `os_arch` 选择嵌套 mirrorlist。
+历史 `conf/build/dev.yml` 中 `pigsty-infra` 的国内 raw source 虽指向 beta，但 frozen
+compatibility 只有 latest authority，因此 v2 stage 明确把该绑定归一到
+`repo.pigsty.cc/.../latest/infra-legacy-*`，不虚构 beta projection。
+
+此时只允许审阅，不允许 `apply`。先把 `RPM_TRUST_BUNDLE` 作为 public asset 的
+`pkg/keys/rpm-trust.asc` 纳管，并使用正常 `sow add` / `publish` 事务发布；不能在桶里手工
+上传一个不受 aggregate inventory 管理的同名对象。bundle 必须是 public-only，覆盖 SOW
+metadata key 与 staged route 可达 RPM 的全部 signer primary key。
+
+随后必须在两个 public origin 上证明每个 mapped
 `/_sow/v1/mirrorlist/latest/<repo>/<os>/<arch>.txt` 返回一个精确 immutable generation
 base，且 `/pkg/keys/rpm-trust.asc` 包含 fingerprint-reviewed repository key 与所有保留的
-RPM source key。随后用 stage 后的真实 Jinja renderer 在 EL7/8/9/10 隔离 client 生成
+RPM source key。先由单一 Go CLI 产生短时、不可覆盖的 endpoint receipt：
+
+```bash
+"$SOW_BIN" compatibility yum-consumer-preflight \
+  --config "$SOW_CONFIG" \
+  --staged "$YUM_CONSUMER_STAGE" \
+  --map docs/migration/yum-consumer-map.tsv \
+  --inventory docs/migration/yum-consumer-files.tsv \
+  --trust-bundle "$RPM_TRUST_BUNDLE" \
+  --receipt "$YUM_ENDPOINT_RECEIPT" \
+  --confirm "$YUM_CONSUMER_PLAN_SHA" \
+  --workers 8 --chunk-entries 4096
+```
+
+preflight 会把 28 个定义展开为全部 release × arch × region binding，逐项绑定当前 canonical
+generation/checkpoint/plan 与 target aggregate inventory；inventory 中 trust object 的
+size/SHA-256、从 CDN 读取的 bytes 和本地 bundle 必须三者完全一致。metadata 与 RPM
+验签都使用客户端实际导入的 aggregate certificate/keyring。每个唯一 endpoint 都必须完成 mirrorlist → exact generation →
+repomd + `.asc` → primary/filelists/other → RPM embedded signature。receipt 默认 15 分钟
+过期，最短 1 秒、最长 1 小时；metadata/RPM 验证与 receipt 使用取得 canonical lock 后的
+同一个 UTC 时刻，探测超过所选窗口则不签发。过期或 canonical/input 漂移后必须换一个
+新路径重新生成，不能覆盖旧 receipt。
+renderer 的外层 release/module/arch selector 与整个 RPM 分支都按精确控制流冻结；四个
+canonical consumer 的 module 也必须分别保持 infra/pgsql/percona/mssql。自定义 YAML tag、
+多行 description 或通过 meta 覆盖 baseurl/mirrorlist/gpgkey/enabled/TLS 都会失败闭锁。
+所有重探测结束后还会轻量重读每个唯一 mirrorlist/trust URL；随后重读 config 引用的
+metadata/package keyring 和全部本地输入，并核对 repository/stage/receipt-parent 的目录
+inode；任一长窗口漂移或同路径目录替换都不会产生 receipt。
+
+Go 协议门禁通过后，仍要用 stage 后的真实 Jinja renderer 在 EL7/8/9/10 隔离 client 生成
 `.repo`，EL7 执行 `yum --refresh makecache`，EL8/9/10 执行
 `dnf --refresh makecache`，全部开启 `repo_gpgcheck=1` 并安装选定包。
 
@@ -672,16 +717,26 @@ RPM source key。随后用 stage 后的真实 Jinja renderer 在 EL7/8/9/10 隔�
 docs/migration/migrate-pigsty-yum-consumers.sh apply \
   --pigsty-root "$PIGSTY_SRC" \
   --staged "$YUM_CONSUMER_STAGE" \
-  --evidence "$YUM_CONSUMER_RECEIPT" \
-  --confirm "$YUM_CONSUMER_PLAN_SHA"
+  --evidence "$YUM_CONSUMER_EVIDENCE" \
+  --confirm "$YUM_CONSUMER_PLAN_SHA" \
+  --sow-bin "$SOW_BIN" \
+  --sow-config "$SOW_CONFIG" \
+  --trust-bundle "$RPM_TRUST_BUNDLE" \
+  --preflight-receipt "$YUM_ENDPOINT_RECEIPT"
 
 docs/migration/migrate-pigsty-yum-consumers.sh verify \
   --pigsty-root "$PIGSTY_SRC"
 ```
 
-apply 逐文件只接受 manifest 记录的 before/after SHA-256，已混合写入的中断状态可安全重放；
-foreign drift 会拒绝继续。receipt 目录是唯一 rollback authority，必须和 deploy 证据一起
-保留在 checkout 外。
+apply 在创建 evidence、备份或改写 Pigsty 之前先执行 network-free
+`yum-consumer-receipt-check`；它重新推导 stage/map/inventory/config/trust 与 canonical
+publication identity，拒绝过期或重放到另一状态的 receipt。脚本再次对比 Go 输出的
+receipt digest 与路径；备份完成后、第一字节写入前还会再次执行同一检查，并要求 receipt
+digest 不变。因此慢备份期间的过期、配置或 canonical 漂移不会进入 source mutation。
+receipt SHA-256，并在任何 source mutation 前将 exact JSON 归档到 evidence；通过后才逐文件接受 manifest
+记录的 before/after SHA-256；已混合写入的中断状态可安全重放，foreign drift 会拒绝继续。
+apply receipt 同时记录 endpoint receipt SHA-256。`YUM_CONSUMER_EVIDENCE` 是唯一 rollback
+authority，必须和 endpoint/deploy 证据一起保留在 checkout 外。
 
 ### Phase 2 回滚
 
@@ -701,12 +756,16 @@ origin root 之外的受保护证据目录；随后再用 `serving-before-adopt.
 ```bash
 docs/migration/migrate-pigsty-yum-consumers.sh rollback \
   --pigsty-root "$PIGSTY_SRC" \
-  --evidence "$YUM_CONSUMER_RECEIPT" \
+  --evidence "$YUM_CONSUMER_EVIDENCE" \
   --confirm "$YUM_CONSUMER_PLAN_SHA"
 ```
 
 回滚完成后必须重新执行 `audit`、逐文件 before SHA-256 对账和旧 raw-baseurl 真 dnf；不能只
 看到脚本退出 0 就恢复 scheduler/writer。
+若曾使用 provisional map/renderer v1，必须用其原 evidence 先执行同一字节回滚，再从 raw
+source 生成新的 v2 stage；v2 工具不会把错误的 v1 infra per-EL route 就地解释成 frozen
+cross-EL authority。v1 rollback evidence 仍受支持，但新的 apply/rollback receipt 会保留
+归档的 endpoint receipt SHA-256。
 
 ## 5. Phase 3：本地切换门禁（BLOCKED）
 

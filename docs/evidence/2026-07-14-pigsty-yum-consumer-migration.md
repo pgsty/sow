@@ -6,15 +6,17 @@ Result: **local executable path PASS; production endpoint and client cutover rem
 
 ## Implemented contract
 
-- `docs/migration/yum-consumer-map.tsv` maps the four reviewed Pigsty
-  definitions to release-specific SOW repository IDs.
+- `docs/migration/yum-consumer-map.tsv` schema v2 maps the four reviewed Pigsty
+  definitions to exact architecture-specific `repo/os/arch` routes. Infra uses
+  the two frozen cross-EL compatibility projections rather than a nonexistent
+  per-release repository.
 - `docs/migration/yum-consumer-files.tsv` freezes the two renderers and nine
   source files containing 28 managed definitions.
 - `docs/migration/migrate-pigsty-yum-consumers.sh` provides read-only
   `audit`/`stage`/`verify`, digest-confirmed `apply`, and byte-exact
   `rollback`.
-- The staged renderer selects a regional `mirrorlist` before the retained raw
-  `baseurl` fallback, emits a regional public-key bundle URL, and enables both
+- The staged renderer selects `mirrorlist[region][os_arch]` before reviewed
+  scalar-mirrorlist and raw `baseurl` fallbacks, emits a regional public-key bundle URL, and enables both
   `gpgcheck=1` and `repo_gpgcheck=1` for the mapped definitions.
 - Stage/evidence directories must be outside the Pigsty checkout. Apply accepts
   only the exact before/after hash of every allow-listed regular file; rollback
@@ -23,6 +25,15 @@ Result: **local executable path PASS; production endpoint and client cutover rem
 - Existing raw URLs remain only as explicit source-level rollback/origin
   fallbacks. The generated `.repo` content uses `mirrorlist=` for the
   `default` and `china` regions.
+- V-27 adds `sow compatibility yum-consumer-preflight` and its network-free
+  receipt checker. Shell apply now refuses to create evidence/backups or edit
+  Pigsty until an unexpired receipt binds every expanded route, canonical
+  publication state, exact aggregate-owned trust identity/bytes and full
+  RPM-MD/RPM evidence. It archives that receipt by digest before source
+  mutation, then revalidates the same receipt immediately before the first
+  write, so expiry during backups fails closed and an interrupted apply retains
+  its proof chain.
+  See `2026-07-19-pigsty-yum-consumer-preflight.md` and ADR-0038.
 
 The generated key URL is
 `/pkg/keys/rpm-trust.asc`. This is a public multi-key package trust bundle,
@@ -47,13 +58,14 @@ audit=pass
 pigsty_yum_consumer_audit=pass mapped_definitions=28
 pigsty_yum_consumer_stage=pass source_unchanged=true
 pigsty_yum_consumer_apply=pass replay_idempotent=true mixed_state_recovered=true
+pigsty_yum_consumer_preflight_gate=pass rejected_before_mutation=true receipt_bound=true
 pigsty_yum_consumer_rollback=pass foreign_drift_rejected=true exact_bytes_restored=true replay_idempotent=true mixed_state_recovered=true
 ```
 
 A fresh stage against the current Pigsty source produced:
 
 ```text
-plan_sha256=b2b9fcaa2f111e55b04399ed22ec41638ee803024f7cc3bbf5541fc23a53cf32
+plan_sha256=2568d84b7d712e2a6ae756581bd5e349ab91181805e4b2e511fa6fcfd91cc371
 changed=true
 ```
 
@@ -70,7 +82,7 @@ Ansible renderer with `region=default`, EL9, and a mapped infra definition.
 The rendered repository fragment contained:
 
 ```ini
-mirrorlist = https://repo.example/_sow/v1/mirrorlist/latest/yum-infra-el9/el9/$basearch.txt
+mirrorlist = https://repo.example/_sow/v1/mirrorlist/latest/infra-legacy-x86-64/cross-el/x86_64.txt
 gpgcheck = 1
 enabled = 1
 module_hotfixes = 1
@@ -92,13 +104,19 @@ inventory, not published endpoint evidence: `yum/infra/{arch}` remains inactive
 configured. Therefore:
 
 1. the plan must not be applied to production Pigsty yet;
-2. every mapped mirrorlist and `rpm-trust.asc` must first exist on both public
-   origins and match the reviewed fingerprints;
+2. every mapped mirrorlist and the aggregate-owned `rpm-trust.asc` must first
+   exist on both public origins, pass the Go endpoint receipt gate and match the
+   reviewed fingerprints/bytes;
 3. isolated EL7/8/9/10 clients must render the resulting Pigsty `.repo` files;
    EL7 must run YUM 3 and EL8/9/10 must run DNF, all with
    `repo_gpgcheck=1`, and install a selected package;
 4. only after those checks may the source plan be applied and deployed; the
    same evidence directory/digest is the rollback authority.
+
+A provisional v1 consumer plan is not upgraded in place: use its retained
+evidence to restore byte-identical raw definitions, then stage v2. Current
+rollback keeps that legacy evidence path usable; v2 apply/rollback additionally
+retains the endpoint receipt archive and digest marker.
 
 This file does not upgrade MIG-04 or FZ-06 to production PASS. It closes the
 previously missing local executable migration/recovery mechanism and leaves the

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
@@ -87,6 +88,38 @@ func ParseRPMPackageKeyring(data []byte) (openpgp.KeyRing, error) {
 		}
 	}
 	return &historicalPackageKeyring{legacy: legacy, bindings: bindings}, nil
+}
+
+// RPMPackageKeyringPrimaryFingerprints returns the deduplicated primary
+// fingerprints from a package trust bundle after applying the same
+// public-only and historical signing-subkey validation as
+// ParseRPMPackageKeyring. Callers that build an aggregate trust closure must
+// not reparse package trust with the lossy legacy model merely to enumerate
+// identities.
+func RPMPackageKeyringPrimaryFingerprints(data []byte) ([]string, error) {
+	keyring, err := ParseRPMPackageKeyring(data)
+	if err != nil {
+		return nil, err
+	}
+	historical, ok := keyring.(*historicalPackageKeyring)
+	if !ok || historical == nil || len(historical.legacy) == 0 {
+		return nil, errors.New("yumrepo: RPM package keyring parser returned no inspectable identities")
+	}
+	fingerprints := make([]string, 0, len(historical.legacy))
+	seen := make(map[string]struct{}, len(historical.legacy))
+	for _, entity := range historical.legacy {
+		if entity == nil || entity.PrimaryKey == nil {
+			return nil, errors.New("yumrepo: RPM package keyring contains an unusable primary identity")
+		}
+		fingerprint := hex.EncodeToString(entity.PrimaryKey.Fingerprint)
+		if _, duplicate := seen[fingerprint]; duplicate {
+			return nil, errors.New("yumrepo: RPM package keyring contains duplicate primary identities")
+		}
+		seen[fingerprint] = struct{}{}
+		fingerprints = append(fingerprints, fingerprint)
+	}
+	sort.Strings(fingerprints)
+	return fingerprints, nil
 }
 
 // ParsePublicKeyring parses every public key in a binary or ASCII-armored

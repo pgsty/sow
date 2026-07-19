@@ -6,6 +6,7 @@ import (
 	"crypto"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -661,6 +662,14 @@ func TestParseRPMPackageKeyringPreservesHistoricalSigningSubkeyBindings(t *testi
 	historical, err := ParseRPMPackageKeyring(encoded)
 	if err != nil {
 		t.Fatal(err)
+	}
+	fingerprints, err := RPMPackageKeyringPrimaryFingerprints(encoded)
+	if err != nil {
+		t.Fatalf("enumerate historical package trust identities: %v", err)
+	}
+	wantedFingerprint := hex.EncodeToString(entity.PrimaryKey.Fingerprint)
+	if len(fingerprints) != 1 || fingerprints[0] != wantedFingerprint {
+		t.Fatalf("historical package trust fingerprints=%v, want %s", fingerprints, wantedFingerprint)
 	}
 	key, err := verifyOpenPGPV4DetachedSignature(bytes.NewReader(signed), detached.Bytes(), historical, signedAt)
 	if err != nil {

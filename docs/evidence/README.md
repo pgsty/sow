@@ -319,10 +319,15 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   8/9/10 DNF 对双 armor、双 signature packet 与 repomd redirect 的负验证，证明
   它们无法消除 raw baseurl 的签名混代窗口；这不等于消费者迁移/支持决策已完成。
 - `2026-07-14-pigsty-yum-consumer-migration.md`：把两个 renderer、九个配置文件中的
-  28 个现有 YUM 定义映射到 generation mirrorlist，提供 source-read-only audit/stage、
-  plan-digest 确认 apply、字节级 rollback、foreign-drift 拒绝与混合中断恢复；真实
-  Ansible 渲染已通过，但 physical endpoints、trust bundle、双 origin、真 dnf 与生产
-  cutover 仍明确开放。
+  28 个现有 YUM 定义映射到 architecture-specific generation mirrorlist，提供
+  source-read-only audit/stage、plan-digest 确认 apply、字节级 rollback、foreign-drift
+  拒绝与混合中断恢复；真实 Ansible 渲染已通过，但双 origin、真 dnf 与生产 cutover
+  仍明确开放。
+- `2026-07-19-pigsty-yum-consumer-preflight.md`：修正 infra 为两个 frozen cross-EL
+  projection，并把 mapped endpoint、canonical channel/aggregate inventory、public trust
+  byte identity 与完整 RPM-MD/RPM 签名探测收进短时 no-replace receipt；apply 在任何
+  evidence/backup 前做 network-free authority replay，并在第一字节写入前以同一 digest
+  再验证一次。真实 provider/生产 consumer 未切换。
 - `2026-07-12-forward-only-remote-restore.md`：已提交历史 generation 以前向新代恢复的
   CLI/CAS/canonical Git/APT/YUM/签名/崩溃续跑/双 target 协议证据，含配置、CAS、证据链、
   beta/latest asset 与 APT/YUM topology 的条件删除、purge/404、remote ref/channel 收敛；

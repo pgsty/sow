@@ -108,7 +108,11 @@ func TestYUMCompatibilityStateMachineWithRealNginxAndDNF(t *testing.T) {
 	freezeOutput := run(append([]string{"compatibility", "yum-freeze", "--id", "infra-legacy-x86-64", "--candidate", candidate, "--confirm", freezeConfirm}, common...)...)
 	cutoverConfirm := nginxTestOutputValue(t, freezeOutput, "cutover_confirm")
 
-	// S2 serves only the separately verified unsigned historical raw bridge.
+	// Establish the ordinary owner's canonical route receipt before asking the
+	// Nginx admission gate to expose any selected YUM route. S2 still serves
+	// only the separately verified unsigned historical raw bridge; the ordinary
+	// materialization cannot activate the not-yet-cut-over compatibility view.
+	run(append([]string{"materialize", "latest", "--gpg-private-key-file", privateKey}, common...)...)
 	run(append([]string{"materialize", "latest", "--nginx-include", includePath}, common...)...)
 	server := startYUMCompatibilityNginx(t, port, includePath)
 	defer func() { server.stop(t) }()

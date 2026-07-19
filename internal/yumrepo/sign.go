@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
@@ -74,6 +76,47 @@ func NewOpenPGPVerifier(key io.Reader, at time.Time) (*OpenPGPKey, error) {
 		entities: entities,
 		config:   yumSigningConfig(at),
 	}, nil
+}
+
+// NewOpenPGPVerifierForFingerprint selects one public certificate from a
+// multi-identity trust bundle. This keeps the single-signer metadata policy
+// while proving against the exact aggregate bundle imported by repository
+// clients rather than a different repo-local copy of the same primary key.
+func NewOpenPGPVerifierForFingerprint(key io.Reader, fingerprint string, at time.Time) (*OpenPGPKey, error) {
+	if key == nil {
+		return nil, fmt.Errorf("yumrepo: nil OpenPGP key reader")
+	}
+	decoded, err := hex.DecodeString(fingerprint)
+	if err != nil || (len(decoded) != 20 && len(decoded) != 32) || fingerprint != strings.ToLower(fingerprint) {
+		return nil, fmt.Errorf("yumrepo: invalid lowercase OpenPGP primary fingerprint")
+	}
+	data, err := io.ReadAll(io.LimitReader(key, maxOpenPGPKeyBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("yumrepo: read OpenPGP trust bundle: %w", err)
+	}
+	if len(data) == 0 || len(data) > maxOpenPGPKeyBytes {
+		return nil, fmt.Errorf("yumrepo: OpenPGP trust bundle is empty or exceeds %d bytes", maxOpenPGPKeyBytes)
+	}
+	entities, err := ParsePublicKeyring(data)
+	if err != nil {
+		return nil, err
+	}
+	var selected *openpgp.Entity
+	for _, entity := range entities {
+		if entity != nil && entity.PrimaryKey != nil && bytes.Equal(entity.PrimaryKey.Fingerprint, decoded) {
+			if selected != nil {
+				return nil, fmt.Errorf("yumrepo: aggregate trust bundle repeats primary fingerprint %s", fingerprint)
+			}
+			selected = entity
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("yumrepo: aggregate trust bundle lacks primary fingerprint %s", fingerprint)
+	}
+	if at.IsZero() {
+		return nil, errorsSigningTimeRequired()
+	}
+	return &OpenPGPKey{entities: openpgp.EntityList{selected}, config: yumSigningConfig(at)}, nil
 }
 
 // yumSigningConfig keeps detached metadata signatures deterministic and

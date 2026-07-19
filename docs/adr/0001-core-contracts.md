@@ -119,8 +119,14 @@ Therefore:
 The local mechanism is `docs/migration/migrate-pigsty-yum-consumers.sh`, driven
 by `yum-consumer-map.tsv` and `yum-consumer-files.tsv`. It stages an exact
 hash-reviewed Pigsty renderer/config change outside that checkout, applies only
-after explicit plan-digest confirmation, and restores byte-identical originals
-while rejecting foreign drift. Its existence does not authorize cutover:
+after explicit plan-digest confirmation **and** an unexpired canonical endpoint
+receipt from `sow compatibility yum-consumer-preflight`, and restores
+byte-identical originals while rejecting foreign drift. The receipt binds every
+expanded route to the exact committed generation, aggregate-owned public trust
+object identity/bytes and an RPM-MD/RPM signature probe using that exact
+aggregate keyring; apply revalidates it without network I/O and archives it by
+digest before creating backups, then revalidates the same receipt immediately
+before changing Pigsty. See ADR-0038. Its existence does not authorize cutover:
 mapped physical generations, the reviewed RPM public-key bundle, dual-origin
 HTTP probes, and real dnf acceptance must all pass first.
 

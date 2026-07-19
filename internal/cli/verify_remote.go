@@ -45,8 +45,9 @@ type verificationStateError struct {
 }
 
 type aggregateVerificationState struct {
-	generation pub.TargetGeneration
-	inventory  map[string]struct{}
+	generation       pub.TargetGeneration
+	inventory        map[string]struct{}
+	inventoryEntries map[string]manifest.Entry
 }
 
 func loadCurrentAggregateVerificationState(canonical *state.Store, target string, inventoryCandidates map[string]struct{}) (aggregateVerificationState, error) {
@@ -77,6 +78,7 @@ func loadCurrentAggregateVerificationState(canonical *state.Store, target string
 	// Inventory can contain millions of keys. Keep only exact change-set keys
 	// needed to decide whether a historical negative was superseded.
 	inventory := make(map[string]struct{}, len(inventoryCandidates))
+	inventoryEntries := make(map[string]manifest.Entry, len(inventoryCandidates))
 	reader := manifest.NewReader(inventoryFile)
 	previous := ""
 	for {
@@ -90,9 +92,10 @@ func loadCurrentAggregateVerificationState(canonical *state.Store, target string
 		previous = entry.Path
 		if _, candidate := inventoryCandidates[entry.Path]; candidate {
 			inventory[entry.Path] = struct{}{}
+			inventoryEntries[entry.Path] = entry
 		}
 	}
-	result.generation, result.inventory = generation, inventory
+	result.generation, result.inventory, result.inventoryEntries = generation, inventory, inventoryEntries
 	return result, nil
 }
 

@@ -152,13 +152,17 @@ func runCompatibility(ctx context.Context, args []string, stdout, stderr io.Writ
 		fmt.Fprintln(stdout, `Usage: sow compatibility <verb> [options]
 
 Verbs:
-  yum-adopt     verify the zero-byte carrier baseline and create immutable cross-EL CAS/source state
-  yum-candidate build an isolated clean signed candidate without changing the served legacy root
-  yum-freeze    bind a confirmed candidate into the immutable compatibility witness
-  yum-cutover   append S3 authority and atomically flip the controlled local serving link
-  yum-rollback  append rollback authority and atomically return the serving link to raw S0
+  yum-adopt                  verify the zero-byte carrier baseline and create immutable cross-EL CAS/source state
+  yum-candidate              build an isolated clean signed candidate without changing the served legacy root
+  yum-freeze                 bind a confirmed candidate into the immutable compatibility witness
+  yum-cutover                append S3 authority and atomically flip the controlled local serving link
+  yum-rollback               append rollback authority and atomically return the serving link to raw S0
+  yum-consumer-preflight     read public endpoints and issue a short-lived Pigsty cutover receipt
+  yum-consumer-receipt-check validate that receipt and current local/canonical authority without network access
 
-No compatibility verb accesses cloud storage or CDN resources.`)
+Workflow mutation verbs do not access cloud storage or CDN resources. The
+consumer preflight performs read-only public CDN requests; receipt-check is
+network-free.`)
 		return nil
 	}
 	switch args[0] {
@@ -172,6 +176,10 @@ No compatibility verb accesses cloud storage or CDN resources.`)
 		return runYUMCompatibilityCutover(ctx, args[1:], stdout, stderr)
 	case "yum-rollback":
 		return runYUMCompatibilityRollback(ctx, args[1:], stdout, stderr)
+	case "yum-consumer-preflight":
+		return runYUMConsumerPreflight(ctx, args[1:], stdout, stderr)
+	case "yum-consumer-receipt-check":
+		return runYUMConsumerReceiptCheck(ctx, args[1:], stdout, stderr)
 	default:
 		return withExitCode(ExitUsage, "unknown compatibility verb %q", args[0])
 	}

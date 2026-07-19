@@ -39,6 +39,7 @@ docs/adr/0034-cloudflare-nonproduction-worker-bootstrap.md
 docs/adr/0035-cloudflare-provider-attestation-and-log-sink-lease.md
 docs/adr/0036-provider-delete-capability-and-checkpoint-fenced-fallback.md
 docs/adr/0037-pre-upload-confidential-edge-denial-attestation.md
+docs/adr/0038-yum-consumer-preflight-receipt.md
 docs/architecture.md
 docs/client-installation.md
 docs/evidence/2026-07-11-client-compat.md
@@ -110,6 +111,7 @@ docs/evidence/2026-07-18-durability-teardown-audit.md
 docs/evidence/2026-07-18-legacy-adoption-50k-performance.md
 docs/evidence/2026-07-18-real-r2-storage-protocol.md
 docs/evidence/2026-07-19-confidential-edge-preflight.md
+docs/evidence/2026-07-19-pigsty-yum-consumer-preflight.md
 docs/evidence/2026-07-19-r2-bootstrap-two-phase-recovery.md
 docs/evidence/2026-07-19-r2-lease-cas-retirement.md
 docs/evidence/2026-07-19-r2-resource-stable-lease-rotation.md
