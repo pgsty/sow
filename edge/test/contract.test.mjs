@@ -1582,6 +1582,83 @@ test("malformed env:// entitlement secrets fail deployment instead of becoming a
 	}
 });
 
+test("entitlement expiry is canonical UTC and malformed Basic documents fail deployment", async () => {
+	const digest = await sha256Hex(tokenA);
+	const basicDigest = await sha256Hex(basicValue);
+	const invalidExpiries = [
+		"2099-01-01T00:00:00",
+		"2099-01-01T08:00:00+08:00",
+		"2099-01-01T00:00:00.000Z",
+		"2099-02-29T00:00:00Z",
+		"2099-01-01T24:00:00Z",
+	];
+	for (const vendor of ["cloudflare", "edgeone"]) {
+		const makeFixture = vendor === "cloudflare" ? makeCloudflareFixture : makeEdgeOneFixture;
+		const canonical = makeFixture(JSON.stringify([entitlement(digest, { expires_at: "2096-02-29T23:59:59Z" })]), "[]");
+		const canonicalResponse = await canonical.handler(new Request(`https://repo.example/pro/v1/${tokenA}/yum/private/pkg.rpm`));
+		assert.equal(canonicalResponse.status, 200, `${vendor}/canonical-leap-day`);
+		assert.equal(canonical.calls.length, 1, `${vendor}/canonical-leap-day origin count`);
+
+		for (const expires_at of invalidExpiries) {
+			let origins = 0;
+			const environment = {
+				...runtimeVariables(),
+				...cosRuntimeVariables(),
+				SOW_TOKEN_ENTITLEMENTS: JSON.stringify([entitlement(digest, { expires_at })]),
+				SOW_BASIC_ENTITLEMENTS: "[]",
+				ORIGIN: { async fetch() { origins += 1; return new Response("unexpected"); } },
+			};
+			const construct = vendor === "cloudflare"
+				? () => createCloudflareHandler(environment)
+				: () => createEdgeOneHandler(environment, deterministicEdgeOnePlatform(async () => { origins += 1; return new Response("unexpected"); }));
+			assert.throws(construct, /strict entitlement JSON/, `${vendor}/${expires_at}`);
+			assert.equal(origins, 0, `${vendor}/${expires_at} touched origin`);
+		}
+
+		for (const basicDocument of [
+			"{",
+			JSON.stringify([entitlement(basicDigest, { expires_at: "2099-01-01T00:00:00" })]),
+		]) {
+			let origins = 0;
+			const malformedBasic = {
+				...runtimeVariables(),
+				...cosRuntimeVariables(),
+				SOW_TOKEN_ENTITLEMENTS: JSON.stringify([entitlement(digest)]),
+				SOW_BASIC_ENTITLEMENTS: basicDocument,
+				ORIGIN: { async fetch() { origins += 1; return new Response("unexpected"); } },
+			};
+			const constructBasic = vendor === "cloudflare"
+				? () => createCloudflareHandler(malformedBasic)
+				: () => createEdgeOneHandler(malformedBasic, deterministicEdgeOnePlatform(async () => { origins += 1; return new Response("unexpected"); }));
+			assert.throws(constructBasic, /SOW_BASIC_ENTITLEMENTS.*strict entitlement JSON/, `${vendor}/${basicDocument}`);
+			assert.equal(origins, 0, `${vendor}/${basicDocument} touched origin`);
+		}
+
+		let providerCalls = 0;
+		let providerOrigins = 0;
+		const malformedDormantStatic = {
+			...runtimeVariables("provider://pigsty-entitlements"),
+			...cosRuntimeVariables(),
+			SOW_TOKEN_ENTITLEMENTS: "{",
+			SOW_BASIC_ENTITLEMENTS: "[]",
+			TOKEN_VERIFIER: { async fetch() { providerCalls += 1; return new Response("{}", { status: 200 }); } },
+			SOW_TOKEN_VERIFIER_URL: "https://entitlements.example/v1/verify",
+			SOW_TOKEN_VERIFIER_BEARER: "edge-verifier-secret",
+			ORIGIN: { async fetch() { providerOrigins += 1; return new Response("unexpected"); } },
+		};
+		const constructProvider = vendor === "cloudflare"
+			? () => createCloudflareHandler(malformedDormantStatic)
+			: () => createEdgeOneHandler(malformedDormantStatic, deterministicEdgeOnePlatform(async (request) => {
+				if (new URL(request.url).hostname === "entitlements.example") providerCalls += 1;
+				else providerOrigins += 1;
+				return new Response("{}", { status: 200 });
+			}));
+		assert.throws(constructProvider, /SOW_TOKEN_ENTITLEMENTS.*strict entitlement JSON/, `${vendor}/provider-dormant-static`);
+		assert.equal(providerCalls, 0, `${vendor}/provider-dormant-static touched provider`);
+		assert.equal(providerOrigins, 0, `${vendor}/provider-dormant-static touched origin`);
+	}
+});
+
 test("duplicate entitlement digests fail closed independent of document order", async () => {
 	const digest = await sha256Hex(tokenA);
 	const duplicates = [

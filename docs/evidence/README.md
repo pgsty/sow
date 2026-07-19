@@ -29,7 +29,9 @@ idle/expired 版本可 CAS 重放而 live holder 仍阻塞；readiness receipt/s
 随后在 owner 授权边界内新增 beta custom domain、把两个 host 的最低 TLS 冻结到 1.2，
 以权威/公共 DNS、TLS 1.0/1.1 拒绝和 1.2/1.3 成功、认证 R2 List 证明真实状态，并把
 exact tuple 钉入独立 readiness registry。SOW Go List 已通过；因缺 scoped Cloudflare
-read-only API token，signed receipt/控制面摘要与 POC-06 仍未通过。
+read-only API token，signed receipt/控制面摘要与 POC-06 仍未通过。2026-07-19 的
+登录面板只读复查又明确显示 `pigsty-entitlements` Worker 不存在；未做任何面板写入，
+因此完整 bootstrap 还缺独立评审的 verifier identity。
 
 大仓库 manifest 性能用例通过 `perf` build tag 隔离，默认单测不会意外读取 100GB 级夹具：
 
@@ -60,6 +62,11 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
 
 其余证据报告与验收入口如下；每项是否实跑、源码日期及外部边界以自身正文为准：
 
+- `2026-07-19-edge-entitlement-expiry-canonicalization.md`：静态 token/Basic
+  entitlement 的 expiry 收紧为唯一 whole-second UTC RFC3339 wire form，拒绝无时区、
+  offset、fractional、calendar rollover 与 `24:00:00`；畸形 Basic 文档也在两个 adapter
+  构造期失败。source/dist、46/46 shared contract、Go deployment/compat focused tests
+  全部通过；仅本地，不替代真 Worker/CDN。
 - `2026-07-19-confidential-edge-preflight.md`：stable/snapshot/gated publication 在首个
   journal 或远端 mutation 前必须匿名证明 `sow-edge-runtime/v2` 的精确 private 404；
   public-only plan 不联网。raw 404/200/redirect/v1/cache/origin/teardown/cancel 负例、双

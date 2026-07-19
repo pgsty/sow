@@ -1496,3 +1496,46 @@ Independent `cmp` returned 0 and both `shasum -a 256` values matched the
 archive digest above. This is the current V-14/V-32 delivery identity. It does
 not upgrade real Cloudflare/COS/EdgeOne publication, production writer
 revocation, or operational metrics; the long-term Goal remains active.
+
+## 2026-07-19 V-33 edge entitlement expiry delivery identity
+
+This section supersedes V-32 after the shared Cloudflare/EdgeOne entitlement
+contract was tightened. Static token and Basic expiry now accepts only exact
+whole-second UTC RFC3339; timezone-less, numeric-offset, fractional, calendar
+rollover and `24:00:00` inputs fail adapter construction. Malformed Basic
+entitlement JSON also fails construction instead of surviving as a
+request-time-only outage. The source contract and both generated vendor bundles
+carry the same check; ADR-0004 and the operator documentation freeze the wire
+format.
+
+The source shared suite passed 46/46, then the generated-bundle freshness,
+syntax/import and shared suite passed 46/46. Independent UTC and Asia/Shanghai
+runs also passed 46/46, directly exercising the cross-timezone invariant. Go
+config/CLI deployment-contract tests passed in 0.473s/54.164s, compat focused
+tests passed in 0.653s, all packages compiled, and patch checks passed. The
+logged-in Cloudflare dashboard was used only for visible read-only inventory;
+it confirmed `pigsty-entitlements` is absent and performed no provider
+mutation. No cloud credential entered the code/test paths.
+
+After delivery content was frozen, two independent fresh HOME/GOMODCACHE/
+GOCACHE reconstructions used only the local read-only Go module download cache
+and returned exactly:
+
+```text
+PRODUCT_SOURCE_SHA256=8c91cffd261f6166c1658d341c136a4be7bc4f1bd1cfa35f0bd7f20eba201f0a
+PRODUCT_SOURCE_FILES=538
+DELIVERY_CONTENT_SHA256=5efaa682f3ab438cef561199ae6cb3800d355eb054fd0545b0f81543cc8967c9
+DELIVERY_FILES=698
+ARCHIVE_SHA256=8abbfe512351f177011f8c503d53ef2d01b7856d02e84eaecf6f3b6d3e5c0cf9
+```
+
+Archives:
+
+- `/tmp/sow-clean-delivery-edge-expiry-v33-reviewed-a/sow-delivery-5efaa682f3ab438c.tgz`
+- `/tmp/sow-clean-delivery-edge-expiry-v33-reviewed-b/sow-delivery-5efaa682f3ab438c.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This is the current V-14/V-33 delivery identity. It does
+not upgrade real Worker/CDN/purge/provider-log evidence, COS/EdgeOne access,
+production migration, or operational metrics; the long-term Goal remains
+active.

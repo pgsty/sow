@@ -2,7 +2,9 @@
 
 Status: live non-production domain configuration and authenticated empty-bucket
 evidence passed; the SOW signed provider-readiness receipt is still blocked on
-one scoped Cloudflare API token. This is not a POC-06 pass.
+one scoped Cloudflare API token. A 2026-07-19 read-only dashboard follow-up also
+confirmed that the independently required `pigsty-entitlements` Worker does not
+exist. This is not a POC-06 pass.
 
 ## Authorized boundary
 
@@ -136,6 +138,16 @@ readiness run must inject a private seed through
 plan pins only the corresponding public key. Until the token is securely
 injected, a keypair/plan is reviewed, and the real test succeeds, the
 provider-control digest, signed readiness receipt and POC-06 remain unclaimed.
+
+On 2026-07-19 a logged-in dashboard session was used only for visible,
+read-only inventory. The account home confirmed the exact account and the
+`R2 / pro` recent resource. Direct navigation to the expected Worker identity
+returned Cloudflare's explicit `未能找到 Worker` page for
+`pigsty-entitlements`. No token, Worker, route, binding, domain, object or other
+provider setting was created, edited or deleted. Therefore the complete
+bootstrap is additionally blocked on a separately reviewed verifier deployment
+identity; the SOW-owned bootstrap deliberately cannot create that commercial
+trust root.
 
 Full POC-06 additionally requires the independently reviewed Worker/origin/
 verifier, purge, provider-log, entitlement, observation and EdgeOne/COS

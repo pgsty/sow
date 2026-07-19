@@ -81,7 +81,8 @@ secret values into either file.
 
 Static authorization documents (for `env://`) and Basic authorization use JSON
 arrays. Every entry is fail-closed and must contain a
-lowercase SHA-256 credential digest, UTC expiry, exact audiences and
+lowercase SHA-256 credential digest, canonical whole-second UTC RFC3339 expiry
+(`YYYY-MM-DDTHH:MM:SSZ` only), exact audiences and
 boundary-aware path prefixes, for example:
 
 ```json
@@ -90,7 +91,10 @@ boundary-aware path prefixes, for example:
 
 Expired credentials return 401; a valid digest with the wrong audience or path
 returns 403. Provider denial uses the same status mapping; provider transport
-failure returns 503. Private-origin variables and secrets are described below.
+failure returns 503. A timezone-less, offset, fractional, calendar-normalized,
+or otherwise malformed expiry makes either token or Basic entitlement binding
+fail deployment; it is never deferred to a vendor-specific `Date.parse`
+interpretation. Private-origin variables and secrets are described below.
 
 The contract deliberately does not use the Workers/Edge Cache API. Origin
 transport is an explicit closed mode, never an implicit fallback. The

@@ -789,14 +789,18 @@ export function constantTimeHexEqual(left, right) {
 export function createStaticEnvironmentVerifier(environment) {
   const tokenEntitlements = parseEntitlements(environment?.SOW_TOKEN_ENTITLEMENTS, true);
   const basicEntitlements = parseEntitlements(environment?.SOW_BASIC_ENTITLEMENTS, true);
+  if (tokenEntitlements === null) {
+	throw new TypeError("SOW_TOKEN_ENTITLEMENTS must contain a strict entitlement JSON array");
+  }
+  if (basicEntitlements === null) {
+	throw new TypeError("SOW_BASIC_ENTITLEMENTS must contain a strict entitlement JSON array");
+  }
   return {
     async verifyToken(token, context) {
-	  if (tokenEntitlements === null) return { status: "unavailable" };
       const digest = await sha256Hex(token);
       return verifyEntitlement(tokenEntitlements, digest, context);
     },
     async verifyBasic(credentials, context) {
-	  if (basicEntitlements === null) return { status: "unavailable" };
       const digest = await sha256Hex(credentials.encoded);
       return verifyEntitlement(basicEntitlements, digest, context);
     },
@@ -991,7 +995,8 @@ function verifyEntitlement(entitlements, digest, context) {
   if (!matched || !context || typeof context.audience !== "string" || typeof context.path !== "string") {
     return { status: "invalid" };
   }
-  if (Date.now() >= Date.parse(matched.expires_at)) {
+  const expiry = canonicalUTCExpiryMillis(matched.expires_at);
+  if (expiry === null || Date.now() >= expiry) {
     return { status: "invalid" };
   }
   if (!matched.audiences.includes(context.audience) || !matched.path_prefixes.some((prefix) => pathHasPrefix(context.path, prefix))) {
@@ -1024,9 +1029,9 @@ function parseEntitlements(value, allowMissing) {
     if (!item || typeof item !== "object" || !/^[0-9a-f]{64}$/.test(item.sha256 || "")) {
 	  return null;
     }
-    if (typeof item.expires_at !== "string" || !Number.isFinite(Date.parse(item.expires_at))) {
+	if (canonicalUTCExpiryMillis(item.expires_at) === null) {
 	  return null;
-    }
+	}
     if (!Array.isArray(item.audiences) || item.audiences.length === 0 || item.audiences.some((audience) => typeof audience !== "string" || !/^[a-z0-9.-]+$/.test(audience))) {
 	  return null;
     }
@@ -1047,4 +1052,20 @@ function parseEntitlements(value, allowMissing) {
 		}
 	}
   return decoded;
+}
+
+// Keep credential expiry interpretation byte-identical across vendor runtimes.
+// Date.parse accepts timezone-less, offset, rollover, and implementation-shaped
+// inputs; a Cloudflare UTC runtime and an EdgeOne regional runtime could then
+// disagree about whether the same credential is live. The entitlement wire
+// contract therefore admits exactly UTC RFC3339 whole seconds and rejects
+// calendar values that the Date implementation would normalize.
+function canonicalUTCExpiryMillis(value) {
+	if (typeof value !== "string" || !/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/.test(value)) {
+		return null;
+	}
+	const parsed = Date.parse(value);
+	if (!Number.isFinite(parsed)) return null;
+	const roundTrip = new Date(parsed).toISOString();
+	return roundTrip === `${value.slice(0, -1)}.000Z` ? parsed : null;
 }

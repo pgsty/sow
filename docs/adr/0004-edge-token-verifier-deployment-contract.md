@@ -4,7 +4,7 @@ Status: accepted
 
 Date: 2026-07-12
 
-Amended: 2026-07-15
+Amended: 2026-07-19
 
 ## Context
 
@@ -35,6 +35,14 @@ token SHA-256, canonical audience and canonical path. Raw bearer tokens are not
 sent to the provider. Provider 200/401/403 responses map to ok/invalid/forbidden;
 all transport, protocol and configuration failures map to unavailable. No
 failure may reach the repository origin.
+
+Static token and Basic entitlement documents use one cross-vendor expiry
+grammar: exact UTC RFC3339 whole seconds (`YYYY-MM-DDTHH:MM:SSZ`). Inputs with
+no timezone, a numeric offset, fractional seconds, invalid calendar rollover,
+or any other `Date.parse`-only spelling fail adapter construction. This keeps
+credential validity independent of vendor runtime timezone and prevents a
+malformed Basic document from surviving deployment as a request-time-only
+outage.
 
 ### 2026-07-15 route-admission amendment
 
