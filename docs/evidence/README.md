@@ -86,6 +86,10 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   单点发布；真实子进程在提交点前后退出、partial unpublished、legacy create collision、
   可见 inode 替换与 permission-reconciliation 前置门禁均通过 ordinary/race/双平台编译。
   全程仅临时目录，无网络或云访问；不替代 FR-28/NFR-09 的真双云验证。
+- `2026-07-19-yum-consumer-lock-release.md`：关闭 YUM consumer preflight 准备阶段唯一残留的
+  裸 `Lock.Release()`；已有主错误保持原对象/退出分类，真实 durable-record 路径替换的释放
+  失败进入 stderr warning，外来锁证据不被删除。ordinary/race、完整 YUM consumer、静态门禁
+  与独立盲审通过；仅本地临时锁，不触云且不升级 FR-28/NFR-09 真双云状态。
 - `2026-07-17-yum-infra-current-compatibility-cutover.md`：当前生产
   `yum/infra` 只读 234-file 快照的精确可写副本；216/216 RPM 由 Pigsty key
   验签，两个 root `modules.yaml` 只在副本 quarantine，完成双架构

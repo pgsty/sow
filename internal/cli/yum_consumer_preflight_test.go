@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pgsty/sow/internal/state"
 	"github.com/pgsty/sow/internal/verify"
 )
 
@@ -878,6 +879,32 @@ func TestYUMConsumerRemoteTrustTreatsCloseFailureAsNetworkFailure(t *testing.T) 
 	err := readYUMConsumerRemoteTrust(t.Context(), client, "https://example.invalid/pkg/keys/rpm-trust.asc", wanted)
 	if !errors.Is(err, verify.ErrClientNetwork) || !strings.Contains(err.Error(), "closed") {
 		t.Fatalf("remote trust close error=%v", err)
+	}
+}
+
+func TestYUMConsumerPreparationFailureDiagnosesDurableLockReleaseFailure(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), ".sow")
+	lock, err := state.AcquireLock(statePath, "consumer-preflight-release-test", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(statePath, "locks", "state.lock")
+	displacedPath := lockPath + ".displaced"
+	if err := os.Rename(lockPath, displacedPath); err != nil {
+		t.Fatal(err)
+	}
+	primary := withExitCode(ExitVerification, "injected preparation failure")
+	var stderr bytes.Buffer
+	resultErr := releaseYUMConsumerPreparationLock(lock, primary, &stderr)
+	if resultErr != primary || exitCode(resultErr) != ExitVerification {
+		t.Fatalf("release failure replaced primary result: got=%v want=%v", resultErr, primary)
+	}
+	if diagnostic := stderr.String(); !strings.Contains(diagnostic, "warning: release state lock") ||
+		!strings.Contains(diagnostic, "durable record is missing") {
+		t.Fatalf("durable lock release failure was hidden: %q", diagnostic)
+	}
+	if _, err := os.Lstat(displacedPath); err != nil {
+		t.Fatalf("foreign lock evidence was removed: %v", err)
 	}
 }
 

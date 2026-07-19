@@ -1,6 +1,7 @@
 README.md
 _bmad-output/brainstorming/brainstorm-sow-repo-cli-2026-07-11/brainstorm-intent.md
 _bmad-output/implementation-artifacts/spec-route-wire-canonicalization.md
+_bmad-output/implementation-artifacts/spec-yum-consumer-preflight-lock-release.md
 _bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/addendum.md
 _bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/prd.md
 _bmad-output/planning-artifacts/research/technical-sow-repo-cli-tech-validation-research-2026-07-11.md
@@ -119,6 +120,7 @@ docs/evidence/2026-07-19-r2-lease-cas-retirement.md
 docs/evidence/2026-07-19-r2-resource-stable-lease-rotation.md
 docs/evidence/2026-07-19-route-safe-caret-url-canonicalization.md
 docs/evidence/2026-07-19-state-lock-atomic-publication.md
+docs/evidence/2026-07-19-yum-consumer-lock-release.md
 docs/evidence/README.md
 docs/examples/sow-pgdg.yaml
 docs/migration/audit-legacy-targets.sh

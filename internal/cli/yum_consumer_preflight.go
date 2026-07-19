@@ -235,7 +235,7 @@ func runYUMConsumerPreflight(ctx context.Context, args []string, stdout, stderr 
 	if err := validateYUMConsumerPreflightOptions(options, true); err != nil {
 		return withExitCode(ExitUsage, "%v", err)
 	}
-	prepared, lock, err := prepareYUMConsumerPreflight(ctx, options, stdout)
+	prepared, lock, err := prepareYUMConsumerPreflight(ctx, options, stdout, stderr)
 	if err != nil {
 		return err
 	}
@@ -301,7 +301,7 @@ func runYUMConsumerReceiptCheck(ctx context.Context, args []string, stdout, stde
 	if err := validateYUMConsumerPreflightOptions(options, false); err != nil {
 		return withExitCode(ExitUsage, "%v", err)
 	}
-	prepared, lock, err := prepareYUMConsumerPreflight(ctx, options, stdout)
+	prepared, lock, err := prepareYUMConsumerPreflight(ctx, options, stdout, stderr)
 	if err != nil {
 		return err
 	}
@@ -1263,7 +1263,7 @@ func readYUMConsumerCompatibilityPackageTrust(canonical *state.Store, frozen yum
 	return body, nil
 }
 
-func prepareYUMConsumerPreflight(ctx context.Context, options yumConsumerPreflightOptions, stdout io.Writer) (*yumConsumerPrepared, *state.Lock, error) {
+func prepareYUMConsumerPreflight(ctx context.Context, options yumConsumerPreflightOptions, stdout, stderr io.Writer) (*yumConsumerPrepared, *state.Lock, error) {
 	cfg, _, err := loadAndSelect(options.values)
 	if err != nil {
 		return nil, nil, err
@@ -1384,8 +1384,7 @@ func prepareYUMConsumerPreflight(ctx context.Context, options yumConsumerPreflig
 		return nil, nil, withExitCode(ExitConflict, "%v", err)
 	}
 	fail := func(err error) (*yumConsumerPrepared, *state.Lock, error) {
-		_ = lock.Release()
-		return nil, nil, err
+		return nil, nil, releaseYUMConsumerPreparationLock(lock, err, stderr)
 	}
 	canonical := state.New(cfg.StatePath())
 	if err := prepareCanonicalState(ctx, canonical, options.values.recover, stdout); err != nil {
@@ -1627,6 +1626,16 @@ func prepareYUMConsumerPreflight(ctx context.Context, options yumConsumerPreflig
 		bindings: bindings, bindingsSHA256: digestBytesCLI(bindingBody), states: states, endpoints: endpoints, verifiedAt: verifyAt,
 	}
 	return prepared, lock, nil
+}
+
+// releaseYUMConsumerPreparationLock preserves the preparation error and its
+// exit class while making a failed durable-lock teardown visible. Without the
+// diagnostic, the next invocation can encounter a residual state.lock without
+// knowing that explicit recovery may be required.
+func releaseYUMConsumerPreparationLock(lock stateLockReleaser, primary error, stderr io.Writer) error {
+	resultErr := primary
+	propagateStateLockRelease(lock, &resultErr, stderr)
+	return resultErr
 }
 
 func (prepared *yumConsumerPrepared) validateLocalInputs(options yumConsumerPreflightOptions) error {
