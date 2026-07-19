@@ -1,8 +1,9 @@
 # sow legacy physical topology snapshot v1
-# captured_at: 2026-07-14
+# captured_at: 2026-07-19
 # source_root: /Users/vonng/pgsty/repo
+# source_commit: c2f7b5fa967d18d03b424fb7d0ee92fc5eabb6e6
 # scope: current local physical source inventory; not migration/cloud/production evidence
-# security: bin/fileauth.txt excluded; pro contents not read or hashed
+# security: bin/fileauth.txt excluded; pro payloads not read or hashed; empty pro/checksums hashed
 # columns: kind logical_path physical_path scope_or_family bytes sha256
 # count apt-index 74
 # count yum-repomd-total 131
@@ -10,8 +11,8 @@
 # count root-exact-key 7
 # count root-directory-prefix 8
 # count pro-file 16
-apt-index	apt/infra/dists/generic/main/binary-amd64	apt/infra/dists/generic/main/binary-amd64/Packages	infra	58617	4f7df92fd8c4ee91cd1ea41540e65ef69d3a3dec8fb32a28a4ec90c09bfffd91
-apt-index	apt/infra/dists/generic/main/binary-arm64	apt/infra/dists/generic/main/binary-arm64/Packages	infra	58503	b793f79d3dbe9c582b4428d35aff604f654971f763b68158d81d80235748ae36
+apt-index	apt/infra/dists/generic/main/binary-amd64	apt/infra/dists/generic/main/binary-amd64/Packages	infra	59415	9c60846f4486ccb5bbff376e62ff2dbd82a5c827016f7211c33f3cb8488f580f
+apt-index	apt/infra/dists/generic/main/binary-arm64	apt/infra/dists/generic/main/binary-arm64/Packages	infra	59301	6e973e04e952691ad29a90ef065fa853de5ee5e1075a0da177339d97c09dcd50
 apt-index	apt/mssql/dists/focal/main/binary-amd64	apt/mssql/dists/focal/main/binary-amd64/Packages	mssql	23481	88497c1be6d0fd62c02dac65a8b83b453faa2acd992404cb3dc476a181ed3be5
 apt-index	apt/mssql/dists/focal/main/binary-arm64	apt/mssql/dists/focal/main/binary-arm64/Packages	mssql	23485	83f8a453f17cfae92fc03261d6267b7d612e2a0d023c43933d8859920a163ab9
 apt-index	apt/mssql/dists/jammy/main/binary-amd64	apt/mssql/dists/jammy/main/binary-amd64/Packages	mssql	23506	6942f0de1acd06576d73ab864b3c4e640206ad4cba151116a3d2ac2cb990ca9f
@@ -70,21 +71,21 @@ apt-index	apt/pgdg/dists/trixie-pgdg-testing/main/binary-amd64	apt/pgdg/dists/tr
 apt-index	apt/pgdg/dists/trixie-pgdg-testing/main/binary-arm64	apt/pgdg/dists/trixie-pgdg-testing/main/binary-arm64/Packages	pgdg	2005571	c84dfba40dd8b0cfd743badbce1b934249c5f71810a7b93836cfaeb212781964
 apt-index	apt/pgdg/dists/trixie-pgdg/main/binary-amd64	apt/pgdg/dists/trixie-pgdg/main/binary-amd64/Packages	pgdg	2226469	94c6e544489ebc836477d4745a13baf5b8c6bb40549bc0c5fb31e2fa2a2a42db
 apt-index	apt/pgdg/dists/trixie-pgdg/main/binary-arm64	apt/pgdg/dists/trixie-pgdg/main/binary-arm64/Packages	pgdg	2167535	d81044608dd8a2d7d76102e5cb22ce61f911626cb9670a6d6dff0b008d2e7915
-apt-index	apt/pgsql/bookworm/dists/bookworm/main/binary-amd64	apt/pgsql/bookworm/dists/bookworm/main/binary-amd64/Packages	pgsql	1615946	0e17fdc4442d1ba942e0ab9fa1374f1006c50f9d4f6fd1f38bfc09c513856f25
-apt-index	apt/pgsql/bookworm/dists/bookworm/main/binary-arm64	apt/pgsql/bookworm/dists/bookworm/main/binary-arm64/Packages	pgsql	1598768	3a42b4fb6fa843c9eb231f280e4f676951f7ab0b19aab0f3ec35a9c8684ea905
+apt-index	apt/pgsql/bookworm/dists/bookworm/main/binary-amd64	apt/pgsql/bookworm/dists/bookworm/main/binary-amd64/Packages	pgsql	1670897	9f6a48aa90a3d8a41ab5c44d6142c7c9c988dcd3c54df8987f82a1e301945a24
+apt-index	apt/pgsql/bookworm/dists/bookworm/main/binary-arm64	apt/pgsql/bookworm/dists/bookworm/main/binary-arm64/Packages	pgsql	1653732	9f7b905554491e669dfd32c3207e2fc85ad198938384cc3c37e0ff46dcf8afad
 apt-index	apt/pgsql/bullseye/dists/bullseye/main/binary-amd64	apt/pgsql/bullseye/dists/bullseye/main/binary-amd64/Packages	pgsql	36013	b20fcb0cd8f5332160c948c071870bd43ff84b3b494f82b30b0c501d8a956ec8
 apt-index	apt/pgsql/bullseye/dists/bullseye/main/binary-arm64	apt/pgsql/bullseye/dists/bullseye/main/binary-arm64/Packages	pgsql	24667	631877d9937e36626f11c1be785cb96645730445d4fb4187a6be17c3b1bc8738
 apt-index	apt/pgsql/focal/dists/focal/main/binary-amd64	apt/pgsql/focal/dists/focal/main/binary-amd64/Packages	pgsql	40932	937e4c23a2b929717289dc0b66767c2a147def1ea257c7271232d147897d41c2
 apt-index	apt/pgsql/focal/dists/focal/main/binary-arm64	apt/pgsql/focal/dists/focal/main/binary-arm64/Packages	pgsql	29579	c4f3a990f4fe66c69402eef7f15d0b2530f7b6fb4ee4d4f841afe7bbceafe6b3
-apt-index	apt/pgsql/jammy/dists/jammy/main/binary-amd64	apt/pgsql/jammy/dists/jammy/main/binary-amd64/Packages	pgsql	1591963	1394a30f63568aa8d9a0d40491dd3ddeac6bfcf5d0a48a50320cd207133cac95
-apt-index	apt/pgsql/jammy/dists/jammy/main/binary-arm64	apt/pgsql/jammy/dists/jammy/main/binary-arm64/Packages	pgsql	1576127	894dc71b13a380b406ede3eea8d146011bab4beb16f407b9e635639e53ad5ef8
-apt-index	apt/pgsql/noble/dists/noble/main/binary-amd64	apt/pgsql/noble/dists/noble/main/binary-amd64/Packages	pgsql	1596411	23a4dd434ceab80af1ad848697e339727615267fed166f65bff1bf383fd961c5
-apt-index	apt/pgsql/noble/dists/noble/main/binary-arm64	apt/pgsql/noble/dists/noble/main/binary-arm64/Packages	pgsql	1583730	5179c6c42917b03a50aac1915ef076cbe89282e186c131181221af72c8dd44c1
-apt-index	apt/pgsql/resolute/dists/resolute/main/binary-amd64	apt/pgsql/resolute/dists/resolute/main/binary-amd64/Packages	pgsql	1438715	377d646aa360b0343c999763075598a3b31f80707db42a3f893457e31172942b
-apt-index	apt/pgsql/resolute/dists/resolute/main/binary-arm64	apt/pgsql/resolute/dists/resolute/main/binary-arm64/Packages	pgsql	1443302	4e8dd3d6d7c32b339da1d7a66fa8cebe500c4cc5606c34afa72fb82b734a5eef
-apt-index	apt/pgsql/trixie/dists/trixie/main/binary-amd64	apt/pgsql/trixie/dists/trixie/main/binary-amd64/Packages	pgsql	1402830	5386cfa62b3780907777af273360ab84f2058ecda4754485507805dcf640e308
-apt-index	apt/pgsql/trixie/dists/trixie/main/binary-arm64	apt/pgsql/trixie/dists/trixie/main/binary-arm64/Packages	pgsql	1399776	b94deb7829dec4a6da4408132ad297d635866aae8293b9a10c272fd7d6d28195
-pro-file	/pro/checksums	pro/checksums	gated-metadata-only	0	-
+apt-index	apt/pgsql/jammy/dists/jammy/main/binary-amd64	apt/pgsql/jammy/dists/jammy/main/binary-amd64/Packages	pgsql	1646611	7cf1dee1212a35f98977b880660a92c2d2b4372878fffa220c06ead80350aac9
+apt-index	apt/pgsql/jammy/dists/jammy/main/binary-arm64	apt/pgsql/jammy/dists/jammy/main/binary-arm64/Packages	pgsql	1630790	303ceaf63774786fcab316fa0e83508be365e4a4e0bb2138e3c09c8b9a4c78a3
+apt-index	apt/pgsql/noble/dists/noble/main/binary-amd64	apt/pgsql/noble/dists/noble/main/binary-amd64/Packages	pgsql	1651080	8a339dbd61c968d1bef60488763e10ac5e01d0a455d5c773e420c54f1f0537b8
+apt-index	apt/pgsql/noble/dists/noble/main/binary-arm64	apt/pgsql/noble/dists/noble/main/binary-arm64/Packages	pgsql	1638399	e87b1b6914802bfe8d6993943c346e47e2e4bbfb24dd8145587faae98be75323
+apt-index	apt/pgsql/resolute/dists/resolute/main/binary-amd64	apt/pgsql/resolute/dists/resolute/main/binary-amd64/Packages	pgsql	1497219	c640c46e781c2c2a6a6138eee3662e2a5a4551e562b37a587b05a11e3e05555c
+apt-index	apt/pgsql/resolute/dists/resolute/main/binary-arm64	apt/pgsql/resolute/dists/resolute/main/binary-arm64/Packages	pgsql	1501806	0be979184bf3ad086ade74d9cb57bb5828e41213069512e5a27fe19f20fa729f
+apt-index	apt/pgsql/trixie/dists/trixie/main/binary-amd64	apt/pgsql/trixie/dists/trixie/main/binary-amd64/Packages	pgsql	1457598	eeb49a5c8ea4e4a672934722a1767aad3221469623751b10b33976add9a68edd
+apt-index	apt/pgsql/trixie/dists/trixie/main/binary-arm64	apt/pgsql/trixie/dists/trixie/main/binary-arm64/Packages	pgsql	1454544	136be9aa64aa31f8737fbe31c88c0a106332471b08e7411abe90ce3eddaf3c59
+pro-file	/pro/checksums	pro/checksums	gated-metadata-only	0	e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
 pro-file	/pro/pigsty-pkg-v4.4.0.d12.aarch64.tgz	pro/pigsty-pkg-v4.4.0.d12.aarch64.tgz	gated-metadata-only	1490049402	-
 pro-file	/pro/pigsty-pkg-v4.4.0.d12.x86_64.tgz	pro/pigsty-pkg-v4.4.0.d12.x86_64.tgz	gated-metadata-only	1620985939	-
 pro-file	/pro/pigsty-pkg-v4.4.0.d13.aarch64.tgz	pro/pigsty-pkg-v4.4.0.d13.aarch64.tgz	gated-metadata-only	1629759422	-
@@ -134,8 +135,8 @@ source	yum/build	yum/build	reviewed-public-source	1859	e7837003d1498dd80d1ab7ade
 yum-repomd	yum/gpsql/el7.x86_64	yum/gpsql/el7.x86_64/repodata/repomd.xml	gpsql	3080	4a0f33b778c657cfe7cfcb39b653a0016553fcc054a1f5267d5fd9eaee622407
 yum-repomd	yum/gpsql/el8.x86_64	yum/gpsql/el8.x86_64/repodata/repomd.xml	gpsql	3538	6f67fb78b563ea28c88e828ff6d8ab4a3f68525350f34aedcc37aae43f9aaf91
 yum-repomd	yum/gpsql/el9.x86_64	yum/gpsql/el9.x86_64/repodata/repomd.xml	gpsql	3538	ba17f5bf0f6eaa3e2977ecd90cad17b75b8fe857a3ff23091852b374ac5fe3a6
-yum-repomd	yum/infra/aarch64	yum/infra/aarch64/repodata/repomd.xml	infra	3548	cd2d47ffabe72518d76f3d0ebffadb2dce435823dea5238dda6503fc4c37547a
-yum-repomd	yum/infra/x86_64	yum/infra/x86_64/repodata/repomd.xml	infra	3548	eae452193e566f404605c65a6516d90d892897dea9f1a19284182f4b36685fab
+yum-repomd	yum/infra/aarch64	yum/infra/aarch64/repodata/repomd.xml	infra	3548	3b52fb5ee32e605828510c063abb4b1a41f45d2fcb82d7c44b119694c0b4b383
+yum-repomd	yum/infra/x86_64	yum/infra/x86_64/repodata/repomd.xml	infra	3548	5f10c947e7ed46906806c96e78701182ad7528927f11663cb1266a2f35dfb797
 yum-repomd	yum/mssql/el7.x86_64	yum/mssql/el7.x86_64/repodata/repomd.xml	mssql	3540	19cad018b610e3364dc83e2cc5842205af7564847a1c8ca93242845cc5e063b1
 yum-repomd	yum/mssql/el8.aarch64	yum/mssql/el8.aarch64/repodata/repomd.xml	mssql	3542	a7241a6081ce2314b24faa3d2a41af6725226b8bd33154c86ad2d4be767d02a0
 yum-repomd	yum/mssql/el8.x86_64	yum/mssql/el8.x86_64/repodata/repomd.xml	mssql	3543	d1f59b30771502741b714e039e8200f3f3a5b7ba7480ca5435d95efbb8286736
@@ -254,11 +255,11 @@ yum-repomd	yum/pgdg/testing/19/redhat/rhel-8-x86_64	yum/pgdg/testing/19/redhat/r
 yum-repomd	yum/pgdg/testing/19/redhat/rhel-9-aarch64	yum/pgdg/testing/19/redhat/rhel-9-aarch64/repodata/repomd.xml	pgdg	3871	f5b2b1835c65249cda404aeaa361e7a3cc3586e9a32fae61a24b97f15bb369d2
 yum-repomd	yum/pgdg/testing/19/redhat/rhel-9-ppc64le	yum/pgdg/testing/19/redhat/rhel-9-ppc64le/repodata/repomd.xml	pgdg	3871	36fc741f1d991d4b92384a5e81c7e5eaa2e96654fb24e2dc9eca488635c8ac8f
 yum-repomd	yum/pgdg/testing/19/redhat/rhel-9-x86_64	yum/pgdg/testing/19/redhat/rhel-9-x86_64/repodata/repomd.xml	pgdg	3871	f25b584a51d6c2de53be5141a94dacafa20664efe39d91f8f45c40377e847da7
-yum-repomd	yum/pgsql/el10.aarch64	yum/pgsql/el10.aarch64/repodata/repomd.xml	pgsql	3561	962adb37345b32dac5dd7436bbb82bcb02bf67ef84289e7a4303a9d72c4105f3
-yum-repomd	yum/pgsql/el10.x86_64	yum/pgsql/el10.x86_64/repodata/repomd.xml	pgsql	3561	8a4dd749cd961d8b67a61d9262499c4bce642e8ee0d60c3aac1e09973e39cb94
+yum-repomd	yum/pgsql/el10.aarch64	yum/pgsql/el10.aarch64/repodata/repomd.xml	pgsql	3561	7d3a2620c5a3ad4ff97221743359e4f23454b93daeaa80e08c35e171d5dc5fc4
+yum-repomd	yum/pgsql/el10.x86_64	yum/pgsql/el10.x86_64/repodata/repomd.xml	pgsql	3561	a2d65623effd9316885100fe85bbbb481477b45dc661e5817d225b37d8216829
 yum-repomd	yum/pgsql/el7.x86_64	yum/pgsql/el7.x86_64/repodata/repomd.xml	pgsql	3091	bb7fd4edf15b0374eb92c4986b3d58a71bdd8e6123d74dca952df2bdc74e7f74
-yum-repomd	yum/pgsql/el8.aarch64	yum/pgsql/el8.aarch64/repodata/repomd.xml	pgsql	3562	76046618efedee2dba2c23c0333de70dba3bb35d0b7fa818441d2616812fa82d
-yum-repomd	yum/pgsql/el8.x86_64	yum/pgsql/el8.x86_64/repodata/repomd.xml	pgsql	3562	ae14f1ffd48b3a54beac977e7395a7e120e1e173c7b1aef7cc7b5bc897b2f83f
-yum-repomd	yum/pgsql/el9.aarch64	yum/pgsql/el9.aarch64/repodata/repomd.xml	pgsql	3562	b8910ad538244ff86b390cb39efb1753eff6a748530303cfc3b6e5d76d096593
-yum-repomd	yum/pgsql/el9.x86_64	yum/pgsql/el9.x86_64/repodata/repomd.xml	pgsql	3562	3cc5067cc22d72c427a6764f148b9eee1461f5df17d8c1b7cf8d2947d8a0702f
+yum-repomd	yum/pgsql/el8.aarch64	yum/pgsql/el8.aarch64/repodata/repomd.xml	pgsql	3562	000c5b81d193eaef26623a816b56276ef9af1dd6c3a5a33270360c31078ccfa1
+yum-repomd	yum/pgsql/el8.x86_64	yum/pgsql/el8.x86_64/repodata/repomd.xml	pgsql	3562	724b7167784c36cc02cd993d80ad9300c25c59964a11b6ab41ff688c31941ab2
+yum-repomd	yum/pgsql/el9.aarch64	yum/pgsql/el9.aarch64/repodata/repomd.xml	pgsql	3562	69f04ff32706fb33bcb58dd8a03e3683423f1bcf1ff24fcc1e6bc84ea3412bbd
+yum-repomd	yum/pgsql/el9.x86_64	yum/pgsql/el9.x86_64/repodata/repomd.xml	pgsql	3562	0b8bcdd21129f56448f7fce37a4f54e72841d893214f8ee7c554a83f89ef639d
 yum-repomd-nested	yum/pgdg/17/redhat/rhel-10-aarch64/rhel-10.0-aarch64	yum/pgdg/17/redhat/rhel-10-aarch64/rhel-10.0-aarch64/repodata/repomd.xml	pgdg	3566	dce1160bcc713aac60fca3fa9727cb3220270329e5770f0c2f0cf9b46c2aa111

@@ -1,7 +1,7 @@
 # 旧 Makefile → SOW 迁移账本
 
 > 状态：176/176 旧目标已形成机器可审计处置，44 个操作族已证明是精确分区；当前 CLI
-> 动词/flag 及表内 repo/os/arch selector 已由脚本和 schema-valid selector fixture 验证；
+> 动词/flag 及表内 repo/os/arch selector 已由脚本和完整物理 Pigsty-v1 配置验证；
 > 本地 Pigsty-v1 布局 adoption/回滚夹具已执行。生产旧树切换、真实 URL、旧 writer 撤权
 > 与双云/CDN 回滚仍未验证。
 > 审计日期：2026-07-14
@@ -125,21 +125,26 @@ docs/migration/test-family-e2e.sh
 
 - [`fixtures/pigsty-v1.yaml`](fixtures/pigsty-v1.yaml) 与
   [`fixtures/pigsty-v1-migration-ledger.tsv`](fixtures/pigsty-v1-migration-ledger.tsv) 共同构成
-  完整本地物理迁移合同：97 repo ID / 134 ledger row 精确展开 74 个 APT index 与
-  130 个 ordinary YUM leaf，并逐项处置 1 个 nested child、7 个根 exact key、8 个根 prefix 和 16 个 gated pro
+  完整本地物理迁移合同：98 repo ID / 135 ledger row 精确展开 74 个 APT index 与
+  130 个 ordinary YUM leaf，并逐项处置 1 个 EL9 compatibility policy owner、2 个精确
+  compatibility projection、1 个 nested child、7 个根 exact key、8 个根 prefix 和 16 个 gated pro
   文件。Pro owner 已在只读生产源精确副本完成本地 stable adoption/checksum replacement，
   其生产 cutover 仍未声明；合同不含 target endpoint、cloud credential、私钥或 entitlement。
-  其余 signer/lifecycle 未验证项仍显式保留为 non-claim。两个 `yum/infra/{arch}` leaf 仅是 inactive、
-  不可选的 quarantine carrier，不冒充已冻结的跨 EL compatibility projection。
+  其余 signer/lifecycle 未验证项仍显式保留为 non-claim。两个 `yum/infra/{arch}` leaf 由同一个 inactive、
+  不可选 carrier 承载；aarch64/x86_64 projection 显式绑定专用 policy owner，且二者都不进入普通 group。
 - [`fixtures/pigsty-v1-synthetic.yaml`](fixtures/pigsty-v1-synthetic.yaml) 保留原来的 12-repo
   pgsql 局部形状，只供 legacy parser/adoption 回归，禁止再称为完整 physical fixture。
-- [`fixtures/selector-matrix.yaml`](fixtures/selector-matrix.yaml) 是纯选择器闭包夹具，覆盖账本
-  出现的全部 **33 个** repo ID 与 `cf/cos` target。`TestLegacyMigrationMapClosesFamiliesAndSelectors`
-  逐条解析 176 行命令模板，验证 repo/os/arch 选择器得到精确 leaf 集；它不执行远端业务副作用，
+- [`fixtures/selector-matrix.yaml`](fixtures/selector-matrix.yaml) 仅保留为 33-repo / 73-leaf
+  通用选择器回归，不再充当迁移映射的 oracle。`TestLegacyMigrationMapClosesFamiliesAndSelectors`
+  逐条解析 176 行命令模板，改用完整 `pigsty-v1.yaml` 展开 repo/group/os/arch，并把每条命令的
+  suite/component/OS/arch/source/route/lifecycle 精确 tuple 集与
+  [`make-target-selector-golden.tsv`](fixtures/make-target-selector-golden.tsv) 的独立摘要比较；同数量
+  换叶、物理 ID/路径漂移或把 compatibility carrier 混入普通 selector 均失败。它不执行远端业务副作用，
   因而不冒充逐 target E2E。
 - [`fixtures/family-e2e.tsv`](fixtures/family-e2e.tsv) 为 44 个操作族逐项绑定真实
   CLI/filesystem/DEB/RPM/parser/provider-protocol 测试，或显式 retire/policy/handoff/migration
-  contract。`test-family-e2e.sh` 以 `GOPROXY=off` 运行其中所有 13 个去重测试及实际二进制
+  contract。`test-family-e2e.sh` 以 `GOPROXY=off` 运行其中所有 16 个去重测试（含直接加载
+  physical config 的 aarch64 与 Nginx/Edge x86_64 compatibility 状态机）及实际二进制
   adoption/rollback，并用 4 个临时突变夹具证明缺族、Help 冒充、错误 disposition 与 publish
   缺 provider 均 fail closed；本地 provider protocol 不冒充真实云。
 
@@ -183,7 +188,7 @@ docs/migration/test-family-e2e.sh
 
 ### 3.1 已确认的静态缺陷与危险语义
 
-1. **`cf-yum` 错依赖已确认**：`LEGACY-ROOT:L105` 依赖 `cf-yum-infra cf-apt-pgsql`，第二项应是 YUM pgsql 路径而不是 APT。它会漏传 `yum/pgsql` 并意外触发 `apt/pgsql` 上传。未来映射必须是 `sow publish --target cf --repo yum-infra,yum-pgsql-el7,yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10`，且用选择器展开测试锁死。
+1. **`cf-yum` 错依赖已确认**：`LEGACY-ROOT:L105` 依赖 `cf-yum-infra cf-apt-pgsql`，第二项应是 YUM pgsql 路径而不是 APT。它会漏传 `yum/pgsql` 并意外触发 `apt/pgsql` 上传。普通叶子的映射必须是 `sow publish --target cf --repo yum-pgsql`；mixed-EL `yum/infra/{arch}` 不得伪装成普通 selector，只能走 ADR-0021 的 compatibility 状态机。两部分均由物理选择器/专用命令门禁锁死。
 2. 根 Makefile 所有 rclone 发布使用 `sync`，会删除目标端多余对象；没有 manifest、checkpoint、CDN purge 或发布后验证（`LEGACY-ROOT:L34-L117`）。
 3. APT 发布同样使用 `rclone sync`，双目标只是 Make 依赖组合，不是事务；没有独立远端跟踪或 purge（`LEGACY-APT:L171-L222`）。
 4. `MAX_AGE` 在 `LEGACY-ROOT:L7-L9` 声称可覆盖 `co-pig`，但所有实际 asset sync 均未引用该变量；`co-img` 反而硬编码 `24h`（L29-L30）。
@@ -243,36 +248,36 @@ docs/migration/test-family-e2e.sh
 | ID | target | 类别 | 依赖/别名 | 当前副作用 | 风险 | 当前替代/明确边界（生产证据另计） | 机器处置 | 回滚 |
 |---|---|---|---|---|---|---|---|---|
 | ROOT-01 | `copy-auth` | Pro 鉴权配置 | 无 | `rclone copyto` 将本地 `bin/fileauth.txt` 覆盖到 COS 根 `/fileauth.txt` | R4：安全敏感文件，单对象覆盖，无版本/验证 | 退役根目录 `fileauth.txt`；授权数据改由边缘 entitlement/secret provider 注入，禁止作为 asset 发布 | policy-reject | RB-X |
-| ROOT-02 | `copy-bin` | asset 业务 | 无 | 以 `get.io/get.cc`、`pig.io/pig.cc`、`pkg.io/pkg.cc` 向 CF/COS 同名 key 发布不同正文；另写 COS `/cc,/claude` | R3：多个单对象可部分成功，无 purge；同 key 双正文违背单一 canonical view | 退役 target-specific bundle。受审 external builder 已钉住六个源 identity，生成 mirror-aware canonical `get/pig/pkg`；最终逐个执行 `sow add <file> --repo asset-bin --dest <key>` 与 `sow publish --repo asset-bin --target cf,cos`。真实 SOW 本地 handoff 已通过且对应 physical owner 按 exact affinity 激活；COS-only `/cc`、`/claude` 也已 exact-copy。真实 URL/cutover/publish 仍 pending | external-handoff | RB-B、RB-A、RB-P |
-| ROOT-03 | `copy-beta` | asset 业务 | 无 | 以 `beta.io/beta.cc` 向两端 `/beta` 发布不同正文，另写 COS `/ray` | R3：部分成功；同 key 双正文违背单一 canonical view；名称与 repo beta view 易混 | 同一 builder 已把两个 beta 源收敛为 canonical `/beta`；最终执行 `sow add <file> --repo asset-bootstrap --dest beta` 与 `sow publish --repo asset-bootstrap --target cf,cos`。真实 SOW 本地 handoff和 COS-only `/ray` exact-copy 已通过，physical owners 已按 exact affinity 激活；生产 URL/cutover 仍 pending | external-handoff | RB-B、RB-A、RB-P |
+| ROOT-02 | `copy-bin` | asset 业务 | 无 | 以 `get.io/get.cc`、`pig.io/pig.cc`、`pkg.io/pkg.cc` 向 CF/COS 同名 key 发布不同正文；另写 COS `/cc,/claude` | R3：多个单对象可部分成功，无 purge；同 key 双正文违背单一 canonical view | 退役 target-specific bundle。受审 external builder 已钉住六个源 identity，生成 mirror-aware canonical `get/pig/pkg`；最终逐个执行 `sow add <file> --repo asset-root-both --dest <key>` 与 `sow publish --repo asset-root-both --target cf,cos`。真实 SOW 本地 handoff 已通过且对应 physical owner 按 exact affinity 激活；COS-only `/cc`、`/claude` 由独立 `asset-root-cos` exact-copy owner 管理。真实 URL/cutover/publish 仍 pending | external-handoff | RB-B、RB-A、RB-P |
+| ROOT-03 | `copy-beta` | asset 业务 | 无 | 以 `beta.io/beta.cc` 向两端 `/beta` 发布不同正文，另写 COS `/ray` | R3：部分成功；同 key 双正文违背单一 canonical view；名称与 repo beta view 易混 | 同一 builder 已把两个 beta 源收敛为 canonical `/beta`；最终执行 `sow add <file> --repo asset-root-both --dest beta` 与 `sow publish --repo asset-root-both --target cf,cos`。真实 SOW 本地 handoff和 COS-only `/ray` 的 `asset-root-cos` exact-copy 已通过，physical owners 已按 exact affinity 激活；生产 URL/cutover 仍 pending | external-handoff | RB-B、RB-A、RB-P |
 | ROOT-04 | `co-img` | asset 业务 | 无 | 只上传 24h 内 `img/` 到 COS，`copy` 不删远端 | R1/R3：时间窗可能漏文件；无 manifest | `sow add <files> --repo asset-img` 后 `sow publish --repo asset-img --target cos`，按 manifest 差异 | sow-cli | RB-A、RB-P |
 | ROOT-05 | `ext-list` | 辅助清单 | 无 | `ls -a` 覆盖 `pkg/ext/README.md` | R1：包含 `.`/`..`，格式非稳定契约 | 退役不稳定的 `ls -a` 派生产物；如该 README 仍属公开契约，由文档/构建流水线生成后作为普通 asset 交给 `sow add <README.md> --repo asset-ext` | external-handoff | RB-B、RB-L |
-| ROOT-06 | `cf-ext` | asset 发布 | 无 | `rclone sync ext/` 到 CF `/ext/` | R3：删除远端多余对象，无 purge | `sow publish --repo ext --target cf` | sow-cli | RB-A、RB-P |
-| ROOT-07 | `co-ext` | asset 发布 | 无 | `rclone sync ext/` 到 COS `/ext/` | R3：同上 | `sow publish --repo ext --target cos` | sow-cli | RB-A、RB-P |
+| ROOT-06 | `cf-ext` | asset 发布 | 无 | `rclone sync ext/` 到 CF `/ext/` | R3：删除远端多余对象，无 purge | `sow publish --repo asset-ext --target cf` | sow-cli | RB-A、RB-P |
+| ROOT-07 | `co-ext` | asset 发布 | 无 | `rclone sync ext/` 到 COS `/ext/` | R3：同上 | `sow publish --repo asset-ext --target cos` | sow-cli | RB-A、RB-P |
 | ROOT-08 | `md5-src` | asset 元数据 | 无 | `md5sum *.tgz` 覆盖 `src/checksums` | R1：外部运行时、MD5、空 glob 风险 | SOW manifest 以 SHA-256 为正典；若旧 `src/checksums` URL 仍需保留，由制品构建流水线生成该兼容文件后执行 `sow add <checksums> --repo asset-src --dest checksums` | external-handoff | RB-B、RB-L |
-| ROOT-09 | `cf-src` | asset 发布 | 无 | `rclone sync src/` 到 CF `/src/` | R3：远端删除，无 purge | `sow publish --repo src --target cf` | sow-cli | RB-A、RB-P |
-| ROOT-10 | `co-src` | asset 发布 | 无 | `rclone sync src/` 到 COS `/src/` | R3：远端删除，无 purge | `sow publish --repo src --target cos` | sow-cli | RB-A、RB-P |
-| ROOT-11 | `cf-pig` | asset 发布 | 无 | 同步 `pkg/pig/` 到 CF，含 `/latest` 指针 | R3：可能删历史版本或 latest，无原子指针 | `sow publish --repo pkg-pig --target cf`；latest 兼容门禁 | sow-cli | RB-A、RB-P |
-| ROOT-12 | `co-pig` | asset 发布 | 无 | 同步 `pkg/pig/` 到 COS | R3：同上；注释所称 MAX_AGE 实际未生效 | `sow publish --repo pkg-pig --target cos` | sow-cli | RB-A、RB-P |
-| ROOT-13 | `co-claude` | asset 发布 | 无 | 同步 `pkg/claude/` 到 COS | R3：远端删除 | `sow publish --repo pkg-claude --target cos` | sow-cli | RB-A、RB-P |
-| ROOT-14 | `co-ray` | asset 发布 | 无 | 同步 `pkg/ray/` 到 COS | R3：远端删除，可能影响 `/latest` | `sow publish --repo pkg-ray --target cos` | sow-cli | RB-A、RB-P |
-| ROOT-15 | `cf-etc` | asset 发布 | 无 | 同步 `etc/` 到 CF | R3：远端删除 | `sow publish --repo etc --target cf` | sow-cli | RB-A、RB-P |
-| ROOT-16 | `co-etc` | asset 发布 | 无 | 同步 `etc/` 到 COS | R3：远端删除 | `sow publish --repo etc --target cos` | sow-cli | RB-A、RB-P |
-| ROOT-17 | `cf-dba` | asset 发布 | 无 | 同步 `dba/` 到 CF | R3：远端删除 | `sow publish --repo dba --target cf` | sow-cli | RB-A、RB-P |
-| ROOT-18 | `co-dba` | asset 发布 | 无 | 同步 `dba/` 到 COS | R3：远端删除 | `sow publish --repo dba --target cos` | sow-cli | RB-A、RB-P |
-| ROOT-19 | `up-pig` | 编排别名 | `co-pig cf-pig` | 依赖顺序上传两端；任一端可独立成功 | R3：没有目标独立 checkpoint | `sow publish --repo pkg-pig --target cf,cos` | sow-cli | RB-P |
-| ROOT-20 | `up-dba` | 编排别名 | `co-dba cf-dba` | 上传两端 dba | R3：部分成功 | `sow publish --repo dba --target cf,cos` | sow-cli | RB-P |
-| ROOT-21 | `up-etc` | 编排别名 | `co-etc cf-etc` | 上传两端 etc | R3：部分成功 | `sow publish --repo etc --target cf,cos` | sow-cli | RB-P |
+| ROOT-09 | `cf-src` | asset 发布 | 无 | `rclone sync src/` 到 CF `/src/` | R3：远端删除，无 purge | `sow publish --repo asset-src --target cf` | sow-cli | RB-A、RB-P |
+| ROOT-10 | `co-src` | asset 发布 | 无 | `rclone sync src/` 到 COS `/src/` | R3：远端删除，无 purge | `sow publish --repo asset-src --target cos` | sow-cli | RB-A、RB-P |
+| ROOT-11 | `cf-pig` | asset 发布 | 无 | 同步 `pkg/pig/` 到 CF，含 `/latest` 指针 | R3：可能删历史版本或 latest，无原子指针 | `sow publish --repo asset-pkg-pig --target cf`；latest 兼容门禁 | sow-cli | RB-A、RB-P |
+| ROOT-12 | `co-pig` | asset 发布 | 无 | 同步 `pkg/pig/` 到 COS | R3：同上；注释所称 MAX_AGE 实际未生效 | `sow publish --repo asset-pkg-pig --target cos` | sow-cli | RB-A、RB-P |
+| ROOT-13 | `co-claude` | asset 发布 | 无 | 同步 `pkg/claude/` 到 COS | R3：远端删除 | `sow publish --repo asset-pkg-claude --target cos` | sow-cli | RB-A、RB-P |
+| ROOT-14 | `co-ray` | asset 发布 | 无 | 同步 `pkg/ray/` 到 COS | R3：远端删除，可能影响 `/latest` | `sow publish --repo asset-pkg-ray --target cos` | sow-cli | RB-A、RB-P |
+| ROOT-15 | `cf-etc` | asset 发布 | 无 | 同步 `etc/` 到 CF | R3：远端删除 | `sow publish --repo asset-etc --target cf` | sow-cli | RB-A、RB-P |
+| ROOT-16 | `co-etc` | asset 发布 | 无 | 同步 `etc/` 到 COS | R3：远端删除 | `sow publish --repo asset-etc --target cos` | sow-cli | RB-A、RB-P |
+| ROOT-17 | `cf-dba` | asset 发布 | 无 | 同步 `dba/` 到 CF | R3：远端删除 | `sow publish --repo asset-dba --target cf` | sow-cli | RB-A、RB-P |
+| ROOT-18 | `co-dba` | asset 发布 | 无 | 同步 `dba/` 到 COS | R3：远端删除 | `sow publish --repo asset-dba --target cos` | sow-cli | RB-A、RB-P |
+| ROOT-19 | `up-pig` | 编排别名 | `co-pig cf-pig` | 依赖顺序上传两端；任一端可独立成功 | R3：没有目标独立 checkpoint | `sow publish --repo asset-pkg-pig --target cf,cos` | sow-cli | RB-P |
+| ROOT-20 | `up-dba` | 编排别名 | `co-dba cf-dba` | 上传两端 dba | R3：部分成功 | `sow publish --repo asset-dba --target cf,cos` | sow-cli | RB-P |
+| ROOT-21 | `up-etc` | 编排别名 | `co-etc cf-etc` | 上传两端 etc | R3：部分成功 | `sow publish --repo asset-etc --target cf,cos` | sow-cli | RB-P |
 | ROOT-22 | `up-src` | 编排别名 | `md5-src co-src cf-src` | 生成 checksums、上传两端、打印两个拼错域名 | R3：部分成功且输出误导 | 兼容文件先 `sow add <files> --repo asset-src`，再 `sow materialize latest --repo asset-src` 与 `sow publish --repo asset-src --target cf,cos` | sow-cli | RB-A、RB-P |
 | ROOT-23 | `ss` | 别名 | `up-src` | 完全继承 up-src | R3：同上 | 与 ROOT-22 相同：`sow add <files> --repo asset-src` 后 `sow publish --repo asset-src --target cf,cos`；旧别名退役 | sow-cli | RB-A、RB-P |
-| ROOT-24 | `co-upload` | 编排别名 | `co-infra co-pgsql` | COS 上传 APT+YUM 的 infra/pgsql | R3：四棵树可部分成功 | `sow publish --target cos --repo apt-infra,apt-pgsql-focal,apt-pgsql-jammy,apt-pgsql-noble,apt-pgsql-resolute,apt-pgsql-bullseye,apt-pgsql-bookworm,apt-pgsql-trixie,yum-infra,yum-pgsql-el7,yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10` | sow-cli | RB-P |
-| ROOT-25 | `co-infra` | 编排别名 | `co-apt-infra co-yum-infra` | COS 上传 APT/YUM infra | R3：部分成功 | `sow publish --target cos --repo apt-infra,yum-infra` | sow-cli | RB-P |
+| ROOT-24 | `co-upload` | 编排别名 | `co-infra co-pgsql` | COS 上传 APT+YUM 的 infra/pgsql | R3：四棵树可部分成功 | 普通叶子执行 `sow publish --target cos --repo apt-infra,apt-pgsql,yum-pgsql`；mixed-EL infra 只随 ADR-0021 已激活 projection 的 policy owner 发布，不能进入普通 selector | sow-cli | RB-P |
+| ROOT-25 | `co-infra` | 编排别名 | `co-apt-infra co-yum-infra` | COS 上传 APT/YUM infra | R3：部分成功 | APT 执行 `sow publish --target cos --repo apt-infra`；mixed-EL YUM 先逐 projection 执行 `sow compatibility yum-adopt --id <id>` 及 ADR-0021 S1→S3 流程，再随 exact policy owner 发布 | sow-cli | RB-P |
 | ROOT-26 | `co-pgsql` | 编排别名 | `co-apt-pgsql co-yum-pgsql` | COS 上传 APT/YUM pgsql | R3：部分成功 | `sow publish --target cos --repo apt-pgsql-focal,apt-pgsql-jammy,apt-pgsql-noble,apt-pgsql-resolute,apt-pgsql-bullseye,apt-pgsql-bookworm,apt-pgsql-trixie,yum-pgsql-el7,yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10` | sow-cli | RB-P |
 | ROOT-27 | `co-pgdg` | 编排别名 | `co-apt-pgdg co-yum-pgdg` | COS 上传 APT/YUM pgdg | R3：部分成功 | `sow publish --target cos --repo apt-pgdg,yum-pgdg` | sow-cli | RB-P |
 | ROOT-28 | `co-percona` | 编排别名 | `co-apt-percona co-yum-percona` | COS 上传 APT/YUM percona | R3：部分成功 | `sow publish --target cos --repo apt-percona,yum-percona` | sow-cli | RB-P |
 | ROOT-29 | `co-apt` | 编排别名 | `co-apt-infra co-apt-pgsql` | COS 上传两个 APT repo，不含 pgdg/percona | R3：名称看似“全部”但只是子集 | `sow publish --target cos --repo apt-infra,apt-pgsql-focal,apt-pgsql-jammy,apt-pgsql-noble,apt-pgsql-resolute,apt-pgsql-bullseye,apt-pgsql-bookworm,apt-pgsql-trixie` | sow-cli | RB-P |
-| ROOT-30 | `co-yum` | 编排别名 | `co-yum-infra co-yum-pgsql` | COS 上传两个 YUM repo，不含 pgdg/percona | R3：同上 | `sow publish --target cos --repo yum-infra,yum-pgsql-el7,yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10` | sow-cli | RB-P |
-| ROOT-31 | `co-yum-infra` | YUM 发布 | 无 | `rclone sync yum/infra/` 到 COS | R3：远端删除，无 repomd pair/purge | `sow publish --target cos --repo yum-infra` | sow-cli | RB-P |
+| ROOT-30 | `co-yum` | 编排别名 | `co-yum-infra co-yum-pgsql` | COS 上传两个 YUM repo，不含 pgdg/percona | R3：同上 | 普通叶子执行 `sow publish --target cos --repo yum-pgsql`；mixed-EL infra 只随 ADR-0021 已激活 projection 的 exact policy owner 发布 | sow-cli | RB-P |
+| ROOT-31 | `co-yum-infra` | YUM 发布 | 无 | `rclone sync yum/infra/` 到 COS | R3：远端删除，无 repomd pair/purge | 禁止普通 repo selector；逐 projection 由 `sow compatibility yum-adopt --id <id>` 开始完成 ADR-0021 S0→S3，最终随 exact policy owner 的 latest publish 原子发布 | sow-cli | RB-P |
 | ROOT-32 | `co-yum-pgsql` | YUM 发布 | 无 | 同步 `yum/pgsql/` 到 COS | R3：同上 | `sow publish --target cos --repo yum-pgsql-el7,yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10` | sow-cli | RB-P |
 | ROOT-33 | `co-yum-pgdg` | YUM 上游镜像发布 | 无 | 同步 `yum/pgdg/` 到 COS | R3：远端删除上游历史的可能性 | `sow sync --repo yum-pgdg` 后 `sow publish --target cos --repo yum-pgdg` | sow-cli | RB-P |
 | ROOT-34 | `co-yum-percona` | YUM 上游镜像发布 | 无 | 同步 `yum/percona/` 到 COS | R3：同上 | `sow sync --repo yum-percona` 后 `sow publish --target cos --repo yum-percona` | sow-cli | RB-P |
@@ -282,13 +287,13 @@ docs/migration/test-family-e2e.sh
 | ROOT-38 | `co-apt-percona` | APT 上游镜像发布 | 无 | 同步 `apt/percona/` 到 COS | R3：同上 | `sow sync --repo apt-percona` 后 `sow publish --target cos --repo apt-percona` | sow-cli | RB-P |
 | ROOT-39 | `co-pro-get` | 旧 Pro 拉取 | 无 | `rclone sync` 从 COS `/pro/` 到本地 `pro/`，会删除本地多余文件 | R3：反向破坏本地；旧双仓设计已废止 | 仅迁移期由外部工具只读下载到隔离目录，再用 `sow init --adopt-content --view stable` 纳入合一池；不提供长期 pull 动词 | migration-only | RB-L、RB-X |
 | ROOT-40 | `co-pro` | 旧 Pro 发布 | 无 | 同步本地 `pro/` 到 COS `/pro/` | R3：旧布局、远端删除、无鉴权事务 | 合一池 stable/gated view 的 `sow publish --view stable --target cos` | sow-cli | RB-P、RB-X |
-| ROOT-41 | `cf-upload` | 编排别名 | `cf-infra cf-pgsql` | CF 上传 APT+YUM infra/pgsql | R3：四棵树部分成功 | `sow publish --target cf --repo apt-infra,apt-pgsql-focal,apt-pgsql-jammy,apt-pgsql-noble,apt-pgsql-resolute,apt-pgsql-bullseye,apt-pgsql-bookworm,apt-pgsql-trixie,yum-infra,yum-pgsql-el7,yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10` | sow-cli | RB-P |
-| ROOT-42 | `cf-infra` | 编排别名 | `cf-apt-infra cf-yum-infra` | CF 上传 APT/YUM infra | R3：部分成功 | `sow publish --target cf --repo apt-infra,yum-infra` | sow-cli | RB-P |
+| ROOT-41 | `cf-upload` | 编排别名 | `cf-infra cf-pgsql` | CF 上传 APT+YUM infra/pgsql | R3：四棵树部分成功 | 普通叶子执行 `sow publish --target cf --repo apt-infra,apt-pgsql,yum-pgsql`；mixed-EL infra 只随 ADR-0021 已激活 projection 的 policy owner 发布 | sow-cli | RB-P |
+| ROOT-42 | `cf-infra` | 编排别名 | `cf-apt-infra cf-yum-infra` | CF 上传 APT/YUM infra | R3：部分成功 | APT 执行 `sow publish --target cf --repo apt-infra`；mixed-EL YUM 先用 `sow compatibility yum-adopt --id <id>` 进入专用状态机，再随 exact policy owner 发布 | sow-cli | RB-P |
 | ROOT-43 | `cf-pgsql` | 编排别名 | `cf-apt-pgsql cf-yum-pgsql` | CF 上传 APT/YUM pgsql | R3：部分成功 | `sow publish --target cf --repo apt-pgsql-focal,apt-pgsql-jammy,apt-pgsql-noble,apt-pgsql-resolute,apt-pgsql-bullseye,apt-pgsql-bookworm,apt-pgsql-trixie,yum-pgsql-el7,yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10` | sow-cli | RB-P |
 | ROOT-44 | `cf-percona` | 编排别名 | `cf-apt-percona cf-yum-percona` | CF 上传 APT/YUM percona | R3：部分成功 | `sow publish --target cf --repo apt-percona,yum-percona` | sow-cli | RB-P |
 | ROOT-45 | `cf-apt` | 编排别名 | `cf-apt-infra cf-apt-pgsql` | CF 上传两个 APT repo | R3：子集名称含混 | `sow publish --target cf --repo apt-infra,apt-pgsql-focal,apt-pgsql-jammy,apt-pgsql-noble,apt-pgsql-resolute,apt-pgsql-bullseye,apt-pgsql-bookworm,apt-pgsql-trixie` | sow-cli | RB-P |
-| ROOT-46 | `cf-yum` | **错误编排别名** | 实际为 `cf-yum-infra cf-apt-pgsql` | 漏传 yum/pgsql，误传 apt/pgsql | R3：已确认依赖错误 | 必须映射为 `sow publish --target cf --repo yum-infra,yum-pgsql-el7,yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10` 并锁定展开测试 | sow-cli | RB-P |
-| ROOT-47 | `cf-yum-infra` | YUM 发布 | 无 | 同步 `yum/infra/` 到 CF | R3：远端删除，无 pair/purge | `sow publish --target cf --repo yum-infra` | sow-cli | RB-P |
+| ROOT-46 | `cf-yum` | **错误编排别名** | 实际为 `cf-yum-infra cf-apt-pgsql` | 漏传 yum/pgsql，误传 apt/pgsql | R3：已确认依赖错误 | 普通叶子必须映射为 `sow publish --target cf --repo yum-pgsql` 并锁定 exact leaf；mixed-EL infra 另走 ADR-0021 compatibility 状态机，不得用不存在的 `yum-infra` selector | sow-cli | RB-P |
+| ROOT-47 | `cf-yum-infra` | YUM 发布 | 无 | 同步 `yum/infra/` 到 CF | R3：远端删除，无 pair/purge | 禁止普通 repo selector；逐 projection 由 `sow compatibility yum-adopt --id <id>` 开始完成 ADR-0021 S0→S3，最终随 exact policy owner 的 latest publish 原子发布 | sow-cli | RB-P |
 | ROOT-48 | `cf-yum-pgsql` | YUM 发布 | 无 | 同步 `yum/pgsql/` 到 CF | R3：同上 | `sow publish --target cf --repo yum-pgsql-el7,yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10` | sow-cli | RB-P |
 | ROOT-49 | `cf-yum-percona` | YUM 上游镜像发布 | 无 | 同步 `yum/percona/` 到 CF | R3：远端删除历史可能性 | `sow sync --repo yum-percona` 后 `sow publish --target cf --repo yum-percona` | sow-cli | RB-P |
 | ROOT-50 | `cf-apt-infra` | APT 发布 | 无 | 同步 `apt/infra/` 到 CF | R3：远端删除，无翻转/purge | `sow publish --target cf --repo apt-infra` | sow-cli | RB-P |
@@ -379,11 +384,11 @@ docs/migration/test-family-e2e.sh
 | ID | target | 类别 | 依赖/别名 | 当前副作用 | 风险 | 当前替代/明确边界（生产证据另计） | 机器处置 | 回滚 |
 |---|---|---|---|---|---|---|---|---|
 | YUM-01 | `default` | 编排入口 | `sign build` | 先按 mtime 重签近期 rpm，再建 pgsql/infra repodata | R4：改包字节；make -j 时顺序也非事务保证 | 不保留该复合入口；`sow add` 保持上游 rpm 字节并原生建索引，随后 verify/publish | policy-reject | RB-R、RB-X |
-| YUM-02 | `build` | YUM 索引编排 | `build-pgsql build-infra` | 为 pgsql 六矩阵和 infra 双架构生成旧式 repodata/modulemd | R2：原地覆盖 repodata；无签名 pair | 日常 `sow add <files> --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10,yum-infra` 自动更新索引；确定性重建用 `sow materialize latest --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10,yum-infra` | sow-cli | RB-R、RB-X |
-| YUM-03 | `build-all` | YUM 索引编排 | `build-pgsql build-infra build-other` | 额外重建 EL7/mssql/ivory/gpsql | R2：多仓部分成功，包含范围外 modulemd | `sow materialize latest --repo yum-pgsql-el7,yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10,yum-infra,yum-mssql,yum-ivory,yum-gpsql`；EOL 只从 frozen ref 重建 | sow-cli | RB-R、RB-X |
-| YUM-04 | `build-infra` | YUM 索引 | 无 | 对 `infra/x86_64`、`infra/aarch64` 调 `./build` | R2：原地 repodata，两个架构可部分成功 | `sow materialize latest --repo yum-infra --arch x86_64,aarch64` | sow-cli | RB-R |
+| YUM-02 | `build` | YUM 索引编排 | `build-pgsql build-infra` | 为 pgsql 六矩阵和 infra 双架构生成旧式 repodata/modulemd | R2：原地覆盖 repodata；无签名 pair | 普通 pgsql 日常 `sow add <files> --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10`，重建用 `sow materialize latest --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10`；mixed-EL infra 禁止普通写入，只能从 `sow compatibility yum-adopt --id <id>` 开始走 ADR-0021 | sow-cli | RB-R、RB-X |
+| YUM-03 | `build-all` | YUM 索引编排 | `build-pgsql build-infra build-other` | 额外重建 EL7/mssql/ivory/gpsql | R2：多仓部分成功，包含范围外 modulemd | 普通物理叶子执行 `sow materialize latest --repo yum-pgsql,yum-mssql,yum-gpsql`；EOL 只从 frozen ref 重建。旧 ivory 没有 inventoried repomd owner，明确退役而非伪造 selector；infra 另走 ADR-0021 | sow-cli | RB-R、RB-X |
+| YUM-04 | `build-infra` | YUM 索引 | 无 | 对 `infra/x86_64`、`infra/aarch64` 调 `./build` | R2：原地 repodata，两个架构可部分成功 | 禁止 ordinary materialize；逐 projection 用 `sow compatibility yum-candidate --id <id> --output <dir>` 生成隔离候选，再 freeze/cutover，完整步骤见 ADR-0021 | sow-cli | RB-R |
 | YUM-05 | `build-pgsql` | YUM 索引 | 无 | 对 EL8/9/10 × x86_64/aarch64 六目录建 repodata | R2：六步部分成功 | `sow materialize latest --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10 --os el8,el9,el10 --arch x86_64,aarch64` | sow-cli | RB-R |
-| YUM-06 | `build-other` | YUM/EOL 索引 | 无 | 重建 pgsql el7、mssql el7/8/9、ivory el7/8/9、gpsql el7/8/9 x86_64 | R2：EOL 与活跃混合；modulemd；不含 ARM 多数路径 | `sow materialize latest --repo yum-mssql,yum-ivory,yum-gpsql --arch x86_64`；EOL leaf 使用 frozen ref | sow-cli | RB-R、RB-X |
+| YUM-06 | `build-other` | YUM/EOL 索引 | 无 | 重建 pgsql el7、mssql el7/8/9、ivory el7/8/9、gpsql el7/8/9 x86_64 | R2：EOL 与活跃混合；modulemd；不含 ARM 多数路径 | `sow materialize latest --repo yum-mssql,yum-gpsql --arch x86_64`；EOL leaf 使用 frozen ref；旧 ivory 无 inventoried repomd owner，明确退役 | sow-cli | RB-R、RB-X |
 | YUM-07 | `build-percona` | YUM 上游镜像索引 | 无 | 对 percona EL8/9 × 双架构建 repodata | R2：四步部分成功；可能重建上游元数据 | `sow sync --repo yum-percona` 后执行 `sow materialize latest --repo yum-percona` | sow-cli | RB-R |
 | YUM-08 | `sign` | RPM 原地重签 | 无 | 对 pgsql/infra 1000 分钟内 rpm 执行 `rpm --addsign` | R4：mtime 非确定、改字节、混淆上游/自建来源 | Day 1 禁止镜像重签；自建包由 builder 签，SOW 只 `verify --layer L1` | policy-reject | RB-X；已改字节须从来源/CAS 原件恢复 |
 | YUM-09 | `sign10` | RPM 原地重签 | 无 | 对全树 10 分钟内 rpm 重签 | R4：同上，范围由时钟决定 | 不迁移；FR-17 策略门禁 | policy-reject | RB-X、RB-R |
@@ -427,16 +432,16 @@ docs/migration/test-family-e2e.sh
 | DKR-26 | `sign-all` | YUM wrapper | 容器内 `make sign-all` | 触发 YUM-12 全量重签 | R4：最大破坏面 | 禁止迁入；未来重签仍受单独商业门禁 | policy-reject | RB-X、RB-R |
 | DKR-27 | `sign-pgsql` | YUM wrapper | 容器内 `make sign-pgsql` | 触发 YUM-13 | R4 | 禁止迁入 | policy-reject | RB-X、RB-R |
 | DKR-28 | `sign-infra` | YUM wrapper | 容器内 `make sign-infra` | 触发 YUM-14 | R4 | 禁止迁入 | policy-reject | RB-X、RB-R |
-| DKR-29 | `build` | YUM wrapper | 容器内 `make build` | 触发 YUM-02，直接改 host repodata | R3：容器/外部 runtime、无原子翻转 | `sow add <files> --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10,yum-infra` 自动建索引；确定性重建用 `sow materialize latest --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10,yum-infra` | sow-cli | RB-R、RB-X |
-| DKR-30 | `build-all` | YUM wrapper | 容器内 `make build-all` | 触发 YUM-03 | R3：多仓部分成功 | `sow materialize latest --repo yum-pgsql-el7,yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10,yum-infra,yum-mssql,yum-ivory,yum-gpsql`；frozen leaf 只从既有 ref 重建 | sow-cli | RB-R、RB-X |
+| DKR-29 | `build` | YUM wrapper | 容器内 `make build` | 触发 YUM-02，直接改 host repodata | R3：容器/外部 runtime、无原子翻转 | 普通 pgsql 用 `sow add <files> --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10`，重建用 `sow materialize latest --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10`；mixed-EL infra 从 `sow compatibility yum-adopt --id <id>` 开始走专用状态机 | sow-cli | RB-R、RB-X |
+| DKR-30 | `build-all` | YUM wrapper | 容器内 `make build-all` | 触发 YUM-03 | R3：多仓部分成功 | `sow materialize latest --repo yum-pgsql,yum-mssql,yum-gpsql`；frozen leaf 只从既有 ref 重建，ivory 无物理 owner 明确退役，infra 另走 ADR-0021 | sow-cli | RB-R、RB-X |
 | DKR-31 | `build-pgsql` | YUM wrapper | 容器内 `make build-pgsql` | 触发 YUM-05 | R3 | `sow materialize latest --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10` | sow-cli | RB-R、RB-X |
-| DKR-32 | `build-infra` | YUM wrapper | 容器内 `make build-infra` | 触发 YUM-04 | R3 | `sow materialize latest --repo yum-infra` | sow-cli | RB-R、RB-X |
-| DKR-33 | `build-other` | YUM wrapper | 容器内 `make build-other` | 触发 YUM-06 | R3：EOL/旧 repo 混合 | `sow materialize latest --repo yum-mssql,yum-ivory,yum-gpsql`；EOL leaf 使用 frozen ref | sow-cli | RB-R、RB-X |
+| DKR-32 | `build-infra` | YUM wrapper | 容器内 `make build-infra` | 触发 YUM-04 | R3 | 逐 projection 用 `sow compatibility yum-candidate --id <id> --output <dir>` 建隔离候选，再按 ADR-0021 freeze/cutover | sow-cli | RB-R、RB-X |
+| DKR-33 | `build-other` | YUM wrapper | 容器内 `make build-other` | 触发 YUM-06 | R3：EOL/旧 repo 混合 | `sow materialize latest --repo yum-mssql,yum-gpsql`；EOL leaf 使用 frozen ref，ivory 明确退役 | sow-cli | RB-R、RB-X |
 | DKR-34 | `build-percona` | YUM wrapper | 容器内 `make build-percona` | 触发 YUM-07 | R3 | `sow sync --repo yum-percona` 后执行 `sow materialize latest --repo yum-percona` | sow-cli | RB-R、RB-X |
 | DKR-35 | `pg` | 快捷别名 | 容器内 `make build-pgsql` | 与 DKR-31 相同 | R3 | 显式替换为 `sow materialize latest --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10` | sow-cli | RB-R、RB-X |
 | DKR-36 | `pgsql` | 快捷别名 | 容器内 `make build-pgsql` | 与 DKR-31 相同 | R3 | 显式替换为 `sow materialize latest --repo yum-pgsql-el8,yum-pgsql-el9,yum-pgsql-el10` | sow-cli | RB-R、RB-X |
-| DKR-37 | `infra` | 快捷别名 | 容器内 `make build-infra` | 与 DKR-32 相同 | R3 | 显式替换为 `sow materialize latest --repo yum-infra` | sow-cli | RB-R、RB-X |
-| DKR-38 | `other` | 快捷别名 | 容器内 `make build-other` | 与 DKR-33 相同 | R3 | 显式替换为 `sow materialize latest --repo yum-mssql,yum-ivory,yum-gpsql` | sow-cli | RB-R、RB-X |
+| DKR-37 | `infra` | 快捷别名 | 容器内 `make build-infra` | 与 DKR-32 相同 | R3 | 显式替换为 `sow compatibility yum-candidate --id <id> --output <dir>` 起始的 ADR-0021 专用流程 | sow-cli | RB-R、RB-X |
+| DKR-38 | `other` | 快捷别名 | 容器内 `make build-other` | 与 DKR-33 相同 | R3 | 显式替换为 `sow materialize latest --repo yum-mssql,yum-gpsql`；ivory 无物理 owner，退役 | sow-cli | RB-R、RB-X |
 | DKR-39 | `percona` | 快捷别名 | 容器内 `make build-percona` | 与 DKR-34 相同 | R3 | `sow sync --repo yum-percona` 后执行 `sow materialize latest --repo yum-percona` | sow-cli | RB-R、RB-X |
 | DKR-40 | `psql` | 外部调试 | 无 | 在容器启动交互式 psql（若存在） | R1：PG 不是 SOW 核心依赖 | 无 SOW 对应；数据库调试移交外部运维工具 | retire | RB-X |
 
@@ -473,15 +478,16 @@ docs/migration/test-family-e2e.sh
   不能因为 115 行有命令模板而批量标成生产通过。Docker `default/help`、`ls-*` 与 Docker `status/ps` 已明确
   退役；ROOT-02/03 已有 canonical builder/SOW handoff，但生产 URL/cutover 未验证，不能据此冲高覆盖计数。
 - **当前结构闭包证据**：44 个族对 176 target 是无重叠、无遗漏的精确分区；46 个 alias-like
-  target 中 36 个 `sow-cli` 行及所有其他表内 SOW 命令都能在 selector fixture 上解析到其
-  显式 leaf。该证据锁住命令模板和配置 schema，不证明文件/索引/远端副作用已等价。
+  target 中 36 个 `sow-cli` 行及所有其他表内普通 SOW selector 命令都能在完整物理配置上解析并
+  匹配独立 exact-leaf golden，compatibility 命令则绑定专用 verb/flag surface。该证据锁住命令模板、
+  suite/component/OS/arch/path 集合和配置 schema，不证明文件/索引/远端副作用已等价。
 
 ## 9. G5 与退役验收门禁
 
 G5 当前状态为 **实现中、未通过**。必须同时满足以下条件后才能把本账本或总追踪矩阵中的 G5 标为通过：
 
 1. `audit-legacy-targets.sh` 对 44-family/176-target 精确分区、源指纹、处置 schema 与当前 CLI
-   surface/闭合 enum 全部退出 0，selector matrix 测试覆盖所有表内 SOW 命令，并保存 177 行
+   surface/闭合 enum 全部退出 0，物理 selector golden 测试覆盖所有表内 selector 命令，并保存 177 行
    （header + 176 target）规范化 TSV；任何旧源/map/config 漂移必须重新审计。
 2. 44 个操作族的本地合同必须持续通过：每个含 `sow-cli` 的族绑定真实 CLI/FS/parser，发布族
    绑定本地 provider protocol；其他族绑定显式 disposition。最终仍须对每个生产 target 证明
@@ -500,15 +506,17 @@ G5 当前状态为 **实现中、未通过**。必须同时满足以下条件后
 ## 10. 当前证据边界
 
 本地已执行：旧源固定摘要 + 176/176 target/处置/CLI 审核；33-repo selector universe 与
-12-repo synthetic 子集 ID/path 对账；完整 97-repo/134-row config/ledger 对 74 APT index、130 ordinary
-YUM leaf、nested quarantine、root assets 和 active gated Pro owner 的双向集合门禁及突变负例；
-44-family E2E/disposition contract 及 4 个突变负例；13 个真实
+12-repo synthetic 子集 ID/path 对账；完整 98-repo/135-row config/ledger 对 74 APT index、130 ordinary
+YUM leaf、专用 EL9 policy owner、双架构 compatibility projection、nested quarantine、root assets 和 active gated Pro owner 的双向集合门禁及突变负例；
+44-family E2E/disposition contract 及 5 个突变负例；16 个真实
 CLI/FS/parser/provider-protocol 测试；`sow init --adopt-content` 的 suite-nested APT、flat-RPM
 YUM 与 asset 测试；零重写与幂等；flat source→canonical
 `Packages/<首字母>/` receipt；隔离 materialize；本地 symlink 切换后回退到只读 legacy
 root；以及 writer-revoke preflight 正负例 fixture。复现命令与实测输出见
 `docs/evidence/2026-07-12-legacy-migration-audit.md` 与
-`docs/evidence/2026-07-14-legacy-family-e2e.md`。后续完整存量树副本的 95-active-repo M0、
+`docs/evidence/2026-07-14-legacy-family-e2e.md`；2026-07-19 的完整物理 selector、
+双架构 family 证据、5 个突变负例与 device/inode writer-fence 收口见
+`docs/evidence/2026-07-19-legacy-migration-review-hardening.md`。后续完整存量树副本的 95-active-repo M0、
 可证明 APT/YUM/asset 子集纳管与源数据 fail-closed 见
 `docs/evidence/2026-07-16-legacy-tree-full-adoption-copy.md`；它仍不等于生产 cutover。
 

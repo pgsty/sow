@@ -74,14 +74,15 @@ func TestPigstyV1PhysicalMigrationContract(t *testing.T) {
 			ledgerRepoIDs[row.owner] = true
 		}
 	}
-	assertExactStringSet(t, "97-repo config/ledger ownership closure", ledgerRepoIDs, configuredRepoIDs)
-	if len(configuredRepoIDs) != 97 || len(ledger) != 134 {
-		t.Fatalf("physical migration identities repos=%d ledger_rows=%d want=97/134", len(configuredRepoIDs), len(ledger))
+	assertExactStringSet(t, "98-repo config/ledger ownership closure", ledgerRepoIDs, configuredRepoIDs)
+	if len(configuredRepoIDs) != 98 || len(ledger) != 135 {
+		t.Fatalf("physical migration identities repos=%d ledger_rows=%d want=98/135", len(configuredRepoIDs), len(ledger))
 	}
 
 	assertPhysicalAPTClosure(t, cfg, repos, topology, ledger)
 	assertAPTInfraQuarantine(t, repos)
 	assertPhysicalYUMClosure(t, cfg, repos, topology, ledger)
+	assertPhysicalCompatibilityProjectionClosure(t, cfg, repos)
 	assertPhysicalAssetClosure(t, cfg, repos, topology, ledger)
 	assertProChecksumFixture(t, topology, "../../docs/migration/fixtures/pro-v4.4.0-checksums.sha256")
 	assertPhysicalRepoGroups(t, cfg)
@@ -254,10 +255,10 @@ func readPhysicalMigrationLedger(t *testing.T, filename string) []physicalMigrat
 
 func assertClosedPhysicalLedgerRow(t *testing.T, filename string, line int, row physicalMigrationLedgerRow) {
 	t.Helper()
-	allowedKinds := setOf("apt-suite", "yum-repo", "yum-nested", "inventory-carrier", "root-key", "root-prefix", "pro-file")
-	allowedDispositions := setOf("mapped-review-required", "mapped-separate-noarch-review-required", "quarantine-compat", "quarantine-overlap", "baseline-only", "external-builder-convergence", "gated-rebase-review-required", "excluded-empty-source+canonical-checksum-add", "adopted-latest-local-cutover-pending", "adopted-stable-local-cutover-pending")
+	allowedKinds := setOf("apt-suite", "yum-repo", "yum-policy-owner", "yum-nested", "inventory-carrier", "root-key", "root-prefix", "pro-file")
+	allowedDispositions := setOf("mapped-review-required", "mapped-separate-noarch-review-required", "compatibility-projection-declared", "compatibility-policy-owner", "quarantine-overlap", "baseline-only", "external-builder-convergence", "gated-rebase-review-required", "excluded-empty-source+canonical-checksum-add", "adopted-latest-local-cutover-pending", "adopted-stable-local-cutover-pending")
 	allowedLifecycle := setOf("active-policy-unverified", "frozen-policy-unverified", "cross-el-unresolved", "lifecycle-unresolved", "stable-gated-policy-unverified", "stable-gated-policy-verified", "not-applicable")
-	allowedSigners := setOf("release-signature-not-inventory", "metadata-not-claimed+payload-keyring-unverified", "content-not-read", "not-applicable", "source-sha256-pinned", "source-pair+generated-sha256-pinned", "source-zero-byte+generated-sha256-verified", "sha256+gzip+tar-verified")
+	allowedSigners := setOf("release-signature-not-inventory", "metadata-not-claimed+payload-keyring-unverified", "payload-keyring-unverified", "content-not-read", "not-applicable", "source-sha256-pinned", "source-pair+generated-sha256-pinned", "source-zero-byte+generated-sha256-verified", "sha256+gzip+tar-verified")
 	allowedTargets := setOf("cf,cos", "cos", "none")
 	checks := []struct {
 		field string
@@ -352,6 +353,7 @@ func assertPhysicalYUMClosure(t *testing.T, cfg *Config, repos map[string]Repo, 
 	got := make(map[string]bool)
 	seenRepos := make(map[string]bool)
 	rows := 0
+	policyRows := 0
 	nestedRows := 0
 	for _, row := range ledger {
 		switch row.kind {
@@ -369,8 +371,8 @@ func assertPhysicalYUMClosure(t *testing.T, cfg *Config, repos map[string]Repo, 
 				t.Fatalf("YUM source/trust contract changed for %s: %+v config_path=%s", row.owner, row, repo.Path)
 			}
 			if repo.ID == "yum-infra-legacy-compat" {
-				if repo.IsActive() || row.disposition != "quarantine-compat" || row.lifecycle != "cross-el-unresolved" || row.targets != "none" {
-					t.Fatalf("YUM infra compatibility carrier became operable: repo=%+v ledger=%+v", repo, row)
+				if repo.IsActive() || row.disposition != "compatibility-projection-declared" || row.lifecycle != "frozen-policy-unverified" || row.targets != "none" {
+					t.Fatalf("YUM infra compatibility carrier contract drifted: repo=%+v ledger=%+v", repo, row)
 				}
 				for group, members := range cfg.RepoGroups {
 					if containsString(members, repo.ID) {
@@ -402,6 +404,23 @@ func assertPhysicalYUMClosure(t *testing.T, cfg *Config, repos map[string]Repo, 
 				}
 				got[leaf] = true
 			}
+		case "yum-policy-owner":
+			policyRows++
+			repo, exists := repos[row.owner]
+			if !exists || repo.ID != "yum-infra-policy-el9" || repo.Type != "yum" || repo.YUM == nil || !repo.IsActive() {
+				t.Fatalf("compatibility policy owner is missing or inactive: %+v", repo)
+			}
+			if seenRepos[row.owner] {
+				t.Fatalf("YUM repo appears twice in ledger: %s", row.owner)
+			}
+			seenRepos[row.owner] = true
+			if row.source != "-" || row.components != "-" || row.disposition != "compatibility-policy-owner" ||
+				row.lifecycle != "active-policy-unverified" || row.signer != "payload-keyring-unverified" || row.targets != "cf,cos" ||
+				repo.Path != "yum/infra/el9/{arch}" || repo.OS.Family != "el" || repo.OS.Major != 9 || repo.OS.Lifecycle != "active" ||
+				repo.YUM.Compression != "zstd" || strings.Join(repo.Arches, ",") != "aarch64,x86_64" {
+				t.Fatalf("compatibility policy owner contract changed: repo=%+v ledger=%+v", repo, row)
+			}
+			assertRepoTargetAffinity(t, repo, row.targets)
 		case "yum-nested":
 			nestedRows++
 			if row.owner != "-" || row.source != "yum/pgdg/17/redhat/rhel-10-aarch64/rhel-10.0-aarch64" || row.disposition != "quarantine-overlap" || row.lifecycle != "lifecycle-unresolved" || row.targets != "none" {
@@ -412,8 +431,8 @@ func assertPhysicalYUMClosure(t *testing.T, cfg *Config, repos map[string]Repo, 
 			}
 		}
 	}
-	if rows != 74 || nestedRows != 1 {
-		t.Fatalf("YUM ledger rows ordinary=%d nested=%d want=74/1", rows, nestedRows)
+	if rows != 74 || policyRows != 1 || nestedRows != 1 {
+		t.Fatalf("YUM ledger rows ordinary=%d policy=%d nested=%d want=74/1/1", rows, policyRows, nestedRows)
 	}
 	for _, repo := range cfg.Repos {
 		if repo.Type == "yum" && !seenRepos[repo.ID] {
@@ -434,15 +453,61 @@ func assertPhysicalYUMClosure(t *testing.T, cfg *Config, repos map[string]Repo, 
 	}
 }
 
+func assertPhysicalCompatibilityProjectionClosure(t *testing.T, cfg *Config, repos map[string]Repo) {
+	t.Helper()
+	want := map[string]struct {
+		root string
+		arch string
+	}{
+		"infra-legacy-aarch64": {root: "yum/infra/aarch64", arch: "aarch64"},
+		"infra-legacy-x86-64":  {root: "yum/infra/x86_64", arch: "x86_64"},
+	}
+	if len(cfg.CompatibilityProjections) != len(want) {
+		t.Fatalf("physical compatibility projections=%d want=%d", len(cfg.CompatibilityProjections), len(want))
+	}
+	seen := make(map[string]bool, len(want))
+	for _, projection := range cfg.CompatibilityProjections {
+		expected, exists := want[projection.ID]
+		if !exists || seen[projection.ID] {
+			t.Fatalf("unknown or duplicate physical compatibility projection %+v", projection)
+		}
+		seen[projection.ID] = true
+		if projection.Root != expected.root || projection.Mode != YUMCompatibilityModeFrozenCrossEL ||
+			projection.Carrier != "yum-infra-legacy-compat" || projection.Source.Repo != "yum-infra-policy-el9" ||
+			projection.Source.View != "latest" || projection.Source.OS != "cross-el" ||
+			projection.Source.Arch != expected.arch || projection.Source.Commit != YUMCompatibilityPinAtFirstFreeze {
+			t.Fatalf("physical compatibility projection changed: %+v", projection)
+		}
+	}
+	carrier := repos["yum-infra-legacy-compat"]
+	owner := repos["yum-infra-policy-el9"]
+	if carrier.IsActive() || owner.Type != "yum" || !owner.IsActive() || owner.YUM == nil || owner.YUM.Compression != "zstd" {
+		t.Fatalf("compatibility carrier/policy separation changed: carrier=%+v owner=%+v", carrier, owner)
+	}
+}
+
 func assertPhysicalAssetClosure(t *testing.T, cfg *Config, repos map[string]Repo, topology []physicalTopologyRow, ledger []physicalMigrationLedgerRow) {
 	t.Helper()
 	rootScopes := topologyLogicalScopes(topology, "root-key-source")
 	prefixScopes := topologyLogicalScopes(topology, "root-prefix-source")
 	proSources := make(map[string]bool)
+	proChecksumRows := 0
 	for _, row := range topology {
 		if row.kind == "pro-file" {
+			if proSources[row.physical] {
+				t.Fatalf("duplicate gated Pro topology source %s", row.physical)
+			}
 			proSources[row.physical] = true
+			if row.physical == "pro/checksums" {
+				proChecksumRows++
+				if row.logical != "/pro/checksums" || row.scope != "gated-metadata-only" || row.bytes != "0" || row.sha256 != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" {
+					t.Fatalf("legacy Pro checksum must remain the exact zero-byte, metadata-only inventory row: %+v", row)
+				}
+			}
 		}
+	}
+	if proChecksumRows != 1 {
+		t.Fatalf("legacy Pro checksum topology rows=%d want=1", proChecksumRows)
 	}
 	seenRoots := make(map[string]bool)
 	seenPrefixes := make(map[string]bool)
@@ -512,8 +577,8 @@ func assertPhysicalAssetClosure(t *testing.T, cfg *Config, repos map[string]Repo
 	if len(seenRoots) != 7 || len(seenPrefixes) != 8 || len(seenPro) != 16 {
 		t.Fatalf("asset migration counts root=%d prefix=%d pro=%d want=7/8/16", len(seenRoots), len(seenPrefixes), len(seenPro))
 	}
-	if len(cfg.Repos) != 97 {
-		t.Fatalf("complete physical migration repositories=%d want=97", len(cfg.Repos))
+	if len(cfg.Repos) != 98 {
+		t.Fatalf("complete physical migration repositories=%d want=98", len(cfg.Repos))
 	}
 }
 
@@ -567,7 +632,7 @@ func assertPhysicalRepoGroups(t *testing.T, cfg *Config) {
 		case "apt":
 			apt[repo.ID] = true
 		case "yum":
-			if repo.IsActive() {
+			if repo.IsActive() && repo.ID != "yum-infra-policy-el9" {
 				yumActive[repo.ID] = true
 			}
 		case "asset":
@@ -599,8 +664,10 @@ func assertPhysicalRepoGroups(t *testing.T, cfg *Config) {
 	}
 	assertExactStringSet(t, "active YUM family group partition", yumUnion, yumActive)
 	for group, members := range cfg.RepoGroups {
-		if containsString(members, "yum-infra-legacy-compat") {
-			t.Fatalf("quarantined YUM infra carrier entered repo group %s", group)
+		for _, forbidden := range []string{"yum-infra-legacy-compat", "yum-infra-policy-el9"} {
+			if containsString(members, forbidden) {
+				t.Fatalf("compatibility-only YUM repo %s entered repo group %s", forbidden, group)
+			}
 		}
 	}
 }

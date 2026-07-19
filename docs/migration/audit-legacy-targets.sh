@@ -317,7 +317,7 @@ fi
 # known-enum disposition or selector being changed while every structural gate
 # still passes. Updating this digest requires an explicit re-review of all 176
 # normalized rows and the evidence record.
-EXPECTED_MACHINE_MAP_SHA256=e29ceea9facb5a63bbce9fcfb2d17f80d01720c0d47a931101c65adcd3655e52
+EXPECTED_MACHINE_MAP_SHA256=54b9e81b837c4010bb16e8a25339375d57043232428a22a8019bb8703253c6ac
 MACHINE_MAP_SHA256=
 if [ -f "$TMP/normalized" ]; then
 	{
@@ -354,7 +354,7 @@ if ! CLI_IDENTITY=$("$SOW_BIN" version 2> "$TMP/sow-version.err"); then
 	status=1
 	CLI_IDENTITY=unavailable
 fi
-for verb in init add rm sync publish gc verify promote materialize fsck; do
+for verb in init add rm sync publish gc verify promote materialize fsck compatibility; do
 	if ! grep -Eq "^[[:space:]]+$verb[[:space:]]" "$TMP/sow-help"; then
 		echo "mapped SOW verb missing from top-level help: $verb" >&2
 		status=1
@@ -364,6 +364,13 @@ for verb in init add rm sync publish gc verify promote materialize fsck; do
 		status=1
 	fi
 	cat "$TMP/sow-$verb-help.out" "$TMP/sow-$verb-help.err" > "$TMP/sow-$verb-help"
+done
+for compatibility_verb in yum-adopt yum-candidate yum-freeze yum-cutover yum-rollback; do
+	if ! "$SOW_BIN" compatibility "$compatibility_verb" --help > "$TMP/sow-compatibility-$compatibility_verb-help.out" 2> "$TMP/sow-compatibility-$compatibility_verb-help.err"; then
+		echo "current SOW compatibility $compatibility_verb help failed" >&2
+		status=1
+	fi
+	cat "$TMP/sow-compatibility-$compatibility_verb-help.out" "$TMP/sow-compatibility-$compatibility_verb-help.err" > "$TMP/sow-compatibility-$compatibility_verb-help"
 done
 
 # Extract inline command templates only from target rows. This makes the
@@ -386,6 +393,13 @@ while IFS="$TAB" read -r id disposition command; do
 	verb=$(printf '%s\n' "$command" | awk '{print $2}')
 	case "$verb" in
 		init|add|rm|sync|publish|gc|verify|promote|materialize|fsck) ;;
+		compatibility)
+			compatibility_verb=$(printf '%s\n' "$command" | awk '{print $3}')
+			case "$compatibility_verb" in
+				yum-adopt|yum-candidate|yum-freeze|yum-cutover|yum-rollback) ;;
+				*) echo "$id references unknown SOW compatibility verb in: $command" >&2; status=1; continue ;;
+			esac
+			;;
 		*) echo "$id references unknown SOW verb in: $command" >&2; status=1; continue ;;
 	esac
 	if [ "$disposition" = "sow-cli" ]; then
@@ -402,10 +416,14 @@ while IFS="$TAB" read -r id disposition command; do
 	# unknown, so that older probe technique could no longer distinguish a stale
 	# mapping from a valid no-side-effect help request.
 	printf '%s\n' "$command" | tr ' ' '\n' | sed -n 's/^\(--[A-Za-z0-9-]*\).*$/\1/p' | LC_ALL=C sort -u > "$TMP/flags"
+	help_file=$TMP/sow-$verb-help
+	if [ "$verb" = compatibility ]; then
+		help_file=$TMP/sow-compatibility-$compatibility_verb-help
+	fi
 	while IFS= read -r flag; do
 		[ -n "$flag" ] || continue
 		flag_name=${flag#--}
-		if ! grep -Eq "^[[:space:]]*-$flag_name([[:space:]]|$)" "$TMP/sow-$verb-help"; then
+		if ! grep -Eq "^[[:space:]]*-$flag_name([[:space:]]|$)" "$help_file"; then
 			echo "$id references undefined $verb flag $flag in: $command" >&2
 			status=1
 		fi

@@ -65,6 +65,13 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   public-only plan 不联网。raw 404/200/redirect/v1/cache/origin/teardown/cancel 负例、双
   provider HTTP、真实 CLI 零 mutation 和 owner 授权 main/beta raw-domain 只读负证据均
   已实跑。当前两个测试域按设计被拒绝；这不冒充 Worker/private-origin/purge/POC-06 通过。
+- `2026-07-19-legacy-migration-review-hardening.md`：迁移 selector 从 synthetic matrix
+  收紧到完整 physical Pigsty-v1 contract 与 158-command exact-leaf/compatibility 静态黄金；
+  x86_64/aarch64 状态机、缺任一物理架构的第 5 个 family 突变、同数量路径漂移、
+  任意进程直接路径及外部 hard-link alias 已打开可写 FD、不可能日期和 Pro 零字节
+  empty-SHA 身份负例均已实跑；writer fence 的 macOS `lsof` 与断网 Linux procfs
+  分支也都通过。旧仓仅只读，
+  用户已有修改保持不动；不冒充生产 writer 撤权或云发布通过。
 - `2026-07-19-r2-resource-stable-lease-rotation.md`：bootstrap key 改由 readiness-resource
   SHA 稳定派生，provider log-sink 固定为 dedicated raw bucket 根 key；跨 plan/deployment 的
   idle/expired CAS 接管、live/foreign/stale-holder 拒绝、当时的 recovery receipt v2 与 readiness
@@ -268,7 +275,7 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   `2026-07-18-legacy-adoption-50k-performance.md`。
 - `2026-07-14-legacy-family-e2e.md`：当前 44 个迁移操作族的可执行合同；校准 33-repo
   selector universe 与 12-repo synthetic parser/adoption subset，修正 `pkg-pig` ID 和 Docker
-  `default/help` 的 retire 语义，并动态运行 13 个真实 CLI/FS/parser/provider-protocol
+  `default/help` 的 retire 语义，并动态运行 16 个真实 CLI/FS/parser/provider-protocol
   E2E、实际二进制零字节纳管/回滚、审计与 writer-fence 负例及 race。明确不替代逐生产
   target、真实双云/CDN 或旧 writer 撤权证据。
 - `2026-07-12-legacy-migration-audit.md`：真实四个旧 Makefile 的 176/176 固定摘要/
@@ -279,8 +286,9 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   ledger 与双向 set equality 精确闭合 98 repo ID/135 row、74 APT index、130 ordinary YUM leaf、
   nested quarantine、7/8 root key/prefix 和 16 gated pro 文件；保留 signer/lifecycle non-claim，
   并证明 12-repo/33-repo synthetic、infra group 泄漏、Percona noarch 回退等突变 fail closed。
-  这是 activation 前历史证据；当前 Pro inventory carrier 已由 active owner 替换，current
-  97-repo/134-row 合同与实跑见 2026-07-17 gated Pro 报告。
+  这是原始 discovery 合同的历史证据；Pro inventory carrier 随后由 active owner 替换为
+  97/134，2026-07-19 又新增专用 EL9 compatibility policy owner，current 恢复为 98/135，
+  但组成不同。两条 physical projection、直接 empty-SHA 与实跑见本日迁移硬化报告。
 - `2026-07-14-package-repository-history-continuity.md`：本地 embedded-Git package ownership
   冻结门禁；覆盖 HEAD + `refs/sow/*` DAG、manifest/view/snapshot/YUM generation、matching-HEAD
   漂移、delete/reintroduce/root reuse、active/lifecycle/keyring/upstream 例外、锁内 mutation/GC

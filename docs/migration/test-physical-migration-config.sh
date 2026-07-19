@@ -95,6 +95,12 @@ expect_fail infra-carrier-cannot-enter-group 'quarantined YUM infra carrier ente
 awk '!changed && $1 == "root-key" && $3 == "beta" { sub(/cf,cos$/, "cos"); changed=1 } { print }' "$LEDGER" > "$TMP/root-target-drift.tsv"
 expect_fail root-target-affinity-is-exact 'root key target affinity beta' "$CONFIG" "$TOPOLOGY" "$TMP/root-target-drift.tsv"
 
+awk 'BEGIN { FS=OFS="\t" } !changed && $1 == "pro-file" && $3 == "pro/checksums" { $5="1"; changed=1 } { print }' "$TOPOLOGY" > "$TMP/nonempty-pro-checksums.tsv"
+expect_fail legacy-pro-checksum-must-remain-empty 'legacy Pro checksum must remain the exact zero-byte' "$CONFIG" "$TMP/nonempty-pro-checksums.tsv" "$LEDGER"
+
+awk 'BEGIN { FS=OFS="\t" } !changed && $1 == "pro-file" && $3 == "pro/checksums" { $6="0000000000000000000000000000000000000000000000000000000000000000"; changed=1 } { print }' "$TOPOLOGY" > "$TMP/wrong-empty-pro-checksum.tsv"
+expect_fail legacy-pro-checksum-must-bind-empty-sha 'legacy Pro checksum must remain the exact zero-byte' "$CONFIG" "$TMP/wrong-empty-pro-checksum.tsv" "$LEDGER"
+
 go_test ./internal/cli -run '^TestPhysicalMigrationCompatibilityCarrierIsNotCLISelectable$'
 printf 'PASS inactive-migration-carrier-cli-gate\n'
 printf 'physical migration config hermetic suite: PASS\n'

@@ -34,7 +34,18 @@ func newFlatYUMCompatibilityFixture(t *testing.T) flatYUMCompatibilityFixture {
 }
 
 func newFlatYUMCompatibilityFixtureWithFrozenRecords(t *testing.T, frozenRecords bool) flatYUMCompatibilityFixture {
+	return newFlatYUMCompatibilityFixtureForArchWithFrozenRecords(t, "x86_64", frozenRecords)
+}
+
+func newFlatYUMCompatibilityFixtureForArch(t *testing.T, arch string) flatYUMCompatibilityFixture {
+	return newFlatYUMCompatibilityFixtureForArchWithFrozenRecords(t, arch, true)
+}
+
+func newFlatYUMCompatibilityFixtureForArchWithFrozenRecords(t *testing.T, arch string, frozenRecords bool) flatYUMCompatibilityFixture {
 	t.Helper()
+	if arch != "aarch64" && arch != "x86_64" {
+		t.Fatalf("unsupported compatibility fixture architecture %q", arch)
+	}
 	workspace := nginxWorkerTempDir(t)
 	privatePath, _ := writeLegacySigningKey(t, workspace)
 	privateKey, err := os.ReadFile(privatePath)
@@ -50,8 +61,8 @@ func newFlatYUMCompatibilityFixtureWithFrozenRecords(t *testing.T, frozenRecords
 		t.Fatal(err)
 	}
 	rpmInput := decodeLegacyFixture(t, filepath.Join("testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(workspace, "input.rpm"))
-	root := filepath.Join(workspace, "yum", "infra", "x86_64")
-	repo := config.Repo{ID: "infra-el9", Type: "yum", Path: "yum/infra/el9/{arch}", Arches: []string{"x86_64"}, OS: config.OSConfig{Family: "el", Major: 8, Lifecycle: "frozen"}, YUM: &config.YUMConfig{Compression: "gzip"}}
+	root := filepath.Join(workspace, "yum", "infra", arch)
+	repo := config.Repo{ID: "infra-el9", Type: "yum", Path: "yum/infra/el9/{arch}", Arches: []string{arch}, OS: config.OSConfig{Family: "el", Major: 8, Lifecycle: "frozen"}, YUM: &config.YUMConfig{Compression: "gzip"}}
 	flat, canonical := writeAllSelectorFlatYUM(t, repo, root, rpmInput, privatePath)
 	if frozenRecords {
 		repomdPath := filepath.Join(root, "repodata", "repomd.xml")

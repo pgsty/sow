@@ -2,8 +2,8 @@
 title: 'Pigsty-v1 存量仓库迁移硬化'
 type: 'feature'
 created: '2026-07-12'
-status: 'in-review'
-review_loop_iteration: 0
+status: 'completed'
+review_loop_iteration: 2
 baseline_commit: '84800a60e01aaaf8dc5b189c3ddb1380930f4865'
 context:
   - '{project-root}/_bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/prd.md'
@@ -64,6 +64,24 @@ context:
 
 ## Spec Change Log
 
+- 2026-07-19: ADR-0027 is the accepted superseding decision for the frozen
+  block's flat-only source-href restriction. Safe normalized, index-proven
+  nested RPM hrefs are accepted while the final canonical layout and all
+  escape/wrong-bucket/collision/unlisted/tamper gates remain unchanged. The
+  frozen historical wording above is retained rather than silently rewritten.
+- 2026-07-19: review hardening moved the 176-target selector audit from the
+  synthetic matrix to the complete physical Pigsty-v1 contract and a static
+  158-command exact-leaf golden; added same-count drift, arbitrary open
+  writable-FD, impossible timestamp, and zero-byte Pro checksum negatives.
+- 2026-07-19: the 44-family E2E gate now expands physical repo groups and
+  classifies dedicated `compatibility/yum-*` verbs. Mixed-EL replacement
+  families bind executable local x86_64 and aarch64
+  adopt/candidate/freeze/cutover/rollback state machines instead of treating
+  compatibility as an ordinary selector. The physical contract has a dedicated
+  EL9 policy owner and two exact compatibility projections; neither the carrier
+  nor policy-only owner can leak into an ordinary repo group. The aarch64
+  state machine loads that complete checked-in physical config directly.
+
 ## Design Notes
 
 `payload` 以 source path 证明 baseline 成员、以 canonical path 建唯一约束；view entry 只携带 canonical path。RPM body inspector 以 basename/NEVRA/hash 验证制品，不能把 primary 的 flat href误当 canonical destination。旧 receipt 缺 `canonical_path` 时按 source==canonical 解码，新 flat adoption 必须显式写出二者。
@@ -77,3 +95,12 @@ context:
 - `go vet ./internal/provenance ./internal/cli && git diff --check` -- 静态与补丁检查通过。
 
 **2026-07-12 result:** normal/race targeted suites、`go vet`、44/176 negative audit、asset/package rollback 与 writer-fence suites 全部退出 0；旧 `/Users/vonng/pgsty/repo` clean，七个固定输入摘要未变。真实生产 IAM/Nginx/双云门禁仍按总 Goal 保持未通过，不属于本 spec 的本地通过声明。
+
+**2026-07-19 review-hardening result:** physical-selector focused and race
+suites, 21-case macOS `lsof` / 20-case Linux procfs writer fence, physical
+fixture, 176-target audit, 44-family
+contract with 16 executable tests, local adoption/rollback, `go vet`, patch
+check, full `go test ./...` (`internal/cli` 1202.757s), and clean-delivery
+archive all passed. The old repo was read only and
+its pre-existing user modification remained untouched. No cloud or production
+mutation was performed; those Goal-level gates remain open.

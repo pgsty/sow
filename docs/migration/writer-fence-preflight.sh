@@ -84,6 +84,10 @@ if [[ ! -d "$LEGACY_ROOT" ]]; then
 	exit 2
 fi
 LEGACY_ROOT=$(CDPATH= cd -- "$LEGACY_ROOT" && pwd -P)
+if [[ "$LEGACY_ROOT" == *$'\n'* || "$LEGACY_ROOT" == *$'\t'* ]]; then
+	echo "legacy root must not contain a newline or tab" >&2
+	exit 2
+fi
 
 case "$OUTPUT" in
 	/*) ;;
@@ -159,6 +163,41 @@ else
 	hash_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 fi
 
+if LEGACY_STAT_PROBE=$(stat -f '%d:%i' "$LEGACY_ROOT" 2>/dev/null) && [[ "$LEGACY_STAT_PROBE" =~ ^[0-9]+:[0-9]+$ ]]; then
+	LEGACY_STAT_STYLE=bsd
+else
+	LEGACY_STAT_STYLE=gnu
+fi
+
+file_identity() {
+	local path=$1
+	if [[ "$LEGACY_STAT_STYLE" == bsd ]]; then
+		stat -L -f '%d:%i' "$path" 2>/dev/null
+	else
+		stat -Lc '%d:%i' -- "$path" 2>/dev/null
+	fi
+}
+
+make_legacy_inode_snapshot() {
+	local destination=$1 unsorted
+	unsorted=$destination.unsorted
+	if [[ "$LEGACY_STAT_STYLE" == bsd ]]; then
+		if ! find "$LEGACY_ROOT" -type f -exec stat -f '%d:%i' {} + > "$unsorted"; then
+			echo "failed to inventory legacy file identities" >&2
+			exit 1
+		fi
+	else
+		if ! find "$LEGACY_ROOT" -type f -exec stat -Lc '%d:%i' -- {} + > "$unsorted"; then
+			echo "failed to inventory legacy file identities" >&2
+			exit 1
+		fi
+	fi
+	if ! LC_ALL=C sort -u "$unsorted" > "$destination"; then
+		echo "failed to normalize legacy file identities" >&2
+		exit 1
+	fi
+}
+
 # The schema is deliberately closed. Unknown fields could accidentally turn a
 # secret-bearing operator note into durable evidence, so they fail validation.
 if ! awk -F= '
@@ -205,14 +244,34 @@ if ! grep -Eq '^approved_change=[A-Za-z0-9][A-Za-z0-9._:/-]{1,127}$' "$ATTESTATI
 	echo "attestation approved_change must be a non-secret change identifier" >&2
 	exit 1
 fi
-if ! grep -Eq '^approved_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$ATTESTATION"; then
+APPROVED_AT=$(sed -n 's/^approved_at=//p' "$ATTESTATION")
+if ! grep -Eq '^approved_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$ATTESTATION" ||
+	! awk -v value="$APPROVED_AT" '
+		BEGIN {
+			year=substr(value,1,4)+0
+			month=substr(value,6,2)+0
+			day=substr(value,9,2)+0
+			hour=substr(value,12,2)+0
+			minute=substr(value,15,2)+0
+			second=substr(value,18,2)+0
+			leap=(year % 4 == 0 && (year % 100 != 0 || year % 400 == 0))
+			days[1]=31; days[2]=(leap ? 29 : 28); days[3]=31; days[4]=30
+			days[5]=31; days[6]=30; days[7]=31; days[8]=31
+			days[9]=30; days[10]=31; days[11]=30; days[12]=31
+			exit !(year >= 1 && month >= 1 && month <= 12 &&
+			       day >= 1 && day <= days[month] &&
+			       hour <= 23 && minute <= 59 && second <= 59)
+		}
+	' </dev/null
+then
 	echo "attestation approved_at must be an RFC3339 UTC timestamp" >&2
 	exit 1
 fi
 
 make_process_snapshot() {
 	local destination=$1 pid class explicit cwd process_count
-	printf 'schema=sow-process-probe/v1\n' > "$destination"
+	printf 'schema=sow-process-probe/v2\n' > "$destination"
+	printf 'scope\tknown-processes-and-effective-user-writable-fds\n' >> "$destination"
 	if ! ps -axo pid=,command= > "$TMP/process-raw"; then
 		echo "live process probe failed" >&2
 		exit 1
@@ -260,7 +319,151 @@ make_process_snapshot() {
 				;;
 		esac
 	done < "$TMP/process-candidates"
+	make_writable_fd_snapshot "$destination"
 	printf 'probe\tcomplete\t%s\n' "$process_count" >> "$destination"
+}
+
+# Permissions on a pathname do not revoke an already-open writable file
+# descriptor. Inspect every descriptor owned by the effective user and bind
+# this closure into the same process snapshot as the known-writer scan. Linux
+# uses procfs directly; macOS and other supported hosts use the system lsof.
+make_writable_fd_snapshot() {
+	local destination=$1
+	: > "$TMP/fd-writers"
+	if [[ -d /proc/self/fd && -r /proc/self/status ]]; then
+		make_proc_writable_fd_snapshot
+	else
+		make_lsof_writable_fd_snapshot
+	fi
+	LC_ALL=C sort -u "$TMP/fd-writers" >> "$destination"
+	IFS=$'\t' read -r FD_PROCESS_COUNT FD_COUNT < "$TMP/fd-total"
+	printf 'fd-probe\tcomplete\t%s\t%s\n' "$FD_PROCESS_COUNT" "$FD_COUNT" >> "$destination"
+}
+
+make_proc_writable_fd_snapshot() {
+	local effective_uid pid_dir pid owner fd flags access target identity matched
+	local processes=0 descriptors=0
+	effective_uid=$(id -u)
+	for pid_dir in /proc/[0-9]*; do
+		[[ -d "$pid_dir" ]] || continue
+		pid=${pid_dir##*/}
+		if ! owner=$(awk '$1 == "Uid:" { print $2; found=1; exit } END { exit found ? 0 : 1 }' "$pid_dir/status" 2>/dev/null); then
+			if [[ -d "$pid_dir" ]] && ps -p "$pid" -o pid= >/dev/null 2>&1; then
+				echo "cannot inspect owner of active process pid=$pid" >&2
+				exit 1
+			fi
+			continue
+		fi
+		[[ "$owner" == "$effective_uid" ]] || continue
+		processes=$((processes + 1))
+		if [[ ! -d "$pid_dir/fd" || ! -r "$pid_dir/fd" ]]; then
+			if ps -p "$pid" -o pid= >/dev/null 2>&1; then
+				echo "cannot inspect descriptors of active effective-user process pid=$pid" >&2
+				exit 1
+			fi
+			continue
+		fi
+		for fd in "$pid_dir"/fd/*; do
+			[[ -L "$fd" ]] || continue
+			if ! flags=$(awk '$1 == "flags:" { print $2; found=1; exit } END { exit found ? 0 : 1 }' "$pid_dir/fdinfo/${fd##*/}" 2>/dev/null); then
+				if [[ -L "$fd" ]] && ps -p "$pid" -o pid= >/dev/null 2>&1; then
+					echo "cannot inspect descriptor flags of active process pid=$pid fd=${fd##*/}" >&2
+					exit 1
+				fi
+				continue
+			fi
+			descriptors=$((descriptors + 1))
+			access=${flags: -1}
+			[[ "$access" == 1 || "$access" == 2 ]] || continue
+			if ! target=$(readlink "$fd" 2>/dev/null); then
+				if [[ -L "$fd" ]] && ps -p "$pid" -o pid= >/dev/null 2>&1; then
+					echo "cannot inspect writable descriptor target of active process pid=$pid fd=${fd##*/}" >&2
+					exit 1
+				fi
+				continue
+			fi
+				target=${target%" (deleted)"}
+				matched=0
+				case "$target" in
+					"$LEGACY_ROOT"|"$LEGACY_ROOT"/*)
+						matched=1
+						;;
+				esac
+				if identity=$(file_identity "$fd"); then
+					if grep -Fqx "$identity" "$TMP/legacy-inodes.before"; then matched=1; fi
+				elif [[ -L "$fd" ]] && ps -p "$pid" -o pid= >/dev/null 2>&1; then
+					echo "cannot inspect writable descriptor identity of active process pid=$pid fd=${fd##*/}" >&2
+					exit 1
+				fi
+				if [[ "$matched" == 1 ]]; then
+					printf 'writer\t%s\twritable-fd\n' "$pid" >> "$TMP/fd-writers"
+				fi
+			done
+	done
+	printf '%s\t%s\n' "$processes" "$descriptors" > "$TMP/fd-total"
+}
+
+make_lsof_writable_fd_snapshot() {
+	local effective_uid pid device inode decimal_device identity
+	effective_uid=$(id -u)
+	if ! command -v lsof >/dev/null 2>&1; then
+		echo "live writable-descriptor probe requires procfs or lsof" >&2
+		exit 1
+	fi
+	if ! lsof -nP -u "$effective_uid" -F pfaDtin > "$TMP/lsof-raw" 2> "$TMP/lsof-error"; then
+		echo "live writable-descriptor lsof probe failed" >&2
+		exit 1
+	fi
+	if [[ -s "$TMP/lsof-error" ]]; then
+		echo "live writable-descriptor lsof probe was incomplete" >&2
+		exit 1
+	fi
+	: > "$TMP/lsof-writable-identities"
+	if ! awk -v root="$LEGACY_ROOT" -v writers="$TMP/fd-writers" -v candidates="$TMP/lsof-writable-identities" -v totals="$TMP/fd-total" '
+		function within(name, root) { return name == root || index(name, root "/") == 1 }
+		substr($0,1,1) == "p" { pid=substr($0,2); processes[pid]=1; access=""; device=""; type=""; inode=""; next }
+		substr($0,1,1) == "f" { access=""; device=""; type=""; inode=""; next }
+		substr($0,1,1) == "a" { access=substr($0,2); next }
+		substr($0,1,1) == "D" { device=substr($0,2); next }
+		substr($0,1,1) == "t" { type=substr($0,2); next }
+		substr($0,1,1) == "i" { inode=substr($0,2); next }
+		substr($0,1,1) == "n" {
+			name=substr($0,2)
+			sub(/ \(deleted\)$/, "", name)
+			descriptors++
+			if (access == "w" || access == "u") {
+				if (within(name, root)) print "writer\t" pid "\twritable-fd" >> writers
+				if (type == "REG" || type == "VREG") {
+					if (device !~ /^(0x[0-9A-Fa-f]+|[0-9]+)$/ || inode !~ /^[0-9]+$/) bad=1
+					else print pid "\t" device "\t" inode >> candidates
+				}
+			}
+			next
+		}
+		END {
+			for (pid in processes) process_count++
+			print process_count+0 "\t" descriptors+0 > totals
+			exit bad ? 1 : 0
+		}
+		' "$TMP/lsof-raw"; then
+		echo "live writable-descriptor lsof output is invalid" >&2
+		exit 1
+	fi
+	while IFS=$'\t' read -r pid device inode; do
+		[[ -n "$pid" ]] || continue
+		if [[ "$device" == 0x* ]]; then
+			if ! printf -v decimal_device '%d' "$device" 2>/dev/null; then
+				echo "live writable-descriptor lsof device is invalid: $device" >&2
+				exit 1
+			fi
+		else
+			decimal_device=$device
+		fi
+		identity=$decimal_device:$inode
+		if grep -Fqx "$identity" "$TMP/legacy-inodes.before"; then
+			printf 'writer\t%s\twritable-fd\n' "$pid" >> "$TMP/fd-writers"
+		fi
+	done < "$TMP/lsof-writable-identities"
 }
 
 live_process_cwd() {
@@ -328,6 +531,12 @@ make_mount_snapshot() {
 	fi
 }
 
+# Bind the complete regular-file device/inode set before inspecting live
+# descriptors. This catches writers that opened an external hard-link alias,
+# whose reported pathname is outside LEGACY_ROOT but whose inode is still part
+# of the legacy repository.
+make_legacy_inode_snapshot "$TMP/legacy-inodes.before"
+
 if [[ -n "$PROCESS_SNAPSHOT" ]]; then
 	PROCESS_PROBE_SOURCE=supplied-snapshot
 	PROCESS_SOURCE=$(canonical_input "$PROCESS_SNAPSHOT" process-snapshot)
@@ -369,16 +578,22 @@ else
 fi
 
 if ! awk -F '\t' '
-	NR == 1 { if ($0 != "schema=sow-process-probe/v1") bad=1; next }
-	$1 == "writer" && NF == 3 && $2 ~ /^[0-9]+$/ && $3 ~ /^(make|repo-writer|rpm-signer|sow-writer|docker-writer)$/ { writers++; next }
+	NR == 1 { if ($0 != "schema=sow-process-probe/v2") bad=1; next }
+	$1 == "scope" && NF == 2 && $2 == "known-processes-and-effective-user-writable-fds" { scope++; next }
+	$1 == "writer" && NF == 3 && $2 ~ /^[0-9]+$/ && $3 ~ /^(make|repo-writer|rpm-signer|sow-writer|docker-writer|writable-fd)$/ { writers++; next }
+	$1 == "fd-probe" && $2 == "complete" && NF == 4 && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ { fd_complete++; fd_processes=$3; descriptors=$4; next }
 	$1 == "probe" && $2 == "complete" && NF == 3 && $3 ~ /^[0-9]+$/ { complete++; next }
 	{ bad=1 }
-	END { if (complete != 1) bad=1; print writers+0; exit bad ? 1 : 0 }
+	END {
+		if (scope != 1 || complete != 1 || fd_complete != 1) bad=1
+		print writers+0 "\t" fd_processes+0 "\t" descriptors+0
+		exit bad ? 1 : 0
+	}
 ' "$PROCESS_SNAPSHOT" > "$TMP/process-count"; then
 	echo "invalid or incomplete process snapshot" >&2
 	exit 1
 fi
-SUSPICIOUS_PROCESSES=$(cat "$TMP/process-count")
+IFS=$'\t' read -r SUSPICIOUS_PROCESSES FD_PROCESS_COUNT FD_COUNT < "$TMP/process-count"
 if [[ "$SUSPICIOUS_PROCESSES" != 0 ]]; then
 	echo "process probe found $SUSPICIOUS_PROCESSES legacy writer process(es)" >&2
 	exit 1
@@ -467,6 +682,12 @@ while IFS= read -r -d '' entry; do
 		if [[ -z "$FIRST_WRITABLE" ]]; then FIRST_WRITABLE=$entry; fi
 	fi
 done < "$TMP/legacy-entries"
+make_legacy_inode_snapshot "$TMP/legacy-inodes.after"
+if ! cmp -s "$TMP/legacy-inodes.before" "$TMP/legacy-inodes.after"; then
+	echo "legacy file identity inventory changed during preflight" >&2
+	exit 1
+fi
+LEGACY_FILE_INODES=$(wc -l < "$TMP/legacy-inodes.before" | tr -d ' ')
 if [[ "$WRITABLE_COUNT" != 0 ]]; then
 	echo "effective user can still write $WRITABLE_COUNT legacy entries; first: $FIRST_WRITABLE" >&2
 	exit 1
@@ -499,7 +720,7 @@ esac
 
 OUTPUT_TMP=$(mktemp "$OUTPUT.tmp.XXXXXX")
 {
-	printf 'schema=sow-writer-fence-report/v2\n'
+	printf 'schema=sow-writer-fence-report/v4\n'
 	printf 'legacy_root=%s\n' "$LEGACY_ROOT"
 	printf 'attestation_sha256=%s\n' "$(hash_file "$ATTESTATION")"
 	printf 'process_snapshot_sha256=%s\n' "$(hash_file "$PROCESS_SNAPSHOT")"
@@ -512,8 +733,13 @@ OUTPUT_TMP=$(mktemp "$OUTPUT.tmp.XXXXXX")
 	printf 'current_host_probe_coverage=%s\n' "$CURRENT_HOST_PROBE_COVERAGE"
 	printf 'production_current_host_preflight=%s\n' "$PRODUCTION_CURRENT_HOST_PREFLIGHT"
 	printf 'legacy_entries=%s\n' "$ENTRY_COUNT"
+	printf 'legacy_file_inodes=%s\n' "$LEGACY_FILE_INODES"
+	printf 'legacy_file_inode_snapshot_sha256=%s\n' "$(hash_file "$TMP/legacy-inodes.before")"
 	printf 'writable_entries=0\n'
 	printf 'suspicious_processes=0\n'
+	printf 'effective_user_processes_inspected=%s\n' "$FD_PROCESS_COUNT"
+	printf 'open_descriptors_inspected=%s\n' "$FD_COUNT"
+	printf 'legacy_writable_open_descriptors=0\n'
 	printf 'container_mounts=%s\n' "$CONTAINER_MOUNTS"
 	printf 'legacy_rw_container_mounts=0\n'
 	printf 'mounts=%s\n' "$MOUNT_COUNT"

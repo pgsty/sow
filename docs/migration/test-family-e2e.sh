@@ -60,11 +60,13 @@ awk -F $'\t' 'BEGIN { OFS=FS } $1 != "D07" { print }' "$CONTRACT" > "$TMP/missin
 awk -F $'\t' 'BEGIN { OFS=FS } $1 == "R03" { $4="TestHelpAndUsageCodes" } { print }' "$CONTRACT" > "$TMP/help-evidence.tsv"
 awk -F $'\t' 'BEGIN { OFS=FS } $1 == "D01" { $4="contract:policy-reject" } { print }' "$CONTRACT" > "$TMP/wrong-disposition.tsv"
 awk -F $'\t' 'BEGIN { OFS=FS } $1 == "R03" { $3="local-cli" } { print }' "$CONTRACT" > "$TMP/missing-provider.tsv"
+awk -F $'\t' 'BEGIN { OFS=FS } $1 == "R13" { gsub(/,TestYUMCompatibilityAArch64StateMachineThroughRollback/, "", $4) } { print }' "$CONTRACT" > "$TMP/missing-compatibility-arch.tsv"
 
 expect_contract_reject missing-family "$TMP/missing-family.tsv"
 expect_contract_reject help-as-business-evidence "$TMP/help-evidence.tsv"
 expect_contract_reject wrong-disposition "$TMP/wrong-disposition.tsv"
 expect_contract_reject publish-without-provider "$TMP/missing-provider.tsv"
+expect_contract_reject compatibility-arch-coverage "$TMP/missing-compatibility-arch.tsv"
 
 if ! comm -23 "$TMP/expected-tests" "$TMP/available-tests" > "$TMP/missing-tests"; then
 	exit 1
@@ -97,7 +99,7 @@ grep -Fq 'zero_byte_adoption=pass' "$TMP/binary-rollback.log"
 grep -Fq 'local_symlink_rollback_replay=pass' "$TMP/binary-rollback.log"
 
 echo "migration_family_contract=pass families=$family_count"
-echo "migration_family_negative_contracts=pass cases=4"
+echo "migration_family_negative_contracts=pass cases=5"
 echo "migration_family_cli_evidence=pass tests=$(wc -l < "$TMP/expected-tests" | tr -d ' ')"
 echo "migration_family_external_network=disabled goproxy=off provider_scope=memory_or_loopback"
 echo "migration_family_production_mutation=none temp_roots_only=true"

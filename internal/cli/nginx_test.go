@@ -1048,6 +1048,113 @@ func TestMaterializeNginxAndEdgeCompatibilityStateMachineThroughRollback(t *test
 	}
 }
 
+func TestYUMCompatibilityAArch64StateMachineThroughRollback(t *testing.T) {
+	fixture := newFlatYUMCompatibilityFixtureForArch(t, "aarch64")
+	workspace := filepath.Clean(filepath.Join(fixture.root, "..", "..", ".."))
+	configPath := filepath.Join(workspace, "sow.yaml")
+	physicalConfig, err := os.ReadFile(filepath.Join("..", "..", "docs", "migration", "fixtures", "pigsty-v1.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, physicalConfig, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, arch := range []string{"aarch64", "x86_64"} {
+		if err := os.MkdirAll(filepath.Join(workspace, "yum", "infra", "el9", arch), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(workspace, "yum", "infra", "x86_64"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keys := filepath.Join(workspace, "keys")
+	if err := os.MkdirAll(keys, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for source, target := range map[string]string{
+		filepath.Join(workspace, "legacy-public.key"): filepath.Join(keys, "migration-unverified-repository-key.asc"),
+		filepath.Join(workspace, "package-trust.asc"): filepath.Join(keys, "migration-unverified-package-signers.asc"),
+	} {
+		body, readErr := os.ReadFile(source)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if writeErr := os.WriteFile(target, body, 0o600); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}
+	cfg, err := config.Load(configPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, exists, err := config.YUMCompatibilityProjectionByID(cfg.CompatibilityProjections, "infra-legacy-aarch64")
+	if err != nil || !exists || projection.Source.Repo != "yum-infra-policy-el9" || projection.Root != "yum/infra/aarch64" {
+		t.Fatalf("physical aarch64 projection is unavailable: projection=%+v exists=%t err=%v", projection, exists, err)
+	}
+
+	scanRaw := func(name string) []byte {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), name+".tsv")
+		if _, err := manifest.Scan(t.Context(), fixture.root, manifest.Scope{Path: "."}, path, manifest.ScanOptions{Workers: 2, ChunkEntries: 2, TempDir: t.TempDir()}); err != nil {
+			t.Fatal(err)
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	rawBefore := scanRaw("raw-before")
+	privateKey := filepath.Join(workspace, "legacy-private.key")
+	candidate := filepath.Join(t.TempDir(), "candidate")
+	run := func(args ...string) (int, string, string) {
+		var stdout, stderr bytes.Buffer
+		code := Main(args, &stdout, &stderr)
+		return code, stdout.String(), stderr.String()
+	}
+	runOK := func(args ...string) string {
+		t.Helper()
+		code, stdout, stderr := run(args...)
+		if code != ExitOK || stderr != "" {
+			t.Fatalf("command %v code=%d stdout=%s stderr=%s", args, code, stdout, stderr)
+		}
+		return stdout
+	}
+
+	runOK("init", "--repo", "yum-infra-policy-el9", "--repo", "yum-infra-legacy-compat", "--config", configPath, "--workers", "1", "--chunk-entries", "2")
+	runOK("add", filepath.Join(fixture.root, fixture.flat), "--repo", "yum-infra-policy-el9", "--config", configPath, "--gpg-private-key-file", privateKey, "--workers", "1", "--chunk-entries", "2")
+	runOK("promote", "beta", "latest", "--repo", "yum-infra-policy-el9", "--config", configPath, "--workers", "1", "--chunk-entries", "2")
+	runOK("compatibility", "yum-adopt", "--id", "infra-legacy-aarch64", "--config", configPath, "--workers", "1", "--chunk-entries", "2")
+	candidateOutput := runOK("compatibility", "yum-candidate", "--id", "infra-legacy-aarch64", "--output", candidate, "--gpg-private-key-file", privateKey, "--config", configPath, "--workers", "1", "--chunk-entries", "2")
+	freezeOutput := runOK("compatibility", "yum-freeze", "--id", "infra-legacy-aarch64", "--candidate", candidate, "--confirm", nginxTestOutputValue(t, candidateOutput, "freeze_confirm"), "--config", configPath, "--workers", "1", "--chunk-entries", "2")
+	cutoverOutput := runOK("compatibility", "yum-cutover", "--id", "infra-legacy-aarch64", "--confirm", nginxTestOutputValue(t, freezeOutput, "cutover_confirm"), "--config", configPath, "--workers", "1", "--chunk-entries", "2")
+	runOK("materialize", "latest", "--repo", "yum-infra-policy-el9", "--config", configPath, "--gpg-private-key-file", privateKey, "--workers", "1", "--chunk-entries", "2")
+	if output := runOK("fsck", "--repo", "yum-infra-policy-el9", "--config", configPath, "--workers", "1", "--chunk-entries", "2"); !strings.Contains(output, "fsck clean") {
+		t.Fatalf("aarch64 cutover did not leave a clean repository: %s", output)
+	}
+	mirror := filepath.Join(workspace, filepath.FromSlash(serving.MirrorlistPath("latest", "infra-legacy-aarch64", "cross-el", "aarch64")))
+	if info, err := os.Stat(mirror); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		t.Fatalf("aarch64 compatibility mirrorlist info=%v err=%v", info, err)
+	}
+	runOK("compatibility", "yum-rollback", "--id", "infra-legacy-aarch64", "--confirm", nginxTestOutputValue(t, cutoverOutput, "rollback_confirm"), "--config", configPath, "--workers", "1", "--chunk-entries", "2")
+	// Topology deletion is intentionally a full-authority reconciliation; a
+	// filtered materialize may add selected routes but cannot delete unselected
+	// canonical channels.
+	runOK("materialize", "latest", "--config", configPath, "--gpg-private-key-file", privateKey, "--workers", "1", "--chunk-entries", "2")
+	if output := runOK("fsck", "--repo", "yum-infra-policy-el9", "--config", configPath, "--workers", "1", "--chunk-entries", "2"); !strings.Contains(output, "fsck clean") {
+		t.Fatalf("aarch64 rollback did not leave a clean repository: %s", output)
+	}
+	if _, err := os.Lstat(mirror); !os.IsNotExist(err) {
+		t.Fatalf("aarch64 rollback mirrorlist survived reconciliation: %v", err)
+	}
+	if rawAfter := scanRaw("raw-after"); !bytes.Equal(rawBefore, rawAfter) {
+		t.Fatal("aarch64 compatibility state machine rewrote the raw Pigsty-v1 carrier")
+	}
+	if err := verifyLegacyYUMCompatibilityRoot(t.Context(), fixture.root, fixture.desired, fixture.packageKeyring); err != nil {
+		t.Fatalf("rolled-back aarch64 repository is not consumable: %v", err)
+	}
+}
+
 func nginxTestOutputValue(t *testing.T, output, name string) string {
 	t.Helper()
 	prefix := name + "="

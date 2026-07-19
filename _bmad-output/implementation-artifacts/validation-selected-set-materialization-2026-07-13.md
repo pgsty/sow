@@ -1417,3 +1417,82 @@ above for both files. This is the current V-14/V-26 delivery identity. It does
 not upgrade real signed provider readiness, Worker/private-origin/purge/negative
 verification, provider logs, COS/EdgeOne, production migration/revocation or
 operational metrics; the long-term Goal remains active.
+
+## 2026-07-19 V-31 legacy migration hardening delivery identity
+
+This section supersedes the preceding V-26 identity. The delivery adds the
+physical Pigsty-v1 selector golden, effective-user writable-FD writer fence,
+strict approval timestamps, direct zero-byte Pro checksum identity, a dedicated
+EL9 compatibility policy owner, exact aarch64/x86_64 projections, and both
+architecture state-machine E2E paths. The old repository was read only; no
+cloud opt-in or production mutation occurred.
+
+The focused ordinary/race suites, 20-case writer fence, physical topology and
+config gates, 176-target/44-family audits, full `go test ./...`, `go vet`, the
+project Staticcheck profile, shell syntax, and patch checks passed. Two
+independent clean-delivery reconstructions used only the read-only local Go
+module cache and returned exactly:
+
+```text
+PRODUCT_SOURCE_SHA256=115df5f22c88b5eccb053030272462a6d95f4412358f7945d59d9737f61b8f21
+PRODUCT_SOURCE_FILES=538
+DELIVERY_CONTENT_SHA256=c08eb549df02e25a36ab8d95c38b900f9f429af34555ff89fc1175a44d8aad94
+DELIVERY_FILES=697
+ARCHIVE_SHA256=701c399a31238531f9ce91ff6491b9c36e9127a65c8d6581de33133f4be69ff7
+```
+
+Archives:
+
+- `/tmp/sow-clean-delivery-migration-review-v31/sow-delivery-c08eb549df02e25a.tgz`
+- `/tmp/sow-clean-delivery-migration-review-v31-b/sow-delivery-c08eb549df02e25a.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the digest
+above. This is the current V-14/V-31 delivery identity. It does not upgrade any
+real Cloudflare/COS/EdgeOne publication, production writer revocation, or
+operational metric; the long-term Goal remains active.
+
+## 2026-07-19 V-32 migration review closure delivery identity
+
+This section supersedes V-31 after the two independent final reviewers found
+and the implementation closed two additional fail-closed gaps. The 44-family
+gate now requires every physical compatibility architecture independently, so
+removing the aarch64 state-machine evidence from one affected family is a
+tested failure even when another family still names that test. The writer
+fence now compares writable regular-file descriptors with the complete legacy
+device/inode set, including external hard-link aliases, and its `lsof` parser
+rejects malformed or missing regular-file identities instead of silently
+omitting them.
+
+The native macOS `lsof` suite passed 21 named cases, including the malformed
+identity mutation. An unprivileged uid 65534 run in the already-present
+`pgsty/d13:latest` image with `--network none` passed all 20 applicable Linux
+procfs cases. The 44-family gate passed 5 contract mutations and 16 executable
+tests; focused four-state-machine ordinary tests, the family contract race
+test, `go vet ./...`, Staticcheck v0.6.1 with the repository profile, shell
+syntax, Go formatting, and patch checks all passed. The prior full-repository
+run remained applicable because these final changes touched only test-contract
+and shell/evidence code; it had passed every package with `internal/cli` at
+1202.757s. Both final reviewers returned an empty finding list. No cloud opt-in,
+production mutation, or legacy-repository write occurred.
+
+After delivery content was frozen, two independent fresh HOME/GOMODCACHE/
+GOCACHE reconstructions used only the local read-only Go module download cache
+and returned exactly:
+
+```text
+PRODUCT_SOURCE_SHA256=280258ad7483406096a93eb57f90e61804b2d9a2ed8d92c0cdd7fc474889bec2
+PRODUCT_SOURCE_FILES=538
+DELIVERY_CONTENT_SHA256=f562a11fd581da3856607e03f708595d83eee5d0f27ea71e814a5afb6caf1785
+DELIVERY_FILES=697
+ARCHIVE_SHA256=797553c61bd629b2176060e07122de11ea41534c980fc13c897665e92bb19df0
+```
+
+Archives:
+
+- `/tmp/sow-clean-delivery-migration-review-v32-a/sow-delivery-f562a11fd581da38.tgz`
+- `/tmp/sow-clean-delivery-migration-review-v32-b/sow-delivery-f562a11fd581da38.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This is the current V-14/V-32 delivery identity. It does
+not upgrade real Cloudflare/COS/EdgeOne publication, production writer
+revocation, or operational metrics; the long-term Goal remains active.

@@ -33,7 +33,8 @@ apt-suite	apt-pgsql-trixie	trixie	main	mapped-review-required	active-policy-unve
 yum-repo	yum-gpsql-el7	yum/gpsql/el7.{arch}	-	mapped-review-required	frozen-policy-unverified	metadata-not-claimed+payload-keyring-unverified	cf,cos
 yum-repo	yum-gpsql-el8	yum/gpsql/el8.{arch}	-	mapped-review-required	frozen-policy-unverified	metadata-not-claimed+payload-keyring-unverified	cf,cos
 yum-repo	yum-gpsql-el9	yum/gpsql/el9.{arch}	-	mapped-review-required	active-policy-unverified	metadata-not-claimed+payload-keyring-unverified	cf,cos
-yum-repo	yum-infra-legacy-compat	yum/infra/{arch}	-	quarantine-compat	cross-el-unresolved	metadata-not-claimed+payload-keyring-unverified	none
+yum-repo	yum-infra-legacy-compat	yum/infra/{arch}	-	compatibility-projection-declared	frozen-policy-unverified	metadata-not-claimed+payload-keyring-unverified	none
+yum-policy-owner	yum-infra-policy-el9	-	-	compatibility-policy-owner	active-policy-unverified	payload-keyring-unverified	cf,cos
 yum-repo	yum-mssql-el7	yum/mssql/el7.{arch}	-	mapped-review-required	frozen-policy-unverified	metadata-not-claimed+payload-keyring-unverified	cf,cos
 yum-repo	yum-mssql-el8	yum/mssql/el8.{arch}	-	mapped-review-required	frozen-policy-unverified	metadata-not-claimed+payload-keyring-unverified	cf,cos
 yum-repo	yum-mssql-el9	yum/mssql/el9.{arch}	-	mapped-review-required	active-policy-unverified	metadata-not-claimed+payload-keyring-unverified	cf,cos

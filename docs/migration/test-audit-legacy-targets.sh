@@ -158,11 +158,14 @@ expect_fail operation-family-id-drift \
 
 cf_yum_replacement=$(awk -F '|' '$2 ~ /^[[:space:]]*ROOT-46[[:space:]]*$/ { print $8 }' "$MAP")
 case "$cf_yum_replacement" in
-	*'sow publish --target cf --repo yum-infra,yum-pgsql'*) ;;
+	*'sow publish --target cf --repo yum-pgsql'*) ;;
 	*) echo "ROOT-46 no longer expands to the corrected YUM-only selector" >&2; exit 1 ;;
 esac
 case "$cf_yum_replacement" in
 	*'apt-'*) echo "ROOT-46 regressed to an APT selector" >&2; exit 1 ;;
+esac
+case "$cf_yum_replacement" in
+	*'--repo yum-infra'*) echo "ROOT-46 regressed to an ordinary mixed-EL infra selector" >&2; exit 1 ;;
 esac
 pass cf-yum-selector-regression
 
@@ -251,6 +254,6 @@ expect_fail invalid-cli-enum \
 	"$AUDIT" --legacy-root "$TMP/legacy" --map "$TMP/invalid-enum.md" --sow-bin "$SOW_BIN" --source-fingerprints "$FINGERPRINTS"
 
 (cd "$PROJECT_ROOT" && go test -count=1 ./internal/cli -run '^TestLegacyMigrationMapClosesFamiliesAndSelectors$')
-pass selector-matrix-all-targets-and-aliases
+pass physical-selector-golden-all-targets-and-aliases
 
 echo 'legacy migration audit negative suite: PASS'

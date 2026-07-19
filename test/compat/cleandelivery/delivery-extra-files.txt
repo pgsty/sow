@@ -114,6 +114,7 @@ docs/evidence/2026-07-18-durability-teardown-audit.md
 docs/evidence/2026-07-18-legacy-adoption-50k-performance.md
 docs/evidence/2026-07-18-real-r2-storage-protocol.md
 docs/evidence/2026-07-19-confidential-edge-preflight.md
+docs/evidence/2026-07-19-legacy-migration-review-hardening.md
 docs/evidence/2026-07-19-pigsty-yum-consumer-preflight.md
 docs/evidence/2026-07-19-r2-bootstrap-two-phase-recovery.md
 docs/evidence/2026-07-19-r2-lease-cas-retirement.md
@@ -130,6 +131,7 @@ docs/migration/builder-handoff.md
 docs/migration/fixtures/family-e2e.tsv
 docs/migration/fixtures/legacy-physical-topology.tsv
 docs/migration/fixtures/legacy-sensitive-paths.txt
+docs/migration/fixtures/make-target-selector-golden.tsv
 docs/migration/fixtures/physical-topology-hermetic.tsv
 docs/migration/fixtures/pigsty-v1-migration-ledger.tsv
 docs/migration/fixtures/pigsty-v1-synthetic.yaml

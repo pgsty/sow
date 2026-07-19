@@ -1,5 +1,14 @@
 # Legacy content adoption evidence — 2026-07-12
 
+> **2026-07-15 supersession:** this page records the original flat-layout
+> acceptance run. [ADR-0027](../adr/0027-legacy-package-adoption-admission-and-canonicalization.md),
+> accepted after the full disposable-copy run, supersedes its flat-only source
+> restriction: a safe, normalized and index-proven RPM href may also be nested.
+> Escape paths, a wrong existing `Packages/<bucket>/` path, collisions,
+> unlisted bodies and tampering still fail closed; every accepted source still
+> canonicalizes to `Packages/<name-initial>/<basename>.rpm`. The historical
+> table below is not the current complete admission contract.
+
 ## Scope and environment
 
 - Host: Darwin arm64

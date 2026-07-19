@@ -216,8 +216,10 @@ while IFS="$(printf '\t')" read -r logical source scope; do
 	record root-prefix-source "$logical" "$source" "$scope" - -
 done < "$TMP/root-prefix-sources"
 
-# Pro artifacts are gated inventory.  Record only path and stat size: do not
-# open or hash their contents.
+# Pro artifacts are gated inventory. Record only path and stat size for payload
+# archives. The reviewed legacy pro/checksums object is exactly zero bytes, so
+# hashing that one empty object cannot disclose content and binds its
+# mathematical empty-file identity instead of carrying an unaudited dash.
 require_directory "$LEGACY_ROOT/pro"
 find "$LEGACY_ROOT/pro" -mindepth 1 ! -type f -print | LC_ALL=C sort > "$TMP/pro-non-files"
 if [ -s "$TMP/pro-non-files" ]; then
@@ -228,7 +230,13 @@ fi
 find "$LEGACY_ROOT/pro" -type f -print | LC_ALL=C sort > "$TMP/pro-files"
 while IFS= read -r file; do
 	rel=${file#"$LEGACY_ROOT"/}
-	record pro-file "/$rel" "$rel" gated-metadata-only "$(file_size "$file")" -
+	size=$(file_size "$file")
+	digest=-
+	if [ "$rel" = pro/checksums ]; then
+		[ "$size" = 0 ] || { echo "legacy pro/checksums is not empty" >&2; exit 1; }
+		digest=$(hash_public_file "$file")
+	fi
+	record pro-file "/$rel" "$rel" gated-metadata-only "$size" "$digest"
 done < "$TMP/pro-files"
 
 if grep -Fq 'fileauth.txt' "$TMP/actual.unsorted"; then
@@ -305,7 +313,7 @@ for category in apt-index yum-repomd-total yum-repomd-nested root-exact-key root
 	fi
 done
 
-# The checked-in canonical fixture is the reviewed 2026-07-14 source contract.
+# The checked-in canonical fixture is the reviewed current local source contract.
 # Custom snapshots are supported for hermetic tests, but cannot weaken these
 # exact production-source inventory facts.
 if [ "$SNAPSHOT" = "$DEFAULT_SNAPSHOT" ]; then

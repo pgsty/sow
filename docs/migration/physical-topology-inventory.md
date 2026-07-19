@@ -73,8 +73,9 @@ root key/prefix ownership 或 gated pro 路径/字节数/文件类型漂移都�
 key/prefix 集合，测试 fixture 不能弱化这些本地旧仓事实。
 
 第三条命令只读取上述 machine snapshot、完整 `pigsty-v1.yaml` 和显式 migration ledger，
-以 production config decoder 展开并执行双向 set equality：97 个 repo ID、74 个 APT index、
-130 个普通 YUM leaf、7/8 个根 key/prefix 与 16 个 gated pro 文件必须恰好一次闭合。它还用
+以 production config decoder 展开并执行双向 set equality：98 个 repo ID、74 个 APT index、
+130 个普通 YUM leaf、1 个仅供兼容候选生成的 EL9 policy owner、2 个精确 compatibility
+projection、7/8 个根 key/prefix 与 16 个 gated pro 文件必须恰好一次闭合。它还用
 临时突变证明：12-repo 与 33/73 synthetic fixture 不能冒充物理合同，缺 APT index、伪造
 lifecycle 证据、解除 nested quarantine、Percona 退回 noarch replication、把 inactive infra
 carrier 加入 group 或改变 asset target affinity 都会非零失败。脚本在执行前清空云凭据、
@@ -86,8 +87,9 @@ carrier 加入 group 或改变 asset target affinity 都会非零失败。脚本
 - PGDG nested child 已在迁移 ledger 中 fail-closed 处置为 `quarantine-overlap`，不会成为
   独立 repo，父 repo 也显式 exclude；它最终应 alias、删除还是形成独立 compatibility URL，
   仍须消费者证据与后续 ADR 决定。
-- `yum/infra/{arch}` 的两个 leaf 仍由 inactive、无 ref/view/publish/upstream 单元的 carrier
-  表达；跨 EL gzip compatibility projection 已在精确副本完成 S0→S3 与六组 strong DNF，
+- `yum/infra/{arch}` 的两个 leaf 仍由 inactive、无 ref/view/upstream 单元的 carrier
+  表达；aarch64/x86_64 两条 projection 显式绑定独立 EL9 policy owner，carrier 与 policy owner
+  均不进入普通 repo group。跨 EL gzip compatibility projection 已在精确副本完成 S0→S3 与六组 strong DNF，
   但 production cutover 未执行，不能把本地 closure 写成现场迁移通过。
 - 旧 `bin/` 仍由 inactive、不可路由、不可 generic-adopt 的 asset inventory carrier 纳入
   M0/local-fsck 基线，且 `bin/fileauth.txt` 保持在显式 exclude 边界之外。`pro/` carrier 已

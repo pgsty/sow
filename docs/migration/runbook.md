@@ -100,7 +100,8 @@ projection、收敛 target-specific 根脚本正文，并按后续门禁配置�
 
 下列命令不执行 Make recipe、不连接外部远端：账本审计证明 fail-closed；family harness
 把 44 个操作族逐项绑定到真实 CLI/FS/parser/本地 provider-protocol 测试或显式 disposition；
-并用仅位于临时目录的 4 个突变夹具验证缺族、Help 冒充、错误处置和 publish 缺 provider 均被拒绝；
+并用仅位于临时目录的 5 个突变夹具验证缺族、Help 冒充、错误处置、publish 缺 provider
+和 compatibility 架构证据缺口均被拒绝；
 adoption fixture 则证明 asset adoption→隔离 materialize→坏候选检测→切回 untouched
 legacy root：
 
@@ -985,8 +986,9 @@ grep -Fqx 'production_current_host_preflight=pass' "$EVIDENCE/writer-fence-repor
     报告、scheduler/container/ACL 与云 IAM 撤权证据全部闭合。
 
 当前结论：Phase 0–2 有可重复本地路径，其中 44-family 本地 E2E/disposition contract、
-33-repo selector generalization、12-repo synthetic parser/adoption、完整 97-repo/134-row
-config/ledger 对 74 APT + 130 ordinary YUM leaf 的双向集合门禁、零字节 adoption 和本地
+33-repo selector generalization、12-repo synthetic parser/adoption、完整 98-repo/135-row
+config/ledger 对 74 APT + 130 ordinary YUM leaf、专用 EL9 policy owner 与双架构 compatibility
+projection 的双向集合门禁、零字节 adoption 和本地
 symlink 回退夹具已实测。完整存量树 fresh copy 已完成 PGDG 官方恢复、775 个稳定负证、
 remainder adoption、真 DNF、full fsck/GC；current `yum/infra` exact copy 已完成 216/216
 包验签、双架构 S0→S3 与六组 strong DNF。另一个只读生产源精确副本已把 15 个

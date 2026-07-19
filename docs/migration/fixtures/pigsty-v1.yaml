@@ -6,10 +6,11 @@
 # key paths are deliberately named "unverified": an operator must replace them
 # with reviewed public-only bundles before adoption/materialization.
 #
-# yum/infra/{arch} is an inactive inventory carrier only. Its cross-EL legacy
-# projection is not frozen, it is absent from every repo_group, and the machine
-# ledger requires quarantine-compat until a later ADR supplies the real ref and
-# consumer contract. The nested PGDG rhel-10.0-aarch64 child is not a repo at
+# yum/infra/{arch} remains an inactive inventory carrier and is absent from
+# every repo_group. ADR-0021 supplies two explicit architecture projections and
+# a separate empty EL9 policy owner; the carrier bytes are never relabelled as
+# that owner. Production freeze/cutover state is still runtime evidence, not a
+# configuration claim. The nested PGDG rhel-10.0-aarch64 child is not a repo at
 # all; the parent excludes it and the ledger quarantines it fail closed.
 schema: sow/v1
 
@@ -78,6 +79,7 @@ repos:
   - {id: yum-gpsql-el8, type: yum, path: "yum/gpsql/el8.{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
   - {id: yum-gpsql-el9, type: yum, path: "yum/gpsql/el9.{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
   - {id: yum-infra-legacy-compat, type: yum, path: "yum/infra/{arch}", os: {family: cross-el, major: 0, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, active: false, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate, compatibility_carrier: true}}
+  - {id: yum-infra-policy-el9, type: yum, path: "yum/infra/el9/{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
   - {id: yum-mssql-el7, type: yum, path: "yum/mssql/el7.{arch}", os: {family: el, major: 7, lifecycle: frozen}, arches: [x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
   - {id: yum-mssql-el8, type: yum, path: "yum/mssql/el8.{arch}", os: {family: el, major: 8, lifecycle: frozen}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: gzip, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
   - {id: yum-mssql-el9, type: yum, path: "yum/mssql/el9.{arch}", os: {family: el, major: 9, lifecycle: active}, arches: [aarch64, x86_64], default_pool: public, publish_targets: [cf, cos], yum: {compression: zstd, package_keyring: keys/migration-unverified-package-signers.asc, noarch_mode: replicate}}
@@ -172,8 +174,13 @@ repos:
   - {id: asset-src, type: asset, path: src, default_pool: public, publish_targets: [cf, cos], asset: {kind: source, public_path: src}}
   - {id: asset-pro-gated, type: asset, path: pro, exclude: [checksums], default_pool: gated, publish_targets: [cf, cos], asset: {kind: offline, public_path: gated/pro}}
 
+compatibility_projections:
+  - {id: infra-legacy-aarch64, root: yum/infra/aarch64, mode: frozen-cross-el, carrier: yum-infra-legacy-compat, source: {repo: yum-infra-policy-el9, view: latest, os: cross-el, arch: aarch64, commit: pin-at-first-freeze}}
+  - {id: infra-legacy-x86-64, root: yum/infra/x86_64, mode: frozen-cross-el, carrier: yum-infra-legacy-compat, source: {repo: yum-infra-policy-el9, view: latest, os: cross-el, arch: x86_64, commit: pin-at-first-freeze}}
+
 # Groups contain only operable, non-quarantined physical repos. In particular,
-# yum-infra-legacy-compat is intentionally absent from every group.
+# the compatibility carrier and its dedicated policy-only owner are
+# intentionally absent from every ordinary family group.
 repo_groups:
   apt-all: [apt-infra, apt-mssql, apt-percona, apt-pgdg, apt-pgsql-bookworm, apt-pgsql-bullseye, apt-pgsql-focal, apt-pgsql-jammy, apt-pgsql-noble, apt-pgsql-resolute, apt-pgsql-trixie]
   apt-pgsql: [apt-pgsql-bookworm, apt-pgsql-bullseye, apt-pgsql-focal, apt-pgsql-jammy, apt-pgsql-noble, apt-pgsql-resolute, apt-pgsql-trixie]

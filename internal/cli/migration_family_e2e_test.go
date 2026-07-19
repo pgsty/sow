@@ -25,9 +25,10 @@ type migrationFamilyContract struct {
 }
 
 type migrationEvidenceCapability struct {
-	verbs    map[string]bool
-	repoType map[string]bool
-	provider bool
+	verbs               map[string]bool
+	repoType            map[string]bool
+	compatibilityArches map[string]bool
+	provider            bool
 }
 
 var migrationEvidenceCapabilities = map[string]migrationEvidenceCapability{
@@ -64,6 +65,8 @@ var migrationEvidenceCapabilities = map[string]migrationEvidenceCapability{
 	"TestMaterializeCLIProducesExactHardlinkTree": evidenceCapability(
 		[]string{"materialize"}, []string{"asset"}, false,
 	),
+	"TestMaterializeNginxAndEdgeCompatibilityStateMachineThroughRollback": compatibilityEvidenceCapability("x86_64"),
+	"TestYUMCompatibilityAArch64StateMachineThroughRollback":              compatibilityEvidenceCapability("aarch64"),
 	"TestPublishCLIUsesRealProviderProtocolAndAdvancesRemoteRefLast": evidenceCapability(
 		[]string{"add", "promote", "publish"}, []string{"asset"}, true,
 	),
@@ -80,8 +83,10 @@ func TestLegacyMigrationFixturesUseCanonical33RepoUniverse(t *testing.T) {
 	rows, _ := readMigrationLedger(t, mapPath)
 	selectorPath := filepath.Join("..", "..", "docs", "migration", "fixtures", "selector-matrix.yaml")
 	subsetPath := filepath.Join("..", "..", "docs", "migration", "fixtures", "pigsty-v1-synthetic.yaml")
+	physicalPath := filepath.Join("..", "..", "docs", "migration", "fixtures", "pigsty-v1.yaml")
 	selector := loadMigrationFixture(t, selectorPath)
 	subset := loadMigrationFixture(t, subsetPath)
+	physical := loadMigrationFixture(t, physicalPath)
 
 	selectorIDs := repoIDSet(selector.Repos)
 	if len(selectorIDs) != 33 {
@@ -95,8 +100,15 @@ func TestLegacyMigrationFixturesUseCanonical33RepoUniverse(t *testing.T) {
 			}
 		}
 	}
-	if got, want := sortedKeys(commandIDs), sortedKeys(selectorIDs); strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("migration command repo universe differs from selector fixture\ncommands-only=%v\nfixture-only=%v", differenceStrings(got, want), differenceStrings(want, got))
+	for _, id := range sortedKeys(commandIDs) {
+		if _, err := physical.ExpandRepoSelectors([]string{id}); err != nil {
+			t.Errorf("migration command selector %q does not resolve in the physical Pigsty-v1 contract: %v", id, err)
+		}
+	}
+	for _, forbidden := range []string{"yum-infra", "yum-ivory"} {
+		if commandIDs[forbidden] {
+			t.Errorf("migration command universe retained forbidden ordinary selector %q", forbidden)
+		}
 	}
 
 	wantPhysical := map[string]string{
@@ -137,7 +149,7 @@ func TestLegacyMigrationFamilyE2EContract(t *testing.T) {
 	if override := os.Getenv("SOW_MIGRATION_FAMILY_CONTRACT"); override != "" {
 		contractPath = override
 	}
-	selectorPath := filepath.Join("..", "..", "docs", "migration", "fixtures", "selector-matrix.yaml")
+	selectorPath := filepath.Join("..", "..", "docs", "migration", "fixtures", "pigsty-v1.yaml")
 	rows, families := readMigrationLedger(t, mapPath)
 	contracts := readMigrationFamilyContracts(t, contractPath)
 	selector := loadMigrationFixture(t, selectorPath)
@@ -225,6 +237,15 @@ func TestLegacyMigrationFamilyE2EContract(t *testing.T) {
 
 func evidenceCapability(verbs, repoTypes []string, provider bool) migrationEvidenceCapability {
 	return migrationEvidenceCapability{verbs: migrationStringSet(verbs), repoType: migrationStringSet(repoTypes), provider: provider}
+}
+
+func compatibilityEvidenceCapability(arch string) migrationEvidenceCapability {
+	capability := evidenceCapability(
+		[]string{"compatibility/yum-adopt", "compatibility/yum-candidate", "compatibility/yum-freeze", "compatibility/yum-cutover", "compatibility/yum-rollback"},
+		[]string{"yum"}, false,
+	)
+	capability.compatibilityArches = map[string]bool{arch: true}
+	return capability
 }
 
 func loadMigrationFixture(t *testing.T, filename string) *config.Config {
@@ -372,6 +393,7 @@ func migrationRowsContainVerb(rows []migrationLedgerRow, wanted string) bool {
 func assertMigrationFamilyCommandsCovered(t *testing.T, family string, rows []migrationLedgerRow, contract migrationFamilyContract, selector *config.Config) {
 	t.Helper()
 	var tests []string
+	coveredCompatibilityArches := make(map[string]bool)
 	for _, item := range contract.evidence {
 		if strings.HasPrefix(item, "Test") {
 			if strings.Contains(item, "Help") || strings.Contains(item, "Selector") {
@@ -379,12 +401,16 @@ func assertMigrationFamilyCommandsCovered(t *testing.T, family string, rows []mi
 				continue
 			}
 			tests = append(tests, item)
+			for arch := range migrationEvidenceCapabilities[item].compatibilityArches {
+				coveredCompatibilityArches[arch] = true
+			}
 		}
 	}
 	if len(tests) == 0 {
 		t.Errorf("family %s has sow-cli rows but no executable Go E2E evidence", family)
 		return
 	}
+	requiredCompatibilityArches := make(map[string]bool)
 	for _, row := range rows {
 		if row.disposition != "sow-cli" {
 			continue
@@ -400,7 +426,17 @@ func assertMigrationFamilyCommandsCovered(t *testing.T, family string, rows []mi
 				t.Errorf("family %s row %s has non-business command %q", family, row.id, command)
 				continue
 			}
-			verb := words[1]
+			verb := migrationCommandBusinessVerb(command)
+			if strings.HasPrefix(verb, "compatibility/") {
+				projections, err := migrationCompatibilityCommandProjections(words, selector)
+				if err != nil {
+					t.Errorf("family %s row %s compatibility command %q: %v", family, row.id, command, err)
+					continue
+				}
+				for _, projection := range projections {
+					requiredCompatibilityArches[projection.Source.Arch] = true
+				}
+			}
 			repoTypes, err := migrationCommandRepoTypes(command, selector)
 			if err != nil {
 				t.Errorf("family %s row %s command %q: %v", family, row.id, command, err)
@@ -424,14 +460,35 @@ func assertMigrationFamilyCommandsCovered(t *testing.T, family string, rows []mi
 			}
 		}
 	}
+	for _, arch := range sortedKeys(requiredCompatibilityArches) {
+		if !coveredCompatibilityArches[arch] {
+			t.Errorf("family %s compatibility commands require physical %s evidence", family, arch)
+		}
+	}
 }
 
 func migrationCommandRepoTypes(command string, cfg *config.Config) ([]string, error) {
+	words := strings.Fields(command)
+	if len(words) >= 3 && words[0] == "sow" && words[1] == "compatibility" {
+		if !strings.HasPrefix(words[2], "yum-") {
+			return nil, fmt.Errorf("unknown compatibility command %s", words[2])
+		}
+		if _, err := migrationCompatibilityCommandProjections(words, cfg); err != nil {
+			return nil, err
+		}
+		return []string{"yum"}, nil
+	}
 	ids := migrationCommandRepoIDs(command)
 	if len(ids) == 0 {
 		for _, repo := range cfg.Repos {
 			ids = append(ids, repo.ID)
 		}
+	} else {
+		expanded, err := cfg.ExpandRepoSelectors(ids)
+		if err != nil {
+			return nil, err
+		}
+		ids = expanded
 	}
 	types := make(map[string]bool)
 	for _, id := range ids {
@@ -442,6 +499,17 @@ func migrationCommandRepoTypes(command string, cfg *config.Config) ([]string, er
 		types[repo.Type] = true
 	}
 	return sortedKeys(types), nil
+}
+
+func migrationCommandBusinessVerb(command string) string {
+	words := strings.Fields(command)
+	if len(words) >= 3 && words[0] == "sow" && words[1] == "compatibility" {
+		return words[1] + "/" + words[2]
+	}
+	if len(words) >= 2 && words[0] == "sow" {
+		return words[1]
+	}
+	return ""
 }
 
 func assertMigrationEvidenceTestsExist(t *testing.T) {

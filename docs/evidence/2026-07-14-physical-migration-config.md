@@ -1,5 +1,13 @@
 # 完整旧物理迁移配置闭环证据 — 2026-07-14
 
+> 2026-07-19 update: the current contract is again 98 repo IDs / 135 ledger
+> rows, but it is not the original discovery composition. The active gated Pro
+> owner remains; one dedicated EL9 compatibility policy owner and exact
+> aarch64/x86_64 projections were added under ADR-0021. The inactive carrier
+> and policy-only owner are excluded from ordinary groups. The legacy empty
+> `pro/checksums` row now binds its exact empty SHA directly. See the dated
+> migration review-hardening report for current tests and boundaries.
+>
 > 2026-07-17 update: the current contract is 97 repo IDs / 134 ledger rows.
 > Gated Pro, COS-only ROOT and shared ROOT canonical owners have completed
 > separate local handoffs and are active with exact target affinity. The
