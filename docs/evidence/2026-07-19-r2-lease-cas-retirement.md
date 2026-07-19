@@ -4,6 +4,11 @@ Date: 2026-07-19
 
 Status: current-source local/protocol evidence passed; no cloud write was made.
 
+Supersession: its no-Delete/CAS finding remains current. Bootstrap's original
+direct expired-live-to-idle recovery is superseded by
+`2026-07-19-r2-bootstrap-two-phase-recovery.md`; provider log-sink retirement
+is unchanged.
+
 ## Defect closed
 
 The owner-authorized V-21 R2 probe proved that Cloudflare R2 accepts a stale

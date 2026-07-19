@@ -5,6 +5,11 @@ Date: 2026-07-19
 Status: current-source local/protocol evidence passed; no cloud request or
 write was made.
 
+Supersession: the resource-stable key and provider log-sink findings remain
+current. Its direct expired-live-to-idle recovery subprotocol and receipt v2
+were never deployed and are superseded by
+`2026-07-19-r2-bootstrap-two-phase-recovery.md`.
+
 ## Defects closed
 
 V-24 correctly replaced unsafe R2 DeleteObject release with conditional Put

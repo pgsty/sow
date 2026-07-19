@@ -1374,3 +1374,46 @@ above for both files. This is the current V-14/V-25 delivery identity. It does
 not upgrade real signed provider readiness, Worker/private-origin/purge/negative
 verification, provider logs, COS/EdgeOne, production migration/revocation or
 operational metrics; the long-term Goal remains active.
+
+## 2026-07-19 V-26 two-phase bootstrap recovery delivery identity
+
+This section supersedes the preceding V-25 delivery identity while preserving
+its resource-stable bootstrap key and provider log-sink rotation findings.
+Expired bootstrap recovery no longer opens a remote idle marker before local
+evidence exists. It conditionally advances the single key through exact live,
+owning recovery-pending v1, no-replace/fsynced/reopened receipt v3 and recovery
+idle v3. Pending binds the recovery run/current plan/resource and full crashed
+lease; final idle binds both canonical pending and receipt digests. Live v3
+appends completed pairs to a bounded canonical lineage preserved by later
+holders and recoveries. Same-run replay therefore converges after every
+committed phase, lost Put response, immediate acquisition/release and another
+completed recovery. Cross-run, cross-plan, readiness, ordinary acquisition,
+stale ETag, forged receipt/digest, unrelated live, duplicate/saturated lineage,
+ordinary idle and stale-holder paths fail closed. Capacity fails before pending
+CAS. No interface or test calls DeleteObject.
+
+Focused ordinary/race were `1.126s`/`2.460s`; complete compat ordinary/race
+were `10.266s`/`14.318s`. `go vet`, the pinned Staticcheck profile and
+`git diff --check` passed with every real-cloud opt-in disabled. No cloud
+request or write occurred. Two independent fresh HOME/GOMODCACHE/GOCACHE
+delivery reconstructions used repository-pinned modules through
+`https://goproxy.cn,direct` and returned exactly:
+
+```text
+PRODUCT_SOURCE_SHA256=344f731c131982537b7f9a1631e4fa1658d7f16dff55c321a7fb69df0bc08ea8
+PRODUCT_SOURCE_FILES=536
+DELIVERY_CONTENT_SHA256=6ef5584ca76557277e8562a930f84c9e512a50a3ba570dafe6e6cd01477eb238
+DELIVERY_FILES=685
+ARCHIVE_SHA256=c1e01fd8e66d6d4561a4cecb46bb55b00ce64350d4ba4089b57d2a36fec1c0c5
+```
+
+Archives:
+
+- `/tmp/sow-clean-delivery-v26-c/sow-delivery-6ef5584ca7655727.tgz`
+- `/tmp/sow-clean-delivery-v26-d/sow-delivery-6ef5584ca7655727.tgz`
+
+Independent `cmp` returned 0 and `shasum -a 256` returned the archive digest
+above for both files. This is the current V-14/V-26 delivery identity. It does
+not upgrade real signed provider readiness, Worker/private-origin/purge/negative
+verification, provider logs, COS/EdgeOne, production migration/revocation or
+operational metrics; the long-term Goal remains active.

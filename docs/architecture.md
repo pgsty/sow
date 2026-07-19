@@ -559,16 +559,26 @@ each no-replace installed from complete synced inodes; an interrupted
 receipt-only pair is resumed by sealing those exact bytes after a matching
 fresh observation, while seal-only or divergent evidence fails closed.
 Auth/origin ownership annotations bind the run; uploads are create-only. A
-provider-visible R2 control lease v2 at the readiness-resource-derived key serializes
+provider-visible R2 control lease v3 at the readiness-resource-derived key serializes
 executors and is renewed before each Worker/route mutation, then CAS-retired
-to a canonical non-owning marker only after one atomic local outcome envelope
-is durable. The final
+to a canonical release-idle v3 marker only after one atomic local outcome
+envelope is durable. The final
 Worker/route/settings/exposure closure must match twice. A crash leaves a
 bounded lease, whose body also binds that readiness-resource digest, that only
-the separately authorized `recover-lease` path for the
-same readiness resource may retire after expiry. Its v2 recovery receipt binds
-both current/recovered plan digests and the complete recovered lease digest.
-Ordinary apply/rollback cannot take over an expired live entity. R2 lacks conditional DeleteObject, so SOW never
+the separately authorized `recover-lease` path for the same readiness resource
+may retire after expiry. Recovery first CASes live to an owning pending v1
+marker bound to the exact recovery run/plan and recovered lease. Only after a
+canonical recovery receipt v3 has been no-replace installed, synced and
+reopened may that pending ETag be CASed to recovery-idle v3, which binds both
+pending and receipt digests. The same run resumes pending/receipt/committed
+response-loss windows; other runs, plans, readiness and ordinary acquisition
+remain blocked. Idle replay reconstructs the pending bytes from its embedded
+lease, plan and receipt instead of trusting self-reported digests. Completed
+pending/receipt pairs append to a bounded canonical lineage carried across
+all later live, release and recovery states, so a delayed replay can prove a
+later descendant without accepting unrelated bytes; capacity fails before the
+live-to-pending CAS. The exact pending plan-registry entry remains pinned until
+completion. R2 lacks conditional DeleteObject, so SOW never
 deletes this reusable key; the next executor can only replace its idle marker
 by ETag CAS. This lease is the sole bootstrap R2 control object;
 it never grants permission to alter repository payloads or any production resource.

@@ -59,14 +59,15 @@ objects, custom domains, DNS, Logpush, cache rules or unrelated routes. The
 only R2 mutation is a provider-visible conditional lease at
 `.sow/bootstrap/leases/<readiness-resource-sha>.json`. The resource-derived
 key remains the only coordination object when bundle bytes, signer key or
-other plan fields rotate. Lease/idle schema v2 binds the readiness-resource
-SHA inside the canonical body as well as in the key; plan SHA remains in each
-live/idle body for audit.
+other plan fields rotate. Live lease schema v3 and idle schema v3 bind the
+readiness-resource SHA inside the canonical body as well as in the key; plan
+SHA remains in each live/idle body for audit. Idle v3 also distinguishes a
+normal holder release from a completed expired-lease recovery.
 An unexpired historical-plan live holder still blocks, while a same-resource
 idle marker may be replaced only by exact ETag CAS. An expired live holder
 must first pass the separately authorized `recover-lease` path; ordinary apply
 or rollback cannot overwrite it and bypass the durable recovery record.
-After the local outcome receipt is
+After the local apply/rollback outcome receipt is
 durable, its exact live bytes are compare-and-set to a canonical idle marker;
 SOW never calls R2 DeleteObject for this reusable key. The initial transport is
 the deployable `r2-service` correctness path; the later cache-normalization POC
@@ -85,20 +86,39 @@ the lower-hex Ed25519 public key. Key rotation therefore requires a new plan
 digest and administrator-reviewed bootstrap-registry entry; a receipt signed
 by any other key fails before provider credentials are read.
 
-`recover-lease` uses the same resource-stable key. Recovery receipt v2 records
-both the current recovery plan, the recovered historical lease plan and the
-SHA-256 of the complete recovered canonical lease bytes; replay
-requires that durable receipt to match the exact canonical idle marker. Thus a
-plan rotation neither forks the lock namespace nor erases the provenance of
-the crashed holder. The receipt final pathname is no-replace linked only from
-a fully written and synced inode, so interruption cannot leave a partial final
-recovery record.
+`recover-lease` uses the same resource-stable key and a two-phase fencing
+protocol. It first CAS-replaces the exact expired live ETag with canonical
+`lease-recovery-pending/v1`. That owning marker binds the recovery run and
+current plan, readiness resource, account/zone, complete recovered lease and
+its digest, and recovery start time. It has no automatic timeout takeover:
+only the exact run/plan can resume it, while apply, rollback and readiness all
+fail closed. Recovery receipt v3 records the pending-marker digest, both the
+current/recovered plan digests, the complete recovered lease and its digest. Its
+final pathname is no-replace linked only from a fully written and synced inode.
+Completion reopens and validates those durable canonical bytes before it may
+CAS the pending ETag to recovery idle v3; that idle binds both the pending and
+receipt SHA-256 values. Idle replay reconstructs the complete pending body
+from the receipt, current plan and embedded previous lease before accepting
+either digest. The next live lease appends that pending/receipt pair to a
+canonical recovery lineage and every later release, recovery and acquisition
+preserves it. A lost final response may therefore be proven by the exact idle
+marker or by any later live, release-idle, or pending descendant; an unrelated
+marker without the pair still fails closed. The lineage is bounded at 1024
+recoveries and capacity is checked before live is changed to pending, so the
+bound cannot strand a half-started transaction. Thus crashes before pending,
+after pending, after receipt or after the final provider commit are safely
+replayable without opening the key between remote retirement and local evidence.
+An observed pending marker's plan-registry entry must remain pinned until that
+exact run completes; registry cleanup is not a recovery mechanism.
 
 The preceding V-24 protocol was local-only evidence: bootstrap and provider
 deployment registries were closed and no real lease marker was created. V-25
-is therefore the first live-capable lease schema. A legacy plan-derived key is
-treated as a foreign object and fails closed; no unsafe automatic deletion or
-dual-key migration is attempted.
+was the first live-capable lease schema, but its registries remained closed and
+it made no cloud write. Its direct live-to-idle recovery and v2 receipt were
+superseded before deployment by the two-phase protocol. A legacy plan-derived
+key, live/idle v2, direct-recovery receipt v2 or other unexpected marker is treated
+as foreign and fails closed; no unsafe automatic deletion or dual-key
+migration is attempted.
 
 Lease acquisition is not treated as proof that the earlier empty-bucket
 readiness observation is still current. Immediately after create/CAS, and
@@ -160,10 +180,12 @@ the final version-closure page is adjacent to DELETE, while deployment,
 settings, exposure and attachment checks precede it. None of those request
 sequences is an atomic CAS. A new external-admin mutation can still race after
 the last relevant read, so no stronger claim is made about writes outside SOW.
-R2 has no conditional DeleteObject. Lease release and expired recovery therefore
-use only the provider-validated conditional PutObject primitive: the exact live
-ETag is CAS-replaced by a non-owning marker containing the digest and canonical
-body of the previous lease. Acquisition may CAS that marker to a new live lease.
+R2 has no conditional DeleteObject. Normal lease release uses only the
+provider-validated conditional PutObject primitive to CAS the exact live ETag
+to a non-owning release marker. Expired recovery CASes exact live to owning
+pending, persists and reopens its private receipt, then CASes exact pending to
+a non-owning recovery marker containing the previous lease plus pending and
+receipt digests. Acquisition may CAS only a canonical idle marker to a new live lease.
 A stale holder can neither renew nor retire the replacement because its ETag no
 longer matches, and there is no unconditional delete that could erase a new holder.
 
@@ -185,7 +207,8 @@ recovery receipt.
   exposure, route creation/deletion, inventories and non-forced script deletion.
   Loopback protocol tests assert both auth and origin multipart bodies, create-only
   headers and exact route bodies. Failure-injection, cross-run takeover,
-  compare-and-set acquisition/renewal/idle retirement/recovery, lease-only bucket pagination/identity,
+  compare-and-set acquisition/renewal/idle retirement/two-phase recovery,
+  every recovery interruption window and committed-response loss, lease-only bucket pagination/identity,
   post-readiness provider drift, stale inventory omission, checked-delete
   identity/version/attachment drift, bounded mutation lifetime, final-read to
   DELETE request adjacency, exact-404 replay and provider-success/client-error

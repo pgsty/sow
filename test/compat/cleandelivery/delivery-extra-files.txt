@@ -110,6 +110,7 @@ docs/evidence/2026-07-18-durability-teardown-audit.md
 docs/evidence/2026-07-18-legacy-adoption-50k-performance.md
 docs/evidence/2026-07-18-real-r2-storage-protocol.md
 docs/evidence/2026-07-19-confidential-edge-preflight.md
+docs/evidence/2026-07-19-r2-bootstrap-two-phase-recovery.md
 docs/evidence/2026-07-19-r2-lease-cas-retirement.md
 docs/evidence/2026-07-19-r2-resource-stable-lease-rotation.md
 docs/evidence/README.md

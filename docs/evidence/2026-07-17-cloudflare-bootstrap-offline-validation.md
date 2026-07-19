@@ -16,8 +16,10 @@
 - 每次 apply/rollback 先在指定测试桶的 `.sow/bootstrap/leases/<readiness-resource-sha>.json`
   取得 create-only/CAS 租约；每个控制面 mutation 前续租，durable outcome receipt 后把 exact
   live ETag CAS 为 canonical idle marker，不调用 DeleteObject。plan/signer/bundle 轮换仍复用同一
-  资源 key；live holder 阻塞，历史 idle/expired holder 才可接管。`recover-lease` 同样只用 CAS，
-  recovery receipt v2 同时绑定当前 plan 与被恢复的旧 plan。
+  资源 key；live holder 阻塞，历史 idle才可接管。expired live 只能由 `recover-lease` 先 CAS 为
+  owning pending v1；canonical recovery receipt v3 完整落盘并重新读取后，pending 才可 CAS 为
+  同时绑定 pending/receipt digest 的 recovery idle v3。live v3 将完成 pair 追加到所有后继状态
+  保留的 canonical lineage；任一中断点仅允许 exact run/plan重放。
 - readiness 与 bootstrap 之间不再只靠时效窗口：取得租约后以及每次 mutation 前续租后，必须
   完整消费 bounded `ListObjectsV2`，证明桶内唯一对象就是当前 size/ETag 的租约，再以 GET 比对
   canonical lease bytes。同时重新读取 exact zone 与 active main/beta R2 custom-domain/TLS 闭包，

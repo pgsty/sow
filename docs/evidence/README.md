@@ -67,8 +67,13 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   已实跑。当前两个测试域按设计被拒绝；这不冒充 Worker/private-origin/purge/POC-06 通过。
 - `2026-07-19-r2-resource-stable-lease-rotation.md`：bootstrap key 改由 readiness-resource
   SHA 稳定派生，provider log-sink 固定为 dedicated raw bucket 根 key；跨 plan/deployment 的
-  idle/expired CAS 接管、live/foreign/stale-holder 拒绝、recovery receipt v2 与 readiness
-  receipt/seal 中断续写均有 ordinary/race 故障注入证据。未触云，POC-06 不变。
+  idle/expired CAS 接管、live/foreign/stale-holder 拒绝、当时的 recovery receipt v2 与 readiness
+  receipt/seal 中断续写均有 ordinary/race 故障注入证据。其 direct recovery 已由下一项替代。
+- `2026-07-19-r2-bootstrap-two-phase-recovery.md`：把 expired bootstrap 恢复改为
+  `live -> owning pending -> durable receipt -> recovery idle`，覆盖 pending/receipt/final-Put
+  三类中断、成功后响应丢失、跨多次恢复保留的 canonical lineage、同 run 幂等、跨
+  run/plan/resource/stale ETag/伪造 digest/readiness 负例及零 Delete；ordinary/race/static/
+  clean-delivery 均从当前源码复现。未触云，POC-06 不变。
 - `2026-07-17-yum-infra-current-compatibility-cutover.md`：当前生产
   `yum/infra` 只读 234-file 快照的精确可写副本；216/216 RPM 由 Pigsty key
   验签，两个 root `modules.yaml` 只在副本 quarantine，完成双架构
