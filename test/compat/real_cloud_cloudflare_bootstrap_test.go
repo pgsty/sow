@@ -4967,7 +4967,10 @@ func TestRealCloudCloudflareBootstrapOfficialSDKInspectContract(t *testing.T) {
 				case base + "/versions/bootstrap-auth-version":
 					writeEnvelope(map[string]any{"id": "bootstrap-auth-version", "resources": map[string]any{
 						"script": map[string]any{"etag": "bootstrap-auth-etag"}, "bindings": bindings,
-						"script_runtime": map[string]any{"compatibility_date": plan.CompatibilityDate, "compatibility_flags": plan.CompatibilityFlags},
+						"script_runtime": map[string]any{
+							"compatibility_date": plan.CompatibilityDate, "compatibility_flags": plan.CompatibilityFlags,
+							"limits": map[string]any{"cpu_ms": 0}, "migration_tag": "", "usage_model": "standard",
+						},
 					}})
 				case base + "/content/v2":
 					writer.Header().Set("Content-Type", "application/javascript")
@@ -5074,7 +5077,10 @@ func TestRealCloudCloudflareBootstrapOfficialSDKVerifierRuntimeAndSettingsContra
 				case base + "/versions/bootstrap-verifier-version":
 					writeEnvelope(map[string]any{"id": "bootstrap-verifier-version", "resources": map[string]any{
 						"script": map[string]any{"etag": "bootstrap-verifier-etag"}, "bindings": []any{},
-						"script_runtime": map[string]any{"compatibility_date": plan.TokenVerifierCompatibilityDate, "compatibility_flags": plan.TokenVerifierCompatibilityFlags},
+						"script_runtime": map[string]any{
+							"compatibility_date": plan.TokenVerifierCompatibilityDate, "compatibility_flags": plan.TokenVerifierCompatibilityFlags,
+							"limits": map[string]any{"cpu_ms": 0}, "migration_tag": "", "usage_model": "standard",
+						},
 					}})
 				case base + "/content/v2":
 					writer.Header().Set("Content-Type", "application/javascript")

@@ -21,10 +21,16 @@ edge contract than SOW intends.
 
 ## Decision
 
-Provider attestation config v3 pins a separate compatibility date and sorted,
-unique flag inventory for the auth, origin and token-verifier Workers. The
-provider deployment identity includes those contracts. Every active Worker is
-then bracketed by deployment reads and two identical security observations:
+Provider attestation config and deployment identity v4 use the product
+`edge.token_verifier` reference as a strict union discriminator. In
+`provider://id` mode they pin a separate compatibility date and sorted, unique
+flag inventory for the auth, origin and token-verifier Workers. In
+`env://NAME` mode every provider-only verifier service, runtime, content,
+binding, URL and deployment field must be empty; the exact `NAME` must instead
+appear in both Cloudflare and EdgeOne secret inventories. The default bounded
+real-cloud acceptance product config uses the latter mode. Every managed
+active Worker is bracketed by deployment reads and two identical security
+observations:
 
 - immutable version runtime uses the exact date/flags, `standard` usage model,
   zero/default limits and no migration tag;
@@ -33,13 +39,81 @@ then bracketed by deployment reads and two identical security observations:
 - schedule inventory is explicitly present and empty;
 - workers.dev and preview exposure are explicitly disabled.
 
-Raw provider attestation v3 records independent security digests for all three
-Workers. Its Cloudflare control digest also includes compatibility values and a
+The discriminator is not allowed to define its own expected product. Decode
+receives the actual generated `sow.yaml` bytes from outside the attestation,
+requires their digest and verifier reference to match before any credential is
+read or provider client is built, and derives both edge contracts from those
+external bytes. The provider entry point loads only those non-secret resource
+fields, not the two entitlement bearer tokens. The exact two-stage active
+evidence set and both vendor config digests are then closed against that product
+digest before any of the six provider/publisher credentials are read. The
+first-step raw-log mutation additionally compares the
+attestation digest with the durable acceptance-ledger binding before reading a
+log/API credential. A self-consistent provider config therefore cannot replace
+the run's default static product config.
+
+Raw provider attestation v4 records the verifier kind and non-secret binding
+name. Provider mode retains independent security digests for all three Workers;
+static mode records no third-Worker identity, ETag or digest and proves the
+secret only through the auth Worker binding name/type and redacted runtime
+digest. Its Cloudflare control digest also includes compatibility values and a
 twice-read canonical inventory of every Worker identity, embedded route, zone
 route and Worker custom domain. Missing custom-domain service/certificate/zone
 identity fails closed. The complete inventory and managed exposure digests
 must be identical across consecutive reads and across the outer raw-log
 collection bracket.
+
+The static Cloudflare closure therefore contains exactly auth and origin as
+managed Workers, with `ORIGIN` as its only service binding. The EdgeOne closure
+omits the provider URL and bearer and requires the same named static secret.
+For EdgeOne, a secret is accepted only when the live runtime response identifies
+it as type `secret` and omits or redacts its value. A same-name `string`/`json`
+variable or a non-empty returned secret value fails closed; the collector never
+uses plaintext presence as secret evidence. This follows Tencent's documented
+[Environment Variable and Secret](https://intl.cloud.tencent.com/document/product/1145/62764)
+contract that a saved Secret value is no longer visible. The current public
+[API data type](https://cloud.tencent.com/document/product/1552/80721#FunctionEnvironmentVariable)
+still documents only `string`/`json`, so a real deployment must prove the
+redacted `secret` wire shape; absence of that shape is a provider capability
+failure, not permission to weaken attestation.
+Because the Tencent SDK does not retain its raw response, the dedicated client
+transport boundedly captures only the runtime-environment response, token-walks
+the exact `Response/EnvironmentVariables/RequestId` shape and each exact
+`Key/Type[/Value]` object, then clears the temporary body after SDK consumption.
+Duplicate `Type`/`Value`, null, missing, unknown or non-string wire fields fail
+before `encoding/json` may collapse them into a trusted struct. The size/read/
+close gate runs before checking HTTP status; non-success responses are cleared
+and replaced by a fixed error so the SDK cannot unboundedly read or embed them.
+Cloudflare binding evidence is also a strict SDK-union closure: the collector
+requires the exact raw JSON keys for each reviewed type and rejects every
+non-zero field belonging to another union variant. Thus `secret_text` plus a
+residual service/bucket/KV/database capability cannot be normalized into an
+apparently exact secret inventory. The outer `bindings` member must be an
+explicit non-null valid array, and all admitted binding values must retain their
+JSON string type; missing arrays, null and wrong-type zero-value coercions fail.
+The SDK-preserved raw resources object is parsed independently and must contain
+`bindings`, `script` and `script_runtime` exactly once with their array/object
+types and no unknown keys. The nested script/runtime/limits objects are also
+token-walked with exact keys and JSON types, including numeric `cpu_ms` and
+string-only compatibility flags; duplicate-key or zero-value SDK projection is
+not trusted. The mutable `/settings` observation is independently token-walked
+from the SDK-preserved raw body as well: every top-level settings member and
+every cache/limit/observability/log/trace member must occur exactly once with
+its reviewed JSON type and closed value. Duplicate booleans, numeric strings,
+null inventories and omitted nested telemetry fields therefore cannot be
+normalized into an apparently closed settings struct. Its flat-string binding
+objects are canonicalized with duplicate-field rejection and must equal the
+active immutable version's exact binding multiset. The schedule and subdomain
+responses likewise require exact raw `{schedules: []}` and explicit false
+exposure booleans, not SDK-projected nil/zero values; the independent complete
+routing/inventory recheck applies the same raw exposure predicate.
+
+The durable acceptance binding parses the canonical verifier reference from the
+exact installed product YAML bytes and stores it beside their SHA-256. A v4 fact
+must match both that config digest and the exact `kind://name`; grammar-valid
+alternate names and provider/static substitutions fail before recovery may use
+the fact. A v3 fact or any provider/static field mixture cannot resume harness
+v8.
 
 The same config pins the EdgeOne realtime-log task's immutable `Area` to exactly
 `mainland` or `overseas`. The collector requires the live task to report that

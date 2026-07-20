@@ -95,6 +95,11 @@ inode replacement。它证明 collector 可执行，不证明任何真实供应�
 provider-deployment registry 在 config decode 后、任何 credential/client/request 之前执行，且
 stable deployment digest 排除供应商动态生成的 raw object key，却绑定资源摘要、log bucket/raw root、
 部署 ID、runtime、verifier content/binding digest。不得临时改常量或跳过任一门来“跑一次”。
+provider 入口先用 resource-only loader 读取非秘密资源字段，不读取两枚 entitlement bearer。
+deployment gate 通过后仍不会立刻读 credential：collector 先要求 active artifact 恰有 generation
+4/5 两个 stage，且 Cloudflare/EdgeOne 四个 vendor stage 的 `ConfigSHA256` 全部等于外部产品配置
+摘要；缺 stage/vendor 或任一摘要漂移均由覆盖八个秘密变量的两层 credential-read sentinel
+证明在六组 provider/publisher 凭据读取前失败。
 
 原先 purge 已提交、generation 5 post-probe 尚未持久化之间的父进程 SIGKILL 窗口，现由
 `real_cloud_purge_watcher_test.go` 的独立子进程合同关闭。`interrupt-cf-g5` 在任何 provider
@@ -350,15 +355,15 @@ POC-06，也不代替后续双云故障、purge、cache 与 provider-log 验收�
 | `SOW_REAL_EDGEONE_ZONE_ID` | EdgeOne zone ID |
 | `SOW_REAL_CLOUD_WORKSPACE` | 本次单一 destructive run 的持久工作区绝对路径；不得位于产品仓库内 |
 | `SOW_REAL_CLOUD_RUN_ID` | 绑定本次配置、确认值、公开签名 key 与外部 edge artifact 的稳定 run ID |
-| `SOW_REAL_CLOUD_PROVIDER_ATTESTATION_JSON` | 单行 canonical JSON v3；绑定确定性产品配置摘要、CF account/zone/Logpush job/auth+origin+verifier Worker 及逐 Worker compatibility date/flags、verifier 内容与 redacted binding 摘要、EO log task 的不可变 `realtime_log_area`、function/default-domain/verifier deployment、两端 exact `https-bearer` runtime，以及与发布桶分离的两个 raw-log bucket/raw root、reader/writer 和独立 CF log-control identity digest；完整 stable identity 还必须命中独立 provider-deployment registry，未知字段或非 canonical 表示失败 |
+| `SOW_REAL_CLOUD_PROVIDER_ATTESTATION_JSON` | 单行 canonical JSON v4；从 attestation 外部绑定实际生成的产品配置字节/摘要与 strict verifier union。默认 `env://NAME` 只允许 CF auth+origin、两端 exact static secret name 和空 provider 字段；EO live runtime 必须把 secret 标为 `secret` 且不返回值，同名 plaintext 失败。`provider://ID` 才要求第三个 Worker、verifier 内容/redacted binding/逐 Worker runtime、EO URL/bearer/deployment。两种模式都绑定 account/zone/Logpush、EO immutable area/function/default-domain、两个隔离 raw sink 与 reader/writer/log-control identity digest；完整 stable identity 还必须命中独立 provider-deployment registry，未知字段、v3 或非 canonical 表示失败 |
 | `SOW_REAL_CLOUD_MODE` | `fresh` 或 `recover`；当前 recover 只允许重放已登记的同一 publish 操作，见下方限制 |
 | `SOW_REAL_EDGE_OBSERVERS_JSON` | 2–8 个 `{"id":"...","proxy_env":"SOW_REAL_EDGE_PROXY_..."}` observer 的严格 JSON 数组；ID、env 名、代理 endpoint 均不得重复 |
 | `SOW_REAL_EDGE_ACTIVE_OBSERVATIONS_JSONL` | 仓库外绝对路径；父目录须预先存在且非 symlink；完成文件使用 `sow-real-edge-active/v5` 并要求同名 `.seal` |
 | `SOW_REAL_EDGE_PROVIDER_LOG_JSONL` | destructive run 后由日志 collector 生成并以同名 `.seal` 完成的仓库外 `sow-real-edge-provider-joined/v3` JSONL 路径 |
 | `SOW_RUN_REAL_EDGE_EVIDENCE` | provider logs 到齐后仅对只读关联验收设为 `1`；不触发 bucket/CDN mutation |
 
-attestation 配置只含资源身份、access-key identity 摘要、secret 名称以及已独立评审的 verifier
-部署/内容/binding 摘要，不含凭据。`product_config_sha256` 必须逐字匹配夹具确定性生成的实际
+attestation 配置只含资源身份、access-key identity 摘要和 secret 名称；只有 provider 模式再含
+已独立评审的 verifier 部署/内容/binding 摘要，任何模式都不含凭据。`product_config_sha256` 必须逐字匹配夹具确定性生成的实际
 SOW 产品配置。`raw_bucket` 必须与对应 publisher bucket 不同；`raw_root` 必须位于
 `sow-provider-logs/`。运行时派生唯一 `<raw_root><same-run-id>/`，由 exporter 自行生成一个或多个
 object key；配置不预言 key。collector 使用 provider-side Prefix ListObjectsV2 全量分页，按 key
@@ -367,7 +372,7 @@ object key；配置不预言 key。collector 使用 provider-side Prefix ListObj
 占位值不能用于运行，尤其不能替换成任何 CO/COS/Cloudflare 生产资源：
 
 ```json
-{"schema":"sow-real-cloud-provider-attestation-config/v3","product_config_sha256":"<64-lower-hex-deterministic-product-config-digest>","cloudflare":{"account_id":"dedicated-test-account","zone_id":"dedicated-test-zone","logpush_job_id":1,"worker_script":"sow-test-auth","worker_runtime":{"compatibility_date":"2026-07-17","compatibility_flags":[]},"origin_worker_script":"sow-test-origin","origin_worker_environment":"","origin_worker_runtime":{"compatibility_date":"2026-07-17","compatibility_flags":[]},"token_verifier_service":"sow-test-verifier","token_verifier_environment":"","token_verifier_runtime":{"compatibility_date":"2026-07-17","compatibility_flags":[]},"token_verifier_content_sha256":"<64-lower-hex-reviewed-digest>","token_verifier_bindings_sha256":"<64-lower-hex-reviewed-redacted-binding-digest>","raw_reader_access_key_sha256":"<64-lower-hex-reader-id-digest>","raw_writer_access_key_sha256":"<64-lower-hex-writer-id-digest>","log_control_access_key_sha256":"<64-lower-hex-log-control-id-digest>","raw_bucket":"sow-test-cf-provider-logs","raw_root":"sow-provider-logs/cloudflare/"},"edgeone":{"zone_id":"dedicated-test-zone","realtime_log_task_id":"sow-test-log-task","realtime_log_area":"overseas","function_id":"sow-test-function","function_domain_sha256":"<64-lower-hex-dedicated-default-domain-digest>","raw_reader_access_key_sha256":"<64-lower-hex-reader-id-digest>","raw_writer_access_key_sha256":"<64-lower-hex-writer-id-digest>","raw_bucket":"sow-test-eo-provider-logs-1250000000","raw_root":"sow-provider-logs/edgeone/"},"runtime":{"token_verifier":"provider://sow-test-verifier","public_prefixes":["apt","pkg","yum"],"public_keys":["keys/test.asc"],"edgeone_token_verifier_url":"https://verifier.test.invalid/v1/verify","edgeone_token_verifier_deployment_sha256":"<64-lower-hex-reviewed-deployment-digest>","cloudflare_secret_names":["SOW_ORIGIN_BEARER"],"edgeone_secret_names":["SOW_ORIGIN_BEARER","SOW_TOKEN_VERIFIER_BEARER"]}}
+{"schema":"sow-real-cloud-provider-attestation-config/v4","product_config_sha256":"<64-lower-hex-deterministic-product-config-digest>","cloudflare":{"account_id":"dedicated-test-account","zone_id":"dedicated-test-zone","logpush_job_id":1,"worker_script":"sow-test-auth","worker_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[]},"origin_worker_script":"sow-test-origin","origin_worker_environment":"","origin_worker_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[]},"token_verifier_service":"","token_verifier_environment":"","token_verifier_runtime":{"compatibility_date":"","compatibility_flags":null},"token_verifier_content_sha256":"","token_verifier_bindings_sha256":"","raw_reader_access_key_sha256":"<64-lower-hex-reader-id-digest>","raw_writer_access_key_sha256":"<64-lower-hex-writer-id-digest>","log_control_access_key_sha256":"<64-lower-hex-log-control-id-digest>","raw_bucket":"sow-test-cf-provider-logs","raw_root":"sow-provider-logs/cloudflare/"},"edgeone":{"zone_id":"dedicated-test-zone","realtime_log_task_id":"sow-test-log-task","realtime_log_area":"overseas","function_id":"sow-test-function","function_domain_sha256":"<64-lower-hex-dedicated-default-domain-digest>","raw_reader_access_key_sha256":"<64-lower-hex-reader-id-digest>","raw_writer_access_key_sha256":"<64-lower-hex-writer-id-digest>","raw_bucket":"sow-test-eo-provider-logs-1250000000","raw_root":"sow-provider-logs/edgeone/"},"runtime":{"token_verifier":"env://SOW_REAL_EDGE_STATIC_ENTITLEMENTS","public_prefixes":["apt","pkg","yum"],"public_keys":["keys/test.asc"],"edgeone_token_verifier_url":"","edgeone_token_verifier_deployment_sha256":"","cloudflare_secret_names":["SOW_ORIGIN_BEARER","SOW_REAL_EDGE_STATIC_ENTITLEMENTS"],"edgeone_secret_names":["SOW_ORIGIN_BEARER","SOW_REAL_EDGE_STATIC_ENTITLEMENTS"]}}
 ```
 
 秘密必须由当前进程的 secret manager/env 注入，不得写进仓库、临时配置、命令行或
@@ -378,6 +383,7 @@ CF provider-log lease control 凭据的严格 JSON schema 为：
 |---|---|
 | `SOW_REAL_CF_STORAGE_JSON` | `access_key_id`, `secret_access_key`, 可选 `session_token` |
 | `SOW_REAL_CF_CDN_JSON` | `api_token`, `basic_username`, `basic_password`；Cloudflare readiness 的 token 至少具备 exact account `Workers R2 Storage Read` 与 exact zone `Zone Read`，完整 POC 再另按部署/purge/Logpush 操作收窄授权 |
+| `SOW_REAL_EDGE_STATIC_ENTITLEMENTS` | 默认 static verifier 的 strict compact JSON secret；Cloudflare bootstrap 只在持有 lease 且 readiness 复核后读取并以 `secret_text` 注入。EdgeOne 平台可在同名 secret 下保存按其 main/beta audience 收窄的独立文档；值和 token digest 清单不得进入配置、registry、receipt 或日志 |
 | `SOW_REAL_COS_STORAGE_JSON` | `access_key_id`, `secret_access_key`, 可选 `session_token` |
 | `SOW_REAL_COS_CDN_JSON` | `secret_id`, `secret_key`, 可选 `session_token`, 以及 `basic_username`, `basic_password` |
 | `SOW_REAL_CF_LOG_STORAGE_JSON` | provider-only R2 log bucket 的 read-only `access_key_id`, `secret_access_key`, 可选 `session_token`；仅允许 exact per-run prefix List/Get，不得具有 Put/Delete 或 publisher bucket 权限 |

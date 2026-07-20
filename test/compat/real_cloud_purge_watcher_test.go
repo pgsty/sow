@@ -310,6 +310,10 @@ func validateRealCloudPurgeWatcherRuntimeBinding(
 	if err != nil || configSHA != spec.ConfigSHA256 || configSHA != identity.ConfigSHA256 {
 		return errors.New("purge watcher runtime config differs from its signed spec")
 	}
+	configBody, err := readRealCloudPurgeWatcherPrivateFile(configPath, config.MaxConfigBytes)
+	if err != nil || realCloudLowerSHA256(configBody) != configSHA {
+		return errors.New("purge watcher runtime config changed while being read")
+	}
 	configAfter, err := os.Lstat(configPath)
 	if err != nil || configAfter.Mode()&os.ModeSymlink != 0 || !configAfter.Mode().IsRegular() ||
 		configAfter.Mode().Perm()&0o077 != 0 || !os.SameFile(configInfo, configAfter) {
@@ -319,7 +323,7 @@ func validateRealCloudPurgeWatcherRuntimeBinding(
 	if _, err := readRealCloudPurgeWatcherJSON(filepath.Join(root, realCloudAcceptanceLedgerFilename), &ledger); err != nil || validateRealCloudAcceptanceLedger(ledger) != nil {
 		return errors.New("purge watcher runtime acceptance ledger is absent or invalid")
 	}
-	currentBinding, err := realCloudAcceptanceBindingFor(identity,
+	currentBinding, err := realCloudAcceptanceBindingFor(identity, configBody,
 		strings.TrimSpace(getenv(realEdgeActiveArtifactEnv)), strings.TrimSpace(getenv(realEdgeProviderLogEnv)), topology)
 	if err != nil || ledger.Binding != currentBinding || ledger.Binding.RunID != spec.RunID ||
 		ledger.Binding.ConfirmationSHA256 != confirmationSHA || ledger.Binding.ConfigSHA256 != configSHA ||
@@ -2190,7 +2194,7 @@ func TestRealCloudPurgeWatcherDetachedRuntimeBinding(t *testing.T) {
 	environment := realCloudEnvironment{
 		CFR2Endpoint: "https://account.example.invalid", CFR2Bucket: "sow-test-r2-watcher",
 		CFCDNBase: "https://cf-test.example.invalid", CFBetaCDNBase: "https://cf-beta-test.example.invalid", CFZoneID: "zone-cf-test",
-		COSEndpoint: "https://cos-test.example.invalid", COSBucket: "sow-test-cos-watcher", COSRegion: "ap-test",
+		COSEndpoint: "https://cos.ap-test.myqcloud.com", COSBucket: "sow-test-cos-watcher-1234567890", COSRegion: "ap-test",
 		COSCDNBase: "https://eo-test.example.invalid", COSBetaBase: "https://eo-beta-test.example.invalid", EdgeOneZoneID: "zone-eo-test",
 		EdgeProTokenA: realCloudPurgeWatcherTestTokenA, EdgeProTokenB: realCloudPurgeWatcherTestTokenB,
 	}
@@ -2215,7 +2219,10 @@ func TestRealCloudPurgeWatcherDetachedRuntimeBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	confirmationSHA := realCloudLowerSHA256([]byte(realCloudConfirmation(environment)))
-	configBody := []byte("watcher detached runtime binding config\n")
+	configBody, err := realCloudConfigBodyForEnvironment(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
 	configSHA := realCloudLowerSHA256(configBody)
 	if err := os.WriteFile(filepath.Join(root, "sow.yaml"), configBody, 0o600); err != nil {
 		t.Fatal(err)
@@ -2231,7 +2238,7 @@ func TestRealCloudPurgeWatcherDetachedRuntimeBinding(t *testing.T) {
 	if installed, err := installRealCloudPrivateFileExclusive(filepath.Join(root, realCloudRunIdentityFilename), append(identityBody, '\n')); err != nil || !installed {
 		t.Fatalf("install detached runtime identity: installed=%v err=%v", installed, err)
 	}
-	binding, err := realCloudAcceptanceBindingFor(identity, values[realEdgeActiveArtifactEnv], values[realEdgeProviderLogEnv], topology)
+	binding, err := realCloudAcceptanceBindingFor(identity, configBody, values[realEdgeActiveArtifactEnv], values[realEdgeProviderLogEnv], topology)
 	if err != nil {
 		t.Fatal(err)
 	}

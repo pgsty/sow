@@ -102,7 +102,7 @@ func executeRealCloudAcceptanceProgram(
 		t.Fatalf("canonicalize real edge provider-log destination: %v", err)
 	}
 	topology := realCloudObserverTopologyBinding(t)
-	binding, err := realCloudAcceptanceBindingFor(identity, artifactPath, providerLogPath, topology)
+	binding, err := realCloudAcceptanceBindingFor(identity, configBody, artifactPath, providerLogPath, topology)
 	if err != nil {
 		t.Fatalf("bind real-cloud acceptance ledger: %v", err)
 	}
@@ -598,7 +598,7 @@ func (program *realCloudAcceptanceProgram) reconcileProviderRawSinks(activeStep 
 	if err := validateRealCloudProviderSinkMutationAdmission(program.ledger.Snapshot(), held, program.mode, activeStep); err != nil {
 		program.t.Fatalf("refuse provider raw-log sink mutation without durable admission: %v", err)
 	}
-	if err := prepareRealCloudProviderPerRunRawSinks(program.t.Context(), program.environment, program.identity.RunID, os.Getenv); err != nil {
+	if err := prepareRealCloudProviderPerRunRawSinks(program.t.Context(), program.environment, program.identity.RunID, program.identity.ConfigSHA256, os.Getenv); err != nil {
 		assertNoRealCloudSecret(program.t, "provider raw-log sink setup error", []byte(err.Error()), program.secretFragments)
 		program.t.Fatalf("prepare exact ledger-bound per-run provider raw-log sinks: %v", err)
 	}

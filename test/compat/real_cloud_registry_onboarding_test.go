@@ -40,8 +40,12 @@ func TestRealCloudRegistryOnboardingCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	expectedProductBody, err := realCloudConfigBodyForEnvironment(environment)
+	if err != nil {
+		t.Fatalf("encode externally expected product config: %v", err)
+	}
 	configuration, _, err := decodeRealCloudProviderAttestationConfig(
-		os.Getenv(realCloudProviderAttestationEnv), environment, realCloudRegistryCandidateRunID,
+		os.Getenv(realCloudProviderAttestationEnv), environment, realCloudRegistryCandidateRunID, expectedProductBody,
 	)
 	if err != nil {
 		t.Fatalf("provider deployment candidate is invalid: %v", err)

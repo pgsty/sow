@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
 	"sort"
 	"strconv"
@@ -36,6 +38,7 @@ import (
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common"
 	"github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common/profile"
 	teo "github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/teo/v20220901"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -45,16 +48,17 @@ const (
 	realCloudProviderLogWriterCredentialCF    = "SOW_REAL_CF_LOG_WRITER_JSON"
 	realCloudProviderLogWriterCredentialCOS   = "SOW_REAL_COS_LOG_WRITER_JSON"
 	realCloudProviderLogControlCredentialCF   = "SOW_REAL_CF_LOG_CONTROL_JSON"
-	realCloudProviderAttestationSchema        = "sow-real-cloud-provider-attestation-config/v3"
-	realCloudProviderCollectorSchema          = "sow-real-cloud-provider-raw-attestation/v3"
+	realCloudProviderAttestationSchema        = "sow-real-cloud-provider-attestation-config/v4"
+	realCloudProviderCollectorSchema          = "sow-real-cloud-provider-raw-attestation/v4"
 	realCloudProviderCollectorSource          = "test/compat/real_cloud_provider_attestation_test.go"
 	realCloudProviderDeploymentRegistryPath   = "test/compat/testdata/real_cloud_nonproduction_provider_deployment_registry.json"
 	realCloudProviderDeploymentRegistrySchema = "sow-real-cloud-pinned-provider-deployment-registry/v1"
 	realCloudProviderDeploymentEntrySchema    = "sow-real-cloud-pinned-provider-deployment/v1"
-	realCloudProviderDeploymentIdentitySchema = "sow-real-cloud-provider-deployment-identity/v3"
+	realCloudProviderDeploymentIdentitySchema = "sow-real-cloud-provider-deployment-identity/v4"
 	realCloudProviderDeploymentRegistrySHA256 = "3eac7304de5472c532fbfcd93f93cc69a5baa778c9c851280e692e0f9d633e52"
 	realCloudProviderMaxRawBytes              = 8 << 20
 	realCloudProviderMaxContentBytes          = 2 << 20
+	realCloudProviderMaxEdgeOneRuntimeWire    = 1 << 20
 	realCloudProviderMaxInventoryItems        = 10_000
 	realCloudProviderLogSinkLeaseSchema       = "sow-real-cloud-provider-log-sink-lease/v2"
 	realCloudProviderLogSinkIdleLeaseSchema   = "sow-real-cloud-provider-log-sink-idle-lease/v2"
@@ -154,6 +158,8 @@ type realCloudProviderRawAttestation struct {
 	CollectorConfigSHA256    string `json:"collector_config_sha256"`
 	ProductConfigSHA256      string `json:"product_config_sha256"`
 	ProviderDeploymentSHA256 string `json:"provider_deployment_sha256"`
+	TokenVerifierKind        string `json:"token_verifier_kind"`
+	TokenVerifierName        string `json:"token_verifier_name"`
 	RawJoinedSHA256          string `json:"raw_joined_sha256"`
 	RedactedClosureSHA256    string `json:"redacted_closure_sha256"`
 	RawRecords               int    `json:"raw_records"`
@@ -239,6 +245,74 @@ type realCloudProviderCollectorClients struct {
 	probeEOFunctionDomain func(context.Context, string) (string, error)
 }
 
+type realCloudEdgeOneRuntimeWireGuard struct {
+	next http.RoundTripper
+}
+
+type realCloudClearingResponseBody struct {
+	reader *bytes.Reader
+	body   []byte
+}
+
+func (body *realCloudClearingResponseBody) Read(target []byte) (int, error) {
+	return body.reader.Read(target)
+}
+
+func (body *realCloudClearingResponseBody) Close() error {
+	clearRealCloudBytes(body.body)
+	body.body = nil
+	body.reader = bytes.NewReader(nil)
+	return nil
+}
+
+func (guard *realCloudEdgeOneRuntimeWireGuard) RoundTrip(request *http.Request) (*http.Response, error) {
+	if guard == nil || guard.next == nil {
+		return nil, errors.New("EdgeOne runtime wire guard has no transport")
+	}
+	response, err := guard.next.RoundTrip(request)
+	if err != nil || response == nil || request.Header.Get("X-TC-Action") != "DescribeFunctionRuntimeEnvironment" {
+		return response, err
+	}
+	if response.Body == nil {
+		return nil, errors.New("EdgeOne runtime wire response has no body")
+	}
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, realCloudProviderMaxEdgeOneRuntimeWire+1))
+	closeErr := response.Body.Close()
+	if readErr != nil || closeErr != nil || len(body) == 0 || len(body) > realCloudProviderMaxEdgeOneRuntimeWire {
+		clearRealCloudBytes(body)
+		return nil, errors.New("EdgeOne runtime wire response is absent, unreadable, or oversized")
+	}
+	if response.StatusCode != http.StatusOK {
+		clearRealCloudBytes(body)
+		return nil, errors.New("EdgeOne runtime wire response has a non-success status")
+	}
+	if !validRealCloudEdgeOneRuntimeWire(body) {
+		clearRealCloudBytes(body)
+		return nil, errors.New("EdgeOne runtime wire response is not an exact duplicate-free environment inventory")
+	}
+	response.Body = &realCloudClearingResponseBody{reader: bytes.NewReader(body), body: body}
+	response.ContentLength = int64(len(body))
+	return response, nil
+}
+
+func validRealCloudEdgeOneRuntimeWire(raw []byte) bool {
+	jsonString := validRealCloudCloudflareJSONString
+	variable := func(value json.RawMessage) bool {
+		withValue := map[string]func(json.RawMessage) bool{"Key": jsonString, "Type": jsonString, "Value": jsonString}
+		withoutValue := map[string]func(json.RawMessage) bool{"Key": jsonString, "Type": jsonString}
+		return validRealCloudCloudflareExactJSONObject(value, withValue) || validRealCloudCloudflareExactJSONObject(value, withoutValue)
+	}
+	response := func(value json.RawMessage) bool {
+		return validRealCloudCloudflareExactJSONObject(value, map[string]func(json.RawMessage) bool{
+			"EnvironmentVariables": func(variables json.RawMessage) bool {
+				return validRealCloudCloudflareJSONArray(variables, variable)
+			},
+			"RequestId": jsonString,
+		})
+	}
+	return validRealCloudCloudflareExactJSONObject(raw, map[string]func(json.RawMessage) bool{"Response": response})
+}
+
 type realCloudProviderLogSinkLease struct {
 	Schema                   string `json:"schema"`
 	RunID                    string `json:"run_id"`
@@ -280,42 +354,70 @@ func validateRealCloudProviderAPIAttestedRawClosure(
 	operatorLogs []realEdgeProviderLog,
 	forbidden []string,
 ) (realCloudProviderRawAttestation, error) {
-	environment, err := realCloudEnvironmentFromLookup(os.Getenv)
+	return validateRealCloudProviderAPIAttestedRawClosureFromLookup(ctx, stages, operatorLogs, forbidden, os.Getenv)
+}
+
+func validateRealCloudProviderAPIAttestedRawClosureFromLookup(
+	ctx context.Context,
+	stages []realEdgeMultiPoPStageEvidence,
+	operatorLogs []realEdgeProviderLog,
+	forbidden []string,
+	getenv func(string) string,
+) (realCloudProviderRawAttestation, error) {
+	environment, err := realCloudResourceEnvironmentFromLookup(getenv)
 	if err != nil {
 		return realCloudProviderRawAttestation{}, fmt.Errorf("%w: provider environment is incomplete", errRealCloudProviderAPIAttestationRequired)
 	}
 	if err := validateRealCloudVendorEndpoints(environment); err != nil {
 		return realCloudProviderRawAttestation{}, fmt.Errorf("%w: provider endpoint family is invalid", errRealCloudProviderAPIAttestationRequired)
 	}
-	if err := validateRealCloudDedicatedTestResources(environment, os.Getenv); err != nil {
+	if err := validateRealCloudDedicatedTestResources(environment, getenv); err != nil {
 		return realCloudProviderRawAttestation{}, fmt.Errorf("%w: exact pinned non-production registry gate rejected the resources", errRealCloudProviderAPIAttestationRequired)
 	}
 
-	configuration, configurationBody, err := decodeAndValidateRealCloudPinnedProviderDeployment(environment, os.Getenv)
+	configuration, configurationBody, err := decodeAndValidateRealCloudPinnedProviderDeployment(environment, getenv)
 	if err != nil {
 		return realCloudProviderRawAttestation{}, fmt.Errorf("%w: administrator-pinned provider deployment gate rejected the config", errRealCloudProviderAPIAttestationRequired)
 	}
-	cfStorage, err := decodeRealCloudProviderSecret[realCloudStorageSecret](os.Getenv(realCloudProviderLogStorageCredentialCF))
+	return validateRealCloudProviderAPIAttestedRawClosureAfterDeploymentGate(
+		ctx, environment, configuration, configurationBody, stages, operatorLogs, forbidden, getenv,
+	)
+}
+
+func validateRealCloudProviderAPIAttestedRawClosureAfterDeploymentGate(
+	ctx context.Context,
+	environment realCloudEnvironment,
+	configuration realCloudProviderAttestationConfig,
+	configurationBody []byte,
+	stages []realEdgeMultiPoPStageEvidence,
+	operatorLogs []realEdgeProviderLog,
+	forbidden []string,
+	getenv func(string) string,
+) (realCloudProviderRawAttestation, error) {
+	if err := validateRealCloudProviderStageConfigClosure(stages, configuration.ProductConfigSHA256); err != nil {
+		return realCloudProviderRawAttestation{}, fmt.Errorf("%w: %v", errRealCloudProviderAPIAttestationRequired, err)
+	}
+	cfStorage, err := decodeRealCloudProviderSecret[realCloudStorageSecret](getenv(realCloudProviderLogStorageCredentialCF))
 	if err != nil {
 		return realCloudProviderRawAttestation{}, fmt.Errorf("%w: Cloudflare raw-log read credential schema is invalid", errRealCloudProviderAPIAttestationRequired)
 	}
-	cfCDN, err := decodeRealCloudProviderSecret[realCloudCloudflareSecret](os.Getenv(realCloudCDNCredentialCF))
+	cfCDN, err := decodeRealCloudProviderSecret[realCloudCloudflareSecret](getenv(realCloudCDNCredentialCF))
 	if err != nil {
 		return realCloudProviderRawAttestation{}, fmt.Errorf("%w: Cloudflare API credential schema is invalid", errRealCloudProviderAPIAttestationRequired)
 	}
-	eoStorage, err := decodeRealCloudProviderSecret[realCloudStorageSecret](os.Getenv(realCloudProviderLogStorageCredentialCOS))
+	eoStorage, err := decodeRealCloudProviderSecret[realCloudStorageSecret](getenv(realCloudProviderLogStorageCredentialCOS))
 	if err != nil {
 		return realCloudProviderRawAttestation{}, fmt.Errorf("%w: EdgeOne raw-log read credential schema is invalid", errRealCloudProviderAPIAttestationRequired)
 	}
-	eoCDN, err := decodeRealCloudProviderSecret[realCloudTencentSecret](os.Getenv(realCloudCDNCredentialCOS))
+	eoCDN, err := decodeRealCloudProviderSecret[realCloudTencentSecret](getenv(realCloudCDNCredentialCOS))
 	if err != nil {
 		return realCloudProviderRawAttestation{}, fmt.Errorf("%w: EdgeOne API credential schema is invalid", errRealCloudProviderAPIAttestationRequired)
 	}
-	cfPublisherStorage, err := decodeRealCloudProviderSecret[realCloudStorageSecret](os.Getenv(realCloudStorageCredentialCF))
+	cfPublisherStorage, err := decodeRealCloudProviderSecret[realCloudStorageSecret](getenv(realCloudStorageCredentialCF))
 	if err != nil {
 		return realCloudProviderRawAttestation{}, fmt.Errorf("%w: Cloudflare publisher storage credential schema is invalid", errRealCloudProviderAPIAttestationRequired)
 	}
-	teoPublisherStorage, err := decodeRealCloudProviderSecret[realCloudStorageSecret](os.Getenv(realCloudStorageCredentialCOS))
+	teoPublisherStorage, err := decodeRealCloudProviderSecret[realCloudStorageSecret](getenv(realCloudStorageCredentialCOS))
 	if err != nil {
 		return realCloudProviderRawAttestation{}, fmt.Errorf("%w: EdgeOne publisher storage credential schema is invalid", errRealCloudProviderAPIAttestationRequired)
 	}
@@ -347,7 +449,7 @@ func validateRealCloudProviderAPIAttestedRawClosure(
 // explicitly opted-in non-production acceptance before any edge probe. A
 // partial cross-provider failure is safe and replayable: probes do not start,
 // and the next invocation writes the same exact per-run configuration.
-func prepareRealCloudProviderPerRunRawSinks(ctx context.Context, environment realCloudEnvironment, runID string, getenv func(string) string) error {
+func prepareRealCloudProviderPerRunRawSinks(ctx context.Context, environment realCloudEnvironment, runID, expectedProductConfigSHA256 string, getenv func(string) string) error {
 	if !validRealCloudRunID(runID) {
 		return errors.New("provider log setup requires the exact bound run ID")
 	}
@@ -360,6 +462,9 @@ func prepareRealCloudProviderPerRunRawSinks(ctx context.Context, environment rea
 	configuration, _, err := decodeAndValidateRealCloudPinnedProviderDeployment(environment, getenv)
 	if err != nil {
 		return err
+	}
+	if !validRealCloudLowerSHA256(expectedProductConfigSHA256) || configuration.ProductConfigSHA256 != expectedProductConfigSHA256 {
+		return errors.New("provider log setup attestation differs from the ledger-bound product config")
 	}
 	cfLog, err := decodeRealCloudProviderSecret[realCloudStorageSecret](getenv(realCloudProviderLogStorageCredentialCF))
 	if err != nil {
@@ -808,7 +913,13 @@ func validateRealCloudProviderLogReaderIdentities(
 }
 
 func decodeAndValidateRealCloudPinnedProviderDeployment(environment realCloudEnvironment, getenv func(string) string) (realCloudProviderAttestationConfig, []byte, error) {
-	configuration, body, err := decodeRealCloudProviderAttestationConfig(getenv(realCloudProviderAttestationEnv), environment, getenv(realCloudRunIDEnv))
+	expectedProductBody, err := realCloudConfigBodyForEnvironment(environment)
+	if err != nil {
+		return realCloudProviderAttestationConfig{}, nil, errors.New("encode externally expected real-cloud product config")
+	}
+	configuration, body, err := decodeRealCloudProviderAttestationConfig(
+		getenv(realCloudProviderAttestationEnv), environment, getenv(realCloudRunIDEnv), expectedProductBody,
+	)
 	if err != nil {
 		return realCloudProviderAttestationConfig{}, nil, err
 	}
@@ -818,7 +929,7 @@ func decodeAndValidateRealCloudPinnedProviderDeployment(environment realCloudEnv
 	return configuration, body, nil
 }
 
-func decodeRealCloudProviderAttestationConfig(raw string, environment realCloudEnvironment, runID string) (realCloudProviderAttestationConfig, []byte, error) {
+func decodeRealCloudProviderAttestationConfig(raw string, environment realCloudEnvironment, runID string, expectedProductBody []byte) (realCloudProviderAttestationConfig, []byte, error) {
 	var configuration realCloudProviderAttestationConfig
 	if raw == "" || raw != strings.TrimSpace(raw) {
 		return configuration, nil, errors.New("missing or non-canonical provider attestation config")
@@ -842,20 +953,19 @@ func decodeRealCloudProviderAttestationConfig(raw string, environment realCloudE
 		configuration.EdgeOne.ZoneID != environment.EdgeOneZoneID {
 		return configuration, nil, errors.New("provider attestation identities do not match the pinned resource environment")
 	}
-	productBody, _, _, err := realCloudProviderProductContracts(environment)
-	if err != nil || !validRealCloudLowerSHA256(configuration.ProductConfigSHA256) || realCloudLowerSHA256(productBody) != configuration.ProductConfigSHA256 {
-		return configuration, nil, errors.New("provider deployment is not bound to the deterministic SOW product config")
+	if len(expectedProductBody) == 0 || len(expectedProductBody) > realCloudProviderMaxContentBytes ||
+		!validRealCloudLowerSHA256(configuration.ProductConfigSHA256) ||
+		realCloudLowerSHA256(expectedProductBody) != configuration.ProductConfigSHA256 {
+		return configuration, nil, errors.New("provider deployment is not bound to the externally expected SOW product config")
+	}
+	expectedProduct, err := sowconfig.Decode(bytes.NewReader(expectedProductBody))
+	if err != nil || expectedProduct.Edge.TokenVerifier != configuration.Runtime.TokenVerifier {
+		return configuration, nil, errors.New("provider verifier mode differs from the externally expected SOW product config")
 	}
 	if configuration.Cloudflare.LogpushJobID <= 0 || !validRealCloudProviderIdentifier(configuration.Cloudflare.WorkerScript, 128) ||
 		!validRealCloudProviderIdentifier(configuration.Cloudflare.OriginWorkerScript, 128) ||
 		configuration.Cloudflare.OriginWorkerScript == configuration.Cloudflare.WorkerScript ||
 		!validRealCloudProviderOptionalIdentifier(configuration.Cloudflare.OriginWorkerEnvironment, 128) ||
-		!validRealCloudProviderIdentifier(configuration.Cloudflare.TokenVerifierService, 128) ||
-		!validRealCloudProviderOptionalIdentifier(configuration.Cloudflare.TokenVerifierEnvironment, 128) ||
-		configuration.Cloudflare.TokenVerifierService == configuration.Cloudflare.WorkerScript ||
-		configuration.Cloudflare.TokenVerifierService == configuration.Cloudflare.OriginWorkerScript ||
-		!validRealCloudLowerSHA256(configuration.Cloudflare.TokenVerifierContentSHA256) ||
-		!validRealCloudLowerSHA256(configuration.Cloudflare.TokenVerifierBindingsSHA256) ||
 		!validRealCloudLowerSHA256(configuration.Cloudflare.RawReaderAccessKeySHA256) ||
 		!validRealCloudLowerSHA256(configuration.Cloudflare.RawWriterAccessKeySHA256) ||
 		!validRealCloudLowerSHA256(configuration.Cloudflare.LogControlAccessKeySHA256) ||
@@ -866,6 +976,31 @@ func decodeRealCloudProviderAttestationConfig(raw string, environment realCloudE
 		!validRealCloudEdgeOneLogArea(configuration.EdgeOne.RealtimeLogArea) ||
 		!validRealCloudProviderIdentifier(configuration.EdgeOne.FunctionID, 128) {
 		return configuration, nil, errors.New("provider attestation job, task, or function identity is invalid")
+	}
+	verifier, err := sowconfig.ParseTokenVerifierReference(configuration.Runtime.TokenVerifier)
+	if err != nil {
+		return configuration, nil, errors.New("provider attestation token verifier reference is invalid")
+	}
+	switch verifier.Kind {
+	case "provider":
+		if !validRealCloudProviderIdentifier(configuration.Cloudflare.TokenVerifierService, 128) ||
+			!validRealCloudProviderOptionalIdentifier(configuration.Cloudflare.TokenVerifierEnvironment, 128) ||
+			configuration.Cloudflare.TokenVerifierService != verifier.Name ||
+			configuration.Cloudflare.TokenVerifierService == configuration.Cloudflare.WorkerScript ||
+			configuration.Cloudflare.TokenVerifierService == configuration.Cloudflare.OriginWorkerScript ||
+			!validRealCloudLowerSHA256(configuration.Cloudflare.TokenVerifierContentSHA256) ||
+			!validRealCloudLowerSHA256(configuration.Cloudflare.TokenVerifierBindingsSHA256) {
+			return configuration, nil, errors.New("provider token verifier deployment identity is invalid")
+		}
+	case "env":
+		if !validRealCloudProviderSecretName(verifier.Name) || configuration.Cloudflare.TokenVerifierService != "" ||
+			configuration.Cloudflare.TokenVerifierEnvironment != "" || configuration.Cloudflare.TokenVerifierContentSHA256 != "" ||
+			configuration.Cloudflare.TokenVerifierBindingsSHA256 != "" || configuration.Cloudflare.TokenVerifierRuntime.CompatibilityDate != "" ||
+			configuration.Cloudflare.TokenVerifierRuntime.CompatibilityFlags != nil {
+			return configuration, nil, errors.New("static token verifier deployment retains provider-only fields")
+		}
+	default:
+		return configuration, nil, errors.New("provider attestation token verifier kind is unsupported")
 	}
 	logIdentities := make(map[string]struct{}, 5)
 	for _, identity := range []string{
@@ -878,14 +1013,20 @@ func decodeRealCloudProviderAttestationConfig(raw string, environment realCloudE
 		}
 		logIdentities[identity] = struct{}{}
 	}
-	for _, worker := range []struct {
+	workersToValidate := []struct {
 		role     string
 		contract realCloudCloudflareWorkerRuntimeContract
 	}{
 		{"auth", configuration.Cloudflare.WorkerRuntime},
 		{"origin", configuration.Cloudflare.OriginWorkerRuntime},
-		{"token-verifier", configuration.Cloudflare.TokenVerifierRuntime},
-	} {
+	}
+	if verifier.Kind == "provider" {
+		workersToValidate = append(workersToValidate, struct {
+			role     string
+			contract realCloudCloudflareWorkerRuntimeContract
+		}{"token-verifier", configuration.Cloudflare.TokenVerifierRuntime})
+	}
+	for _, worker := range workersToValidate {
 		if err := validateRealCloudCloudflareWorkerRuntimeContract(worker.contract); err != nil {
 			return configuration, nil, fmt.Errorf("provider attestation %s Worker runtime contract is invalid: %w", worker.role, err)
 		}
@@ -897,7 +1038,7 @@ func decodeRealCloudProviderAttestationConfig(raw string, environment realCloudE
 		!validRealCloudProviderRawPrefix(configuration.Cloudflare.RawRoot) || !validRealCloudProviderRawPrefix(configuration.EdgeOne.RawRoot) {
 		return configuration, nil, errors.New("provider raw exports must use distinct dedicated non-production log buckets and safe prefixes")
 	}
-	if err := validateRealCloudProviderRuntimeConfig(environment, configuration.Runtime, configuration.Cloudflare.TokenVerifierService); err != nil {
+	if err := validateRealCloudProviderRuntimeConfig(environment, configuration.Runtime, configuration.Cloudflare.TokenVerifierService, expectedProduct); err != nil {
 		return configuration, nil, err
 	}
 	runID = strings.TrimSpace(runID)
@@ -922,9 +1063,9 @@ func validateRealCloudCloudflareWorkerRuntimeContract(contract realCloudCloudfla
 	return nil
 }
 
-func realCloudProviderProductContracts(environment realCloudEnvironment) ([]byte, sowconfig.EdgeDeploymentContract, sowconfig.EdgeDeploymentContract, error) {
-	product := realCloudConfigForEnvironment(environment)
-	body, err := realCloudConfigBodyForEnvironment(environment)
+func realCloudProviderProductContracts(environment realCloudEnvironment, tokenVerifier string) ([]byte, sowconfig.EdgeDeploymentContract, sowconfig.EdgeDeploymentContract, error) {
+	product := realCloudConfigForEnvironmentAndVerifier(environment, tokenVerifier)
+	body, err := yaml.Marshal(product)
 	if err != nil {
 		return nil, sowconfig.EdgeDeploymentContract{}, sowconfig.EdgeDeploymentContract{}, errors.New("encode deterministic SOW product config")
 	}
@@ -939,19 +1080,22 @@ func realCloudProviderProductContracts(environment realCloudEnvironment) ([]byte
 	return body, cloudflare, edgeOne, nil
 }
 
-func validateRealCloudProviderRuntimeConfig(environment realCloudEnvironment, runtime realCloudEdgeRuntimeAttestationConfig, tokenVerifierService string) error {
-	_, cloudflare, edgeOne, err := realCloudProviderProductContracts(environment)
+func validateRealCloudProviderRuntimeConfig(environment realCloudEnvironment, runtime realCloudEdgeRuntimeAttestationConfig, tokenVerifierService string, expectedProduct *sowconfig.Config) error {
+	if expectedProduct == nil {
+		return errors.New("externally expected product config is absent")
+	}
+	cloudflare, err := expectedProduct.EdgeDeployment("cf")
 	if err != nil {
-		return err
+		return fmt.Errorf("derive externally expected Cloudflare product edge contract: %w", err)
+	}
+	edgeOne, err := expectedProduct.EdgeDeployment("cos")
+	if err != nil {
+		return fmt.Errorf("derive externally expected EdgeOne product edge contract: %w", err)
 	}
 	verifier, err := sowconfig.ParseTokenVerifierReference(runtime.TokenVerifier)
-	if err != nil || verifier.Kind != "provider" || verifier.Name != tokenVerifierService ||
-		cloudflare.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] != runtime.TokenVerifier ||
+	if err != nil || cloudflare.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] != runtime.TokenVerifier ||
 		edgeOne.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] != runtime.TokenVerifier {
-		return errors.New("runtime token verifier reference does not bind the exact Cloudflare service")
-	}
-	if !validRealCloudProviderHTTPSURL(runtime.EdgeOneTokenVerifierURL, true) || !validRealCloudLowerSHA256(runtime.EdgeOneTokenVerifierDeploymentSHA256) {
-		return errors.New("EdgeOne runtime token verifier URL is not one canonical HTTPS endpoint")
+		return errors.New("runtime token verifier reference differs from the deterministic product contract")
 	}
 	if !validRealCloudProviderRouteList(runtime.PublicPrefixes) || !validRealCloudProviderRouteList(runtime.PublicKeys) {
 		return errors.New("runtime public prefix or key allowlist is non-canonical")
@@ -964,9 +1108,23 @@ func validateRealCloudProviderRuntimeConfig(environment realCloudEnvironment, ru
 		edgeOne.Variables[sowconfig.EdgeRuntimePublicKeysVariable] != string(keys) {
 		return errors.New("runtime public route allowlists differ from the deterministic SOW product config")
 	}
-	if !validRealCloudProviderSecretNameList(runtime.CloudflareSecretNames, []string{"SOW_ORIGIN_BEARER"}) ||
-		!validRealCloudProviderSecretNameList(runtime.EdgeOneSecretNames, []string{"SOW_ORIGIN_BEARER", "SOW_TOKEN_VERIFIER_BEARER"}) {
-		return errors.New("runtime secret-name inventory is non-canonical or incomplete")
+	switch verifier.Kind {
+	case "provider":
+		if verifier.Name != tokenVerifierService || !validRealCloudProviderHTTPSURL(runtime.EdgeOneTokenVerifierURL, true) ||
+			!validRealCloudLowerSHA256(runtime.EdgeOneTokenVerifierDeploymentSHA256) ||
+			!validRealCloudProviderSecretNameList(runtime.CloudflareSecretNames, []string{"SOW_ORIGIN_BEARER"}) ||
+			!validRealCloudProviderSecretNameList(runtime.EdgeOneSecretNames, []string{"SOW_ORIGIN_BEARER", "SOW_TOKEN_VERIFIER_BEARER"}) {
+			return errors.New("provider token verifier runtime closure is non-canonical or incomplete")
+		}
+	case "env":
+		secretNames := sortedRealCloudProviderStrings([]string{"SOW_ORIGIN_BEARER", verifier.Name})
+		if tokenVerifierService != "" || runtime.EdgeOneTokenVerifierURL != "" || runtime.EdgeOneTokenVerifierDeploymentSHA256 != "" ||
+			!validRealCloudProviderSecretNameList(runtime.CloudflareSecretNames, secretNames) ||
+			!validRealCloudProviderSecretNameList(runtime.EdgeOneSecretNames, secretNames) {
+			return errors.New("static token verifier runtime closure is non-canonical or retains provider-only fields")
+		}
+	default:
+		return errors.New("runtime token verifier kind is unsupported")
 	}
 	return nil
 }
@@ -976,7 +1134,7 @@ func realCloudProviderExpectedRuntimeVariables(
 	runtime realCloudEdgeRuntimeAttestationConfig,
 	vendor string,
 ) (map[string]string, error) {
-	_, cloudflare, edgeOne, err := realCloudProviderProductContracts(environment)
+	_, cloudflare, edgeOne, err := realCloudProviderProductContracts(environment, runtime.TokenVerifier)
 	if err != nil {
 		return nil, err
 	}
@@ -1012,7 +1170,13 @@ func realCloudProviderExpectedRuntimeVariables(
 	delete(variables, "SOW_COS_REGION")
 	delete(variables, "SOW_COS_BUCKET")
 	if vendor == "edgeone" {
-		variables["SOW_TOKEN_VERIFIER_URL"] = runtime.EdgeOneTokenVerifierURL
+		verifier, parseErr := sowconfig.ParseTokenVerifierReference(runtime.TokenVerifier)
+		if parseErr != nil {
+			return nil, errors.New("runtime token verifier reference is invalid")
+		}
+		if verifier.Kind == "provider" {
+			variables["SOW_TOKEN_VERIFIER_URL"] = runtime.EdgeOneTokenVerifierURL
+		}
 	}
 	return variables, nil
 }
@@ -1189,7 +1353,7 @@ func newRealCloudProviderCollectorClients(
 	if transport == nil {
 		transport = http.DefaultTransport
 	}
-	result.edgeOne.WithHttpTransport(transport)
+	result.edgeOne.WithHttpTransport(&realCloudEdgeOneRuntimeWireGuard{next: transport})
 
 	cfObjects, err := publish.NewR2CloudflareHTTP(publish.R2CloudflareHTTPConfig{
 		Bucket: providerConfiguration.Cloudflare.RawBucket, ObjectBaseURL: endpoints.CFObjectBaseURL, CDNBaseURL: environment.CFCDNBase,
@@ -1268,6 +1432,24 @@ func newRealCloudProviderLogSinkLeaseStore(
 	return store, nil
 }
 
+func validateRealCloudProviderStageConfigClosure(stages []realEdgeMultiPoPStageEvidence, productConfigSHA256 string) error {
+	if !validRealCloudLowerSHA256(productConfigSHA256) {
+		return errors.New("attested SOW product config digest is invalid")
+	}
+	if len(stages) != 2 {
+		return errors.New("active edge evidence does not contain the exact two-stage provider closure")
+	}
+	for _, stage := range stages {
+		for _, vendor := range []string{"cloudflare", "edgeone"} {
+			vendorEvidence, exists := stage.Vendors[vendor]
+			if !exists || vendorEvidence.ConfigSHA256 != productConfigSHA256 {
+				return errors.New("active edge evidence was not produced from the attested SOW product config")
+			}
+		}
+	}
+	return nil
+}
+
 func collectRealCloudProviderRawAttestationAfterGate(
 	ctx context.Context,
 	environment realCloudEnvironment,
@@ -1285,16 +1467,12 @@ func collectRealCloudProviderRawAttestationAfterGate(
 	if err != nil {
 		return realCloudProviderRawAttestation{}, err
 	}
-	productBody, _, _, err := realCloudProviderProductContracts(environment)
+	productBody, _, _, err := realCloudProviderProductContracts(environment, configuration.Runtime.TokenVerifier)
 	if err != nil || realCloudLowerSHA256(productBody) != configuration.ProductConfigSHA256 {
 		return realCloudProviderRawAttestation{}, errors.New("provider collector product config binding is invalid")
 	}
-	for _, stage := range stages {
-		for _, vendor := range []string{"cloudflare", "edgeone"} {
-			if stage.Vendors[vendor].ConfigSHA256 != configuration.ProductConfigSHA256 {
-				return realCloudProviderRawAttestation{}, errors.New("active edge evidence was not produced from the attested SOW product config")
-			}
-		}
+	if err := validateRealCloudProviderStageConfigClosure(stages, configuration.ProductConfigSHA256); err != nil {
+		return realCloudProviderRawAttestation{}, err
 	}
 
 	cfControl, err := collectRealCloudCloudflareControl(ctx, environment, configuration, clients.cloudflare)
@@ -1354,12 +1532,18 @@ func collectRealCloudProviderRawAttestationAfterGate(
 	if err != nil {
 		return realCloudProviderRawAttestation{}, err
 	}
+	verifier, err := sowconfig.ParseTokenVerifierReference(configuration.Runtime.TokenVerifier)
+	if err != nil {
+		return realCloudProviderRawAttestation{}, errors.New("provider attestation token verifier reference is invalid after collection")
+	}
 	attestation := realCloudProviderRawAttestation{
 		Schema:                realCloudProviderCollectorSchema,
 		CollectorSourceSHA256: sourceSHA, CollectorBuildSHA256: buildSHA,
 		CollectorConfigSHA256: realCloudLowerSHA256(configurationBody), RawJoinedSHA256: joinedSHA,
 		ProductConfigSHA256:      configuration.ProductConfigSHA256,
 		ProviderDeploymentSHA256: providerDeploymentSHA,
+		TokenVerifierKind:        verifier.Kind,
+		TokenVerifierName:        verifier.Name,
 		RedactedClosureSHA256:    redactedSHA, RawRecords: len(reconstructed),
 		CFAccountID: configuration.Cloudflare.AccountID, CFZoneID: configuration.Cloudflare.ZoneID, CFZoneIdentitySHA256: cfControl.zoneSHA,
 		CFLogpushJobID: configuration.Cloudflare.LogpushJobID, CFLogpushJobSHA256: cfControl.jobSHA,
@@ -1478,14 +1662,20 @@ func collectRealCloudCloudflareControl(ctx context.Context, environment realClou
 	if err != nil {
 		return result, fmt.Errorf("Cloudflare origin Worker attestation: %w", err)
 	}
-	result.verifier, err = collectRealCloudCloudflareActiveWorker(ctx, client, configuration.AccountID, configuration.TokenVerifierService,
-		"", configuration.TokenVerifierContentSHA256, configuration.TokenVerifierRuntime, true)
+	verifier, err := sowconfig.ParseTokenVerifierReference(providerConfiguration.Runtime.TokenVerifier)
 	if err != nil {
-		return result, fmt.Errorf("Cloudflare token verifier Worker attestation: %w", err)
+		return result, errors.New("Cloudflare token verifier mode is invalid")
 	}
-	result.verifierBindingsSHA, err = validateRealCloudCloudflareVerifierBindings(result.verifier.bindings)
-	if err != nil || result.verifierBindingsSHA != configuration.TokenVerifierBindingsSHA256 {
-		return result, errors.New("Cloudflare token verifier binding inventory differs from the administrator-pinned digest")
+	if verifier.Kind == "provider" {
+		result.verifier, err = collectRealCloudCloudflareActiveWorker(ctx, client, configuration.AccountID, configuration.TokenVerifierService,
+			"", configuration.TokenVerifierContentSHA256, configuration.TokenVerifierRuntime, true)
+		if err != nil {
+			return result, fmt.Errorf("Cloudflare token verifier Worker attestation: %w", err)
+		}
+		result.verifierBindingsSHA, err = validateRealCloudCloudflareVerifierBindings(result.verifier.bindings)
+		if err != nil || result.verifierBindingsSHA != configuration.TokenVerifierBindingsSHA256 {
+			return result, errors.New("Cloudflare token verifier binding inventory differs from the administrator-pinned digest")
+		}
 	}
 	result.authBindingsSHA, result.authRuntimeSHA, err = validateRealCloudCloudflareAuthBindings(result.auth.bindings, environment, providerConfiguration)
 	if err != nil {
@@ -1558,7 +1748,8 @@ func collectRealCloudCloudflareActiveWorker(
 		return result, err
 	}
 	version, err := client.Workers.Scripts.Versions.Get(ctx, script, versionID, workers.ScriptVersionGetParams{AccountID: cloudflareapi.F(accountID)})
-	if err != nil || version == nil || version.ID != versionID || !validRealCloudProviderETag(version.Resources.Script.Etag) {
+	if err != nil || version == nil || version.ID != versionID || !validRealCloudProviderETag(version.Resources.Script.Etag) ||
+		!validRealCloudCloudflareBindingInventory(version.Resources) {
 		return result, errors.New("active version is absent or inconsistent")
 	}
 	if attestSecurity && (validateRealCloudCloudflareWorkerRuntimeContract(runtimeContract) != nil ||
@@ -1595,11 +1786,15 @@ func collectRealCloudCloudflareActiveWorker(
 	}
 	securitySHA := ""
 	if attestSecurity {
-		securitySHA, err = collectRealCloudCloudflareWorkerSecurityObservation(ctx, client, accountID, script, runtimeContract)
+		expectedBindingsSHA, bindingErr := realCloudCloudflareVersionBindingInventorySHA(version.Resources.Bindings)
+		if bindingErr != nil {
+			return result, errors.New("active version binding inventory cannot be compared with mutable settings")
+		}
+		securitySHA, err = collectRealCloudCloudflareWorkerSecurityObservation(ctx, client, accountID, script, runtimeContract, expectedBindingsSHA)
 		if err != nil {
 			return result, err
 		}
-		stableSecuritySHA, stableErr := collectRealCloudCloudflareWorkerSecurityObservation(ctx, client, accountID, script, runtimeContract)
+		stableSecuritySHA, stableErr := collectRealCloudCloudflareWorkerSecurityObservation(ctx, client, accountID, script, runtimeContract, expectedBindingsSHA)
 		if stableErr != nil || stableSecuritySHA != securitySHA {
 			return result, errors.New("active Worker runtime, trigger, telemetry, or public exposure changed while attested")
 		}
@@ -1621,11 +1816,314 @@ func collectRealCloudCloudflareActiveWorker(
 	return result, nil
 }
 
+func validRealCloudCloudflareBindingInventory(resources workers.ScriptVersionGetResponseResources) bool {
+	if resources.JSON.Bindings.IsMissing() || resources.JSON.Bindings.IsNull() || resources.JSON.Bindings.IsInvalid() ||
+		resources.JSON.Script.IsMissing() || resources.JSON.Script.IsNull() || resources.JSON.Script.IsInvalid() ||
+		resources.JSON.ScriptRuntime.IsMissing() || resources.JSON.ScriptRuntime.IsNull() || resources.JSON.ScriptRuntime.IsInvalid() ||
+		len(resources.JSON.ExtraFields) != 0 {
+		return false
+	}
+	raw := resources.JSON.RawJSON()
+	if raw == "" {
+		return false
+	}
+	return validRealCloudCloudflareExactJSONObject([]byte(raw), map[string]func(json.RawMessage) bool{
+		"bindings": func(value json.RawMessage) bool {
+			trimmed := bytes.TrimSpace(value)
+			if len(trimmed) == 0 || trimmed[0] != '[' {
+				return false
+			}
+			var bindings []json.RawMessage
+			return json.Unmarshal(trimmed, &bindings) == nil
+		},
+		"script": func(value json.RawMessage) bool {
+			return validRealCloudCloudflareExactJSONObject(value, map[string]func(json.RawMessage) bool{
+				"etag": validRealCloudCloudflareJSONString,
+			})
+		},
+		"script_runtime": func(value json.RawMessage) bool {
+			return validRealCloudCloudflareExactJSONObject(value, map[string]func(json.RawMessage) bool{
+				"compatibility_date": validRealCloudCloudflareJSONString,
+				"compatibility_flags": func(flags json.RawMessage) bool {
+					trimmed := bytes.TrimSpace(flags)
+					if len(trimmed) == 0 || trimmed[0] != '[' {
+						return false
+					}
+					var values []json.RawMessage
+					if json.Unmarshal(trimmed, &values) != nil {
+						return false
+					}
+					for _, flag := range values {
+						if !validRealCloudCloudflareJSONString(flag) {
+							return false
+						}
+					}
+					return true
+				},
+				"limits": func(limits json.RawMessage) bool {
+					return validRealCloudCloudflareExactJSONObject(limits, map[string]func(json.RawMessage) bool{
+						"cpu_ms": func(value json.RawMessage) bool { return string(bytes.TrimSpace(value)) == "0" },
+					})
+				},
+				"migration_tag": validRealCloudCloudflareJSONString,
+				"usage_model":   validRealCloudCloudflareJSONString,
+			})
+		},
+	})
+}
+
+func validRealCloudCloudflareJSONString(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) < 2 || trimmed[0] != '"' {
+		return false
+	}
+	var value string
+	return json.Unmarshal(trimmed, &value) == nil
+}
+
+func validRealCloudCloudflareExactJSONObject(raw json.RawMessage, fields map[string]func(json.RawMessage) bool) bool {
+	return validRealCloudCloudflareJSONObject(raw, fields, true)
+}
+
+func validRealCloudCloudflareJSONObject(raw json.RawMessage, fields map[string]func(json.RawMessage) bool, requireAll bool) bool {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return false
+	}
+	seen := make(map[string]struct{}, len(fields))
+	for decoder.More() {
+		token, err := decoder.Token()
+		name, ok := token.(string)
+		validate, allowed := fields[name]
+		if err != nil || !ok || !allowed {
+			return false
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return false
+		}
+		seen[name] = struct{}{}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil || !validate(value) {
+			return false
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return false
+	}
+	if requireAll {
+		for name := range fields {
+			if _, found := seen[name]; !found {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validRealCloudCloudflareJSONArray(raw json.RawMessage, validate func(json.RawMessage) bool) bool {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('[') {
+		return false
+	}
+	for decoder.More() {
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil || validate != nil && !validate(value) {
+			return false
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim(']') {
+		return false
+	}
+	var trailing any
+	return errors.Is(decoder.Decode(&trailing), io.EOF)
+}
+
+func validRealCloudCloudflareEmptyJSONArray(raw json.RawMessage) bool {
+	return validRealCloudCloudflareJSONArray(raw, func(json.RawMessage) bool { return false })
+}
+
+func validRealCloudCloudflareWorkerSettingsRaw(raw, expectedBindingsSHA string) bool {
+	jsonStringArray := func(value json.RawMessage) bool {
+		return validRealCloudCloudflareJSONArray(value, validRealCloudCloudflareJSONString)
+	}
+	jsonFalse := func(value json.RawMessage) bool { return string(bytes.TrimSpace(value)) == "false" }
+	jsonZero := func(value json.RawMessage) bool { return string(bytes.TrimSpace(value)) == "0" }
+	return validRealCloudCloudflareExactJSONObject([]byte(raw), map[string]func(json.RawMessage) bool{
+		"annotations": func(value json.RawMessage) bool {
+			return validRealCloudCloudflareJSONObject(value, map[string]func(json.RawMessage) bool{
+				"workers/message":      validRealCloudCloudflareJSONString,
+				"workers/tag":          validRealCloudCloudflareJSONString,
+				"workers/triggered_by": validRealCloudCloudflareJSONString,
+			}, false)
+		},
+		"bindings": func(value json.RawMessage) bool {
+			actual, err := realCloudCloudflareCanonicalFlatBindingInventorySHA(value)
+			return err == nil && validRealCloudLowerSHA256(expectedBindingsSHA) && actual == expectedBindingsSHA
+		},
+		"cache_options": func(value json.RawMessage) bool {
+			return validRealCloudCloudflareExactJSONObject(value, map[string]func(json.RawMessage) bool{
+				"enabled":             jsonFalse,
+				"cross_version_cache": jsonFalse,
+			})
+		},
+		"compatibility_date":  validRealCloudCloudflareJSONString,
+		"compatibility_flags": jsonStringArray,
+		"limits": func(value json.RawMessage) bool {
+			return validRealCloudCloudflareExactJSONObject(value, map[string]func(json.RawMessage) bool{
+				"cpu_ms":      jsonZero,
+				"subrequests": jsonZero,
+			})
+		},
+		"logpush": jsonFalse,
+		"observability": func(value json.RawMessage) bool {
+			return validRealCloudCloudflareExactJSONObject(value, map[string]func(json.RawMessage) bool{
+				"enabled":            jsonFalse,
+				"head_sampling_rate": jsonZero,
+				"logs": func(logs json.RawMessage) bool {
+					return validRealCloudCloudflareExactJSONObject(logs, map[string]func(json.RawMessage) bool{
+						"enabled":            jsonFalse,
+						"invocation_logs":    jsonFalse,
+						"destinations":       validRealCloudCloudflareEmptyJSONArray,
+						"head_sampling_rate": jsonZero,
+						"persist":            jsonFalse,
+					})
+				},
+				"traces": func(traces json.RawMessage) bool {
+					return validRealCloudCloudflareExactJSONObject(traces, map[string]func(json.RawMessage) bool{
+						"enabled":            jsonFalse,
+						"destinations":       validRealCloudCloudflareEmptyJSONArray,
+						"head_sampling_rate": jsonZero,
+						"persist":            jsonFalse,
+						"propagation_policy": validRealCloudCloudflareJSONString,
+					})
+				},
+			})
+		},
+		"placement": func(value json.RawMessage) bool {
+			return validRealCloudCloudflareJSONObject(value, map[string]func(json.RawMessage) bool{
+				"mode":     validRealCloudCloudflareJSONString,
+				"host":     validRealCloudCloudflareJSONString,
+				"hostname": validRealCloudCloudflareJSONString,
+				"region":   validRealCloudCloudflareJSONString,
+			}, false)
+		},
+		"tags":           func(value json.RawMessage) bool { return validRealCloudCloudflareEmptyJSONArray(value) },
+		"tail_consumers": func(value json.RawMessage) bool { return validRealCloudCloudflareEmptyJSONArray(value) },
+		"usage_model":    validRealCloudCloudflareJSONString,
+	})
+}
+
+func realCloudCloudflareCanonicalFlatBindingInventorySHA(raw json.RawMessage) (string, error) {
+	rows := make([]string, 0)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('[') {
+		return "", errors.New("Cloudflare binding inventory is not an array")
+	}
+	for decoder.More() {
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return "", errors.New("Cloudflare binding inventory contains invalid JSON")
+		}
+		row, err := realCloudCloudflareCanonicalFlatBinding(value)
+		if err != nil {
+			return "", err
+		}
+		rows = append(rows, row)
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim(']') {
+		return "", errors.New("Cloudflare binding inventory is unterminated")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return "", errors.New("Cloudflare binding inventory contains trailing data")
+	}
+	sort.Strings(rows)
+	body, _ := json.Marshal(rows)
+	return realCloudLowerSHA256(body), nil
+}
+
+func realCloudCloudflareCanonicalFlatBinding(raw json.RawMessage) (string, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return "", errors.New("Cloudflare binding is not an object")
+	}
+	fields := make(map[string]string)
+	for decoder.More() {
+		token, err := decoder.Token()
+		name, ok := token.(string)
+		if err != nil || !ok {
+			return "", errors.New("Cloudflare binding has an invalid field name")
+		}
+		if _, duplicate := fields[name]; duplicate {
+			return "", errors.New("Cloudflare binding repeats a field")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil || !validRealCloudCloudflareJSONString(value) {
+			return "", errors.New("Cloudflare binding value is not a JSON string")
+		}
+		var decoded string
+		if err := json.Unmarshal(value, &decoded); err != nil {
+			return "", errors.New("Cloudflare binding value is invalid")
+		}
+		fields[name] = decoded
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return "", errors.New("Cloudflare binding object is unterminated")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return "", errors.New("Cloudflare binding contains trailing data")
+	}
+	body, _ := json.Marshal(fields)
+	return string(body), nil
+}
+
+func realCloudCloudflareVersionBindingInventorySHA(bindings []workers.ScriptVersionGetResponseResourcesBinding) (string, error) {
+	rows := make([]string, 0, len(bindings))
+	for _, binding := range bindings {
+		row, err := realCloudCloudflareCanonicalFlatBinding([]byte(binding.JSON.RawJSON()))
+		if err != nil {
+			return "", err
+		}
+		rows = append(rows, row)
+	}
+	sort.Strings(rows)
+	body, _ := json.Marshal(rows)
+	return realCloudLowerSHA256(body), nil
+}
+
+func validRealCloudCloudflareEmptyScheduleInventoryRaw(raw string) bool {
+	return validRealCloudCloudflareExactJSONObject([]byte(raw), map[string]func(json.RawMessage) bool{
+		"schedules": validRealCloudCloudflareEmptyJSONArray,
+	})
+}
+
+func validRealCloudCloudflareClosedSubdomainRaw(raw string) bool {
+	jsonFalse := func(value json.RawMessage) bool { return string(bytes.TrimSpace(value)) == "false" }
+	return validRealCloudCloudflareExactJSONObject([]byte(raw), map[string]func(json.RawMessage) bool{
+		"enabled":          jsonFalse,
+		"previews_enabled": jsonFalse,
+	})
+}
+
 func collectRealCloudCloudflareWorkerSecurityObservation(
 	ctx context.Context,
 	client *cloudflareapi.Client,
 	accountID, script string,
 	runtimeContract realCloudCloudflareWorkerRuntimeContract,
+	expectedBindingsSHA string,
 ) (string, error) {
 	settings, err := client.Workers.Scripts.ScriptAndVersionSettings.Get(ctx, script, workers.ScriptScriptAndVersionSettingGetParams{
 		AccountID: cloudflareapi.F(accountID),
@@ -1633,7 +2131,8 @@ func collectRealCloudCloudflareWorkerSecurityObservation(
 	if err != nil || settings == nil {
 		return "", errors.New("Cloudflare Worker settings query failed")
 	}
-	if settings.JSON.CompatibilityDate.IsMissing() || settings.JSON.CompatibilityFlags.IsMissing() || settings.JSON.CacheOptions.IsMissing() ||
+	if !validRealCloudCloudflareWorkerSettingsRaw(settings.JSON.RawJSON(), expectedBindingsSHA) ||
+		settings.JSON.CompatibilityDate.IsMissing() || settings.JSON.CompatibilityFlags.IsMissing() || settings.JSON.CacheOptions.IsMissing() ||
 		settings.JSON.Limits.IsMissing() || settings.JSON.Logpush.IsMissing() || settings.JSON.Observability.IsMissing() ||
 		settings.JSON.Placement.IsMissing() || settings.JSON.Tags.IsMissing() || settings.JSON.TailConsumers.IsMissing() || settings.JSON.UsageModel.IsMissing() ||
 		len(settings.JSON.ExtraFields) != 0 || len(settings.CacheOptions.JSON.ExtraFields) != 0 || len(settings.Limits.JSON.ExtraFields) != 0 ||
@@ -1655,11 +2154,13 @@ func collectRealCloudCloudflareWorkerSecurityObservation(
 		return "", errors.New("Cloudflare Worker settings differ from the closed runtime and telemetry policy")
 	}
 	schedules, err := client.Workers.Scripts.Schedules.Get(ctx, script, workers.ScriptScheduleGetParams{AccountID: cloudflareapi.F(accountID)})
-	if err != nil || schedules == nil || schedules.JSON.Schedules.IsMissing() || len(schedules.JSON.ExtraFields) != 0 || len(schedules.Schedules) != 0 {
+	if err != nil || schedules == nil || !validRealCloudCloudflareEmptyScheduleInventoryRaw(schedules.JSON.RawJSON()) ||
+		schedules.JSON.Schedules.IsMissing() || len(schedules.JSON.ExtraFields) != 0 || len(schedules.Schedules) != 0 {
 		return "", errors.New("Cloudflare Worker has an incomplete or non-empty schedule inventory")
 	}
 	exposure, err := client.Workers.Scripts.Subdomain.Get(ctx, script, workers.ScriptSubdomainGetParams{AccountID: cloudflareapi.F(accountID)})
-	if err != nil || exposure == nil || exposure.JSON.Enabled.IsMissing() || exposure.JSON.PreviewsEnabled.IsMissing() ||
+	if err != nil || exposure == nil || !validRealCloudCloudflareClosedSubdomainRaw(exposure.JSON.RawJSON()) ||
+		exposure.JSON.Enabled.IsMissing() || exposure.JSON.PreviewsEnabled.IsMissing() ||
 		len(exposure.JSON.ExtraFields) != 0 || exposure.Enabled || exposure.PreviewsEnabled {
 		return "", errors.New("Cloudflare Worker workers.dev or preview URL exposure is not closed")
 	}
@@ -1682,8 +2183,16 @@ func validateRealCloudCloudflareAuthBindings(
 	wantedServices := map[string]struct {
 		service, environment string
 	}{
-		"ORIGIN":         {configuration.OriginWorkerScript, configuration.OriginWorkerEnvironment},
-		"TOKEN_VERIFIER": {configuration.TokenVerifierService, configuration.TokenVerifierEnvironment},
+		"ORIGIN": {configuration.OriginWorkerScript, configuration.OriginWorkerEnvironment},
+	}
+	verifier, err := sowconfig.ParseTokenVerifierReference(providerConfiguration.Runtime.TokenVerifier)
+	if err != nil {
+		return "", "", errors.New("Cloudflare auth Worker token verifier mode is invalid")
+	}
+	if verifier.Kind == "provider" {
+		wantedServices["TOKEN_VERIFIER"] = struct {
+			service, environment string
+		}{configuration.TokenVerifierService, configuration.TokenVerifierEnvironment}
 	}
 	wantedVariables, err := realCloudProviderExpectedRuntimeVariables(environment, providerConfiguration.Runtime, "cloudflare")
 	if err != nil {
@@ -1704,20 +2213,23 @@ func validateRealCloudCloudflareAuthBindings(
 		switch binding.Type {
 		case workers.ScriptVersionGetResponseResourcesBindingsTypeService:
 			expected, found := wantedServices[binding.Name]
-			if !found || binding.Service != expected.service || binding.Environment != expected.environment || binding.Entrypoint != "" {
+			if !found || binding.Service != expected.service || binding.Environment != expected.environment || binding.Entrypoint != "" ||
+				!validRealCloudCloudflareBindingShape(binding, []string{"Service", "Environment"}, []string{"name", "type", "service"}, []string{"environment"}) {
 				return "", "", errors.New("Cloudflare auth Worker service binding differs from the exact origin or token verifier service")
 			}
 			delete(wantedServices, binding.Name)
 			serviceRows = append(serviceRows, strings.Join([]string{binding.Name, string(binding.Type), binding.Service, binding.Environment}, "\x00"))
 		case workers.ScriptVersionGetResponseResourcesBindingsTypePlainText:
 			expected, found := wantedVariables[binding.Name]
-			if !found || binding.Text != expected {
+			if !found || binding.Text != expected ||
+				!validRealCloudCloudflareBindingShape(binding, []string{"Text"}, []string{"name", "type", "text"}, nil) {
 				return "", "", errors.New("Cloudflare auth Worker runtime variable differs from the exact clean-URL deployment contract")
 			}
 			delete(wantedVariables, binding.Name)
 			runtimeRows = append(runtimeRows, strings.Join([]string{binding.Name, string(binding.Type), binding.Text}, "\x00"))
 		case workers.ScriptVersionGetResponseResourcesBindingsTypeSecretText:
-			if _, found := wantedSecrets[binding.Name]; !found {
+			if _, found := wantedSecrets[binding.Name]; !found ||
+				!validRealCloudCloudflareBindingShape(binding, nil, []string{"name", "type"}, nil) {
 				return "", "", errors.New("Cloudflare auth Worker has an unexpected or mode-inapplicable secret")
 			}
 			delete(wantedSecrets, binding.Name)
@@ -1736,6 +2248,83 @@ func validateRealCloudCloudflareAuthBindings(
 	return realCloudLowerSHA256(serviceBody), realCloudLowerSHA256(runtimeBody), nil
 }
 
+func validRealCloudCloudflareBindingShape(
+	binding workers.ScriptVersionGetResponseResourcesBinding,
+	allowedStructFields, requiredJSONFields, optionalJSONFields []string,
+) bool {
+	if len(binding.JSON.ExtraFields) != 0 {
+		return false
+	}
+	allowedStruct := make(map[string]struct{}, len(allowedStructFields))
+	for _, name := range allowedStructFields {
+		allowedStruct[name] = struct{}{}
+	}
+	value := reflect.ValueOf(binding)
+	type_ := value.Type()
+	for index := 0; index < value.NumField(); index++ {
+		name := type_.Field(index).Name
+		if name == "Name" || name == "Type" || name == "JSON" || name == "union" {
+			continue
+		}
+		if _, allowed := allowedStruct[name]; !allowed && !value.Field(index).IsZero() {
+			return false
+		}
+	}
+	raw := binding.JSON.RawJSON()
+	if raw == "" {
+		return false
+	}
+	allowedJSON := make(map[string]struct{}, len(requiredJSONFields)+len(optionalJSONFields))
+	for _, name := range requiredJSONFields {
+		allowedJSON[name] = struct{}{}
+	}
+	for _, name := range optionalJSONFields {
+		allowedJSON[name] = struct{}{}
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return false
+	}
+	seen := make(map[string]struct{}, len(allowedJSON))
+	for decoder.More() {
+		token, err := decoder.Token()
+		name, ok := token.(string)
+		if err != nil || !ok {
+			return false
+		}
+		_, allowed := allowedJSON[name]
+		if !allowed {
+			return false
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return false
+		}
+		seen[name] = struct{}{}
+		var field any
+		if err := decoder.Decode(&field); err != nil {
+			return false
+		}
+		if _, stringValue := field.(string); !stringValue {
+			return false
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return false
+	}
+	for _, name := range requiredJSONFields {
+		if _, found := seen[name]; !found {
+			return false
+		}
+	}
+	return true
+}
+
 func validateRealCloudCloudflareVerifierBindings(bindings []workers.ScriptVersionGetResponseResourcesBinding) (string, error) {
 	seen := make(map[string]struct{}, len(bindings))
 	rows := make([]string, 0, len(bindings))
@@ -1747,21 +2336,30 @@ func validateRealCloudCloudflareVerifierBindings(bindings []workers.ScriptVersio
 		var target string
 		switch binding.Type {
 		case workers.ScriptVersionGetResponseResourcesBindingsTypeSecretText:
+			if !validRealCloudCloudflareBindingShape(binding, nil, []string{"name", "type"}, nil) {
+				return "", errors.New("Cloudflare token verifier secret binding contains another capability")
+			}
 			target = "secret-present"
 		case workers.ScriptVersionGetResponseResourcesBindingsTypePlainText:
+			if !validRealCloudCloudflareBindingShape(binding, []string{"Text"}, []string{"name", "type", "text"}, nil) {
+				return "", errors.New("Cloudflare token verifier plaintext binding contains another capability")
+			}
 			target = "text-sha256:" + realCloudLowerSHA256([]byte(binding.Text))
 		case workers.ScriptVersionGetResponseResourcesBindingsTypeService:
-			if !validRealCloudProviderIdentifier(binding.Service, 128) || !validRealCloudProviderOptionalIdentifier(binding.Environment, 128) || binding.Entrypoint != "" {
+			if !validRealCloudProviderIdentifier(binding.Service, 128) || !validRealCloudProviderOptionalIdentifier(binding.Environment, 128) || binding.Entrypoint != "" ||
+				!validRealCloudCloudflareBindingShape(binding, []string{"Service", "Environment"}, []string{"name", "type", "service"}, []string{"environment"}) {
 				return "", errors.New("Cloudflare token verifier service target is invalid")
 			}
 			target = strings.Join([]string{binding.Service, binding.Environment}, "\x00")
 		case workers.ScriptVersionGetResponseResourcesBindingsTypeKVNamespace:
-			if !validRealCloudProviderIdentifier(binding.NamespaceID, 256) {
+			if !validRealCloudProviderIdentifier(binding.NamespaceID, 256) ||
+				!validRealCloudCloudflareBindingShape(binding, []string{"NamespaceID"}, []string{"name", "type", "namespace_id"}, nil) {
 				return "", errors.New("Cloudflare token verifier KV target is invalid")
 			}
 			target = binding.NamespaceID
 		case workers.ScriptVersionGetResponseResourcesBindingsTypeD1:
-			if !validRealCloudProviderIdentifier(binding.DatabaseID, 256) {
+			if !validRealCloudProviderIdentifier(binding.DatabaseID, 256) ||
+				!validRealCloudCloudflareBindingShape(binding, []string{"DatabaseID"}, []string{"name", "type", "database_id"}, nil) {
 				return "", errors.New("Cloudflare token verifier D1 target is invalid")
 			}
 			target = binding.DatabaseID
@@ -1776,7 +2374,8 @@ func validateRealCloudCloudflareVerifierBindings(bindings []workers.ScriptVersio
 }
 
 func validateRealCloudCloudflareOriginBindings(bindings []workers.ScriptVersionGetResponseResourcesBinding, bucket string) (string, error) {
-	if len(bindings) != 1 || bindings[0].Name != "REPOSITORY" || bindings[0].Type != workers.ScriptVersionGetResponseResourcesBindingsTypeR2Bucket || bindings[0].BucketName != bucket {
+	if len(bindings) != 1 || bindings[0].Name != "REPOSITORY" || bindings[0].Type != workers.ScriptVersionGetResponseResourcesBindingsTypeR2Bucket || bindings[0].BucketName != bucket ||
+		!validRealCloudCloudflareBindingShape(bindings[0], []string{"BucketName"}, []string{"name", "type", "bucket_name"}, nil) {
 		return "", errors.New("Cloudflare origin Worker is not capability-limited to the exact REPOSITORY R2 binding")
 	}
 	body, _ := json.Marshal([]string{bindings[0].Name, string(bindings[0].Type), bindings[0].BucketName})
@@ -1790,7 +2389,14 @@ func collectRealCloudCloudflareRoutingClosure(ctx context.Context, client *cloud
 		mainHost + "/*": false,
 		betaHost + "/*": false,
 	}
-	wantedScripts := map[string]bool{configuration.WorkerScript: false, configuration.OriginWorkerScript: false, configuration.TokenVerifierService: false}
+	attestedScripts := []string{configuration.WorkerScript, configuration.OriginWorkerScript}
+	if configuration.TokenVerifierService != "" {
+		attestedScripts = append(attestedScripts, configuration.TokenVerifierService)
+	}
+	wantedScripts := make(map[string]bool, len(attestedScripts))
+	for _, script := range attestedScripts {
+		wantedScripts[script] = false
+	}
 	accountRoutes := make([]string, 0, 2)
 	inventoryRows := make([]string, 0, 32)
 	scriptIDs := make(map[string]struct{})
@@ -1939,9 +2545,10 @@ func collectRealCloudCloudflareRoutingClosure(ctx context.Context, client *cloud
 		return "", "", errors.New("Cloudflare Worker custom-domain query failed")
 	}
 	exposure := make([]string, 0, 3)
-	for _, script := range []string{configuration.WorkerScript, configuration.OriginWorkerScript, configuration.TokenVerifierService} {
+	for _, script := range attestedScripts {
 		subdomain, subdomainErr := client.Workers.Scripts.Subdomain.Get(ctx, script, workers.ScriptSubdomainGetParams{AccountID: cloudflareapi.F(configuration.AccountID)})
-		if subdomainErr != nil || subdomain == nil || subdomain.Enabled || subdomain.PreviewsEnabled {
+		if subdomainErr != nil || subdomain == nil || !validRealCloudCloudflareClosedSubdomainRaw(subdomain.JSON.RawJSON()) ||
+			subdomain.Enabled || subdomain.PreviewsEnabled {
 			return "", "", errors.New("Cloudflare Worker workers.dev or preview URL exposure is not disabled")
 		}
 		exposure = append(exposure, script+"\x00disabled")
@@ -2695,9 +3302,8 @@ func validateRealCloudEdgeOneRuntimeEnvironment(
 	seen := make(map[string]struct{}, len(variables))
 	redactedRows := make([]string, 0, len(variables))
 	for _, variable := range variables {
-		if variable == nil || variable.Key == nil || variable.Value == nil || variable.Type == nil || stringValue(variable.Type) != "string" ||
-			!validRealCloudProviderSecretName(stringValue(variable.Key)) {
-			return "", errors.New("EdgeOne function runtime variable is incomplete or has the wrong type")
+		if variable == nil || variable.Key == nil || variable.Type == nil || !validRealCloudProviderSecretName(stringValue(variable.Key)) {
+			return "", errors.New("EdgeOne function runtime variable is incomplete")
 		}
 		name := stringValue(variable.Key)
 		if _, duplicate := seen[name]; duplicate {
@@ -2705,18 +3311,21 @@ func validateRealCloudEdgeOneRuntimeEnvironment(
 		}
 		seen[name] = struct{}{}
 		if expected, found := wantedVariables[name]; found {
-			if stringValue(variable.Value) != expected {
+			if stringValue(variable.Type) != "string" || variable.Value == nil || stringValue(variable.Value) != expected {
 				return "", errors.New("EdgeOne function runtime variable differs from the exact clean-URL deployment contract")
 			}
 			delete(wantedVariables, name)
 			redactedRows = append(redactedRows, strings.Join([]string{name, "string", expected}, "\x00"))
 			continue
 		}
-		if _, found := wantedSecrets[name]; !found || stringValue(variable.Value) == "" {
+		if _, found := wantedSecrets[name]; !found {
 			return "", errors.New("EdgeOne function has an unexpected, missing, or mode-inapplicable secret")
 		}
+		if stringValue(variable.Type) != "secret" || variable.Value != nil && stringValue(variable.Value) != "" {
+			return "", errors.New("EdgeOne secret inventory is plaintext, non-redacted, or not typed as secret")
+		}
 		delete(wantedSecrets, name)
-		redactedRows = append(redactedRows, strings.Join([]string{name, "string", "secret-present"}, "\x00"))
+		redactedRows = append(redactedRows, strings.Join([]string{name, "secret", "redacted-present"}, "\x00"))
 	}
 	if len(wantedVariables) != 0 || len(wantedSecrets) != 0 {
 		return "", errors.New("EdgeOne function lacks an exact runtime variable or secret")
@@ -3217,7 +3826,8 @@ func realCloudProviderRawAttestationForTest(records int) realCloudProviderRawAtt
 	sha := func(value byte) string { return strings.Repeat(string(value), 64) }
 	return realCloudProviderRawAttestation{
 		Schema: realCloudProviderCollectorSchema, CollectorSourceSHA256: sha('a'), CollectorBuildSHA256: sha('b'),
-		CollectorConfigSHA256: sha('c'), ProductConfigSHA256: sha('f'), ProviderDeploymentSHA256: sha('0'), RawJoinedSHA256: sha('d'), RedactedClosureSHA256: sha('e'), RawRecords: records,
+		CollectorConfigSHA256: sha('c'), ProductConfigSHA256: sha('f'), ProviderDeploymentSHA256: sha('0'),
+		TokenVerifierKind: "provider", TokenVerifierName: "cf-verifier", RawJoinedSHA256: sha('d'), RedactedClosureSHA256: sha('e'), RawRecords: records,
 		CFAccountID: "cf-account", CFZoneID: "cf-zone", CFZoneIdentitySHA256: sha('e'), CFLogpushJobID: 1, CFLogpushJobSHA256: sha('f'),
 		CFLogReaderIdentitySHA256: sha('f'), CFLogWriterIdentitySHA256: sha('d'), CFLogControlIdentitySHA256: sha('e'),
 		CFRawObjectIdentitySHA256: sha('1'), CFRawObjectETag: "cf-raw-etag", CFRawObjectSHA256: sha('2'),
@@ -3234,6 +3844,20 @@ func realCloudProviderRawAttestationForTest(records int) realCloudProviderRawAtt
 		EdgeOneFunctionContentSHA256: sha('d'), EdgeOneFunctionComponentsSHA256: sha('e'), EdgeOneFunctionReplicasSHA256: sha('f'),
 		EdgeOneFunctionRuntimeSHA256: sha('c'), EdgeOneFunctionRulesSHA256: sha('e'), EdgeOneTokenVerifierDeploymentSHA256: sha('d'), CFRawObjects: 1, EdgeOneRawObjects: 1,
 	}
+}
+
+func realCloudStaticProviderRawAttestationForTest(records int) realCloudProviderRawAttestation {
+	attestation := realCloudProviderRawAttestationForTest(records)
+	attestation.TokenVerifierKind = "env"
+	attestation.TokenVerifierName = realCloudEdgeEntitlementsEnv
+	attestation.CFTokenVerifierService = ""
+	attestation.CFTokenVerifierVersionID = ""
+	attestation.CFTokenVerifierVersionETag = ""
+	attestation.CFTokenVerifierContentSHA256 = ""
+	attestation.CFTokenVerifierBindingsSHA256 = ""
+	attestation.CFTokenVerifierSecuritySHA256 = ""
+	attestation.EdgeOneTokenVerifierDeploymentSHA256 = ""
+	return attestation
 }
 
 func sortRealCloudProviderLogs(logs []realEdgeProviderLog) {
@@ -3433,7 +4057,7 @@ func validRealCloudProviderSecretNameList(actual, required []string) bool {
 		return false
 	}
 	for index, name := range actual {
-		if name != required[index] || !validRealCloudProviderSecretName(name) {
+		if name != required[index] || !validRealCloudProviderSecretName(name) || index > 0 && name <= actual[index-1] {
 			return false
 		}
 	}
@@ -3441,7 +4065,7 @@ func validRealCloudProviderSecretNameList(actual, required []string) bool {
 }
 
 func validRealCloudProviderSecretName(value string) bool {
-	if value == "" || value[0] < 'A' || value[0] > 'Z' {
+	if value == "" || value[0] != '_' && (value[0] < 'A' || value[0] > 'Z') {
 		return false
 	}
 	for _, character := range value[1:] {
@@ -3663,22 +4287,78 @@ func TestRealCloudProviderRepositoryIdentityRejectsSymlinkAndInodeSwap(t *testin
 func TestRealCloudProviderCollectorStopsAtPinnedResourceGateBeforeCredentials(t *testing.T) {
 	environment := realCloudSafetyFixtureEnvironment()
 	values := realCloudSafetyEnvironmentMap(environment)
-	for name, value := range values {
-		t.Setenv(name, value)
-	}
 	// These are deliberately malformed. The compiled empty non-production
 	// registry must reject the exact resources before config/credential decode,
 	// SDK construction, transport construction, or any provider request.
-	t.Setenv(realCloudProviderAttestationEnv, "not-json")
-	t.Setenv(realCloudStorageCredentialCF, "not-json")
-	t.Setenv(realCloudProviderLogStorageCredentialCF, "not-json")
-	t.Setenv(realCloudCDNCredentialCF, "not-json")
-	t.Setenv(realCloudStorageCredentialCOS, "not-json")
-	t.Setenv(realCloudProviderLogStorageCredentialCOS, "not-json")
-	t.Setenv(realCloudCDNCredentialCOS, "not-json")
-	_, err := validateRealCloudProviderAPIAttestedRawClosure(t.Context(), nil, nil, nil)
+	for _, name := range []string{
+		realCloudProviderAttestationEnv,
+		realCloudStorageCredentialCF, realCloudProviderLogStorageCredentialCF, realCloudCDNCredentialCF,
+		realCloudStorageCredentialCOS, realCloudProviderLogStorageCredentialCOS, realCloudCDNCredentialCOS,
+		realCloudEdgeProTokenAEnv, realCloudEdgeProTokenBEnv,
+	} {
+		values[name] = "not-json"
+	}
+	credentialNames := map[string]struct{}{
+		realCloudStorageCredentialCF: {}, realCloudProviderLogStorageCredentialCF: {}, realCloudCDNCredentialCF: {},
+		realCloudStorageCredentialCOS: {}, realCloudProviderLogStorageCredentialCOS: {}, realCloudCDNCredentialCOS: {},
+		realCloudEdgeProTokenAEnv: {}, realCloudEdgeProTokenBEnv: {},
+	}
+	reads := make(map[string]int)
+	getenv := func(name string) string {
+		if _, credential := credentialNames[name]; credential {
+			reads[name]++
+		}
+		return values[name]
+	}
+	_, err := validateRealCloudProviderAPIAttestedRawClosureFromLookup(t.Context(), nil, nil, nil, getenv)
 	if !errors.Is(err, errRealCloudProviderAPIAttestationRequired) || !strings.Contains(err.Error(), "pinned non-production registry gate") {
 		t.Fatalf("provider collector did not stop at the pre-credential resource gate: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("provider resource gate read a provider or entitlement credential: %v", reads)
+	}
+}
+
+func TestRealCloudProviderCollectorRejectsStageConfigBeforeCredentials(t *testing.T) {
+	environment, stages, _, _, _ := realCloudProviderRawParserFixture(t)
+	configuration := realCloudStaticProviderConfigurationFixture(environment)
+	configurationBody, err := json.Marshal(configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage := stages[0].Vendors["cloudflare"]
+	stage.ConfigSHA256 = strings.Repeat("f", 64)
+	stages[0].Vendors["cloudflare"] = stage
+	credentialNames := map[string]struct{}{
+		realCloudProviderLogStorageCredentialCF: {}, realCloudCDNCredentialCF: {},
+		realCloudProviderLogStorageCredentialCOS: {}, realCloudCDNCredentialCOS: {},
+		realCloudStorageCredentialCF: {}, realCloudStorageCredentialCOS: {},
+		realCloudEdgeProTokenAEnv: {}, realCloudEdgeProTokenBEnv: {},
+	}
+	reads := make(map[string]int)
+	getenv := func(name string) string {
+		if _, credential := credentialNames[name]; credential {
+			reads[name]++
+		}
+		return "not-json"
+	}
+	_, err = validateRealCloudProviderAPIAttestedRawClosureAfterDeploymentGate(
+		t.Context(), environment, configuration, configurationBody, stages, nil, nil, getenv,
+	)
+	if !errors.Is(err, errRealCloudProviderAPIAttestationRequired) || !strings.Contains(err.Error(), "active edge evidence") {
+		t.Fatalf("stage/config mismatch did not fail at the pre-credential gate: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("stage/config mismatch read provider credentials: %v", reads)
+	}
+	_, err = validateRealCloudProviderAPIAttestedRawClosureAfterDeploymentGate(
+		t.Context(), environment, configuration, configurationBody, nil, nil, nil, getenv,
+	)
+	if !errors.Is(err, errRealCloudProviderAPIAttestationRequired) || !strings.Contains(err.Error(), "two-stage") {
+		t.Fatalf("missing stage closure did not fail at the pre-credential gate: %v", err)
+	}
+	if len(reads) != 0 {
+		t.Fatalf("missing stage closure read provider credentials: %v", reads)
 	}
 }
 
@@ -3758,6 +4438,10 @@ func TestRealCloudProviderDeploymentRegistryIsIndependentAndStable(t *testing.T)
 func TestRealCloudProviderAttestationConfigRequiresHTTPSBearerAndSeparateRawSinks(t *testing.T) {
 	environment := realCloudSafetyFixtureEnvironment()
 	configuration := realCloudProviderConfigurationFixture(environment, strings.Repeat("a", 64))
+	expectedProductBody, _, _, err := realCloudProviderProductContracts(environment, configuration.Runtime.TokenVerifier)
+	if err != nil {
+		t.Fatal(err)
+	}
 	encode := func(value realCloudProviderAttestationConfig) string {
 		body, err := json.Marshal(value)
 		if err != nil {
@@ -3765,8 +4449,15 @@ func TestRealCloudProviderAttestationConfigRequiresHTTPSBearerAndSeparateRawSink
 		}
 		return string(body)
 	}
-	if _, _, err := decodeRealCloudProviderAttestationConfig(encode(configuration), environment, "real-edge-test-run-20260714"); err != nil {
+	if _, _, err := decodeRealCloudProviderAttestationConfig(encode(configuration), environment, "real-edge-test-run-20260714", expectedProductBody); err != nil {
 		t.Fatalf("exact https-bearer provider config rejected: %v", err)
+	}
+	actualDefaultBody, err := realCloudConfigBodyForEnvironment(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := decodeRealCloudProviderAttestationConfig(encode(configuration), environment, "real-edge-test-run-20260714", actualDefaultBody); err == nil || !strings.Contains(err.Error(), "externally expected") {
+		t.Fatalf("self-consistent provider attestation replaced the externally expected static product config: %v", err)
 	}
 	for _, test := range []struct {
 		name   string
@@ -3804,8 +4495,96 @@ func TestRealCloudProviderAttestationConfigRequiresHTTPSBearerAndSeparateRawSink
 		t.Run(test.name, func(t *testing.T) {
 			candidate := configuration
 			test.mutate(&candidate)
-			if _, _, err := decodeRealCloudProviderAttestationConfig(encode(candidate), environment, "real-edge-test-run-20260714"); err == nil {
+			if _, _, err := decodeRealCloudProviderAttestationConfig(encode(candidate), environment, "real-edge-test-run-20260714", expectedProductBody); err == nil {
 				t.Fatal("unsafe provider attestation config was accepted")
+			}
+		})
+	}
+}
+
+func TestRealCloudStaticProviderAttestationConfigIsClosed(t *testing.T) {
+	environment := realCloudSafetyFixtureEnvironment()
+	configuration := realCloudStaticProviderConfigurationFixture(environment)
+	expectedProductBody, _, _, err := realCloudProviderProductContracts(environment, configuration.Runtime.TokenVerifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encode := func(value realCloudProviderAttestationConfig) string {
+		body, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	if _, _, err := decodeRealCloudProviderAttestationConfig(encode(configuration), environment, "real-edge-test-run-20260720", expectedProductBody); err != nil {
+		t.Fatalf("exact static provider attestation config rejected: %v", err)
+	}
+	leadingUnderscore := configuration
+	leadingUnderscore.Runtime.TokenVerifier = "env://_SOW_EDGE_ENTITLEMENTS"
+	leadingSecrets := sortedRealCloudProviderStrings([]string{"SOW_ORIGIN_BEARER", "_SOW_EDGE_ENTITLEMENTS"})
+	leadingUnderscore.Runtime.CloudflareSecretNames = append([]string(nil), leadingSecrets...)
+	leadingUnderscore.Runtime.EdgeOneSecretNames = append([]string(nil), leadingSecrets...)
+	leadingProduct, _, _, err := realCloudProviderProductContracts(environment, leadingUnderscore.Runtime.TokenVerifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leadingUnderscore.ProductConfigSHA256 = realCloudLowerSHA256(leadingProduct)
+	if _, _, err := decodeRealCloudProviderAttestationConfig(encode(leadingUnderscore), environment, "real-edge-test-run-20260720", leadingProduct); err != nil {
+		t.Fatalf("product-valid leading-underscore static secret rejected: %v", err)
+	}
+	originBearerAlias := configuration
+	originBearerAlias.Runtime.TokenVerifier = "env://SOW_ORIGIN_BEARER"
+	originBearerAlias.Runtime.CloudflareSecretNames = []string{"SOW_ORIGIN_BEARER", "SOW_ORIGIN_BEARER"}
+	originBearerAlias.Runtime.EdgeOneSecretNames = []string{"SOW_ORIGIN_BEARER", "SOW_ORIGIN_BEARER"}
+	originAliasProduct, _, _, err := realCloudProviderProductContracts(environment, originBearerAlias.Runtime.TokenVerifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originBearerAlias.ProductConfigSHA256 = realCloudLowerSHA256(originAliasProduct)
+	if _, _, err := decodeRealCloudProviderAttestationConfig(encode(originBearerAlias), environment, "real-edge-test-run-20260720", originAliasProduct); err == nil {
+		t.Fatal("static token verifier aliased the independent origin bearer secret")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*realCloudProviderAttestationConfig)
+	}{
+		{"provider-service-retained", func(value *realCloudProviderAttestationConfig) {
+			value.Cloudflare.TokenVerifierService = "pigsty-entitlements"
+		}},
+		{"provider-runtime-retained", func(value *realCloudProviderAttestationConfig) {
+			value.Cloudflare.TokenVerifierRuntime = realCloudCloudflareWorkerRuntimeContract{CompatibilityDate: "2026-07-17", CompatibilityFlags: []string{}}
+		}},
+		{"provider-digest-retained", func(value *realCloudProviderAttestationConfig) {
+			value.Cloudflare.TokenVerifierContentSHA256 = strings.Repeat("a", 64)
+		}},
+		{"edgeone-provider-url-retained", func(value *realCloudProviderAttestationConfig) {
+			value.Runtime.EdgeOneTokenVerifierURL = "https://verifier.test.invalid/v1/verify"
+		}},
+		{"edgeone-provider-deployment-retained", func(value *realCloudProviderAttestationConfig) {
+			value.Runtime.EdgeOneTokenVerifierDeploymentSHA256 = strings.Repeat("b", 64)
+		}},
+		{"cloudflare-static-secret-missing", func(value *realCloudProviderAttestationConfig) {
+			value.Runtime.CloudflareSecretNames = []string{"SOW_ORIGIN_BEARER"}
+		}},
+		{"edgeone-static-secret-missing", func(value *realCloudProviderAttestationConfig) {
+			value.Runtime.EdgeOneSecretNames = []string{"SOW_ORIGIN_BEARER"}
+		}},
+		{"provider-bearer-retained", func(value *realCloudProviderAttestationConfig) {
+			value.Runtime.EdgeOneSecretNames = []string{"SOW_ORIGIN_BEARER", "SOW_TOKEN_VERIFIER_BEARER"}
+		}},
+		{"product-config-substitution", func(value *realCloudProviderAttestationConfig) {
+			productBody, _, _, err := realCloudProviderProductContracts(environment, "provider://pigsty-entitlements")
+			if err != nil {
+				t.Fatal(err)
+			}
+			value.ProductConfigSHA256 = realCloudLowerSHA256(productBody)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := configuration
+			test.mutate(&candidate)
+			if _, _, err := decodeRealCloudProviderAttestationConfig(encode(candidate), environment, "real-edge-test-run-20260720", expectedProductBody); err == nil {
+				t.Fatal("mixed static provider attestation config was accepted")
 			}
 		})
 	}
@@ -3960,6 +4739,465 @@ func TestRealCloudProviderRuntimeInventoriesAreExactAndSecretFree(t *testing.T) 
 	}
 }
 
+func TestRealCloudCloudflareBindingInventoryRequiresExplicitArray(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "empty-array", raw: `{"bindings":[],"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`, want: true},
+		{name: "missing", raw: `{"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
+		{name: "null", raw: `{"bindings":null,"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
+		{name: "object", raw: `{"bindings":{},"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
+		{name: "string", raw: `{"bindings":"none","script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
+		{name: "duplicate", raw: `{"bindings":[],"bindings":[{"name":"EXTRA","type":"secret_text"}],"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
+		{name: "unknown", raw: `{"bindings":[],"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"},"other":true}`},
+		{name: "missing-script", raw: `{"bindings":[],"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
+		{name: "duplicate-script-etag", raw: `{"bindings":[],"script":{"etag":"first","etag":"second"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
+		{name: "duplicate-runtime-limits", raw: `{"bindings":[],"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
+		{name: "string-cpu", raw: `{"bindings":[],"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":"0"},"migration_tag":"","usage_model":"standard"}}`},
+		{name: "non-string-flag", raw: `{"bindings":[],"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[1],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var resources workers.ScriptVersionGetResponseResources
+			err := json.Unmarshal([]byte(test.raw), &resources)
+			got := err == nil && validRealCloudCloudflareBindingInventory(resources)
+			if got != test.want {
+				t.Fatalf("binding inventory valid=%v want=%v unmarshal_err=%v", got, test.want, err)
+			}
+		})
+	}
+}
+
+func TestRealCloudCloudflareWorkerSettingsRawRejectsSDKProjectionAmbiguity(t *testing.T) {
+	valid := `{"annotations":{},"bindings":[],"cache_options":{"enabled":false,"cross_version_cache":false},"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0,"subrequests":0},"logpush":false,"observability":{"enabled":false,"head_sampling_rate":0,"logs":{"enabled":false,"invocation_logs":false,"destinations":[],"head_sampling_rate":0,"persist":false},"traces":{"enabled":false,"destinations":[],"head_sampling_rate":0,"persist":false,"propagation_policy":""}},"placement":{},"tags":[],"tail_consumers":[],"usage_model":"standard"}`
+	emptyBindingsSHA, err := realCloudCloudflareCanonicalFlatBindingInventorySHA([]byte(`[]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "exact", raw: valid, want: true},
+		{name: "duplicate-outer-logpush", raw: strings.Replace(valid, `"logpush":false`, `"logpush":false,"logpush":false`, 1)},
+		{name: "missing-cache-enabled", raw: strings.Replace(valid, `"enabled":false,"cross_version_cache":false`, `"cross_version_cache":false`, 1)},
+		{name: "string-cpu-limit", raw: strings.Replace(valid, `"cpu_ms":0`, `"cpu_ms":"0"`, 1)},
+		{name: "missing-subrequest-limit", raw: strings.Replace(valid, `,"subrequests":0`, ``, 1)},
+		{name: "duplicate-observability-logs", raw: strings.Replace(valid, `"logs":{`, `"logs":{},"logs":{`, 1)},
+		{name: "missing-log-persist", raw: strings.Replace(valid, `,"persist":false},"traces"`, `},"traces"`, 1)},
+		{name: "missing-trace-destinations", raw: strings.Replace(valid, `"traces":{"enabled":false,"destinations":[]`, `"traces":{"enabled":false`, 1)},
+		{name: "numeric-string-sampling", raw: strings.Replace(valid, `"head_sampling_rate":0`, `"head_sampling_rate":"0"`, 1)},
+		{name: "non-string-compatibility-flag", raw: strings.Replace(valid, `"compatibility_flags":[]`, `"compatibility_flags":[1]`, 1)},
+		{name: "null-tags", raw: strings.Replace(valid, `"tags":[]`, `"tags":null`, 1)},
+		{name: "non-object-binding", raw: strings.Replace(valid, `"bindings":[]`, `"bindings":[null]`, 1)},
+		{name: "unexpected-binding", raw: strings.Replace(valid, `"bindings":[]`, `"bindings":[{"name":"EXTRA","type":"secret_text"}]`, 1)},
+		{name: "duplicate-binding-field", raw: strings.Replace(valid, `"bindings":[]`, `"bindings":[{"name":"EXTRA","name":"EXTRA","type":"secret_text"}]`, 1)},
+		{name: "non-string-binding-field", raw: strings.Replace(valid, `"bindings":[]`, `"bindings":[{"name":"EXTRA","type":1}]`, 1)},
+		{name: "placement-target", raw: strings.Replace(valid, `"placement":{}`, `"placement":{"target":null}`, 1)},
+		{name: "unknown-observability-field", raw: strings.Replace(valid, `"observability":{"enabled":false`, `"observability":{"unknown":false,"enabled":false`, 1)},
+		{name: "unknown-annotation", raw: strings.Replace(valid, `"annotations":{}`, `"annotations":{"future":false}`, 1)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validRealCloudCloudflareWorkerSettingsRaw(test.raw, emptyBindingsSHA); got != test.want {
+				t.Fatalf("raw Worker settings valid=%v want=%v body=%s", got, test.want, test.raw)
+			}
+		})
+	}
+	bindingRaw := `[{"type":"service","environment":"production","service":"pigsty-origin","name":"ORIGIN"}]`
+	bindingSHA, err := realCloudCloudflareCanonicalFlatBindingInventorySHA([]byte(bindingRaw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	withBinding := strings.Replace(valid, `"bindings":[]`, `"bindings":`+bindingRaw, 1)
+	if !validRealCloudCloudflareWorkerSettingsRaw(withBinding, bindingSHA) {
+		t.Fatal("raw Worker settings rejected an exact active-version binding multiset")
+	}
+	reordered := strings.Replace(withBinding, bindingRaw, `[{"name":"ORIGIN","service":"pigsty-origin","type":"service","environment":"production"}]`, 1)
+	if !validRealCloudCloudflareWorkerSettingsRaw(reordered, bindingSHA) {
+		t.Fatal("raw Worker settings binding comparison depended on object key order")
+	}
+}
+
+func TestRealCloudCloudflareScheduleAndSubdomainRawRejectSDKProjectionAmbiguity(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "schedule-exact", raw: `{"schedules":[]}`, want: true},
+		{name: "schedule-null", raw: `{"schedules":null}`},
+		{name: "schedule-missing", raw: `{}`},
+		{name: "schedule-duplicate", raw: `{"schedules":[],"schedules":[]}`},
+		{name: "schedule-non-empty", raw: `{"schedules":[{"cron":"0 * * * *"}]}`},
+		{name: "schedule-unknown", raw: `{"schedules":[],"future":false}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validRealCloudCloudflareEmptyScheduleInventoryRaw(test.raw); got != test.want {
+				t.Fatalf("raw schedule inventory valid=%v want=%v body=%s", got, test.want, test.raw)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "subdomain-exact", raw: `{"enabled":false,"previews_enabled":false}`, want: true},
+		{name: "subdomain-null", raw: `{"enabled":null,"previews_enabled":false}`},
+		{name: "subdomain-missing", raw: `{"enabled":false}`},
+		{name: "subdomain-duplicate", raw: `{"enabled":false,"enabled":false,"previews_enabled":false}`},
+		{name: "subdomain-enabled", raw: `{"enabled":true,"previews_enabled":false}`},
+		{name: "preview-enabled", raw: `{"enabled":false,"previews_enabled":true}`},
+		{name: "subdomain-unknown", raw: `{"enabled":false,"previews_enabled":false,"future":false}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validRealCloudCloudflareClosedSubdomainRaw(test.raw); got != test.want {
+				t.Fatalf("raw subdomain exposure valid=%v want=%v body=%s", got, test.want, test.raw)
+			}
+		})
+	}
+}
+
+func TestRealCloudEdgeOneRuntimeWireGuardRejectsSDKProjectionAmbiguity(t *testing.T) {
+	valid := `{"Response":{"EnvironmentVariables":[{"Key":"SOW_ORIGIN_BEARER","Type":"secret"},{"Key":"SOW_PUBLIC_PREFIXES","Value":"[]","Type":"string"}],"RequestId":"wire-test"}}`
+	for _, test := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "exact", raw: valid, want: true},
+		{name: "explicit-empty-secret", raw: strings.Replace(valid, `"Type":"secret"`, `"Value":"","Type":"secret"`, 1), want: true},
+		{name: "duplicate-type", raw: strings.Replace(valid, `"Type":"secret"`, `"Type":"string","Type":"secret"`, 1)},
+		{name: "duplicate-value", raw: strings.Replace(valid, `"Type":"secret"`, `"Value":"plaintext-fixture","Value":"","Type":"secret"`, 1)},
+		{name: "null-value", raw: strings.Replace(valid, `"Type":"secret"`, `"Value":null,"Type":"secret"`, 1)},
+		{name: "missing-type", raw: strings.Replace(valid, `,"Type":"secret"`, ``, 1)},
+		{name: "unknown-variable-field", raw: strings.Replace(valid, `"Type":"secret"`, `"Type":"secret","Future":false`, 1)},
+		{name: "null-inventory", raw: `{"Response":{"EnvironmentVariables":null,"RequestId":"wire-test"}}`},
+		{name: "duplicate-inventory", raw: `{"Response":{"EnvironmentVariables":[],"EnvironmentVariables":[],"RequestId":"wire-test"}}`},
+		{name: "unknown-response-field", raw: `{"Response":{"EnvironmentVariables":[],"RequestId":"wire-test","Future":false}}`},
+		{name: "duplicate-response", raw: `{"Response":{"EnvironmentVariables":[],"RequestId":"one"},"Response":{"EnvironmentVariables":[],"RequestId":"two"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := validRealCloudEdgeOneRuntimeWire([]byte(test.raw)); got != test.want {
+				t.Fatalf("EdgeOne runtime wire valid=%v want=%v", got, test.want)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name    string
+		body    string
+		status  int
+		wantErr bool
+	}{
+		{name: "exact", body: valid},
+		{name: "duplicate-secret-type", body: strings.Replace(valid, `"Type":"secret"`, `"Type":"string","Type":"secret"`, 1), wantErr: true},
+		{name: "non-success", body: "bounded-error-fixture", status: http.StatusServiceUnavailable, wantErr: true},
+		{name: "oversized-non-success", body: strings.Repeat("oversized-error-fixture", realCloudProviderMaxEdgeOneRuntimeWire/len("oversized-error-fixture")+2), status: http.StatusServiceUnavailable, wantErr: true},
+	} {
+		t.Run("transport-"+test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				if test.status != 0 {
+					writer.WriteHeader(test.status)
+				}
+				_, _ = io.WriteString(writer, test.body)
+			}))
+			defer server.Close()
+			request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL, strings.NewReader(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("X-TC-Action", "DescribeFunctionRuntimeEnvironment")
+			client := &http.Client{Transport: &realCloudEdgeOneRuntimeWireGuard{next: server.Client().Transport}}
+			response, err := client.Do(request)
+			if test.wantErr {
+				if err == nil {
+					response.Body.Close()
+					t.Fatal("ambiguous EdgeOne runtime wire crossed the transport guard")
+				}
+				if strings.Contains(err.Error(), "bounded-error-fixture") || strings.Contains(err.Error(), "oversized-error-fixture") || len(err.Error()) > 512 {
+					t.Fatalf("EdgeOne runtime wire guard leaked or embedded its response body: %v", err)
+				}
+				return
+			}
+			if err != nil || response == nil || response.Body == nil {
+				t.Fatalf("exact EdgeOne runtime wire rejected: %v", err)
+			}
+			body, readErr := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			if readErr != nil || closeErr != nil || string(body) != test.body {
+				t.Fatalf("guarded EdgeOne runtime body changed read=%v close=%v", readErr, closeErr)
+			}
+		})
+	}
+}
+
+func TestRealCloudStaticRuntimeInventoriesAreExactAndSecretFree(t *testing.T) {
+	environment := realCloudSafetyFixtureEnvironment()
+	configuration := realCloudStaticProviderConfigurationFixture(environment)
+	fakeBindings, err := realCloudProviderFakeCloudflareAuthBindings(environment, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingBody, _ := json.Marshal(fakeBindings)
+	if !bytes.Contains(bindingBody, []byte(realCloudEdgeEntitlementsEnv)) || bytes.Contains(bindingBody, []byte("loopback-secret")) {
+		t.Fatalf("static Cloudflare binding fixture is not redacted or mode-exact: %s", bindingBody)
+	}
+	var bindings []workers.ScriptVersionGetResponseResourcesBinding
+	if err := json.Unmarshal(bindingBody, &bindings); err != nil {
+		t.Fatal(err)
+	}
+	for _, binding := range bindings {
+		if binding.Name == "TOKEN_VERIFIER" || binding.Type == workers.ScriptVersionGetResponseResourcesBindingsTypeService && binding.Service == "pigsty-entitlements" {
+			t.Fatal("static Cloudflare binding fixture retained the provider service")
+		}
+	}
+	serviceSHA, runtimeSHA, err := validateRealCloudCloudflareAuthBindings(bindings, environment, configuration)
+	if err != nil || !validRealCloudLowerSHA256(serviceSHA) || !validRealCloudLowerSHA256(runtimeSHA) {
+		t.Fatalf("exact static Cloudflare runtime inventory rejected service=%q runtime=%q err=%v", serviceSHA, runtimeSHA, err)
+	}
+	providerSubstitution := append(append([]workers.ScriptVersionGetResponseResourcesBinding(nil), bindings...), workers.ScriptVersionGetResponseResourcesBinding{
+		Name: "TOKEN_VERIFIER", Type: workers.ScriptVersionGetResponseResourcesBindingsTypeService, Service: "pigsty-entitlements",
+	})
+	if _, _, err := validateRealCloudCloudflareAuthBindings(providerSubstitution, environment, configuration); err == nil {
+		t.Fatal("static Cloudflare runtime accepted a provider-service substitution")
+	}
+	mixedSecret := append([]workers.ScriptVersionGetResponseResourcesBinding(nil), bindings...)
+	mixedSecretFound := false
+	for index := range mixedSecret {
+		if mixedSecret[index].Name == realCloudEdgeEntitlementsEnv {
+			mixedSecret[index].Service = "pigsty-entitlements"
+			mixedSecretFound = true
+			break
+		}
+	}
+	if !mixedSecretFound {
+		t.Fatal("static Cloudflare fixture lacks the entitlement secret binding")
+	}
+	if _, _, err := validateRealCloudCloudflareAuthBindings(mixedSecret, environment, configuration); err == nil {
+		t.Fatal("static Cloudflare runtime accepted a secret_text binding with a residual service capability")
+	}
+	nullEnvironmentBody := bytes.Replace(bindingBody, []byte(`"environment":""`), []byte(`"environment":null`), 1)
+	if bytes.Equal(nullEnvironmentBody, bindingBody) {
+		t.Fatal("static Cloudflare fixture lacks the optional empty environment field")
+	}
+	var nullEnvironment []workers.ScriptVersionGetResponseResourcesBinding
+	if err := json.Unmarshal(nullEnvironmentBody, &nullEnvironment); err != nil {
+		t.Fatalf("SDK fixture did not retain the malformed optional binding value for validation: %v", err)
+	}
+	if _, _, err := validateRealCloudCloudflareAuthBindings(nullEnvironment, environment, configuration); err == nil {
+		t.Fatal("static Cloudflare runtime accepted a null value for a string binding field")
+	}
+
+	variables, err := realCloudProviderFakeEdgeOneRuntimeVariables(environment, configuration.Runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	variableBody, _ := json.Marshal(variables)
+	if bytes.Contains(variableBody, []byte("SOW_TOKEN_VERIFIER_URL")) || !bytes.Contains(variableBody, []byte(realCloudEdgeEntitlementsEnv)) {
+		t.Fatalf("static EdgeOne runtime fixture retained provider transport or lost the secret binding: %s", variableBody)
+	}
+	var edgeVariables []*teo.FunctionEnvironmentVariable
+	if err := json.Unmarshal(variableBody, &edgeVariables); err != nil {
+		t.Fatal(err)
+	}
+	if digest, err := validateRealCloudEdgeOneRuntimeEnvironment(edgeVariables, environment, configuration.Runtime); err != nil || !validRealCloudLowerSHA256(digest) {
+		t.Fatalf("exact static EdgeOne runtime inventory rejected digest=%q err=%v", digest, err)
+	}
+	for _, variable := range edgeVariables {
+		if variable != nil && stringValue(variable.Value) != "" {
+			t.Fatal("static EdgeOne runtime value remained in memory after redacted comparison")
+		}
+	}
+	for _, substitution := range []struct {
+		name  string
+		type_ string
+		value string
+	}{
+		{name: "plaintext-substitution", type_: "string", value: `{"tokens":[]}`},
+		{name: "non-redacted-secret", type_: "secret", value: `{"tokens":[]}`},
+	} {
+		t.Run(substitution.name, func(t *testing.T) {
+			candidate := make([]map[string]any, len(variables))
+			for index, variable := range variables {
+				candidate[index] = maps.Clone(variable)
+				if candidate[index]["Key"] == realCloudEdgeEntitlementsEnv {
+					candidate[index]["Type"] = substitution.type_
+					candidate[index]["Value"] = substitution.value
+				}
+			}
+			body, _ := json.Marshal(candidate)
+			var decoded []*teo.FunctionEnvironmentVariable
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := validateRealCloudEdgeOneRuntimeEnvironment(decoded, environment, configuration.Runtime); err == nil || !strings.Contains(err.Error(), "plaintext") {
+				t.Fatalf("EdgeOne static secret substitution accepted: %v", err)
+			}
+		})
+	}
+	variables = append(variables, map[string]any{"Key": "SOW_TOKEN_VERIFIER_BEARER", "Value": "provider-only-bearer", "Type": "string"})
+	variableBody, _ = json.Marshal(variables)
+	edgeVariables = nil
+	if err := json.Unmarshal(variableBody, &edgeVariables); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateRealCloudEdgeOneRuntimeEnvironment(edgeVariables, environment, configuration.Runtime); err == nil {
+		t.Fatal("static EdgeOne runtime accepted a provider-only bearer")
+	}
+}
+
+func TestRealCloudStaticProviderControlUsesTwoCloudflareWorkers(t *testing.T) {
+	environment := realCloudSafetyFixtureEnvironment()
+	environment.CFCDNBase = "https://sow-test-cf.test.invalid"
+	environment.CFBetaCDNBase = "https://sow-test-cf-beta.test.invalid"
+	environment.COSCDNBase = "https://sow-test-eo.test.invalid"
+	environment.COSBetaBase = "https://sow-ci-eo-beta.test.invalid"
+	configuration := realCloudStaticProviderConfigurationFixture(environment)
+	t.Setenv(realCloudRunIDEnv, "real-edge-test-run-20260720-static")
+	authBundle, err := readRealCloudProviderRepositoryFile("edge/dist/cloudflare-worker.mjs", realCloudProviderMaxContentBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearRealCloudBytes(authBundle)
+	originBundle, err := readRealCloudProviderRepositoryFile("edge/dist/cloudflare-origin-worker.mjs", realCloudProviderMaxContentBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearRealCloudBytes(originBundle)
+	edgeOneBundle, err := readRealCloudProviderRepositoryFile("edge/dist/edgeone.js", realCloudProviderMaxContentBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearRealCloudBytes(edgeOneBundle)
+	fake := &realCloudProviderFakeAPI{
+		t: t, environment: environment, configuration: configuration,
+		authBundle: authBundle, originBundle: originBundle, edgeOneBundle: edgeOneBundle,
+		requests: make(map[string]int),
+	}
+	server := httptest.NewServer(fake)
+	defer server.Close()
+	clients, err := newRealCloudProviderCollectorClients(
+		environment,
+		configuration,
+		realCloudStorageSecret{AccessKeyID: "static-log-reader", SecretAccessKey: "static-log-reader-secret"},
+		realCloudCloudflareSecret{APIToken: "test-cloudflare-token"},
+		realCloudStorageSecret{AccessKeyID: "static-edge-log-reader", SecretAccessKey: "static-edge-log-reader-secret"},
+		realCloudTencentSecret{SecretID: "test-tencent-id", SecretKey: "test-tencent-secret"},
+		realCloudProviderCollectorEndpoints{
+			CloudflareAPIURL: server.URL + "/client/v4", EdgeOneAPIURL: server.URL,
+			CFObjectBaseURL:         server.URL + "/" + configuration.Cloudflare.RawBucket,
+			EOObjectBaseURL:         server.URL + "/" + configuration.EdgeOne.RawBucket,
+			EOFunctionDomainBaseURL: server.URL, HTTPClient: server.Client(), AllowInsecure: true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("construct static provider SDK clients: %v", err)
+	}
+	cfControl, err := collectRealCloudCloudflareControl(t.Context(), environment, configuration, clients.cloudflare)
+	if err != nil {
+		fake.mu.Lock()
+		requests := fmt.Sprint(fake.requests)
+		fake.mu.Unlock()
+		t.Fatalf("collect static Cloudflare control: %v requests=%v", err, requests)
+	}
+	if !validRealCloudLowerSHA256(cfControl.authBindingsSHA) || !validRealCloudLowerSHA256(cfControl.authRuntimeSHA) ||
+		cfControl.verifier.script != "" || cfControl.verifier.versionID != "" || len(cfControl.verifier.bindings) != 0 || cfControl.verifierBindingsSHA != "" {
+		t.Fatalf("static Cloudflare control retained verifier Worker evidence: %+v", cfControl)
+	}
+	eoControl, err := collectRealCloudEdgeOneControl(t.Context(), environment, configuration, clients.edgeOne, clients.probeEOFunctionDomain)
+	if err != nil {
+		t.Fatalf("collect static EdgeOne control: %v", err)
+	}
+	if !validRealCloudLowerSHA256(eoControl.runtimeSHA) {
+		t.Fatal("static EdgeOne control omitted its redacted runtime digest")
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for request := range fake.requests {
+		if strings.Contains(request, "pigsty-entitlements") || strings.Contains(request, "/workers/scripts//") {
+			t.Fatalf("static provider control requested a third verifier Worker: %s", request)
+		}
+	}
+}
+
+func TestRealCloudProviderControlKeepsThreeWorkerVerifierContract(t *testing.T) {
+	environment := realCloudSafetyFixtureEnvironment()
+	environment.CFCDNBase = "https://sow-test-cf.test.invalid"
+	environment.CFBetaCDNBase = "https://sow-test-cf-beta.test.invalid"
+	environment.COSCDNBase = "https://sow-test-eo.test.invalid"
+	environment.COSBetaBase = "https://sow-ci-eo-beta.test.invalid"
+	t.Setenv(realCloudRunIDEnv, "real-edge-test-run-20260720-provider")
+	authBundle, err := readRealCloudProviderRepositoryFile("edge/dist/cloudflare-worker.mjs", realCloudProviderMaxContentBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearRealCloudBytes(authBundle)
+	originBundle, err := readRealCloudProviderRepositoryFile("edge/dist/cloudflare-origin-worker.mjs", realCloudProviderMaxContentBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearRealCloudBytes(originBundle)
+	edgeOneBundle, err := readRealCloudProviderRepositoryFile("edge/dist/edgeone.js", realCloudProviderMaxContentBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clearRealCloudBytes(edgeOneBundle)
+	verifierBundle := []byte("export default {async fetch(){return new Response('{}')}};\n")
+	configuration := realCloudProviderConfigurationFixture(environment, realCloudLowerSHA256(verifierBundle))
+	fake := &realCloudProviderFakeAPI{
+		t: t, environment: environment, configuration: configuration,
+		authBundle: authBundle, originBundle: originBundle, verifierBundle: verifierBundle, edgeOneBundle: edgeOneBundle,
+		requests: make(map[string]int),
+	}
+	server := httptest.NewServer(fake)
+	defer server.Close()
+	clients, err := newRealCloudProviderCollectorClients(
+		environment,
+		configuration,
+		realCloudStorageSecret{AccessKeyID: "provider-log-reader", SecretAccessKey: "provider-log-reader-secret"},
+		realCloudCloudflareSecret{APIToken: "test-cloudflare-token"},
+		realCloudStorageSecret{AccessKeyID: "provider-edge-log-reader", SecretAccessKey: "provider-edge-log-reader-secret"},
+		realCloudTencentSecret{SecretID: "test-tencent-id", SecretKey: "test-tencent-secret"},
+		realCloudProviderCollectorEndpoints{
+			CloudflareAPIURL: server.URL + "/client/v4", EdgeOneAPIURL: server.URL,
+			CFObjectBaseURL:         server.URL + "/" + configuration.Cloudflare.RawBucket,
+			EOObjectBaseURL:         server.URL + "/" + configuration.EdgeOne.RawBucket,
+			EOFunctionDomainBaseURL: server.URL, HTTPClient: server.Client(), AllowInsecure: true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("construct provider SDK clients: %v", err)
+	}
+	cfControl, err := collectRealCloudCloudflareControl(t.Context(), environment, configuration, clients.cloudflare)
+	if err != nil {
+		t.Fatalf("collect provider Cloudflare control: %v", err)
+	}
+	if cfControl.verifier.script != configuration.Cloudflare.TokenVerifierService ||
+		!validRealCloudLowerSHA256(cfControl.verifier.securitySHA) || !validRealCloudLowerSHA256(cfControl.verifierBindingsSHA) {
+		t.Fatalf("provider Cloudflare control lost the third Worker evidence: %+v", cfControl)
+	}
+	if _, err := collectRealCloudEdgeOneControl(t.Context(), environment, configuration, clients.edgeOne, clients.probeEOFunctionDomain); err != nil {
+		t.Fatalf("collect provider EdgeOne control: %v", err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	foundVerifier := false
+	for request := range fake.requests {
+		if strings.Contains(request, "/workers/scripts/"+configuration.Cloudflare.TokenVerifierService+"/") {
+			foundVerifier = true
+			break
+		}
+	}
+	if !foundVerifier {
+		t.Fatal("provider control did not attest the independently deployed verifier Worker")
+	}
+}
+
 func realCloudProviderRawParserFixture(t *testing.T) (realCloudEnvironment, []realEdgeMultiPoPStageEvidence, []realEdgeProviderLog, []byte, []byte) {
 	t.Helper()
 	environment := realCloudSafetyFixtureEnvironment()
@@ -3973,7 +5211,7 @@ func realCloudProviderRawParserFixture(t *testing.T) (realCloudEnvironment, []re
 	before := realEdgeTestEvidence(4, "generation-four", baseTime)
 	after := attachRealEdgeTestPrePurge(before, realEdgeTestEvidence(5, "generation-five", baseTime.Add(10*time.Minute)))
 	stages := []realEdgeMultiPoPStageEvidence{before, after}
-	productBody, _, _, err := realCloudProviderProductContracts(environment)
+	productBody, _, _, err := realCloudProviderProductContracts(environment, "env://"+realCloudEdgeEntitlementsEnv)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4053,15 +5291,14 @@ func TestRealCloudProviderCollectorUsesExactSDKAndSignedObjectContracts(t *testi
 		t.Fatal(err)
 	}
 	defer clearRealCloudBytes(edgeOneBundle)
-	verifierBundle := []byte("export default {async fetch(){return new Response('{}')}};\n")
-	configuration := realCloudProviderConfigurationFixture(environment, realCloudLowerSHA256(verifierBundle))
+	configuration := realCloudStaticProviderConfigurationFixture(environment)
 	configurationBody, err := json.Marshal(configuration)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fake := &realCloudProviderFakeAPI{
 		t: t, environment: environment, configuration: configuration, authBundle: authBundle, originBundle: originBundle,
-		verifierBundle: verifierBundle, edgeOneBundle: edgeOneBundle, cfRaw: cfRaw, eoRaw: eoRaw, requests: make(map[string]int),
+		edgeOneBundle: edgeOneBundle, cfRaw: cfRaw, eoRaw: eoRaw, requests: make(map[string]int),
 	}
 	server := httptest.NewServer(fake)
 	defer server.Close()
@@ -4092,10 +5329,12 @@ func TestRealCloudProviderCollectorUsesExactSDKAndSignedObjectContracts(t *testi
 	}
 	if attestation.Schema != realCloudProviderCollectorSchema || attestation.RawRecords != len(operatorLogs) ||
 		attestation.CFOriginWorkerScript != configuration.Cloudflare.OriginWorkerScript ||
-		attestation.CFTokenVerifierService != configuration.Cloudflare.TokenVerifierService ||
+		attestation.TokenVerifierKind != "env" || attestation.TokenVerifierName != realCloudEdgeEntitlementsEnv ||
+		attestation.CFTokenVerifierService != "" || attestation.CFTokenVerifierVersionID != "" ||
+		attestation.CFTokenVerifierSecuritySHA256 != "" || attestation.EdgeOneTokenVerifierDeploymentSHA256 != "" ||
 		attestation.EdgeOneLogArea != configuration.EdgeOne.RealtimeLogArea ||
 		!validRealCloudLowerSHA256(attestation.CFWorkerSecuritySHA256) || !validRealCloudLowerSHA256(attestation.CFOriginSecuritySHA256) ||
-		!validRealCloudLowerSHA256(attestation.CFTokenVerifierSecuritySHA256) || !validRealCloudLowerSHA256(attestation.CFWorkerInventorySHA256) ||
+		!validRealCloudLowerSHA256(attestation.CFWorkerInventorySHA256) ||
 		!validRealCloudLowerSHA256(attestation.CFWorkerRoutesSHA256) || !validRealCloudLowerSHA256(attestation.EdgeOneFunctionRulesSHA256) {
 		t.Fatalf("incomplete provider attestation: %#v", attestation)
 	}
@@ -4304,7 +5543,7 @@ func TestRealCloudProviderCollectorUsesExactSDKAndSignedObjectContracts(t *testi
 }
 
 func realCloudProviderConfigurationFixture(environment realCloudEnvironment, verifierContentSHA string) realCloudProviderAttestationConfig {
-	productBody, cloudflareContract, _, err := realCloudProviderProductContracts(environment)
+	productBody, cloudflareContract, _, err := realCloudProviderProductContracts(environment, "provider://pigsty-entitlements")
 	if err != nil {
 		panic(err)
 	}
@@ -4343,6 +5582,27 @@ func realCloudProviderConfigurationFixture(environment realCloudEnvironment, ver
 			EdgeOneSecretNames:                   []string{"SOW_ORIGIN_BEARER", "SOW_TOKEN_VERIFIER_BEARER"},
 		},
 	}
+}
+
+func realCloudStaticProviderConfigurationFixture(environment realCloudEnvironment) realCloudProviderAttestationConfig {
+	configuration := realCloudProviderConfigurationFixture(environment, realCloudLowerSHA256([]byte("unused-static-verifier-bundle")))
+	productBody, cloudflareContract, _, err := realCloudProviderProductContracts(environment, "env://"+realCloudEdgeEntitlementsEnv)
+	if err != nil {
+		panic(err)
+	}
+	configuration.ProductConfigSHA256 = realCloudLowerSHA256(productBody)
+	configuration.Cloudflare.TokenVerifierService = ""
+	configuration.Cloudflare.TokenVerifierEnvironment = ""
+	configuration.Cloudflare.TokenVerifierRuntime = realCloudCloudflareWorkerRuntimeContract{}
+	configuration.Cloudflare.TokenVerifierContentSHA256 = ""
+	configuration.Cloudflare.TokenVerifierBindingsSHA256 = ""
+	configuration.Runtime.TokenVerifier = cloudflareContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable]
+	configuration.Runtime.EdgeOneTokenVerifierURL = ""
+	configuration.Runtime.EdgeOneTokenVerifierDeploymentSHA256 = ""
+	secretNames := sortedRealCloudProviderStrings([]string{"SOW_ORIGIN_BEARER", realCloudEdgeEntitlementsEnv})
+	configuration.Runtime.CloudflareSecretNames = append([]string(nil), secretNames...)
+	configuration.Runtime.EdgeOneSecretNames = append([]string(nil), secretNames...)
+	return configuration
 }
 
 type realCloudProviderFakeAPI struct {
@@ -4569,7 +5829,9 @@ func (fake *realCloudProviderFakeAPI) serveCloudflare(writer http.ResponseWriter
 				{"id": "beta-route", "pattern": hostOnly(fake.environment.CFBetaCDNBase) + "/*", "script": configuration.WorkerScript},
 			}, "tail_consumers": authTailConsumers},
 			{"id": configuration.OriginWorkerScript, "routes": []any{}, "tail_consumers": []any{}},
-			{"id": configuration.TokenVerifierService, "routes": []any{}, "tail_consumers": []any{}},
+		}
+		if configuration.TokenVerifierService != "" {
+			scripts = append(scripts, map[string]any{"id": configuration.TokenVerifierService, "routes": []any{}, "tail_consumers": []any{}})
 		}
 		if fake.unrelatedZoneRoute {
 			scripts = append(scripts, map[string]any{"id": "unrelated-worker", "routes": []map[string]any{{"id": "unrelated-route", "pattern": "unrelated.test.invalid/*", "script": "unrelated-worker"}}, "tail_consumers": []any{}})
@@ -4579,11 +5841,14 @@ func (fake *realCloudProviderFakeAPI) serveCloudflare(writer http.ResponseWriter
 		}
 		writeEnvelope(scripts)
 	default:
-		for script, content := range map[string][]byte{
-			configuration.WorkerScript:         fake.authBundle,
-			configuration.OriginWorkerScript:   fake.originBundle,
-			configuration.TokenVerifierService: fake.verifierBundle,
-		} {
+		workerBundles := map[string][]byte{
+			configuration.WorkerScript:       fake.authBundle,
+			configuration.OriginWorkerScript: fake.originBundle,
+		}
+		if configuration.TokenVerifierService != "" {
+			workerBundles[configuration.TokenVerifierService] = fake.verifierBundle
+		}
+		for script, content := range workerBundles {
 			base := fmt.Sprintf("/accounts/%s/workers/scripts/%s", configuration.AccountID, script)
 			runtimeContract := configuration.WorkerRuntime
 			if script == configuration.OriginWorkerScript {
@@ -4599,17 +5864,10 @@ func (fake *realCloudProviderFakeAPI) serveCloudflare(writer http.ResponseWriter
 				}}})
 				return
 			case base + "/versions/" + script + "-version":
-				bindings := []map[string]any{}
-				switch script {
-				case configuration.WorkerScript:
-					var bindingErr error
-					bindings, bindingErr = realCloudProviderFakeCloudflareAuthBindings(fake.environment, fake.configuration)
-					if bindingErr != nil {
-						http.Error(writer, "invalid fake Cloudflare runtime", http.StatusInternalServerError)
-						return
-					}
-				case configuration.OriginWorkerScript:
-					bindings = []map[string]any{{"name": "REPOSITORY", "type": "r2_bucket", "bucket_name": fake.environment.CFR2Bucket}}
+				bindings, bindingErr := realCloudProviderFakeCloudflareWorkerBindings(fake.environment, fake.configuration, script)
+				if bindingErr != nil {
+					http.Error(writer, "invalid fake Cloudflare runtime", http.StatusInternalServerError)
+					return
 				}
 				writeEnvelope(map[string]any{"id": script + "-version", "resources": map[string]any{
 					"script": map[string]any{"etag": script + "-etag"}, "bindings": bindings,
@@ -4625,12 +5883,17 @@ func (fake *realCloudProviderFakeAPI) serveCloudflare(writer http.ResponseWriter
 				writeEnvelope(map[string]any{"enabled": false, "previews_enabled": false})
 				return
 			case base + "/settings":
+				bindings, bindingErr := realCloudProviderFakeCloudflareWorkerBindings(fake.environment, fake.configuration, script)
+				if bindingErr != nil {
+					http.Error(writer, "invalid fake Cloudflare runtime", http.StatusInternalServerError)
+					return
+				}
 				usageModel := "standard"
 				if fake.unsafeCFSettings && script == configuration.WorkerScript {
 					usageModel = "unbound"
 				}
 				writeEnvelope(map[string]any{
-					"annotations": map[string]any{}, "bindings": []any{}, "cache_options": map[string]any{"enabled": false, "cross_version_cache": false},
+					"annotations": map[string]any{}, "bindings": bindings, "cache_options": map[string]any{"enabled": false, "cross_version_cache": false},
 					"compatibility_date": runtimeContract.CompatibilityDate, "compatibility_flags": runtimeContract.CompatibilityFlags,
 					"limits": map[string]any{"cpu_ms": 0, "subrequests": 0}, "logpush": false,
 					"observability": map[string]any{"enabled": false, "head_sampling_rate": 0,
@@ -4652,10 +5915,31 @@ func (fake *realCloudProviderFakeAPI) serveCloudflare(writer http.ResponseWriter
 	}
 }
 
+func realCloudProviderFakeCloudflareWorkerBindings(
+	environment realCloudEnvironment,
+	configuration realCloudProviderAttestationConfig,
+	script string,
+) ([]map[string]any, error) {
+	switch script {
+	case configuration.Cloudflare.WorkerScript:
+		return realCloudProviderFakeCloudflareAuthBindings(environment, configuration)
+	case configuration.Cloudflare.OriginWorkerScript:
+		return []map[string]any{{"name": "REPOSITORY", "type": "r2_bucket", "bucket_name": environment.CFR2Bucket}}, nil
+	default:
+		return []map[string]any{}, nil
+	}
+}
+
 func realCloudProviderFakeCloudflareAuthBindings(environment realCloudEnvironment, configuration realCloudProviderAttestationConfig) ([]map[string]any, error) {
 	bindings := []map[string]any{
 		{"name": "ORIGIN", "type": "service", "service": configuration.Cloudflare.OriginWorkerScript, "environment": configuration.Cloudflare.OriginWorkerEnvironment},
-		{"name": "TOKEN_VERIFIER", "type": "service", "service": configuration.Cloudflare.TokenVerifierService, "environment": configuration.Cloudflare.TokenVerifierEnvironment},
+	}
+	verifier, err := sowconfig.ParseTokenVerifierReference(configuration.Runtime.TokenVerifier)
+	if err != nil {
+		return nil, err
+	}
+	if verifier.Kind == "provider" {
+		bindings = append(bindings, map[string]any{"name": "TOKEN_VERIFIER", "type": "service", "service": configuration.Cloudflare.TokenVerifierService, "environment": configuration.Cloudflare.TokenVerifierEnvironment})
 	}
 	variables, err := realCloudProviderExpectedRuntimeVariables(environment, configuration.Runtime, "cloudflare")
 	if err != nil {
@@ -4690,7 +5974,7 @@ func realCloudProviderFakeEdgeOneRuntimeVariables(environment realCloudEnvironme
 		result = append(result, map[string]any{"Key": name, "Value": variables[name], "Type": "string"})
 	}
 	for _, name := range runtime.EdgeOneSecretNames {
-		result = append(result, map[string]any{"Key": name, "Value": "loopback-secret-value-never-persisted", "Type": "string"})
+		result = append(result, map[string]any{"Key": name, "Type": "secret"})
 	}
 	return result, nil
 }
@@ -4970,7 +6254,11 @@ func (fake *realCloudProviderFakeAPI) assertRequests(t *testing.T) {
 		"GET /.sow/provider-attestation-deny":                                                     2,
 		"POST /":                                                                                  20,
 	}
-	for _, script := range []string{fake.configuration.Cloudflare.WorkerScript, fake.configuration.Cloudflare.OriginWorkerScript, fake.configuration.Cloudflare.TokenVerifierService} {
+	scripts := []string{fake.configuration.Cloudflare.WorkerScript, fake.configuration.Cloudflare.OriginWorkerScript}
+	if fake.configuration.Cloudflare.TokenVerifierService != "" {
+		scripts = append(scripts, fake.configuration.Cloudflare.TokenVerifierService)
+	}
+	for _, script := range scripts {
 		base := "GET /client/v4/accounts/" + fake.configuration.Cloudflare.AccountID + "/workers/scripts/" + script
 		want[base+"/deployments"] = 4
 		want[base+"/versions/"+script+"-version"] = 2

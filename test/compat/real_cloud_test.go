@@ -57,6 +57,7 @@ const (
 	realCloudCDNCredentialCOS     = "SOW_REAL_COS_CDN_JSON"
 	realCloudEdgeProTokenAEnv     = "SOW_REAL_EDGE_PRO_TOKEN_A"
 	realCloudEdgeProTokenBEnv     = "SOW_REAL_EDGE_PRO_TOKEN_B"
+	realCloudEdgeEntitlementsEnv  = "SOW_REAL_EDGE_STATIC_ENTITLEMENTS"
 	realCloudWorkspaceEnv         = "SOW_REAL_CLOUD_WORKSPACE"
 	realCloudRunIDEnv             = "SOW_REAL_CLOUD_RUN_ID"
 	realCloudModeEnv              = "SOW_REAL_CLOUD_MODE"
@@ -729,12 +730,17 @@ func TestRealCloudGeneratedConfigUsesOnlyEnvironmentSecretReferences(t *testing.
 		COSCDNBase: "https://repo-cos.example.invalid", COSBetaBase: "https://beta-cos.example.invalid", EdgeOneZoneID: "eo-zone",
 	}
 	body := marshalRealCloudConfig(t, environment)
+	attestedBody, _, _, err := realCloudProviderProductContracts(environment, "env://"+realCloudEdgeEntitlementsEnv)
+	if err != nil || !bytes.Equal(body, attestedBody) {
+		t.Fatalf("generated product config differs from provider attestation identity err=%v", err)
+	}
 	for _, reference := range []string{
 		"env://" + realCloudPrivateSigningKeyEnv,
 		"env://" + realCloudStorageCredentialCF,
 		"env://" + realCloudCDNCredentialCF,
 		"env://" + realCloudStorageCredentialCOS,
 		"env://" + realCloudCDNCredentialCOS,
+		"env://" + realCloudEdgeEntitlementsEnv,
 	} {
 		if !bytes.Contains(body, []byte(reference)) {
 			t.Fatalf("generated config omitted secret reference %s", reference)
@@ -1367,6 +1373,30 @@ func loadRealCloudEnvironment(t *testing.T) realCloudEnvironment {
 }
 
 func realCloudEnvironmentFromLookup(getenv func(string) string) (realCloudEnvironment, error) {
+	result, err := realCloudResourceEnvironmentFromLookup(getenv)
+	if err != nil {
+		return realCloudEnvironment{}, err
+	}
+	for _, entitlement := range []struct {
+		name   string
+		target *string
+	}{{realCloudEdgeProTokenAEnv, &result.EdgeProTokenA}, {realCloudEdgeProTokenBEnv, &result.EdgeProTokenB}} {
+		value := strings.TrimSpace(getenv(entitlement.name))
+		if value == "" {
+			return realCloudEnvironment{}, fmt.Errorf("required real-cloud environment variable %s is empty", entitlement.name)
+		}
+		if !validRealCloudEdgeToken(value) {
+			return realCloudEnvironment{}, fmt.Errorf("%s must be a 22-256 character route-safe edge token", entitlement.name)
+		}
+		*entitlement.target = value
+	}
+	if result.EdgeProTokenA == result.EdgeProTokenB {
+		return realCloudEnvironment{}, fmt.Errorf("%s and %s must be distinct entitlements", realCloudEdgeProTokenAEnv, realCloudEdgeProTokenBEnv)
+	}
+	return result, nil
+}
+
+func realCloudResourceEnvironmentFromLookup(getenv func(string) string) (realCloudEnvironment, error) {
 	get := func(name string) (string, error) {
 		value := strings.TrimSpace(getenv(name))
 		if value == "" {
@@ -1374,13 +1404,12 @@ func realCloudEnvironmentFromLookup(getenv func(string) string) (realCloudEnviro
 		}
 		return value, nil
 	}
-	values := make(map[string]string, len(realCloudEnvironmentNames)+2)
+	values := make(map[string]string, len(realCloudEnvironmentNames))
 	for _, name := range []string{
 		realCloudEnvironmentNames["CFR2Endpoint"], realCloudEnvironmentNames["CFR2Bucket"],
 		realCloudEnvironmentNames["CFCDNBase"], realCloudEnvironmentNames["CFBetaCDNBase"], realCloudEnvironmentNames["CFZoneID"],
 		realCloudEnvironmentNames["COSEndpoint"], realCloudEnvironmentNames["COSBucket"], realCloudEnvironmentNames["COSRegion"],
 		realCloudEnvironmentNames["COSCDNBase"], realCloudEnvironmentNames["COSBetaBase"], realCloudEnvironmentNames["EdgeOneZoneID"],
-		realCloudEdgeProTokenAEnv, realCloudEdgeProTokenBEnv,
 	} {
 		value, err := get(name)
 		if err != nil {
@@ -1388,7 +1417,7 @@ func realCloudEnvironmentFromLookup(getenv func(string) string) (realCloudEnviro
 		}
 		values[name] = value
 	}
-	result := realCloudEnvironment{
+	return realCloudEnvironment{
 		CFR2Endpoint:  values[realCloudEnvironmentNames["CFR2Endpoint"]],
 		CFR2Bucket:    values[realCloudEnvironmentNames["CFR2Bucket"]],
 		CFCDNBase:     values[realCloudEnvironmentNames["CFCDNBase"]],
@@ -1400,21 +1429,7 @@ func realCloudEnvironmentFromLookup(getenv func(string) string) (realCloudEnviro
 		COSCDNBase:    values[realCloudEnvironmentNames["COSCDNBase"]],
 		COSBetaBase:   values[realCloudEnvironmentNames["COSBetaBase"]],
 		EdgeOneZoneID: values[realCloudEnvironmentNames["EdgeOneZoneID"]],
-		EdgeProTokenA: values[realCloudEdgeProTokenAEnv],
-		EdgeProTokenB: values[realCloudEdgeProTokenBEnv],
-	}
-	for _, entitlement := range []struct {
-		name  string
-		value string
-	}{{realCloudEdgeProTokenAEnv, result.EdgeProTokenA}, {realCloudEdgeProTokenBEnv, result.EdgeProTokenB}} {
-		if !validRealCloudEdgeToken(entitlement.value) {
-			return realCloudEnvironment{}, fmt.Errorf("%s must be a 22-256 character route-safe edge token", entitlement.name)
-		}
-	}
-	if result.EdgeProTokenA == result.EdgeProTokenB {
-		return realCloudEnvironment{}, fmt.Errorf("%s and %s must be distinct entitlements", realCloudEdgeProTokenAEnv, realCloudEdgeProTokenBEnv)
-	}
-	return result, nil
+	}, nil
 }
 
 func realCloudConfirmation(environment realCloudEnvironment) string {
@@ -2851,6 +2866,10 @@ func realCloudConfigBodyForEnvironment(environment realCloudEnvironment) ([]byte
 }
 
 func realCloudConfigForEnvironment(environment realCloudEnvironment) config.Config {
+	return realCloudConfigForEnvironmentAndVerifier(environment, "env://"+realCloudEdgeEntitlementsEnv)
+}
+
+func realCloudConfigForEnvironmentAndVerifier(environment realCloudEnvironment, tokenVerifier string) config.Config {
 	return config.Config{
 		Schema: config.Schema,
 		// A deliberately wide APT by-hash window prevents unrelated index
@@ -2906,7 +2925,7 @@ func realCloudConfigForEnvironment(environment realCloudEnvironment) config.Conf
 				CDN:     config.CDN{Kind: "edgeone", BaseURL: environment.COSCDNBase, BetaBaseURL: environment.COSBetaBase, Distribution: environment.EdgeOneZoneID, Credential: "env://" + realCloudCDNCredentialCOS},
 			},
 		},
-		Edge: config.EdgeConfig{ProPrefix: config.DefaultProPrefix, TokenVerifier: "provider://pigsty-entitlements"},
+		Edge: config.EdgeConfig{ProPrefix: config.DefaultProPrefix, TokenVerifier: tokenVerifier},
 	}
 }
 

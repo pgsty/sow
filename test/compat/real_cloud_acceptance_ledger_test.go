@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	sowconfig "github.com/pgsty/sow/internal/config"
 	"github.com/pgsty/sow/internal/views"
 	"golang.org/x/sys/unix"
 )
@@ -27,7 +28,7 @@ const (
 	realCloudAcceptanceLedgerFilename = ".sow-real-cloud-acceptance.json"
 	realCloudAcceptanceLockFilename   = ".sow-real-cloud-acceptance.lock"
 	realCloudAcceptanceLedgerSchema   = "sow-real-cloud-acceptance/v1"
-	realCloudAcceptanceHarnessVersion = "real-cloud-acceptance-20260717-v6"
+	realCloudAcceptanceHarnessVersion = "real-cloud-acceptance-20260720-v8"
 	realCloudAcceptanceLedgerLimit    = 256 << 10
 )
 
@@ -92,6 +93,7 @@ type realCloudAcceptanceBinding struct {
 	RunID                    string `json:"run_id"`
 	ConfirmationSHA256       string `json:"confirmation_sha256"`
 	ConfigSHA256             string `json:"config_sha256"`
+	TokenVerifier            string `json:"token_verifier"`
 	PublicKeySHA256          string `json:"public_key_sha256"`
 	HarnessRevision          string `json:"harness_revision"`
 	ImplementationSHA256     string `json:"implementation_sha256"`
@@ -329,11 +331,15 @@ func realCloudAcceptanceDescriptorSHA256(descriptor realCloudAcceptanceStepDescr
 	return realCloudLowerSHA256(body)
 }
 
-func realCloudAcceptanceBindingFor(identity realCloudRunIdentity, artifactPath, providerLogPath string, observerTopology []byte) (realCloudAcceptanceBinding, error) {
+func realCloudAcceptanceBindingFor(identity realCloudRunIdentity, configBody []byte, artifactPath, providerLogPath string, observerTopology []byte) (realCloudAcceptanceBinding, error) {
 	if identity.Schema != "sow-real-cloud-run/v1" || !validRealCloudRunID(identity.RunID) ||
 		!validRealCloudLowerSHA256(identity.ConfirmationSHA256) || !validRealCloudLowerSHA256(identity.ConfigSHA256) ||
 		!validRealCloudLowerSHA256(identity.PublicKeySHA256) {
 		return realCloudAcceptanceBinding{}, errors.New("real-cloud run identity is invalid")
+	}
+	tokenVerifier, err := realCloudAcceptanceTokenVerifier(configBody, identity.ConfigSHA256)
+	if err != nil {
+		return realCloudAcceptanceBinding{}, err
 	}
 	if artifactPath == "" || !filepath.IsAbs(artifactPath) || filepath.Clean(artifactPath) != artifactPath || strings.ContainsRune(artifactPath, '\x00') {
 		return realCloudAcceptanceBinding{}, errors.New("real-cloud active artifact path is not one absolute clean path")
@@ -347,11 +353,31 @@ func realCloudAcceptanceBindingFor(identity realCloudRunIdentity, artifactPath, 
 	}
 	return realCloudAcceptanceBinding{
 		RunID: identity.RunID, ConfirmationSHA256: identity.ConfirmationSHA256,
-		ConfigSHA256: identity.ConfigSHA256, PublicKeySHA256: identity.PublicKeySHA256,
+		ConfigSHA256: identity.ConfigSHA256, TokenVerifier: tokenVerifier, PublicKeySHA256: identity.PublicKeySHA256,
 		HarnessRevision: realCloudAcceptanceHarnessVersion, ImplementationSHA256: implementationSHA, StepTableSHA256: realCloudAcceptanceStepTableSHA256(),
 		ActiveArtifactPathSHA256: realCloudLowerSHA256([]byte(artifactPath)), ProviderLogPathSHA256: realCloudLowerSHA256([]byte(providerLogPath)),
 		ObserverTopologySHA256: realCloudLowerSHA256(observerTopology),
 	}, nil
+}
+
+func realCloudAcceptanceTokenVerifier(configBody []byte, configSHA256 string) (string, error) {
+	if len(configBody) == 0 || len(configBody) > sowconfig.MaxConfigBytes || !validRealCloudLowerSHA256(configSHA256) ||
+		realCloudLowerSHA256(configBody) != configSHA256 {
+		return "", errors.New("real-cloud acceptance product config bytes differ from the run identity")
+	}
+	product, err := sowconfig.Decode(bytes.NewReader(configBody))
+	if err != nil {
+		return "", fmt.Errorf("decode real-cloud acceptance product config: %w", err)
+	}
+	verifier, err := sowconfig.ParseTokenVerifierReference(product.Edge.TokenVerifier)
+	if err != nil {
+		return "", errors.New("real-cloud acceptance product token verifier is invalid")
+	}
+	reference := verifier.Kind + "://" + verifier.Name
+	if product.Edge.TokenVerifier != reference {
+		return "", errors.New("real-cloud acceptance product token verifier is not canonical")
+	}
+	return reference, nil
 }
 
 // realCloudAcceptanceImplementationSHA256 prevents receipts produced by
@@ -1078,6 +1104,15 @@ func validateRealCloudAcceptanceLedger(ledger realCloudAcceptanceLedger) error {
 	if err := validateRealCloudResumeFacts(ledger.Facts); err != nil {
 		return err
 	}
+	if ledger.Facts.ProviderClosure != nil {
+		attestation := ledger.Facts.ProviderClosure.ProviderAttestation
+		if attestation.ProductConfigSHA256 != ledger.Binding.ConfigSHA256 {
+			return errors.New("real-cloud acceptance provider attestation belongs to another product config")
+		}
+		if attestation.TokenVerifierKind+"://"+attestation.TokenVerifierName != ledger.Binding.TokenVerifier {
+			return errors.New("real-cloud acceptance provider attestation belongs to another product token verifier")
+		}
+	}
 	return nil
 }
 
@@ -1171,8 +1206,10 @@ func validateRealCloudFactReceiptPrefix(ledger realCloudAcceptanceLedger) error 
 }
 
 func validateRealCloudAcceptanceBinding(binding realCloudAcceptanceBinding) error {
+	verifier, verifierErr := sowconfig.ParseTokenVerifierReference(binding.TokenVerifier)
 	if !validRealCloudRunID(binding.RunID) || !validRealCloudLowerSHA256(binding.ConfirmationSHA256) ||
 		!validRealCloudLowerSHA256(binding.ConfigSHA256) || !validRealCloudLowerSHA256(binding.PublicKeySHA256) ||
+		verifierErr != nil || binding.TokenVerifier != verifier.Kind+"://"+verifier.Name ||
 		binding.HarnessRevision != realCloudAcceptanceHarnessVersion || !validRealCloudLowerSHA256(binding.ImplementationSHA256) || binding.StepTableSHA256 != realCloudAcceptanceStepTableSHA256() ||
 		!validRealCloudLowerSHA256(binding.ActiveArtifactPathSHA256) || !validRealCloudLowerSHA256(binding.ProviderLogPathSHA256) ||
 		!validRealCloudLowerSHA256(binding.ObserverTopologySHA256) {
@@ -1252,11 +1289,10 @@ func validateRealCloudResumeFacts(facts realCloudResumeFacts) error {
 			attestation.CFWorkerBindingsSHA256, attestation.CFWorkerRuntimeSHA256, attestation.CFWorkerSecuritySHA256,
 			attestation.CFWorkerRoutesSHA256, attestation.CFWorkerInventorySHA256, attestation.CFOriginContentSHA256,
 			attestation.CFOriginBindingsSHA256, attestation.CFOriginSecuritySHA256, attestation.CFOriginExposureSHA256,
-			attestation.CFTokenVerifierContentSHA256, attestation.CFTokenVerifierBindingsSHA256, attestation.CFTokenVerifierSecuritySHA256,
 			attestation.EdgeOneZoneIdentitySHA256, attestation.EdgeOneDomainsSHA256, attestation.EdgeOneLogTaskSHA256, attestation.EdgeOneLogReaderIdentitySHA256, attestation.EdgeOneLogWriterIdentitySHA256, attestation.EdgeOneRawObjectIdentitySHA256, attestation.EdgeOneRawObjectSHA256,
 			attestation.EdgeOneFunctionDomainSHA256, attestation.EdgeOneFunctionDomainBehaviorSHA256, attestation.EdgeOneFunctionContentSHA256,
 			attestation.EdgeOneFunctionComponentsSHA256, attestation.EdgeOneFunctionReplicasSHA256, attestation.EdgeOneFunctionRuntimeSHA256,
-			attestation.EdgeOneFunctionRulesSHA256, attestation.EdgeOneTokenVerifierDeploymentSHA256,
+			attestation.EdgeOneFunctionRulesSHA256,
 		} {
 			if !validRealCloudLowerSHA256(digest) {
 				return errors.New("real-cloud acceptance provider API attestation digest is invalid")
@@ -1265,7 +1301,7 @@ func validateRealCloudResumeFacts(facts realCloudResumeFacts) error {
 		for _, identity := range []string{
 			attestation.CFAccountID, attestation.CFZoneID, attestation.CFWorkerScript, attestation.CFWorkerDeploymentID,
 			attestation.CFWorkerVersionID, attestation.CFOriginWorkerScript, attestation.CFOriginDeploymentID,
-			attestation.CFOriginVersionID, attestation.CFTokenVerifierService, attestation.CFTokenVerifierVersionID,
+			attestation.CFOriginVersionID,
 			attestation.EdgeOneZoneID, attestation.EdgeOneLogTaskID, attestation.EdgeOneFunctionID,
 		} {
 			if !validRealCloudProviderIdentifier(identity, 128) {
@@ -1278,11 +1314,82 @@ func validateRealCloudResumeFacts(facts realCloudResumeFacts) error {
 		if attestation.CFLogpushJobID <= 0 || attestation.CFRawObjects <= 0 || attestation.CFRawObjects > realCloudProviderMaxInventoryItems ||
 			attestation.EdgeOneRawObjects <= 0 || attestation.EdgeOneRawObjects > realCloudProviderMaxInventoryItems || !validRealCloudProviderETag(attestation.CFRawObjectETag) ||
 			!validRealCloudProviderETag(attestation.CFWorkerVersionETag) || !validRealCloudProviderETag(attestation.CFOriginVersionETag) ||
-			!validRealCloudProviderETag(attestation.CFTokenVerifierVersionETag) || !validRealCloudProviderETag(attestation.EdgeOneRawObjectETag) {
+			!validRealCloudProviderETag(attestation.EdgeOneRawObjectETag) {
 			return errors.New("real-cloud acceptance provider API attestation job or ETag is invalid")
+		}
+		verifier, verifierErr := sowconfig.ParseTokenVerifierReference(attestation.TokenVerifierKind + "://" + attestation.TokenVerifierName)
+		if verifierErr != nil || verifier.Kind != attestation.TokenVerifierKind || verifier.Name != attestation.TokenVerifierName {
+			return errors.New("real-cloud acceptance provider API attestation verifier reference is invalid")
+		}
+		switch verifier.Kind {
+		case "provider":
+			if attestation.CFTokenVerifierService != verifier.Name ||
+				!validRealCloudProviderIdentifier(attestation.CFTokenVerifierVersionID, 128) ||
+				!validRealCloudProviderETag(attestation.CFTokenVerifierVersionETag) ||
+				!validRealCloudLowerSHA256(attestation.CFTokenVerifierContentSHA256) ||
+				!validRealCloudLowerSHA256(attestation.CFTokenVerifierBindingsSHA256) ||
+				!validRealCloudLowerSHA256(attestation.CFTokenVerifierSecuritySHA256) ||
+				!validRealCloudLowerSHA256(attestation.EdgeOneTokenVerifierDeploymentSHA256) {
+				return errors.New("real-cloud acceptance provider verifier attestation is incomplete")
+			}
+		case "env":
+			if !validRealCloudProviderSecretName(attestation.TokenVerifierName) || attestation.CFTokenVerifierService != "" ||
+				attestation.CFTokenVerifierVersionID != "" || attestation.CFTokenVerifierVersionETag != "" ||
+				attestation.CFTokenVerifierContentSHA256 != "" || attestation.CFTokenVerifierBindingsSHA256 != "" ||
+				attestation.CFTokenVerifierSecuritySHA256 != "" || attestation.EdgeOneTokenVerifierDeploymentSHA256 != "" {
+				return errors.New("real-cloud acceptance static verifier attestation retains provider-only evidence")
+			}
+		default:
+			return errors.New("real-cloud acceptance provider API attestation verifier kind is invalid")
 		}
 	}
 	return nil
+}
+
+func TestRealCloudAcceptanceLedgerValidatesVerifierEvidenceUnion(t *testing.T) {
+	closureFor := func(attestation realCloudProviderRawAttestation) realCloudResumeFacts {
+		return realCloudResumeFacts{ProviderClosure: &realCloudProviderClosureFact{
+			ProviderLogPathSHA256: strings.Repeat("1", 64), ProviderLogSHA256: strings.Repeat("2", 64),
+			ProviderSealSHA256: strings.Repeat("3", 64), ActiveArtifactSHA256: strings.Repeat("4", 64),
+			ActiveSealSHA256: strings.Repeat("5", 64), CFPurgeEvidenceSHA256: strings.Repeat("6", 64),
+			COSPurgeEvidenceSHA256: strings.Repeat("7", 64), ProviderRecords: 12, ProviderAttestation: attestation,
+		}}
+	}
+	provider := realCloudProviderRawAttestationForTest(12)
+	static := realCloudStaticProviderRawAttestationForTest(12)
+	for name, attestation := range map[string]realCloudProviderRawAttestation{"provider": provider, "static": static} {
+		t.Run(name, func(t *testing.T) {
+			if err := validateRealCloudResumeFacts(closureFor(attestation)); err != nil {
+				t.Fatalf("valid %s verifier evidence rejected: %v", name, err)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name   string
+		value  realCloudProviderRawAttestation
+		mutate func(*realCloudProviderRawAttestation)
+	}{
+		{"provider-missing-worker", provider, func(value *realCloudProviderRawAttestation) { value.CFTokenVerifierVersionID = "" }},
+		{"provider-name-drift", provider, func(value *realCloudProviderRawAttestation) { value.TokenVerifierName = "other-verifier" }},
+		{"static-retains-worker", static, func(value *realCloudProviderRawAttestation) { value.CFTokenVerifierService = "cf-verifier" }},
+		{"static-retains-edgeone-deployment", static, func(value *realCloudProviderRawAttestation) {
+			value.EdgeOneTokenVerifierDeploymentSHA256 = strings.Repeat("a", 64)
+		}},
+		{"static-invalid-secret-name", static, func(value *realCloudProviderRawAttestation) { value.TokenVerifierName = "lowercase" }},
+		{"static-secret-name-too-long", static, func(value *realCloudProviderRawAttestation) { value.TokenVerifierName = "S" + strings.Repeat("A", 128) }},
+		{"provider-uppercase-name", provider, func(value *realCloudProviderRawAttestation) {
+			value.TokenVerifierName, value.CFTokenVerifierService = "CF-Verifier", "CF-Verifier"
+		}},
+		{"unknown-kind", static, func(value *realCloudProviderRawAttestation) { value.TokenVerifierKind = "remote" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := test.value
+			test.mutate(&candidate)
+			if err := validateRealCloudResumeFacts(closureFor(candidate)); err == nil {
+				t.Fatal("mixed verifier evidence union was accepted")
+			}
+		})
+	}
 }
 
 func realCloudCanonicalValueSHA256(value any) (string, error) {
@@ -1562,12 +1669,14 @@ func TestRealCloudAcceptanceLedgerCompletesOnlyExactStepTable(t *testing.T) {
 			}
 		case "final-fsck":
 			updateFacts = func(facts *realCloudResumeFacts) error {
+				attestation := realCloudStaticProviderRawAttestationForTest(12)
+				attestation.ProductConfigSHA256 = binding.ConfigSHA256
 				facts.ProviderClosure = &realCloudProviderClosureFact{
 					ProviderLogPathSHA256: binding.ProviderLogPathSHA256,
 					ProviderLogSHA256:     strings.Repeat("d", 64), ProviderSealSHA256: strings.Repeat("e", 64),
 					ActiveArtifactSHA256: strings.Repeat("f", 64), ActiveSealSHA256: strings.Repeat("1", 64),
 					CFPurgeEvidenceSHA256: strings.Repeat("2", 64), COSPurgeEvidenceSHA256: strings.Repeat("3", 64), ProviderRecords: 12,
-					ProviderAttestation: realCloudProviderRawAttestationForTest(12),
+					ProviderAttestation: attestation,
 				}
 				return nil
 			}
@@ -1575,6 +1684,16 @@ func TestRealCloudAcceptanceLedgerCompletesOnlyExactStepTable(t *testing.T) {
 		if err := store.CompleteStep(id, map[string]any{"status": "verified", "step": id}, updateFacts, instant.Add(time.Second)); err != nil {
 			t.Fatalf("complete %s: %v", id, err)
 		}
+	}
+	spliced := store.Snapshot()
+	spliced.Facts.ProviderClosure.ProviderAttestation.ProductConfigSHA256 = strings.Repeat("9", 64)
+	if err := validateRealCloudAcceptanceLedger(spliced); err == nil || !strings.Contains(err.Error(), "another product config") {
+		t.Fatalf("cross-config provider attestation replay err=%v", err)
+	}
+	spliced = store.Snapshot()
+	spliced.Facts.ProviderClosure.ProviderAttestation.TokenVerifierName = "SOW_OTHER_ENTITLEMENTS"
+	if err := validateRealCloudAcceptanceLedger(spliced); err == nil || !strings.Contains(err.Error(), "another product token verifier") {
+		t.Fatalf("cross-verifier provider attestation replay err=%v", err)
 	}
 	if err := store.MarkComplete(time.Date(2026, 7, 14, 4, 0, 0, 0, time.UTC)); err != nil {
 		t.Fatal(err)
@@ -1590,11 +1709,15 @@ func TestRealCloudAcceptanceLedgerCompletesOnlyExactStepTable(t *testing.T) {
 
 func realCloudAcceptanceLedgerTestBinding(t *testing.T, root, runID string) realCloudAcceptanceBinding {
 	t.Helper()
+	configBody, err := realCloudConfigBodyForEnvironment(realCloudSafetyFixtureEnvironment())
+	if err != nil {
+		t.Fatal(err)
+	}
 	identity := realCloudRunIdentity{
 		Schema: "sow-real-cloud-run/v1", RunID: runID,
-		ConfirmationSHA256: strings.Repeat("a", 64), ConfigSHA256: strings.Repeat("b", 64), PublicKeySHA256: strings.Repeat("c", 64),
+		ConfirmationSHA256: strings.Repeat("a", 64), ConfigSHA256: realCloudLowerSHA256(configBody), PublicKeySHA256: strings.Repeat("c", 64),
 	}
-	binding, err := realCloudAcceptanceBindingFor(identity, filepath.Join(filepath.Dir(root), "active.jsonl"), filepath.Join(filepath.Dir(root), "provider.jsonl"), []byte("observer-a\x00observer-b\n"))
+	binding, err := realCloudAcceptanceBindingFor(identity, configBody, filepath.Join(filepath.Dir(root), "active.jsonl"), filepath.Join(filepath.Dir(root), "provider.jsonl"), []byte("observer-a\x00observer-b\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1757,11 +1880,13 @@ func advanceRealCloudAcceptanceReceiptsForTest(t *testing.T, store *realCloudAcc
 			update = func(facts *realCloudResumeFacts) error { facts.RecentSnapshotID = "el10-20260714"; return nil }
 		case "final-fsck":
 			update = func(facts *realCloudResumeFacts) error {
+				attestation := realCloudStaticProviderRawAttestationForTest(12)
+				attestation.ProductConfigSHA256 = binding.ConfigSHA256
 				facts.ProviderClosure = &realCloudProviderClosureFact{
 					ProviderLogPathSHA256: binding.ProviderLogPathSHA256, ProviderLogSHA256: strings.Repeat("d", 64), ProviderSealSHA256: strings.Repeat("e", 64),
 					ActiveArtifactSHA256: strings.Repeat("f", 64), ActiveSealSHA256: strings.Repeat("1", 64),
 					CFPurgeEvidenceSHA256: strings.Repeat("2", 64), COSPurgeEvidenceSHA256: strings.Repeat("3", 64), ProviderRecords: 12,
-					ProviderAttestation: realCloudProviderRawAttestationForTest(12),
+					ProviderAttestation: attestation,
 				}
 				return nil
 			}
