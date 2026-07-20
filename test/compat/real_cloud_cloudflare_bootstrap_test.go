@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -26,8 +27,8 @@ import (
 )
 
 const (
-	realCloudCloudflareBootstrapReceiptSchema      = "sow-real-cloud-cloudflare-bootstrap-receipt/v1"
-	realCloudCloudflareBootstrapEnvelopeSchema     = "sow-real-cloud-cloudflare-bootstrap-receipt-envelope/v1"
+	realCloudCloudflareBootstrapReceiptSchema      = "sow-real-cloud-cloudflare-bootstrap-receipt/v2"
+	realCloudCloudflareBootstrapEnvelopeSchema     = "sow-real-cloud-cloudflare-bootstrap-receipt-envelope/v2"
 	realCloudCloudflareBootstrapLeaseSchema        = "sow-real-cloud-cloudflare-bootstrap-lease/v3"
 	realCloudCloudflareBootstrapIdleLeaseSchema    = "sow-real-cloud-cloudflare-bootstrap-idle-lease/v3"
 	realCloudCloudflareLeaseRecoveryPendingSchema  = "sow-real-cloud-cloudflare-bootstrap-lease-recovery-pending/v1"
@@ -209,8 +210,29 @@ type realCloudCloudflareBootstrapLeaseRecoveryReceipt struct {
 }
 
 type realCloudCloudflareSDKBootstrapControl struct {
-	client *cloudflareapi.Client
+	client         *cloudflareapi.Client
+	secretBindings map[string]string
 }
+
+type realCloudCloudflareStaticEntitlement struct {
+	SHA256       string   `json:"sha256"`
+	ExpiresAt    string   `json:"expires_at"`
+	Audiences    []string `json:"audiences"`
+	PathPrefixes []string `json:"path_prefixes"`
+}
+
+const (
+	// Cloudflare Workers limits every environment variable, including
+	// secret_text, to 5 KB. Use the decimal interpretation so the local gate is
+	// never more permissive than the provider's published boundary.
+	realCloudCloudflareStaticSecretMaxBytes = 5000
+	// Leave enough lifetime for bounded upload, exposure, route, and repeated
+	// closure observations instead of sealing an already-expiring deployment.
+	realCloudCloudflareStaticEntitlementMinTTL = 15 * time.Minute
+)
+
+var realCloudCloudflareStaticAudiencePattern = regexp.MustCompile(`^[a-z0-9.-]+$`)
+var realCloudCloudflareStaticPathPattern = regexp.MustCompile(`^/(?:[A-Za-z0-9+._~^:-]+(?:/[A-Za-z0-9+._~^:-]+)*)?$`)
 
 type realCloudCloudflareLeasedBootstrapControl struct {
 	inner           realCloudCloudflareBootstrapControl
@@ -320,9 +342,12 @@ type realCloudCloudflareBootstrapFile struct {
 func (file *realCloudCloudflareBootstrapFile) Filename() string    { return file.filename }
 func (file *realCloudCloudflareBootstrapFile) ContentType() string { return file.contentType }
 
-func newRealCloudCloudflareSDKBootstrapControl(apiToken, baseURL string, client *http.Client) (*realCloudCloudflareSDKBootstrapControl, error) {
+func newRealCloudCloudflareSDKBootstrapControl(apiToken, baseURL string, client *http.Client, secretSets ...map[string]string) (*realCloudCloudflareSDKBootstrapControl, error) {
 	if strings.TrimSpace(apiToken) == "" || apiToken != strings.TrimSpace(apiToken) {
 		return nil, errors.New("Cloudflare bootstrap API token is empty or non-canonical")
+	}
+	if len(secretSets) > 1 {
+		return nil, errors.New("Cloudflare bootstrap accepts at most one secret binding set")
 	}
 	if baseURL == "" {
 		baseURL = "https://api.cloudflare.com/client/v4"
@@ -334,10 +359,103 @@ func newRealCloudCloudflareSDKBootstrapControl(apiToken, baseURL string, client 
 	if client == nil {
 		client = realCloudProviderHTTPClient()
 	}
+	secrets := make(map[string]string)
+	if len(secretSets) == 1 {
+		for name, value := range secretSets[0] {
+			if !validRealCloudCloudflareStaticSecretName(name) || value == "" {
+				return nil, errors.New("Cloudflare bootstrap secret binding set is invalid")
+			}
+			secrets[name] = value
+		}
+	}
 	return &realCloudCloudflareSDKBootstrapControl{client: cloudflareapi.NewClient(
 		option.WithBaseURL(strings.TrimSuffix(canonical, "/")+"/"), option.WithAPIToken(apiToken),
 		option.WithHTTPClient(client), option.WithMaxRetries(0),
-	)}, nil
+	), secretBindings: secrets}, nil
+}
+
+func realCloudCloudflareBootstrapUsesProvider(plan realCloudCloudflareBootstrapPlan) bool {
+	return plan.TokenVerifierKind == "provider"
+}
+
+func realCloudCloudflareBootstrapManagedWorkers(plan realCloudCloudflareBootstrapPlan) map[string]bool {
+	workers := map[string]bool{plan.AuthScript: false, plan.OriginScript: false}
+	if realCloudCloudflareBootstrapUsesProvider(plan) {
+		workers[plan.TokenVerifierService] = false
+	}
+	return workers
+}
+
+func validateRealCloudCloudflareStaticEntitlements(raw string, plan realCloudCloudflareBootstrapPlan, now time.Time) error {
+	if plan.TokenVerifierKind != "env" || !validRealCloudCloudflareStaticSecretName(plan.TokenVerifierSecret) ||
+		raw == "" || len(raw) > realCloudCloudflareStaticSecretMaxBytes || raw != strings.TrimSpace(raw) {
+		return errors.New("Cloudflare bootstrap static entitlement secret is absent, oversized, or non-canonical")
+	}
+	var entries []realCloudCloudflareStaticEntitlement
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&entries); err != nil {
+		return errors.New("Cloudflare bootstrap static entitlement secret is not strict JSON")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) || len(entries) == 0 || len(entries) > 10000 {
+		return errors.New("Cloudflare bootstrap static entitlement secret has an invalid document closure")
+	}
+	mainAudience := strings.TrimPrefix(plan.MainBase, "https://")
+	betaAudience := strings.TrimPrefix(plan.BetaBase, "https://")
+	previousSHA := ""
+	for _, entry := range entries {
+		if !validRealCloudLowerSHA256(entry.SHA256) || entry.SHA256 <= previousSHA {
+			return errors.New("Cloudflare bootstrap static entitlements are not strictly sorted and unique")
+		}
+		previousSHA = entry.SHA256
+		expires, err := time.Parse("2006-01-02T15:04:05Z", entry.ExpiresAt)
+		if err != nil || expires.Format("2006-01-02T15:04:05Z") != entry.ExpiresAt || expires.Before(now.UTC().Add(realCloudCloudflareStaticEntitlementMinTTL)) {
+			return errors.New("Cloudflare bootstrap static entitlement expiry is invalid or not live")
+		}
+		if len(entry.Audiences) == 0 || len(entry.PathPrefixes) == 0 {
+			return errors.New("Cloudflare bootstrap static entitlement scope is empty")
+		}
+		for index, audience := range entry.Audiences {
+			if !realCloudCloudflareStaticAudiencePattern.MatchString(audience) || audience != mainAudience && audience != betaAudience ||
+				index > 0 && audience <= entry.Audiences[index-1] {
+				return errors.New("Cloudflare bootstrap static entitlement audience is outside the exact test hosts or non-canonical")
+			}
+		}
+		for index, prefix := range entry.PathPrefixes {
+			if !realCloudCloudflareStaticPathPattern.MatchString(prefix) || index > 0 && prefix <= entry.PathPrefixes[index-1] {
+				return errors.New("Cloudflare bootstrap static entitlement path scope is invalid or non-canonical")
+			}
+		}
+	}
+	canonical, err := json.Marshal(entries)
+	if err != nil || raw != string(canonical) {
+		return errors.New("Cloudflare bootstrap static entitlement secret must be canonical compact JSON")
+	}
+	return nil
+}
+
+func realCloudCloudflareStaticSecretFragments(raw string) []string {
+	fragments := realCloudScopedSecretFragments(raw)
+	for index := 0; index+64 <= len(raw); index++ {
+		candidate := raw[index : index+64]
+		if validRealCloudLowerSHA256(candidate) {
+			fragments = append(fragments, candidate)
+			index += 63
+		}
+	}
+	return fragments
+}
+
+func bindRealCloudCloudflareStaticEntitlement(control *realCloudCloudflareSDKBootstrapControl, plan realCloudCloudflareBootstrapPlan, raw string, now time.Time) error {
+	if control == nil || control.client == nil || plan.TokenVerifierKind != "env" || len(control.secretBindings) != 0 {
+		return errors.New("Cloudflare bootstrap static entitlement binding state is invalid")
+	}
+	if err := validateRealCloudCloudflareStaticEntitlements(raw, plan, now); err != nil {
+		return err
+	}
+	control.secretBindings[plan.TokenVerifierSecret] = raw
+	return nil
 }
 
 func newRealCloudCloudflareBootstrapLeaseStore(resource realCloudProviderReadinessResource, plan realCloudCloudflareBootstrapPlan, storage realCloudStorageSecret, client *http.Client) (*publish.R2CloudflareControlHTTP, error) {
@@ -404,6 +522,7 @@ func (control *realCloudCloudflareSDKBootstrapControl) Inventory(ctx context.Con
 	if control == nil || control.client == nil {
 		return inventory, errors.New("Cloudflare bootstrap client is absent")
 	}
+	managedWorkers := realCloudCloudflareBootstrapManagedWorkers(plan)
 	workerPager := control.client.Workers.Scripts.ListAutoPaging(ctx, workers.ScriptListParams{AccountID: cloudflareapi.F(plan.AccountID)})
 	for workerPager.Next() {
 		if workerPager.Index() > realCloudProviderMaxInventoryItems {
@@ -411,7 +530,7 @@ func (control *realCloudCloudflareSDKBootstrapControl) Inventory(ctx context.Con
 		}
 		worker := workerPager.Current()
 		inventory.Workers = append(inventory.Workers, worker.ID)
-		if worker.ID == plan.AuthScript || worker.ID == plan.OriginScript || worker.ID == plan.TokenVerifierService {
+		if _, managed := managedWorkers[worker.ID]; managed {
 			if len(worker.TailConsumers) != 0 {
 				inventory.ManagedAttachments = append(inventory.ManagedAttachments, worker.ID+"\x00tail-consumer")
 			}
@@ -480,6 +599,9 @@ func (control *realCloudCloudflareSDKBootstrapControl) Inspect(ctx context.Conte
 		script, repositoryBundle = plan.OriginScript, plan.OriginBundle.Path
 		runtimeContract = realCloudCloudflareWorkerRuntimeContract{CompatibilityDate: plan.CompatibilityDate, CompatibilityFlags: append([]string(nil), plan.CompatibilityFlags...)}
 	case "verifier":
+		if !realCloudCloudflareBootstrapUsesProvider(plan) {
+			return state, errors.New("static Cloudflare bootstrap has no token-verifier Worker")
+		}
 		script, expectedSHA = plan.TokenVerifierService, plan.TokenVerifierContentSHA256
 		runtimeContract = realCloudCloudflareWorkerRuntimeContract{CompatibilityDate: plan.TokenVerifierCompatibilityDate, CompatibilityFlags: append([]string(nil), plan.TokenVerifierCompatibilityFlags...)}
 	default:
@@ -541,6 +663,9 @@ func (control *realCloudCloudflareSDKBootstrapControl) inspectSecurityObservatio
 	}
 	expectedDate, expectedFlags := plan.CompatibilityDate, plan.CompatibilityFlags
 	if role == "verifier" {
+		if !realCloudCloudflareBootstrapUsesProvider(plan) {
+			return observation, errors.New("static Cloudflare bootstrap has no token-verifier Worker settings")
+		}
 		expectedDate, expectedFlags = plan.TokenVerifierCompatibilityDate, plan.TokenVerifierCompatibilityFlags
 	}
 	if settings.CompatibilityDate != expectedDate || !equalRealCloudStrings(settings.CompatibilityFlags, expectedFlags) ||
@@ -1468,11 +1593,17 @@ func validateRealCloudCloudflareBootstrapAuthBindings(bindings []workers.ScriptV
 	for name, value := range plan.EdgeContract.Variables {
 		wantedVariables[name] = value
 	}
-	wantedServices := map[string]string{"ORIGIN": plan.OriginScript, "TOKEN_VERIFIER": plan.TokenVerifierService}
+	wantedServices := map[string]string{"ORIGIN": plan.OriginScript}
+	wantedSecrets := make(map[string]struct{})
+	if realCloudCloudflareBootstrapUsesProvider(plan) {
+		wantedServices["TOKEN_VERIFIER"] = plan.TokenVerifierService
+	} else {
+		wantedSecrets[plan.TokenVerifierSecret] = struct{}{}
+	}
 	seen := make(map[string]struct{}, len(bindings))
 	rows := make([]string, 0, len(bindings))
 	for _, binding := range bindings {
-		if _, duplicate := seen[binding.Name]; duplicate || !validRealCloudProviderSecretName(binding.Name) {
+		if _, duplicate := seen[binding.Name]; duplicate || !validRealCloudCloudflareRuntimeBindingName(binding.Name) {
 			return "", errors.New("Cloudflare bootstrap auth Worker repeats or has an invalid binding")
 		}
 		seen[binding.Name] = struct{}{}
@@ -1492,11 +1623,17 @@ func validateRealCloudCloudflareBootstrapAuthBindings(bindings []workers.ScriptV
 			}
 			delete(wantedServices, binding.Name)
 			rows = append(rows, strings.Join([]string{binding.Name, string(binding.Type), binding.Service, binding.Environment}, "\x00"))
+		case workers.ScriptVersionGetResponseResourcesBindingsTypeSecretText:
+			if _, found := wantedSecrets[binding.Name]; !found {
+				return "", errors.New("Cloudflare bootstrap auth Worker secret binding differs from the plan")
+			}
+			delete(wantedSecrets, binding.Name)
+			rows = append(rows, strings.Join([]string{binding.Name, string(binding.Type)}, "\x00"))
 		default:
 			return "", errors.New("Cloudflare bootstrap auth Worker has an excessive capability binding")
 		}
 	}
-	if len(wantedVariables) != 0 || len(wantedServices) != 0 {
+	if len(wantedVariables) != 0 || len(wantedServices) != 0 || len(wantedSecrets) != 0 {
 		return "", errors.New("Cloudflare bootstrap auth Worker lacks a planned binding")
 	}
 	sort.Strings(rows)
@@ -1534,17 +1671,29 @@ func (control *realCloudCloudflareSDKBootstrapControl) Upload(ctx context.Contex
 				Type: cloudflareapi.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindPlainTextTypePlainText),
 			})
 		}
-		bindings = append(bindings,
-			workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindService{
-				Name: cloudflareapi.F("ORIGIN"), Service: cloudflareapi.F(plan.OriginScript),
-				Type: cloudflareapi.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindServiceTypeService),
-			},
-			workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindService{
+		bindings = append(bindings, workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindService{
+			Name: cloudflareapi.F("ORIGIN"), Service: cloudflareapi.F(plan.OriginScript),
+			Type: cloudflareapi.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindServiceTypeService),
+		})
+		if realCloudCloudflareBootstrapUsesProvider(plan) {
+			if len(control.secretBindings) != 0 {
+				return errors.New("Cloudflare bootstrap provider upload received an unexpected static secret")
+			}
+			bindings = append(bindings, workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindService{
 				Name: cloudflareapi.F("TOKEN_VERIFIER"), Service: cloudflareapi.F(plan.TokenVerifierService),
 				Environment: cloudflareapi.F(plan.TokenVerifierEnvironment),
 				Type:        cloudflareapi.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindServiceTypeService),
-			},
-		)
+			})
+		} else {
+			secret, found := control.secretBindings[plan.TokenVerifierSecret]
+			if !found || len(control.secretBindings) != 1 || validateRealCloudCloudflareStaticEntitlements(secret, plan, time.Now().UTC()) != nil {
+				return errors.New("Cloudflare bootstrap static entitlement secret is absent or invalid before upload")
+			}
+			bindings = append(bindings, workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindSecretText{
+				Name: cloudflareapi.F(plan.TokenVerifierSecret), Text: cloudflareapi.F(secret),
+				Type: cloudflareapi.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindSecretTextTypeSecretText),
+			})
+		}
 	default:
 		return errors.New("Cloudflare bootstrap may upload only auth or origin Workers")
 	}
@@ -1720,7 +1869,7 @@ func realCloudCloudflareAPINotFound(err error) bool {
 }
 
 func validateRealCloudCloudflareBootstrapInventory(plan realCloudCloudflareBootstrapPlan, inventory realCloudCloudflareBootstrapInventory, complete bool) (map[string]bool, map[string]realCloudCloudflareBootstrapInventoryRoute, error) {
-	wantedWorkers := map[string]bool{plan.AuthScript: false, plan.OriginScript: false, plan.TokenVerifierService: false}
+	wantedWorkers := realCloudCloudflareBootstrapManagedWorkers(plan)
 	seenWorkers := make(map[string]struct{}, len(inventory.Workers))
 	for _, script := range inventory.Workers {
 		if !validRealCloudProviderIdentifier(script, 128) {
@@ -1734,7 +1883,7 @@ func validateRealCloudCloudflareBootstrapInventory(plan realCloudCloudflareBoots
 			wantedWorkers[script] = true
 		}
 	}
-	if !wantedWorkers[plan.TokenVerifierService] {
+	if realCloudCloudflareBootstrapUsesProvider(plan) && !wantedWorkers[plan.TokenVerifierService] {
 		return nil, nil, errors.New("Cloudflare bootstrap token verifier service is absent")
 	}
 	if complete && (!wantedWorkers[plan.AuthScript] || !wantedWorkers[plan.OriginScript]) {
@@ -1760,7 +1909,7 @@ func validateRealCloudCloudflareBootstrapInventory(plan realCloudCloudflareBoots
 			return nil, nil, errors.New("Cloudflare route inventory contains an incomplete or unsafe identity")
 		}
 		wanted, exact := wantedRoutes[route.Pattern]
-		relevantScript := route.Script == plan.AuthScript || route.Script == plan.OriginScript || route.Script == plan.TokenVerifierService
+		_, relevantScript := wantedWorkers[route.Script]
 		overlaps := realCloudCloudflareRouteMayMatchHost(route.Pattern, mainHost) || realCloudCloudflareRouteMayMatchHost(route.Pattern, betaHost)
 		if !exact && !relevantScript && !overlaps {
 			continue
@@ -1789,8 +1938,12 @@ func realCloudCloudflareBootstrapExpectedAuthBindingsSHA(plan realCloudCloudflar
 	}
 	rows = append(rows,
 		strings.Join([]string{"ORIGIN", string(workers.ScriptVersionGetResponseResourcesBindingsTypeService), plan.OriginScript, ""}, "\x00"),
-		strings.Join([]string{"TOKEN_VERIFIER", string(workers.ScriptVersionGetResponseResourcesBindingsTypeService), plan.TokenVerifierService, plan.TokenVerifierEnvironment}, "\x00"),
 	)
+	if realCloudCloudflareBootstrapUsesProvider(plan) {
+		rows = append(rows, strings.Join([]string{"TOKEN_VERIFIER", string(workers.ScriptVersionGetResponseResourcesBindingsTypeService), plan.TokenVerifierService, plan.TokenVerifierEnvironment}, "\x00"))
+	} else {
+		rows = append(rows, strings.Join([]string{plan.TokenVerifierSecret, string(workers.ScriptVersionGetResponseResourcesBindingsTypeSecretText)}, "\x00"))
+	}
 	sort.Strings(rows)
 	body, _ := json.Marshal(rows)
 	return realCloudLowerSHA256(body)
@@ -1812,6 +1965,9 @@ func validateRealCloudCloudflareBootstrapWorkerState(role string, state realClou
 	case "origin":
 		script, contentSHA, bindingsSHA = plan.OriginScript, plan.OriginBundle.SHA256, realCloudCloudflareBootstrapExpectedOriginBindingsSHA(plan)
 	case "verifier":
+		if !realCloudCloudflareBootstrapUsesProvider(plan) {
+			return errors.New("static Cloudflare bootstrap has no token-verifier Worker state")
+		}
 		script, contentSHA, bindingsSHA = plan.TokenVerifierService, plan.TokenVerifierContentSHA256, plan.TokenVerifierBindingsSHA256
 	default:
 		return errors.New("unknown Cloudflare bootstrap Worker role")
@@ -1844,8 +2000,12 @@ func validateRealCloudCloudflareBootstrapWorkerState(role string, state realClou
 }
 
 func inspectRealCloudCloudflareBootstrapExisting(ctx context.Context, control realCloudCloudflareBootstrapControl, plan realCloudCloudflareBootstrapPlan, runID string, workersFound map[string]bool, requireExposureDisabled bool) (map[string]realCloudCloudflareBootstrapWorkerState, error) {
-	states := make(map[string]realCloudCloudflareBootstrapWorkerState, 3)
-	for _, role := range []string{"verifier", "origin", "auth"} {
+	roles := []string{"origin", "auth"}
+	if realCloudCloudflareBootstrapUsesProvider(plan) {
+		roles = append([]string{"verifier"}, roles...)
+	}
+	states := make(map[string]realCloudCloudflareBootstrapWorkerState, len(roles))
+	for _, role := range roles {
 		var script string
 		switch role {
 		case "verifier":
@@ -1871,6 +2031,60 @@ func inspectRealCloudCloudflareBootstrapExisting(ctx context.Context, control re
 	return states, nil
 }
 
+// Cloudflare never returns a secret_text value. An unsealed static apply
+// therefore cannot prove that a same-run auth Worker contains the entitlement
+// supplied by the recovering process. Remove only the exact run-owned routes
+// and auth Worker under the provider-visible lease, then create them again.
+// A sealed receipt is handled by the caller's read-only replay path and never
+// reaches this reset.
+func resetRealCloudCloudflareUnsealedStaticAuth(
+	ctx context.Context,
+	control realCloudCloudflareBootstrapControl,
+	plan realCloudCloudflareBootstrapPlan,
+	runID string,
+	states map[string]realCloudCloudflareBootstrapWorkerState,
+	routesFound map[string]realCloudCloudflareBootstrapInventoryRoute,
+) error {
+	if plan.TokenVerifierKind != "env" {
+		return nil
+	}
+	auth, exists := states["auth"]
+	if !exists {
+		if len(routesFound) != 0 {
+			return errors.New("Cloudflare static bootstrap found planned routes without the run-owned auth Worker")
+		}
+		return nil
+	}
+	if !auth.ExposureDisabled {
+		if len(routesFound) != 0 {
+			return errors.New("Cloudflare static bootstrap found routes attached to an exposed partial auth Worker")
+		}
+		if err := control.DisableExposure(ctx, plan, plan.AuthScript); err != nil {
+			return fmt.Errorf("disable unsealed Cloudflare static auth Worker before reset: %w", err)
+		}
+		var err error
+		auth, err = control.Inspect(ctx, plan, "auth")
+		if err != nil || validateRealCloudCloudflareBootstrapWorkerState("auth", auth, plan, runID, true) != nil {
+			return errors.New("verify unsealed Cloudflare static auth Worker before reset")
+		}
+	}
+	for _, planned := range plan.Routes {
+		route, found := routesFound[planned.Pattern]
+		if !found {
+			continue
+		}
+		if err := control.DeleteRouteIfMatch(ctx, plan, route); err != nil {
+			return fmt.Errorf("reset unsealed Cloudflare static route %s: %w", planned.Pattern, err)
+		}
+		delete(routesFound, planned.Pattern)
+	}
+	if err := control.DeleteScriptIfMatch(ctx, plan, "auth", runID, realCloudCloudflareBootstrapReceiptWorkerFromState(auth)); err != nil {
+		return fmt.Errorf("reset unsealed Cloudflare static auth Worker: %w", err)
+	}
+	delete(states, "auth")
+	return nil
+}
+
 func applyRealCloudCloudflareBootstrap(ctx context.Context, control realCloudCloudflareBootstrapControl, resource realCloudProviderReadinessResource, plan realCloudCloudflareBootstrapPlan, planSHA, runID string) (realCloudCloudflareBootstrapReceipt, error) {
 	var receipt realCloudCloudflareBootstrapReceipt
 	if control == nil || planSHA != realCloudCloudflareBootstrapPlanSHA(plan) || !validRealCloudRunID(runID) {
@@ -1892,6 +2106,9 @@ func applyRealCloudCloudflareBootstrap(ctx context.Context, control realCloudClo
 		if _, owned := states["auth"]; !owned {
 			return receipt, errors.New("Cloudflare bootstrap planned route exists without the run-owned auth Worker")
 		}
+	}
+	if err := resetRealCloudCloudflareUnsealedStaticAuth(ctx, control, plan, runID, states, routesFound); err != nil {
+		return receipt, err
 	}
 	for _, role := range []string{"origin", "auth"} {
 		var script string
@@ -1997,7 +2214,12 @@ func validateRealCloudCloudflareBootstrapReceipt(receipt realCloudCloudflareBoot
 	if _, err := time.Parse(time.RFC3339Nano, receipt.ObservedAt); err != nil {
 		return errors.New("Cloudflare bootstrap receipt observation time is invalid")
 	}
-	wantedWorkers := []realCloudCloudflareBootstrapReceiptWorker{receipt.Auth, receipt.Origin, receipt.Verifier}
+	wantedWorkers := []realCloudCloudflareBootstrapReceiptWorker{receipt.Auth, receipt.Origin}
+	if realCloudCloudflareBootstrapUsesProvider(plan) {
+		wantedWorkers = append(wantedWorkers, receipt.Verifier)
+	} else if receipt.Verifier != (realCloudCloudflareBootstrapReceiptWorker{}) {
+		return errors.New("static Cloudflare bootstrap receipt contains a token-verifier Worker")
+	}
 	for _, worker := range wantedWorkers {
 		if !validRealCloudProviderIdentifier(worker.Script, 128) || !validRealCloudProviderIdentifier(worker.DeploymentID, 128) ||
 			!validRealCloudProviderIdentifier(worker.VersionID, 128) || !validRealCloudProviderETag(worker.VersionETag) ||
@@ -2005,12 +2227,15 @@ func validateRealCloudCloudflareBootstrapReceipt(receipt realCloudCloudflareBoot
 			return errors.New("Cloudflare bootstrap receipt Worker evidence is invalid")
 		}
 	}
-	if receipt.Auth.Script != plan.AuthScript || receipt.Origin.Script != plan.OriginScript || receipt.Verifier.Script != plan.TokenVerifierService ||
+	if receipt.Auth.Script != plan.AuthScript || receipt.Origin.Script != plan.OriginScript ||
 		receipt.Auth.ContentSHA256 != plan.AuthBundle.SHA256 || receipt.Origin.ContentSHA256 != plan.OriginBundle.SHA256 ||
-		receipt.Verifier.ContentSHA256 != plan.TokenVerifierContentSHA256 || receipt.Verifier.BindingsSHA256 != plan.TokenVerifierBindingsSHA256 ||
 		receipt.Auth.BindingsSHA256 != realCloudCloudflareBootstrapExpectedAuthBindingsSHA(plan) ||
 		receipt.Origin.BindingsSHA256 != realCloudCloudflareBootstrapExpectedOriginBindingsSHA(plan) {
 		return errors.New("Cloudflare bootstrap receipt Worker closure differs from the plan")
+	}
+	if realCloudCloudflareBootstrapUsesProvider(plan) && (receipt.Verifier.Script != plan.TokenVerifierService ||
+		receipt.Verifier.ContentSHA256 != plan.TokenVerifierContentSHA256 || receipt.Verifier.BindingsSHA256 != plan.TokenVerifierBindingsSHA256) {
+		return errors.New("Cloudflare bootstrap receipt token-verifier closure differs from the plan")
 	}
 	message, tag := realCloudCloudflareBootstrapOwnershipAnnotations(plan, runID)
 	if receipt.Auth.OwnershipMessage != message || receipt.Auth.OwnershipTag != tag ||
@@ -2052,11 +2277,13 @@ func rollbackRealCloudCloudflareBootstrap(ctx context.Context, control realCloud
 	if err != nil {
 		return rollback, err
 	}
-	if _, exists := states["verifier"]; !exists {
-		return rollback, errors.New("Cloudflare bootstrap rollback refuses an absent token verifier")
-	}
-	if !realCloudCloudflareBootstrapStateMatchesReceipt(states["verifier"], applyReceipt.Verifier) {
-		return rollback, errors.New("Cloudflare bootstrap rollback token verifier differs from the sealed apply receipt")
+	if realCloudCloudflareBootstrapUsesProvider(plan) {
+		if _, exists := states["verifier"]; !exists {
+			return rollback, errors.New("Cloudflare bootstrap rollback refuses an absent token verifier")
+		}
+		if !realCloudCloudflareBootstrapStateMatchesReceipt(states["verifier"], applyReceipt.Verifier) {
+			return rollback, errors.New("Cloudflare bootstrap rollback token verifier differs from the sealed apply receipt")
+		}
 	}
 	for role, workerReceipt := range map[string]realCloudCloudflareBootstrapReceiptWorker{"auth": applyReceipt.Auth, "origin": applyReceipt.Origin} {
 		if state, exists := states[role]; exists && !realCloudCloudflareBootstrapStateMatchesReceipt(state, workerReceipt) {
@@ -2098,10 +2325,13 @@ func rollbackRealCloudCloudflareBootstrap(ctx context.Context, control realCloud
 	if finalWorkers[plan.AuthScript] || finalWorkers[plan.OriginScript] || len(finalRoutes) != 0 {
 		return rollback, errors.New("Cloudflare bootstrap rollback left an auth/origin Worker or planned route")
 	}
-	verifier, err := control.Inspect(ctx, plan, "verifier")
-	if err != nil || validateRealCloudCloudflareBootstrapWorkerState("verifier", verifier, plan, runID, true) != nil ||
-		!realCloudCloudflareBootstrapStateMatchesReceipt(verifier, applyReceipt.Verifier) {
-		return rollback, errors.New("Cloudflare bootstrap rollback changed or exposed the token verifier")
+	var verifier realCloudCloudflareBootstrapWorkerState
+	if realCloudCloudflareBootstrapUsesProvider(plan) {
+		verifier, err = control.Inspect(ctx, plan, "verifier")
+		if err != nil || validateRealCloudCloudflareBootstrapWorkerState("verifier", verifier, plan, runID, true) != nil ||
+			!realCloudCloudflareBootstrapStateMatchesReceipt(verifier, applyReceipt.Verifier) {
+			return rollback, errors.New("Cloudflare bootstrap rollback changed or exposed the token verifier")
+		}
 	}
 	rollback = applyReceipt
 	rollback.Mode = "rollback"
@@ -2204,10 +2434,12 @@ func validateRealCloudCloudflareBootstrapRollbackClosure(ctx context.Context, co
 	if workers[plan.AuthScript] || workers[plan.OriginScript] || len(routes) != 0 {
 		return errors.New("Cloudflare bootstrap rollback closure still contains an auth/origin Worker or planned route")
 	}
-	verifier, err := control.Inspect(ctx, plan, "verifier")
-	if err != nil || validateRealCloudCloudflareBootstrapWorkerState("verifier", verifier, plan, runID, true) != nil ||
-		!realCloudCloudflareBootstrapStateMatchesReceipt(verifier, applyReceipt.Verifier) {
-		return errors.New("Cloudflare bootstrap rollback closure changed or exposed the token verifier")
+	if realCloudCloudflareBootstrapUsesProvider(plan) {
+		verifier, inspectErr := control.Inspect(ctx, plan, "verifier")
+		if inspectErr != nil || validateRealCloudCloudflareBootstrapWorkerState("verifier", verifier, plan, runID, true) != nil ||
+			!realCloudCloudflareBootstrapStateMatchesReceipt(verifier, applyReceipt.Verifier) {
+			return errors.New("Cloudflare bootstrap rollback closure changed or exposed the token verifier")
+		}
 	}
 	return nil
 }
@@ -2218,7 +2450,8 @@ func validateRealCloudCloudflareBootstrapRollbackClosure(ctx context.Context, co
 // the exact mutation phrase pass. Apply and rollback use one conditional R2
 // lease object under .sow/bootstrap/leases and retire it by compare-and-set
 // only after a durable receipt. They never alter repository payload objects, DNS, custom domains,
-// the token-verifier deployment, or unrelated Worker routes.
+// any provider token-verifier deployment, or unrelated Worker routes. Static
+// plans inject one secret binding into the run-owned auth Worker only.
 func TestRealCloudCloudflareBootstrap(t *testing.T) {
 	mode := strings.TrimSpace(os.Getenv(realCloudCloudflareBootstrapOptInEnv))
 	if mode == "" || mode == "0" {
@@ -2345,6 +2578,16 @@ func TestRealCloudCloudflareBootstrap(t *testing.T) {
 			assertNoRealCloudSecret(t, "Cloudflare bootstrap post-lease closure error", []byte(combined.Error()), secretFragments)
 			t.Fatalf("Cloudflare bootstrap post-lease closure failed before any Worker or route mutation: %v", combined)
 		}
+		if plan.TokenVerifierKind == "env" {
+			staticRaw := os.Getenv(plan.TokenVerifierSecret)
+			secretFragments = append(secretFragments, realCloudCloudflareStaticSecretFragments(staticRaw)...)
+			if err := bindRealCloudCloudflareStaticEntitlement(control, plan, staticRaw, time.Now().UTC()); err != nil {
+				releaseErr := held.release(t.Context())
+				combined := errors.Join(err, releaseErr)
+				assertNoRealCloudSecret(t, "Cloudflare static entitlement mutation-gate error", []byte(combined.Error()), secretFragments)
+				t.Fatalf("Cloudflare static entitlement failed after the leased readiness gate and before Worker mutation: %v", combined)
+			}
+		}
 		receipt, applyErr := applyRealCloudCloudflareBootstrap(t.Context(), leasedControl, resource, plan, planSHA, runID)
 		if applyErr != nil {
 			assertNoRealCloudSecret(t, "Cloudflare bootstrap apply error", []byte(applyErr.Error()), secretFragments)
@@ -2352,6 +2595,12 @@ func TestRealCloudCloudflareBootstrap(t *testing.T) {
 		}
 		if err := validateRealCloudCloudflareBootstrapReceipt(receipt, resource, plan, planSHA, "apply", runID); err != nil {
 			t.Fatal(err)
+		}
+		if plan.TokenVerifierKind == "env" {
+			if err := validateRealCloudCloudflareStaticEntitlements(control.secretBindings[plan.TokenVerifierSecret], plan, time.Now().UTC()); err != nil {
+				assertNoRealCloudSecret(t, "Cloudflare static entitlement post-closure error", []byte(err.Error()), secretFragments)
+				t.Fatalf("Cloudflare static entitlement lost its minimum lifetime before durable receipt: %v", err)
+			}
 		}
 		if err := held.renew(t.Context(), time.Now()); err != nil {
 			t.Fatalf("renew Cloudflare bootstrap lease before durable receipt: %v", err)
@@ -2553,7 +2802,9 @@ func newFakeRealCloudCloudflareBootstrapControl(plan realCloudCloudflareBootstra
 		omitWorkerInventory: make(map[string]bool), omitRouteInventory: make(map[string]bool),
 		errorAfterRouteDelete: make(map[string]int), errorAfterScriptDelete: make(map[string]int),
 	}
-	fake.workers[plan.TokenVerifierService] = fakeRealCloudCloudflareBootstrapWorkerState(plan, "verifier", "20260717T000000Z-fixture", true)
+	if realCloudCloudflareBootstrapUsesProvider(plan) {
+		fake.workers[plan.TokenVerifierService] = fakeRealCloudCloudflareBootstrapWorkerState(plan, "verifier", "20260717T000000Z-fixture", true)
+	}
 	return fake
 }
 
@@ -2785,6 +3036,143 @@ func TestRealCloudCloudflareBootstrapRecoverLeaseRuntimeUsesOnlyR2Authority(t *t
 	}
 	if reads[realCloudStorageCredentialCF] != 1 || reads[realCloudCDNCredentialCF] != 0 || len(reads) != 1 {
 		t.Fatalf("recover-lease credential surface=%v", reads)
+	}
+}
+
+func realCloudCloudflareStaticEntitlementsFixture(t *testing.T, plan realCloudCloudflareBootstrapPlan) string {
+	t.Helper()
+	audiences := []string{strings.TrimPrefix(plan.BetaBase, "https://"), strings.TrimPrefix(plan.MainBase, "https://")}
+	sort.Strings(audiences)
+	entries := []realCloudCloudflareStaticEntitlement{
+		{SHA256: strings.Repeat("a", 64), ExpiresAt: "2099-01-01T00:00:00Z", Audiences: audiences, PathPrefixes: []string{"/"}},
+		{SHA256: strings.Repeat("b", 64), ExpiresAt: "2099-01-01T00:00:00Z", Audiences: audiences, PathPrefixes: []string{"/apt", "/yum"}},
+	}
+	body, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+func TestRealCloudCloudflareStaticBootstrapRuntimeDefersSecretUntilUnsealedMutation(t *testing.T) {
+	resource, plan := realCloudCloudflareStaticBootstrapPlanFixture(t)
+	secret := realCloudCloudflareStaticEntitlementsFixture(t, plan)
+	values := map[string]string{
+		realCloudStorageCredentialCF: `{"access_key_id":"static-bootstrap-access","secret_access_key":"static-bootstrap-storage-secret"}`,
+		realCloudCDNCredentialCF:     `{"api_token":"static-bootstrap-api-token"}`,
+		plan.TokenVerifierSecret:     secret,
+	}
+	reads := make(map[string]int)
+	getenv := func(name string) string {
+		reads[name]++
+		return values[name]
+	}
+	runtime, err := newRealCloudCloudflareBootstrapRuntime("apply", resource, plan, getenv, "https://api.cloudflare.com/client/v4", &http.Client{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.control == nil || len(runtime.control.secretBindings) != 0 || reads[plan.TokenVerifierSecret] != 0 {
+		t.Fatalf("static bootstrap runtime read a secret before the unsealed mutation branch reads=%v bindings=%d", reads, len(runtime.control.secretBindings))
+	}
+	if err := bindRealCloudCloudflareStaticEntitlement(runtime.control, plan, secret, time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	runtime.secretFragments = append(runtime.secretFragments, realCloudCloudflareStaticSecretFragments(secret)...)
+	if len(runtime.control.secretBindings) != 1 || runtime.control.secretBindings[plan.TokenVerifierSecret] != secret {
+		t.Fatal("unsealed static mutation branch did not inject exactly one secret")
+	}
+	if !containsRealCloudSecret([]byte(secret), runtime.secretFragments) {
+		t.Fatal("static entitlement was not included in the runtime leak detector")
+	}
+	if !containsRealCloudSecret([]byte(strings.Repeat("a", 64)), runtime.secretFragments) {
+		t.Fatal("individual static entitlement token digest was not included in the runtime leak detector")
+	}
+	delete(values, plan.TokenVerifierSecret)
+	reads = make(map[string]int)
+	rollback, err := newRealCloudCloudflareBootstrapRuntime("rollback", resource, plan, getenv, "https://api.cloudflare.com/client/v4", &http.Client{})
+	if err != nil || rollback.control == nil || len(rollback.control.secretBindings) != 0 || reads[plan.TokenVerifierSecret] != 0 {
+		t.Fatalf("static rollback unnecessarily required entitlement material err=%v reads=%v", err, reads)
+	}
+}
+
+func TestRealCloudCloudflareStaticBootstrapEntitlementValidationFailsClosed(t *testing.T) {
+	_, plan := realCloudCloudflareStaticBootstrapPlanFixture(t)
+	valid := realCloudCloudflareStaticEntitlementsFixture(t, plan)
+	if err := validateRealCloudCloudflareStaticEntitlements(valid, plan, time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	var entries []realCloudCloudflareStaticEntitlement
+	if err := json.Unmarshal([]byte(valid), &entries); err != nil {
+		t.Fatal(err)
+	}
+	encode := func(mutate func([]realCloudCloudflareStaticEntitlement)) string {
+		copyEntries := append([]realCloudCloudflareStaticEntitlement(nil), entries...)
+		for index := range copyEntries {
+			copyEntries[index].Audiences = append([]string(nil), entries[index].Audiences...)
+			copyEntries[index].PathPrefixes = append([]string(nil), entries[index].PathPrefixes...)
+		}
+		mutate(copyEntries)
+		body, _ := json.Marshal(copyEntries)
+		return string(body)
+	}
+	tests := map[string]string{
+		"missing":        "",
+		"non-canonical":  valid + " ",
+		"unknown-field":  strings.Replace(valid, `"expires_at"`, `"raw_token":"forbidden","expires_at"`, 1),
+		"wrong-audience": encode(func(value []realCloudCloudflareStaticEntitlement) { value[0].Audiences = []string{"repo.pigsty.io"} }),
+		"expired":        encode(func(value []realCloudCloudflareStaticEntitlement) { value[0].ExpiresAt = "2020-01-01T00:00:00Z" }),
+		"expires-during-bootstrap": encode(func(value []realCloudCloudflareStaticEntitlement) {
+			value[0].ExpiresAt = "2026-07-20T00:00:01Z"
+		}),
+		"duplicate":     encode(func(value []realCloudCloudflareStaticEntitlement) { value[1].SHA256 = value[0].SHA256 }),
+		"unsorted-path": encode(func(value []realCloudCloudflareStaticEntitlement) { value[1].PathPrefixes = []string{"/yum", "/apt"} }),
+	}
+	for name, raw := range tests {
+		t.Run(name, func(t *testing.T) {
+			err := validateRealCloudCloudflareStaticEntitlements(raw, plan, time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC))
+			if err == nil || raw != "" && strings.Contains(err.Error(), raw) {
+				t.Fatalf("unsafe entitlement validation result err=%v", err)
+			}
+		})
+	}
+	boundaryNow := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	atHorizon := encode(func(value []realCloudCloudflareStaticEntitlement) {
+		value[0].ExpiresAt = boundaryNow.Add(realCloudCloudflareStaticEntitlementMinTTL).Format("2006-01-02T15:04:05Z")
+	})
+	if err := validateRealCloudCloudflareStaticEntitlements(atHorizon, plan, boundaryNow); err != nil {
+		t.Fatalf("exact 15-minute static entitlement horizon rejected: %v", err)
+	}
+	belowHorizon := encode(func(value []realCloudCloudflareStaticEntitlement) {
+		value[0].ExpiresAt = boundaryNow.Add(realCloudCloudflareStaticEntitlementMinTTL - time.Second).Format("2006-01-02T15:04:05Z")
+	})
+	if err := validateRealCloudCloudflareStaticEntitlements(belowHorizon, plan, boundaryNow); err == nil {
+		t.Fatal("static entitlement below the 15-minute deployment horizon was accepted")
+	}
+	boundary := []realCloudCloudflareStaticEntitlement{{
+		SHA256: strings.Repeat("c", 64), ExpiresAt: "2099-01-01T00:00:00Z",
+		Audiences: entries[0].Audiences, PathPrefixes: []string{"/"},
+	}}
+	base, err := json.Marshal(boundary)
+	if err != nil || len(base) >= realCloudCloudflareStaticSecretMaxBytes {
+		t.Fatalf("construct static entitlement boundary: len=%d err=%v", len(base), err)
+	}
+	boundary[0].PathPrefixes[0] = "/" + strings.Repeat("a", realCloudCloudflareStaticSecretMaxBytes-len(base))
+	exact, err := json.Marshal(boundary)
+	if err != nil || len(exact) != realCloudCloudflareStaticSecretMaxBytes {
+		t.Fatalf("construct exact 5 KB static entitlement: len=%d err=%v", len(exact), err)
+	}
+	if err := validateRealCloudCloudflareStaticEntitlements(string(exact), plan, time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("exact 5 KB static entitlement rejected: %v", err)
+	}
+	overBoundary := append([]realCloudCloudflareStaticEntitlement(nil), boundary...)
+	overBoundary[0].Audiences = append([]string(nil), boundary[0].Audiences...)
+	overBoundary[0].PathPrefixes = []string{boundary[0].PathPrefixes[0] + "a"}
+	over, err := json.Marshal(overBoundary)
+	if err != nil || len(over) != realCloudCloudflareStaticSecretMaxBytes+1 {
+		t.Fatalf("construct over-limit static entitlement: len=%d err=%v", len(over), err)
+	}
+	if err := validateRealCloudCloudflareStaticEntitlements(string(over), plan, time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)); err == nil {
+		t.Fatal("static entitlement over the Cloudflare 5 KB limit was accepted")
 	}
 }
 
@@ -3679,6 +4067,94 @@ func TestRealCloudCloudflareBootstrapApplyRollbackIsReplayable(t *testing.T) {
 	}
 }
 
+func TestRealCloudCloudflareStaticBootstrapApplyRollbackIsReplayable(t *testing.T) {
+	resource, plan := realCloudCloudflareStaticBootstrapPlanFixture(t)
+	planSHA := realCloudCloudflareBootstrapPlanSHA(plan)
+	runID := "20260720T120000Z-static-bootstrap"
+	fake := newFakeRealCloudCloudflareBootstrapControl(plan)
+	receipt, err := applyRealCloudCloudflareBootstrap(t.Context(), fake, resource, plan, planSHA, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Verifier != (realCloudCloudflareBootstrapReceiptWorker{}) {
+		t.Fatal("static bootstrap persisted a token-verifier Worker receipt")
+	}
+	if err := validateRealCloudCloudflareBootstrapReceipt(receipt, resource, plan, planSHA, "apply", runID); err != nil {
+		t.Fatal(err)
+	}
+	receiptBody, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoRealCloudSecret(t, "static bootstrap receipt", receiptBody, realCloudCloudflareStaticSecretFragments(realCloudCloudflareStaticEntitlementsFixture(t, plan)))
+	mutations := fake.calls["upload-origin"] + fake.calls["upload-auth"]
+	for operation, calls := range fake.calls {
+		if strings.HasPrefix(operation, "create-route-") {
+			mutations += calls
+		}
+	}
+	replayed, err := observeRealCloudCloudflareBootstrapClosure(t.Context(), fake, resource, plan, planSHA, runID, "apply")
+	if err != nil || replayed.ClosureSHA256 != receipt.ClosureSHA256 {
+		t.Fatalf("sealed static bootstrap replay changed closure err=%v", err)
+	}
+	mutationsAfter := fake.calls["upload-origin"] + fake.calls["upload-auth"]
+	for operation, calls := range fake.calls {
+		if strings.HasPrefix(operation, "create-route-") {
+			mutationsAfter += calls
+		}
+	}
+	if mutationsAfter != mutations {
+		t.Fatalf("sealed static bootstrap replay performed mutations before=%d after=%d", mutations, mutationsAfter)
+	}
+	rollback, err := rollbackRealCloudCloudflareBootstrap(t.Context(), fake, resource, plan, planSHA, runID, receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateRealCloudCloudflareBootstrapRollbackReceipt(rollback, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.workers) != 0 || len(fake.routes) != 0 {
+		t.Fatalf("static rollback left managed state workers=%v routes=%v", fake.workers, fake.routes)
+	}
+}
+
+func TestRealCloudCloudflareStaticBootstrapUnsealedRecoveryResetsOpaqueSecret(t *testing.T) {
+	resource, plan := realCloudCloudflareStaticBootstrapPlanFixture(t)
+	planSHA := realCloudCloudflareBootstrapPlanSHA(plan)
+	runID := "20260720T120000Z-static-unsealed-recovery"
+	fake := newFakeRealCloudCloudflareBootstrapControl(plan)
+	first, err := applyRealCloudCloudflareBootstrap(t.Context(), fake, resource, plan, planSHA, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.errorAfterRouteDelete[first.Routes[0].ID] = 1
+	if _, err := applyRealCloudCloudflareBootstrap(t.Context(), fake, resource, plan, planSHA, runID); err == nil {
+		t.Fatal("unsealed static recovery ignored route-delete response loss")
+	}
+	fake.errorAfterScriptDelete[plan.AuthScript] = 1
+	if _, err := applyRealCloudCloudflareBootstrap(t.Context(), fake, resource, plan, planSHA, runID); err == nil {
+		t.Fatal("unsealed static recovery ignored auth-delete response loss")
+	}
+	recovered, err := applyRealCloudCloudflareBootstrap(t.Context(), fake, resource, plan, planSHA, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fake.calls["upload-origin"] != 1 || fake.calls["upload-auth"] != 2 || fake.calls["check-delete-script-"+plan.AuthScript] != 1 {
+		t.Fatalf("unsealed static recovery did not preserve origin and recreate auth calls=%v", fake.calls)
+	}
+	for _, route := range plan.Routes {
+		if fake.calls["create-route-"+route.Pattern] != 2 {
+			t.Fatalf("unsealed static recovery did not recreate exact route %s calls=%v", route.Pattern, fake.calls)
+		}
+	}
+	if recovered.ClosureSHA256 == first.ClosureSHA256 {
+		t.Fatal("unsealed static recovery retained the opaque pre-crash auth/route closure")
+	}
+	if _, err := rollbackRealCloudCloudflareBootstrap(t.Context(), fake, resource, plan, planSHA, runID, recovered); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRealCloudCloudflareBootstrapRollbackReplaysProviderSuccessAfterClientError(t *testing.T) {
 	resource, plan := realCloudCloudflareBootstrapPlanFixture(t)
 	planSHA := realCloudCloudflareBootstrapPlanSHA(plan)
@@ -4130,6 +4606,131 @@ func TestRealCloudCloudflareBootstrapOfficialSDKMutationContract(t *testing.T) {
 	routePath := "/client/v4/zones/" + plan.ZoneID + "/workers/routes/" + routeID
 	if len(sequence) < 2 || sequence[len(sequence)-2] != "GET "+routePath || sequence[len(sequence)-1] != "DELETE "+routePath {
 		t.Fatalf("checked route delete was not adjacent to its final identity recheck: %v", sequence)
+	}
+}
+
+func TestRealCloudCloudflareStaticBootstrapOfficialSDKSecretBindingContract(t *testing.T) {
+	_, plan := realCloudCloudflareStaticBootstrapPlanFixture(t)
+	secret := realCloudCloudflareStaticEntitlementsFixture(t, plan)
+	wantedBundle, err := readRealCloudProviderRepositoryFile(plan.AuthBundle.Path, realCloudProviderMaxContentBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requests++
+		writer.Header().Set("Content-Type", "application/json")
+		if request.Method != http.MethodPut || request.URL.Path != "/client/v4/accounts/"+plan.AccountID+"/workers/scripts/"+plan.AuthScript {
+			t.Error("static bootstrap sent an unexpected provider request")
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		mediaType, parameters, parseErr := mime.ParseMediaType(request.Header.Get("Content-Type"))
+		if parseErr != nil || mediaType != "multipart/form-data" {
+			t.Error("static Worker upload is not multipart")
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		reader := multipart.NewReader(request.Body, parameters["boundary"])
+		seenMetadata, seenFile := false, false
+		for {
+			part, partErr := reader.NextPart()
+			if errors.Is(partErr, io.EOF) {
+				break
+			}
+			if partErr != nil {
+				t.Error("read static Worker multipart")
+				break
+			}
+			partBody, _ := io.ReadAll(part)
+			switch part.FormName() {
+			case "metadata":
+				var metadata struct {
+					Bindings []struct {
+						Name        string `json:"name"`
+						Type        string `json:"type"`
+						Text        string `json:"text"`
+						Service     string `json:"service"`
+						Environment string `json:"environment"`
+					} `json:"bindings"`
+				}
+				if json.Unmarshal(partBody, &metadata) != nil {
+					break
+				}
+				wanted := make(map[string]string, len(plan.EdgeContract.Variables)+2)
+				for name, value := range plan.EdgeContract.Variables {
+					wanted[name] = "plain_text\x00" + value
+				}
+				wanted["ORIGIN"] = "service\x00" + plan.OriginScript + "\x00"
+				wanted[plan.TokenVerifierSecret] = "secret_text\x00" + secret
+				for _, binding := range metadata.Bindings {
+					observed := binding.Type + "\x00" + binding.Text
+					if binding.Type == "service" {
+						observed = binding.Type + "\x00" + binding.Service + "\x00" + binding.Environment
+					}
+					if wanted[binding.Name] != observed {
+						wanted["invalid"] = "present"
+						break
+					}
+					delete(wanted, binding.Name)
+				}
+				seenMetadata = len(wanted) == 0
+			case "files":
+				seenFile = part.FileName() == "worker.mjs" && bytes.Equal(partBody, wantedBundle)
+			}
+		}
+		if !seenMetadata || !seenFile {
+			t.Error("static Worker upload omitted the exact secret binding or bundle")
+		}
+		_ = json.NewEncoder(writer).Encode(map[string]any{"success": true, "errors": []any{}, "messages": []any{}, "result": map[string]any{"startup_time_ms": 1, "id": plan.AuthScript, "compatibility_date": plan.CompatibilityDate, "compatibility_flags": []any{}}})
+	}))
+	defer server.Close()
+	control, err := newRealCloudCloudflareSDKBootstrapControl("static-bootstrap-test-token", server.URL+"/client/v4", server.Client(), map[string]string{plan.TokenVerifierSecret: secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := control.Upload(t.Context(), plan, "auth", realCloudCloudflareBootstrapPlanSHA(plan), "20260720T120000Z-static-sdk"); err != nil {
+		t.Fatal(err)
+	}
+	withoutSecret, err := newRealCloudCloudflareSDKBootstrapControl("static-bootstrap-test-token", server.URL+"/client/v4", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := withoutSecret.Upload(t.Context(), plan, "auth", realCloudCloudflareBootstrapPlanSHA(plan), "20260720T120000Z-static-sdk"); err == nil || requests != 1 {
+		t.Fatalf("missing static secret reached provider requests=%d err=%v", requests, err)
+	}
+	_, providerPlan := realCloudCloudflareBootstrapPlanFixture(t)
+	withUnexpectedSecret, err := newRealCloudCloudflareSDKBootstrapControl("static-bootstrap-test-token", server.URL+"/client/v4", server.Client(), map[string]string{plan.TokenVerifierSecret: secret})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := withUnexpectedSecret.Upload(t.Context(), providerPlan, "auth", realCloudCloudflareBootstrapPlanSHA(providerPlan), "20260720T120000Z-static-sdk"); err == nil || requests != 1 {
+		t.Fatalf("provider plan accepted a static secret requests=%d err=%v", requests, err)
+	}
+}
+
+func TestRealCloudCloudflareStaticBootstrapBindingInspectionIsExact(t *testing.T) {
+	_, plan := realCloudCloudflareStaticBootstrapPlanFixture(t)
+	bindings := make([]workers.ScriptVersionGetResponseResourcesBinding, 0, len(plan.EdgeContract.Variables)+2)
+	for name, value := range plan.EdgeContract.Variables {
+		bindings = append(bindings, workers.ScriptVersionGetResponseResourcesBinding{
+			Name: name, Type: workers.ScriptVersionGetResponseResourcesBindingsTypePlainText, Text: value,
+		})
+	}
+	bindings = append(bindings,
+		workers.ScriptVersionGetResponseResourcesBinding{Name: "ORIGIN", Type: workers.ScriptVersionGetResponseResourcesBindingsTypeService, Service: plan.OriginScript},
+		workers.ScriptVersionGetResponseResourcesBinding{Name: plan.TokenVerifierSecret, Type: workers.ScriptVersionGetResponseResourcesBindingsTypeSecretText},
+	)
+	got, err := validateRealCloudCloudflareBootstrapAuthBindings(bindings, plan)
+	if err != nil || got != realCloudCloudflareBootstrapExpectedAuthBindingsSHA(plan) {
+		t.Fatalf("static binding inspection digest=%q err=%v", got, err)
+	}
+	drifted := append([]workers.ScriptVersionGetResponseResourcesBinding(nil), bindings...)
+	drifted[len(drifted)-1] = workers.ScriptVersionGetResponseResourcesBinding{
+		Name: "TOKEN_VERIFIER", Type: workers.ScriptVersionGetResponseResourcesBindingsTypeService, Service: "pigsty-entitlements",
+	}
+	if _, err := validateRealCloudCloudflareBootstrapAuthBindings(drifted, plan); err == nil {
+		t.Fatal("static binding inspection accepted a provider service substitution")
 	}
 }
 

@@ -28,8 +28,11 @@
 - final closure 连续执行两次完整 Worker/route/custom-domain/attachment inventory；两次 closure
   digest 必须相同。Worker settings 与 workers.dev/preview exposure 也连续读取两次，并由 active
   deployment recheck 固定内容观察窗口。
-- verifier 不再只验内容与 binding：compatibility date/flags、usage model、limits、placement、
-  Logpush、observability、tail consumer、tags 与公开 exposure 全部 fail closed。
+- provider 模式的 verifier 不再只验内容与 binding：compatibility date/flags、usage model、limits、
+  placement、Logpush、observability、tail consumer、tags 与公开 exposure 全部 fail closed。
+  2026-07-20 增补的 static 模式不部署 verifier Worker，而是把 edge contract 声明的唯一
+  `env://NAME` 作为 auth Worker 的 `secret_text`；严格联合类型和验证证据见
+  [static entitlement bootstrap](2026-07-20-cloudflare-static-entitlement-bootstrap.md)。
 - rollback 在删除 route 前按 ID 重新读取 exact pattern/script；删除 Worker 前重新验证
   deployment/version/ETag/content/binding/ownership。Cloudflare 没有文档化的 conditional route/
   script delete，因此只声明“租约串行 SOW executor + 删除前外部漂移复核”，不伪报不存在的 CAS。
@@ -86,7 +89,8 @@ PASS
 至通过至少还需要：生成独立 readiness Ed25519 keypair，把公钥连同 bootstrap plan 一并评审钉住；
 用专用最小权限 storage/API credential 与环境注入的 signer seed 生成 fresh readiness receipt；执行一次
 apply、真实 main/beta 请求与 provider attestation；执行 rollback 并证明租约、routes、auth/origin
-全部消失且 verifier 未变。任何一步不得使用 CO/CF 生产仓库。
+全部消失。provider 模式还必须证明 verifier 未变；static 模式必须证明 secret 只存在于 auth
+Worker binding 且随 auth rollback 消失。任何一步不得使用 CO/CF 生产仓库。
 
 部署后的长期 runtime/inventory 观察、custom-domain TLS policy 与 provider-log setup lease 不属于
 本 bootstrap receipt；其独立合同和离线结果见

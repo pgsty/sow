@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-17
+- Amended: 2026-07-20
 - Scope: real-cloud POC infrastructure only; never production resources
 
 ## Context
@@ -51,10 +52,28 @@ The bootstrap owns only:
   binding;
 - `pro.pigsty.io/*` and `beta.pro.pigsty.io/*`, both bound to the auth Worker.
 
-It does not create or mutate the token verifier. That service is a separate
-commercial identity dependency and must already match independently reviewed
-content, binding, compatibility-date/flags, closed telemetry, placement,
-limits, usage-model and exposure policy. It does not write repository payload
+The verifier is a closed union inherited from the state-admitted edge contract:
+
+- `provider://id` does not create or mutate the token verifier. That service is
+  a separate commercial identity dependency and must already match independently
+  reviewed content, binding, compatibility-date/flags, closed telemetry,
+  placement, limits, usage-model and exposure policy.
+- `env://NAME` is a bounded non-production/static deployment. It manages no
+  verifier Worker and injects exactly one `secret_text` binding named `NAME`
+  into the run-owned auth Worker. The strict canonical entitlement JSON is read
+  only by `apply`, after selection/readiness gates; it is never placed in the
+  plan, registry, receipt, lease, log or repository. `rollback` does not require
+  the secret and removes it by deleting the exact sealed auth Worker. The name
+  follows the shared runtime grammar (including a leading underscore), may not
+  collide with any plain/service/control binding, and the value is capped at a
+  conservative 5,000 bytes with at least 15 minutes of remaining entitlement
+  lifetime at upload. `SOW_BASIC_ENTITLEMENTS` remains a separate optional
+  authority and is reserved so one digest document cannot authorize both token
+  and Basic credentials.
+
+The two shapes cannot be mixed or used as implicit fallbacks. Provider-only
+identity/evidence fields must be empty for static plans, while static secret
+fields and bindings must be absent from provider plans. It does not write repository payload
 objects, custom domains, DNS, Logpush, cache rules or unrelated routes. The
 only R2 mutation is a provider-visible conditional lease at
 `.sow/bootstrap/leases/<readiness-resource-sha>.json`. The resource-derived
@@ -133,7 +152,7 @@ mutation runs.
 
 Before the first mutation, the executor reads the account Worker inventory,
 zone routes, Worker custom domains, managed-script schedules, tail consumers,
-the verifier deployment, and any pre-existing planned scripts. Foreign routes
+the provider verifier deployment when configured, and any pre-existing planned scripts. Foreign routes
 that exactly match or may overlap either designated host fail closed. Existing
 planned scripts are reusable only when their active bytes, bindings and
 runtime match the plan exactly. Custom domains, schedules, tail consumers or
@@ -146,9 +165,15 @@ exposure disable, then the two exact routes. Every step is followed by active
 deployment inspection, the auth Worker is rechecked immediately before every
 route creation, and the final account/route/Worker closure must match across
 two consecutive complete observations. Settings and workers.dev/preview
-exposure are also read twice around the active-deployment check. A retry
-reconciles only an exact same-run partial state and does not recreate completed
-resources. A different run cannot adopt it. The receipt atomically stores a
+exposure are also read twice around the active-deployment check. A provider-mode
+retry reconciles only an exact same-run partial state and does not recreate
+completed resources. A static apply with a sealed receipt is likewise read-only.
+Without a sealed receipt Cloudflare's hidden `secret_text` value cannot prove
+that a same-run auth Worker contains the recovering process's entitlement, so
+the apply lease performs checked deletion of only the exact same-run routes and
+auth Worker, tolerates provider-success/response-loss, and recreates them with
+the current secret; the origin Worker is retained. A different run cannot adopt
+either shape. The receipt atomically stores a
 canonical envelope containing active deployment/version IDs, ETags, content
 and binding hashes, route IDs and a closure hash outside the repository; there
 is no crash window between a receipt file and a second seal file.
@@ -201,8 +226,9 @@ recovery receipt.
 
 - The shipped readiness and bootstrap registries remain empty, so ordinary
   tests and accidental environment variables cannot perform a cloud mutation.
-- A reviewed plan can be produced offline from the CLI edge contract without
-  credentials. Registry candidates are private files outside the repository.
+- A reviewed plan can be produced offline from either valid CLI edge-contract
+  verifier shape without credentials. Registry candidates are private files
+  outside the repository; static secret values are not candidate inputs.
 - The official Cloudflare Go SDK is used for multipart Worker upload, per-script
   exposure, route creation/deletion, inventories and non-forced script deletion.
   Loopback protocol tests assert both auth and origin multipart bodies, create-only
@@ -214,6 +240,8 @@ recovery receipt.
   DELETE request adjacency, exact-404 replay and provider-success/client-error
   replay tests are required.
 - This closes the hidden manual deployment step for SOW-owned Cloudflare
-  bundles. It does not claim the live Cloudflare POC passed; readiness,
+  bundles and removes an independent commercial verifier as a prerequisite for
+  a bounded static-token non-production PoC. It does not claim the live
+  Cloudflare POC passed; readiness,
   credentials, explicit authorization and real provider observations are still
   required.

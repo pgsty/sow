@@ -26,6 +26,10 @@ const (
 	EdgeRuntimePublicKeysVariable     = "SOW_PUBLIC_KEYS"
 	EdgeRuntimeCompatibilityVariable  = "SOW_COMPATIBILITY_ADMISSION"
 	EdgeRuntimeOriginModeVariable     = "SOW_ORIGIN_MODE"
+	// EdgeRuntimeBasicEntitlementsVariable is an optional independent fallback
+	// authority consumed by both edge adapters. A token verifier must never
+	// alias it or one entitlement document would authorize two credential forms.
+	EdgeRuntimeBasicEntitlementsVariable = "SOW_BASIC_ENTITLEMENTS"
 )
 
 var tokenVerifierProviderPattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$`)
@@ -77,6 +81,51 @@ type EdgeDeploymentContract struct {
 	RequiredVariables []string          `json:"required_variables,omitempty"`
 	RequiredSecrets   []string          `json:"required_secrets,omitempty"`
 	ServiceBindings   []string          `json:"service_bindings,omitempty"`
+}
+
+// ValidateEdgeDeploymentBindingNamespaces rejects a deployment that assigns
+// one runtime name to more than one binding kind. Workers and EdgeOne expose
+// these collections in one environment namespace; accepting a plain value,
+// service, or secret collision would make provider behavior ambiguous.
+func ValidateEdgeDeploymentBindingNamespaces(contract EdgeDeploymentContract) error {
+	type namedBinding struct {
+		name string
+		kind string
+	}
+	bindings := make([]namedBinding, 0, len(contract.Variables)+len(contract.RequiredVariables)+len(contract.RequiredSecrets)+len(contract.ServiceBindings))
+	variableNames := make([]string, 0, len(contract.Variables))
+	for name := range contract.Variables {
+		variableNames = append(variableNames, name)
+	}
+	sort.Strings(variableNames)
+	for _, name := range variableNames {
+		bindings = append(bindings, namedBinding{name: name, kind: "plain variable"})
+	}
+	for _, group := range []struct {
+		kind  string
+		names []string
+	}{
+		{kind: "required variable", names: contract.RequiredVariables},
+		{kind: "secret", names: contract.RequiredSecrets},
+		{kind: "service", names: contract.ServiceBindings},
+	} {
+		names := append([]string(nil), group.names...)
+		sort.Strings(names)
+		for _, name := range names {
+			bindings = append(bindings, namedBinding{name: name, kind: group.kind})
+		}
+	}
+	seen := make(map[string]string, len(bindings))
+	for _, binding := range bindings {
+		if !environmentNamePattern.MatchString(binding.name) || len(binding.name) > 128 {
+			return fmt.Errorf("edge deployment %s binding %q is not a valid runtime name", binding.kind, binding.name)
+		}
+		if previous, exists := seen[binding.name]; exists {
+			return fmt.Errorf("edge deployment binding %q collides between %s and %s", binding.name, previous, binding.kind)
+		}
+		seen[binding.name] = binding.kind
+	}
+	return nil
 }
 
 // EdgeCompatibilityAdmission is a caller-proven projection of canonical
@@ -304,6 +353,9 @@ func (c *Config) EdgeDeployment(targetName string, admissions ...EdgeCompatibili
 	if err != nil {
 		return EdgeDeploymentContract{}, fmt.Errorf("edge.token_verifier: %w", err)
 	}
+	if verifier.Kind == "env" && verifier.Name == EdgeRuntimeBasicEntitlementsVariable {
+		return EdgeDeploymentContract{}, errors.New("edge.token_verifier must not alias the independent Basic entitlement binding")
+	}
 	publicPrefixes, publicKeys, compatibility, err := c.edgePublicRouteAllowlists(targetName, admission)
 	if err != nil {
 		return EdgeDeploymentContract{}, err
@@ -352,6 +404,9 @@ func (c *Config) EdgeDeployment(targetName string, admissions ...EdgeCompatibili
 	sort.Strings(contract.RequiredVariables)
 	sort.Strings(contract.RequiredSecrets)
 	sort.Strings(contract.ServiceBindings)
+	if err := ValidateEdgeDeploymentBindingNamespaces(contract); err != nil {
+		return EdgeDeploymentContract{}, err
+	}
 	return contract, nil
 }
 

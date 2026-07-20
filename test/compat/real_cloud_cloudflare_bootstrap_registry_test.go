@@ -29,8 +29,8 @@ const (
 	realCloudCloudflareBootstrapRegistryPath        = "test/compat/testdata/real_cloud_nonproduction_cloudflare_bootstrap_registry.json"
 	realCloudCloudflareBootstrapRegistrySchema      = "sow-real-cloud-pinned-cloudflare-bootstrap-registry/v1"
 	realCloudCloudflareBootstrapRegistryEntrySchema = "sow-real-cloud-pinned-cloudflare-bootstrap/v1"
-	realCloudCloudflareBootstrapPlanSchema          = "sow-real-cloud-cloudflare-bootstrap-plan/v2"
-	realCloudCloudflareBootstrapDescriptorSchema    = "sow-real-cloud-cloudflare-bootstrap-descriptor/v2"
+	realCloudCloudflareBootstrapPlanSchema          = "sow-real-cloud-cloudflare-bootstrap-plan/v3"
+	realCloudCloudflareBootstrapDescriptorSchema    = "sow-real-cloud-cloudflare-bootstrap-descriptor/v3"
 	realCloudCloudflareBootstrapRegistrySHA256      = "618888507e92fe29cc7582698e54f519bc058ef424ac4898c0509decc8a82f60"
 	realCloudCloudflareAuthBundlePath               = "edge/dist/cloudflare-worker.mjs"
 	realCloudCloudflareOriginBundlePath             = "edge/dist/cloudflare-origin-worker.mjs"
@@ -62,8 +62,10 @@ type realCloudCloudflareBootstrapPlan struct {
 	BetaBase                        string                              `json:"beta_base"`
 	AuthScript                      string                              `json:"auth_script"`
 	OriginScript                    string                              `json:"origin_script"`
+	TokenVerifierKind               string                              `json:"token_verifier_kind"`
 	TokenVerifierService            string                              `json:"token_verifier_service"`
 	TokenVerifierEnvironment        string                              `json:"token_verifier_environment"`
+	TokenVerifierSecret             string                              `json:"token_verifier_secret"`
 	TokenVerifierContentSHA256      string                              `json:"token_verifier_content_sha256"`
 	TokenVerifierBindingsSHA256     string                              `json:"token_verifier_bindings_sha256"`
 	TokenVerifierCompatibilityDate  string                              `json:"token_verifier_compatibility_date"`
@@ -98,8 +100,10 @@ type realCloudCloudflareBootstrapDescriptor struct {
 	ReadinessSealPublicKey          string   `json:"readiness_seal_public_key"`
 	AuthScript                      string   `json:"auth_script"`
 	OriginScript                    string   `json:"origin_script"`
+	TokenVerifierKind               string   `json:"token_verifier_kind"`
 	TokenVerifierService            string   `json:"token_verifier_service"`
 	TokenVerifierEnvironment        string   `json:"token_verifier_environment"`
+	TokenVerifierSecret             string   `json:"token_verifier_secret"`
 	TokenVerifierContentSHA256      string   `json:"token_verifier_content_sha256"`
 	TokenVerifierBindingsSHA256     string   `json:"token_verifier_bindings_sha256"`
 	TokenVerifierCompatibilityDate  string   `json:"token_verifier_compatibility_date"`
@@ -198,16 +202,11 @@ func validateRealCloudCloudflareBootstrapPlan(plan realCloudCloudflareBootstrapP
 	}
 	clearRealCloudBytes(publicKey)
 	if !validRealCloudProviderIdentifier(plan.AuthScript, 128) || !validRealCloudProviderIdentifier(plan.OriginScript, 128) ||
-		!validRealCloudProviderIdentifier(plan.TokenVerifierService, 128) || !validRealCloudProviderOptionalIdentifier(plan.TokenVerifierEnvironment, 128) ||
-		plan.AuthScript == plan.OriginScript || plan.AuthScript == plan.TokenVerifierService || plan.OriginScript == plan.TokenVerifierService {
+		plan.AuthScript == plan.OriginScript {
 		return errors.New("Cloudflare bootstrap Worker identities are invalid or overlap")
 	}
-	if !validRealCloudLowerSHA256(plan.TokenVerifierContentSHA256) || !validRealCloudLowerSHA256(plan.TokenVerifierBindingsSHA256) {
-		return errors.New("Cloudflare bootstrap token-verifier evidence digests are invalid")
-	}
-	verifierDate, err := time.Parse("2006-01-02", plan.TokenVerifierCompatibilityDate)
-	if err != nil || verifierDate.Format("2006-01-02") != plan.TokenVerifierCompatibilityDate || len(plan.TokenVerifierCompatibilityFlags) != 0 {
-		return errors.New("Cloudflare bootstrap token-verifier runtime must use one canonical date and no unreviewed flags")
+	if err := validateRealCloudCloudflareBootstrapVerifierShape(plan); err != nil {
+		return err
 	}
 	parsedDate, err := time.Parse("2006-01-02", plan.CompatibilityDate)
 	if err != nil || parsedDate.Format("2006-01-02") != plan.CompatibilityDate || len(plan.CompatibilityFlags) != 0 {
@@ -219,7 +218,7 @@ func validateRealCloudCloudflareBootstrapPlan(plan realCloudCloudflareBootstrapP
 	if err := validateRealCloudCloudflareBootstrapBundle(plan.OriginBundle, realCloudCloudflareOriginBundlePath); err != nil {
 		return fmt.Errorf("Cloudflare origin bundle: %w", err)
 	}
-	if err := validateRealCloudCloudflareBootstrapEdgeContract(plan.EdgeContract, *identity, plan.TokenVerifierService); err != nil {
+	if err := validateRealCloudCloudflareBootstrapEdgeContract(plan.EdgeContract, *identity, plan); err != nil {
 		return err
 	}
 	wantedRoutes := []realCloudCloudflareBootstrapRoute{
@@ -236,6 +235,74 @@ func validateRealCloudCloudflareBootstrapPlan(plan realCloudCloudflareBootstrapP
 		}
 	}
 	return nil
+}
+
+func validateRealCloudCloudflareBootstrapVerifierShape(plan realCloudCloudflareBootstrapPlan) error {
+	verifier, err := sowconfig.ParseTokenVerifierReference(plan.EdgeContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable])
+	if err != nil || plan.TokenVerifierKind != verifier.Kind {
+		return errors.New("Cloudflare bootstrap token-verifier kind differs from the edge contract")
+	}
+	switch verifier.Kind {
+	case "provider":
+		if plan.TokenVerifierService != verifier.Name || !validRealCloudProviderIdentifier(plan.TokenVerifierService, 128) ||
+			!validRealCloudProviderOptionalIdentifier(plan.TokenVerifierEnvironment, 128) || plan.TokenVerifierSecret != "" ||
+			plan.AuthScript == plan.TokenVerifierService || plan.OriginScript == plan.TokenVerifierService ||
+			!validRealCloudLowerSHA256(plan.TokenVerifierContentSHA256) || !validRealCloudLowerSHA256(plan.TokenVerifierBindingsSHA256) {
+			return errors.New("Cloudflare bootstrap provider token-verifier shape or evidence is invalid")
+		}
+		verifierDate, dateErr := time.Parse("2006-01-02", plan.TokenVerifierCompatibilityDate)
+		if dateErr != nil || verifierDate.Format("2006-01-02") != plan.TokenVerifierCompatibilityDate || len(plan.TokenVerifierCompatibilityFlags) != 0 {
+			return errors.New("Cloudflare bootstrap token-verifier runtime must use one canonical date and no unreviewed flags")
+		}
+	case "env":
+		if plan.TokenVerifierSecret != verifier.Name || !validRealCloudCloudflareStaticSecretName(plan.TokenVerifierSecret) ||
+			plan.TokenVerifierService != "" || plan.TokenVerifierEnvironment != "" || plan.TokenVerifierContentSHA256 != "" ||
+			plan.TokenVerifierBindingsSHA256 != "" || plan.TokenVerifierCompatibilityDate != "" || len(plan.TokenVerifierCompatibilityFlags) != 0 {
+			return errors.New("Cloudflare bootstrap static token-verifier shape contains missing or provider-only fields")
+		}
+	default:
+		return errors.New("Cloudflare bootstrap token-verifier kind is unsupported")
+	}
+	return nil
+}
+
+func validRealCloudCloudflareRuntimeBindingName(name string) bool {
+	reference, err := sowconfig.ParseTokenVerifierReference("env://" + name)
+	return err == nil && reference.Kind == "env" && reference.Name == name
+}
+
+func validRealCloudCloudflareStaticSecretName(name string) bool {
+	if !validRealCloudCloudflareRuntimeBindingName(name) {
+		return false
+	}
+	for _, reserved := range []string{
+		realCloudOptInEnv,
+		realCloudProviderReadinessOptInEnv,
+		realEdgeEvidenceOptInEnv,
+		realCloudPurgeWatcherHelperEnv,
+		realCloudConfirmationEnv,
+		realCloudNonProductionEnv,
+		realCloudRunIDEnv,
+		realCloudStorageCredentialCF,
+		realCloudCDNCredentialCF,
+		realCloudProviderReadinessResourceEnv,
+		realCloudRegistryOutputDirEnv,
+		realCloudCloudflareBootstrapOptInEnv,
+		realCloudCloudflareBootstrapPlanEnv,
+		realCloudCloudflareBootstrapConfirmationEnv,
+		realCloudCloudflareBootstrapReceiptEnv,
+		realCloudCloudflareBootstrapReadinessReceiptEnv,
+		realCloudCloudflareBootstrapRegistryOnboardEnv,
+		realCloudCloudflareBootstrapPlanOnboardEnv,
+		realCloudCloudflareBootstrapDescriptorEnv,
+		realCloudCloudflareBootstrapEdgeContractFileEnv,
+		sowconfig.EdgeRuntimeBasicEntitlementsVariable,
+	} {
+		if name == reserved {
+			return false
+		}
+	}
+	return true
 }
 
 func validateRealCloudCloudflareBootstrapBundle(bundle realCloudCloudflareBootstrapBundle, wantedPath string) error {
@@ -341,7 +408,9 @@ func buildRealCloudCloudflareBootstrapPlan(
 		AccountID: identity.AccountID, ZoneID: identity.ZoneID,
 		R2Bucket: identity.R2Bucket, MainBase: identity.CDNBase, BetaBase: identity.BetaBase,
 		AuthScript: descriptor.AuthScript, OriginScript: descriptor.OriginScript,
+		TokenVerifierKind:    descriptor.TokenVerifierKind,
 		TokenVerifierService: descriptor.TokenVerifierService, TokenVerifierEnvironment: descriptor.TokenVerifierEnvironment,
+		TokenVerifierSecret:        descriptor.TokenVerifierSecret,
 		TokenVerifierContentSHA256: descriptor.TokenVerifierContentSHA256, TokenVerifierBindingsSHA256: descriptor.TokenVerifierBindingsSHA256,
 		TokenVerifierCompatibilityDate:  descriptor.TokenVerifierCompatibilityDate,
 		TokenVerifierCompatibilityFlags: append([]string(nil), descriptor.TokenVerifierCompatibilityFlags...),
@@ -365,11 +434,30 @@ func buildRealCloudCloudflareBootstrapPlan(
 	return plan, body, nil
 }
 
-func validateRealCloudCloudflareBootstrapEdgeContract(contract sowconfig.EdgeDeploymentContract, identity realCloudCloudflareReadinessResource, verifierService string) error {
-	if contract.Schema != sowconfig.EdgeRuntimeSchema || contract.Target != "cf" || contract.Runtime != "cloudflare" ||
-		len(contract.RequiredVariables) != 0 || len(contract.RequiredSecrets) != 0 ||
-		len(contract.ServiceBindings) != 2 || contract.ServiceBindings[0] != "ORIGIN" || contract.ServiceBindings[1] != "TOKEN_VERIFIER" {
-		return errors.New("Cloudflare bootstrap edge contract is not the exact provider-service deployment shape")
+func validateRealCloudCloudflareBootstrapEdgeContract(contract sowconfig.EdgeDeploymentContract, identity realCloudCloudflareReadinessResource, plan realCloudCloudflareBootstrapPlan) error {
+	if contract.Schema != sowconfig.EdgeRuntimeSchema || contract.Target != "cf" || contract.Runtime != "cloudflare" || len(contract.RequiredVariables) != 0 {
+		return errors.New("Cloudflare bootstrap edge contract has an invalid runtime identity or external variable")
+	}
+	if err := sowconfig.ValidateEdgeDeploymentBindingNamespaces(contract); err != nil {
+		return fmt.Errorf("Cloudflare bootstrap edge contract binding namespace: %w", err)
+	}
+	verifier, err := sowconfig.ParseTokenVerifierReference(contract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable])
+	if err != nil || verifier.Kind != plan.TokenVerifierKind {
+		return errors.New("Cloudflare bootstrap edge contract has an invalid token-verifier reference")
+	}
+	switch verifier.Kind {
+	case "provider":
+		if verifier.Name != plan.TokenVerifierService || len(contract.RequiredSecrets) != 0 ||
+			len(contract.ServiceBindings) != 2 || contract.ServiceBindings[0] != "ORIGIN" || contract.ServiceBindings[1] != "TOKEN_VERIFIER" {
+			return errors.New("Cloudflare bootstrap edge contract is not the exact provider-service deployment shape")
+		}
+	case "env":
+		if verifier.Name != plan.TokenVerifierSecret || len(contract.RequiredSecrets) != 1 || contract.RequiredSecrets[0] != verifier.Name ||
+			len(contract.ServiceBindings) != 1 || contract.ServiceBindings[0] != "ORIGIN" {
+			return errors.New("Cloudflare bootstrap edge contract is not the exact static-secret deployment shape")
+		}
+	default:
+		return errors.New("Cloudflare bootstrap edge contract token-verifier kind is unsupported")
 	}
 	wantedKeys := []string{
 		sowconfig.EdgeRuntimeBetaBaseURLVariable,
@@ -402,10 +490,6 @@ func validateRealCloudCloudflareBootstrapEdgeContract(contract sowconfig.EdgeDep
 		contract.Variables[sowconfig.EdgeRuntimeBetaBaseURLVariable] != identity.BetaBase ||
 		contract.Variables[sowconfig.EdgeRuntimeOriginModeVariable] != "r2-service" {
 		return errors.New("Cloudflare bootstrap runtime variables differ from the exact R2-service topology")
-	}
-	verifier, err := sowconfig.ParseTokenVerifierReference(contract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable])
-	if err != nil || verifier.Kind != "provider" || verifier.Name != verifierService {
-		return errors.New("Cloudflare bootstrap edge contract does not bind the exact provider token verifier")
 	}
 	for _, name := range []string{sowconfig.EdgeRuntimePublicPrefixesVariable, sowconfig.EdgeRuntimePublicKeysVariable} {
 		var values []string
@@ -661,7 +745,7 @@ func realCloudCloudflareBootstrapPlanFixture(t *testing.T) (realCloudProviderRea
 		ReadinessResourceSHA256: realCloudProviderReadinessResourceSHA(resource), ReadinessSealPublicKey: readinessSealPublicKey,
 		AccountID: identity.AccountID, ZoneID: identity.ZoneID,
 		R2Bucket: identity.R2Bucket, MainBase: identity.CDNBase, BetaBase: identity.BetaBase,
-		AuthScript: "sow-test-pro-auth", OriginScript: "sow-test-pro-origin", TokenVerifierService: "pigsty-entitlements",
+		AuthScript: "sow-test-pro-auth", OriginScript: "sow-test-pro-origin", TokenVerifierKind: "provider", TokenVerifierService: "pigsty-entitlements",
 		TokenVerifierContentSHA256: strings.Repeat("a", 64), TokenVerifierBindingsSHA256: strings.Repeat("b", 64),
 		TokenVerifierCompatibilityDate: "2026-07-17", TokenVerifierCompatibilityFlags: []string{},
 		CompatibilityDate: "2026-07-17", CompatibilityFlags: []string{},
@@ -674,6 +758,27 @@ func realCloudCloudflareBootstrapPlanFixture(t *testing.T) (realCloudProviderRea
 		},
 	}
 	sort.Slice(plan.Routes, func(i, j int) bool { return plan.Routes[i].Pattern < plan.Routes[j].Pattern })
+	return resource, plan
+}
+
+func realCloudCloudflareStaticBootstrapPlanFixture(t *testing.T) (realCloudProviderReadinessResource, realCloudCloudflareBootstrapPlan) {
+	t.Helper()
+	resource, plan := realCloudCloudflareBootstrapPlanFixture(t)
+	const secret = "SOW_TOKEN_ENTITLEMENTS"
+	plan.TokenVerifierKind = "env"
+	plan.TokenVerifierService = ""
+	plan.TokenVerifierEnvironment = ""
+	plan.TokenVerifierSecret = secret
+	plan.TokenVerifierContentSHA256 = ""
+	plan.TokenVerifierBindingsSHA256 = ""
+	plan.TokenVerifierCompatibilityDate = ""
+	plan.TokenVerifierCompatibilityFlags = []string{}
+	plan.EdgeContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] = "env://" + secret
+	plan.EdgeContract.RequiredSecrets = []string{secret}
+	plan.EdgeContract.ServiceBindings = []string{"ORIGIN"}
+	if err := validateRealCloudCloudflareBootstrapPlan(plan, resource); err != nil {
+		t.Fatalf("static Cloudflare bootstrap fixture: %v", err)
+	}
 	return resource, plan
 }
 
@@ -743,12 +848,97 @@ func TestRealCloudCloudflareBootstrapPlanIsClosedAndDeterministic(t *testing.T) 
 	}
 }
 
+func TestRealCloudCloudflareStaticBootstrapPlanIsClosedAndDeterministic(t *testing.T) {
+	resource, plan := realCloudCloudflareStaticBootstrapPlanFixture(t)
+	body, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, decodedBody, err := decodeRealCloudCloudflareBootstrapPlan(string(body), resource)
+	if err != nil || !bytes.Equal(body, decodedBody) || decoded.TokenVerifierKind != "env" || decoded.TokenVerifierSecret != "SOW_TOKEN_ENTITLEMENTS" {
+		t.Fatalf("static Cloudflare bootstrap plan did not round-trip exactly err=%v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*realCloudCloudflareBootstrapPlan)
+	}{
+		{"provider service retained", func(value *realCloudCloudflareBootstrapPlan) { value.TokenVerifierService = "pigsty-entitlements" }},
+		{"service name collision", func(value *realCloudCloudflareBootstrapPlan) {
+			value.TokenVerifierSecret = "ORIGIN"
+			value.EdgeContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] = "env://ORIGIN"
+			value.EdgeContract.RequiredSecrets = []string{"ORIGIN"}
+		}},
+		{"plain variable name collision", func(value *realCloudCloudflareBootstrapPlan) {
+			value.TokenVerifierSecret = sowconfig.EdgeRuntimePublicBaseURLVariable
+			value.EdgeContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] = "env://" + sowconfig.EdgeRuntimePublicBaseURLVariable
+			value.EdgeContract.RequiredSecrets = []string{sowconfig.EdgeRuntimePublicBaseURLVariable}
+		}},
+		{"bootstrap control env collision", func(value *realCloudCloudflareBootstrapPlan) {
+			value.TokenVerifierSecret = realCloudCDNCredentialCF
+			value.EdgeContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] = "env://" + realCloudCDNCredentialCF
+			value.EdgeContract.RequiredSecrets = []string{realCloudCDNCredentialCF}
+		}},
+		{"readiness process env collision", func(value *realCloudCloudflareBootstrapPlan) {
+			value.TokenVerifierSecret = realCloudProviderReadinessOptInEnv
+			value.EdgeContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] = "env://" + realCloudProviderReadinessOptInEnv
+			value.EdgeContract.RequiredSecrets = []string{realCloudProviderReadinessOptInEnv}
+		}},
+		{"edge evidence process env collision", func(value *realCloudCloudflareBootstrapPlan) {
+			value.TokenVerifierSecret = realEdgeEvidenceOptInEnv
+			value.EdgeContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] = "env://" + realEdgeEvidenceOptInEnv
+			value.EdgeContract.RequiredSecrets = []string{realEdgeEvidenceOptInEnv}
+		}},
+		{"purge watcher process env collision", func(value *realCloudCloudflareBootstrapPlan) {
+			value.TokenVerifierSecret = realCloudPurgeWatcherHelperEnv
+			value.EdgeContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] = "env://" + realCloudPurgeWatcherHelperEnv
+			value.EdgeContract.RequiredSecrets = []string{realCloudPurgeWatcherHelperEnv}
+		}},
+		{"basic entitlement authority collision", func(value *realCloudCloudflareBootstrapPlan) {
+			value.TokenVerifierSecret = sowconfig.EdgeRuntimeBasicEntitlementsVariable
+			value.EdgeContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] = "env://" + sowconfig.EdgeRuntimeBasicEntitlementsVariable
+			value.EdgeContract.RequiredSecrets = []string{sowconfig.EdgeRuntimeBasicEntitlementsVariable}
+		}},
+		{"provider digest retained", func(value *realCloudCloudflareBootstrapPlan) {
+			value.TokenVerifierContentSHA256 = strings.Repeat("a", 64)
+		}},
+		{"secret name drift", func(value *realCloudCloudflareBootstrapPlan) { value.TokenVerifierSecret = "OTHER_SECRET" }},
+		{"service binding added", func(value *realCloudCloudflareBootstrapPlan) {
+			value.EdgeContract.ServiceBindings = []string{"ORIGIN", "TOKEN_VERIFIER"}
+		}},
+		{"secret binding omitted", func(value *realCloudCloudflareBootstrapPlan) { value.EdgeContract.RequiredSecrets = nil }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidateBody, _ := json.Marshal(plan)
+			var candidate realCloudCloudflareBootstrapPlan
+			if err := json.Unmarshal(candidateBody, &candidate); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(&candidate)
+			if err := validateRealCloudCloudflareBootstrapPlan(candidate, resource); err == nil {
+				t.Fatal("mixed static/provider bootstrap plan was accepted")
+			}
+		})
+	}
+	leadingUnderscore := plan
+	leadingUnderscore.TokenVerifierSecret = "_SOW_TOKEN_ENTITLEMENTS"
+	leadingUnderscore.EdgeContract.Variables = make(map[string]string, len(plan.EdgeContract.Variables))
+	for name, value := range plan.EdgeContract.Variables {
+		leadingUnderscore.EdgeContract.Variables[name] = value
+	}
+	leadingUnderscore.EdgeContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] = "env://_SOW_TOKEN_ENTITLEMENTS"
+	leadingUnderscore.EdgeContract.RequiredSecrets = []string{"_SOW_TOKEN_ENTITLEMENTS"}
+	if err := validateRealCloudCloudflareBootstrapPlan(leadingUnderscore, resource); err != nil {
+		t.Fatalf("product-valid leading-underscore secret binding was rejected: %v", err)
+	}
+}
+
 func TestRealCloudCloudflareBootstrapPlanBuilderConsumesExactEdgeContract(t *testing.T) {
 	resource, fixture := realCloudCloudflareBootstrapPlanFixture(t)
 	descriptor := realCloudCloudflareBootstrapDescriptor{
 		Schema: realCloudCloudflareBootstrapDescriptorSchema, ReadinessSealPublicKey: fixture.ReadinessSealPublicKey,
-		AuthScript: fixture.AuthScript, OriginScript: fixture.OriginScript,
+		AuthScript: fixture.AuthScript, OriginScript: fixture.OriginScript, TokenVerifierKind: fixture.TokenVerifierKind,
 		TokenVerifierService: fixture.TokenVerifierService, TokenVerifierEnvironment: fixture.TokenVerifierEnvironment,
+		TokenVerifierSecret:        fixture.TokenVerifierSecret,
 		TokenVerifierContentSHA256: fixture.TokenVerifierContentSHA256, TokenVerifierBindingsSHA256: fixture.TokenVerifierBindingsSHA256,
 		TokenVerifierCompatibilityDate:  fixture.TokenVerifierCompatibilityDate,
 		TokenVerifierCompatibilityFlags: append([]string(nil), fixture.TokenVerifierCompatibilityFlags...),
@@ -772,6 +962,55 @@ func TestRealCloudCloudflareBootstrapPlanBuilderConsumesExactEdgeContract(t *tes
 	contract.Variables[sowconfig.EdgeRuntimePublicBaseURLVariable] = "https://repo.pigsty.io"
 	if _, _, err := buildRealCloudCloudflareBootstrapPlan(resource, descriptor, contract); err == nil {
 		t.Fatal("Cloudflare bootstrap plan builder accepted a production/drifted edge contract")
+	}
+}
+
+func TestRealCloudCloudflareBootstrapPlanBuilderConsumesStaticEdgeContract(t *testing.T) {
+	resource, fixture := realCloudCloudflareStaticBootstrapPlanFixture(t)
+	descriptor := realCloudCloudflareBootstrapDescriptor{
+		Schema: realCloudCloudflareBootstrapDescriptorSchema, ReadinessSealPublicKey: fixture.ReadinessSealPublicKey,
+		AuthScript: fixture.AuthScript, OriginScript: fixture.OriginScript, TokenVerifierKind: fixture.TokenVerifierKind,
+		TokenVerifierSecret: fixture.TokenVerifierSecret, TokenVerifierCompatibilityFlags: []string{},
+		CompatibilityDate: fixture.CompatibilityDate, CompatibilityFlags: []string{},
+	}
+	first, firstBody, err := buildRealCloudCloudflareBootstrapPlan(resource, descriptor, fixture.EdgeContract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secondBody, err := buildRealCloudCloudflareBootstrapPlan(resource, descriptor, fixture.EdgeContract)
+	if err != nil || !bytes.Equal(firstBody, secondBody) || first.TokenVerifierSecret != fixture.TokenVerifierSecret || first.TokenVerifierService != "" {
+		t.Fatalf("static Cloudflare bootstrap plan builder is not deterministic or closed err=%v", err)
+	}
+	bad := descriptor
+	bad.TokenVerifierService = "pigsty-entitlements"
+	if _, _, err := buildRealCloudCloudflareBootstrapPlan(resource, bad, fixture.EdgeContract); err == nil {
+		t.Fatal("static Cloudflare bootstrap descriptor retained provider-only fields")
+	}
+}
+
+func TestRealCloudCloudflareBootstrapPlanBuilderConsumesGeneratedStaticProductContract(t *testing.T) {
+	resource, fixture := realCloudCloudflareStaticBootstrapPlanFixture(t)
+	environment := realCloudProviderReadinessEnvironment(resource)
+	product := realCloudConfigForEnvironment(environment)
+	product.Edge.TokenVerifier = "env://" + fixture.TokenVerifierSecret
+	contract, err := product.EdgeDeployment("cf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := realCloudCloudflareBootstrapDescriptor{
+		Schema: realCloudCloudflareBootstrapDescriptorSchema, ReadinessSealPublicKey: fixture.ReadinessSealPublicKey,
+		AuthScript: fixture.AuthScript, OriginScript: fixture.OriginScript, TokenVerifierKind: "env",
+		TokenVerifierSecret: fixture.TokenVerifierSecret, TokenVerifierCompatibilityFlags: []string{},
+		CompatibilityDate: fixture.CompatibilityDate, CompatibilityFlags: []string{},
+	}
+	plan, _, err := buildRealCloudCloudflareBootstrapPlan(resource, descriptor, contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.EdgeContract.Variables[sowconfig.EdgeRuntimeTokenVerifierVariable] != "env://"+fixture.TokenVerifierSecret ||
+		len(plan.EdgeContract.RequiredSecrets) != 1 || plan.EdgeContract.RequiredSecrets[0] != fixture.TokenVerifierSecret ||
+		len(plan.EdgeContract.ServiceBindings) != 1 || plan.EdgeContract.ServiceBindings[0] != "ORIGIN" {
+		t.Fatalf("generated product contract lost the static verifier shape: %+v", plan.EdgeContract)
 	}
 }
 

@@ -388,6 +388,46 @@ func TestEdgeDeploymentMapsEnvReferenceToNamedSecretOnBothVendors(t *testing.T) 
 	}
 }
 
+func TestEdgeDeploymentRejectsCrossKindBindingNameCollisions(t *testing.T) {
+	yaml := strings.Replace(validYAML(""), "targets: {}", `targets:
+  cf:
+    storage: {kind: r2, endpoint: "https://storage.example.invalid", bucket: repo-cf, credential: env://CF_STORAGE}
+    cdn: {kind: cloudflare, base_url: "https://repo.example", beta_base_url: "https://beta.example", zone_id: zone-cf, credential: env://CF_CDN}
+  cos:
+    storage: {kind: cos, endpoint: "https://cos.example.invalid", bucket: repo-cos-1250000000, region: ap-shanghai, credential: env://COS_STORAGE, unversioned_bucket_confirmed: true}
+    cdn: {kind: edgeone, base_url: "https://repo-cn.example", beta_base_url: "https://beta-cn.example", distribution: zone-cos, credential: env://COS_CDN}`, 1)
+	cfg, err := Decode(strings.NewReader(yaml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		target   string
+		verifier string
+	}{
+		{target: "cf", verifier: "env://ORIGIN"},
+		{target: "cf", verifier: "env://SOW_PUBLIC_BASE_URL"},
+		{target: "cos", verifier: "env://SOW_COS_SECRET_ID"},
+	} {
+		t.Run(test.target+"-"+test.verifier, func(t *testing.T) {
+			cfg.Edge.TokenVerifier = test.verifier
+			if _, err := cfg.EdgeDeployment(test.target); err == nil || !strings.Contains(err.Error(), "collides") {
+				t.Fatalf("edge deployment accepted cross-kind binding collision verifier=%s err=%v", test.verifier, err)
+			}
+		})
+	}
+}
+
+func TestEdgeDeploymentRejectsTokenAndBasicEntitlementAlias(t *testing.T) {
+	yaml := strings.Replace(validYAML(""), "token_verifier: provider://pigsty-entitlements", "token_verifier: env://"+EdgeRuntimeBasicEntitlementsVariable, 1)
+	yaml = strings.Replace(yaml, "targets: {}", `targets:
+  cf:
+    storage: {kind: r2, endpoint: "https://storage.example.invalid", bucket: repo-cf, credential: env://CF_STORAGE}
+    cdn: {kind: cloudflare, base_url: "https://repo.example", beta_base_url: "https://beta.example", zone_id: zone-cf, credential: env://CF_CDN}`, 1)
+	if _, err := Decode(strings.NewReader(yaml)); err == nil || !strings.Contains(err.Error(), "Basic entitlement") {
+		t.Fatalf("edge deployment accepted token/Basic authority alias err=%v", err)
+	}
+}
+
 func TestSharedEdgeRuntimeFixtureMatchesGoMapping(t *testing.T) {
 	data, err := os.ReadFile("../../edge/testdata/runtime-contract.json")
 	if err != nil {
