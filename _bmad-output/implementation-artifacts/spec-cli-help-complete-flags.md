@@ -2,8 +2,8 @@
 title: 'CLI help 完整展示注册参数'
 type: 'bugfix'
 created: '2026-07-12'
-status: 'in-review'
-review_loop_iteration: 0
+status: 'done'
+review_loop_iteration: 1
 baseline_commit: '84800a6743b0d72f3664a45dcf3eca59d1a1e663'
 context:
   - '{project-root}/_bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/prd.md'

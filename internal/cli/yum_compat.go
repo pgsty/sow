@@ -22,7 +22,6 @@ import (
 	"github.com/pgsty/sow/internal/config"
 	"github.com/pgsty/sow/internal/manifest"
 	"github.com/pgsty/sow/internal/repository"
-	"github.com/pgsty/sow/internal/serving"
 	"github.com/pgsty/sow/internal/state"
 	"github.com/pgsty/sow/internal/upstream"
 	"github.com/pgsty/sow/internal/yumrepo"
@@ -70,15 +69,6 @@ type yumCompatibilityWitness struct {
 	Packages           int64  `json:"packages"`
 	Bytes              int64  `json:"bytes"`
 	FlatAliases        bool   `json:"flat_aliases"`
-}
-
-type yumCompatibilityMaterializeResult struct {
-	Projection config.YUMCompatibilityProjection
-	Packages   repository.MaterializeStats
-	Aliases    repository.MaterializeStats
-	Reconciled repository.ReconcileStats
-	Generation *yumrepo.Generation
-	Target     string
 }
 
 // admitYUMCompatibilityProjection proves that the package source is the
@@ -1010,143 +1000,6 @@ func writeSortedLegacyYUMCompatibilityManifest(ctx context.Context, root, destin
 	}
 	committed = true
 	return count, nil
-}
-
-func materializeYUMCompatibilityProjection(ctx context.Context, cfg *config.Config, canonical *state.Store, pool *repository.Store, projection config.YUMCompatibilityProjection, targetRoot, txDir string, values commonFlags, privateKey, passphrase []byte) (result yumCompatibilityMaterializeResult, resultErr error) {
-	result.Projection = projection
-	admission, err := admitYUMCompatibilityProjection(cfg, canonical, projection)
-	if err != nil {
-		return result, err
-	}
-	values.materializeUnit, err = materializationUnitFor(values, "yum-compat", projection.Source.View, projection.Source.Repo, projection.Source.OS, projection.Source.Arch, targetRoot)
-	if err != nil {
-		return result, err
-	}
-	packagesPath, aliasesPath, payloadPath, witnessPath, packages, bytesTotal, err := buildYUMCompatibilityPayload(canonical, admission, txDir)
-	if err != nil {
-		return result, err
-	}
-	trust, err := stageYUMCompatibilityPackageTrust(cfg, canonical, admission, txDir)
-	if err != nil {
-		return result, err
-	}
-	yumCompatibilityWitnessMu.Lock()
-	witnessErr := ensureYUMCompatibilityWitness(ctx, cfg, canonical, admission, witnessPath, aliasesPath, txDir, privateKey, trust, packages, bytesTotal)
-	yumCompatibilityWitnessMu.Unlock()
-	if witnessErr != nil {
-		return result, witnessErr
-	}
-	commitTime, err := canonical.CommitTime(admission.sourceCommit)
-	if err != nil {
-		return result, err
-	}
-	signer, err := newDeterministicMaterializeKey(privateKey, passphrase, commitTime)
-	if err != nil {
-		return result, errors.New("cannot initialize YUM compatibility signing key")
-	}
-	if err := requireMaterializationRepositoryTrust(values, cfg, privateKey, materializeTrustPayloadBefore); err != nil {
-		return result, err
-	}
-	packageKeyring := trust.keyring
-	rootRelative, err := filepath.Rel(cfg.Root, filepath.Join(targetRoot, filepath.FromSlash(projection.Root)))
-	if err != nil || rootRelative == ".." || strings.HasPrefix(rootRelative, ".."+string(filepath.Separator)) || filepath.IsAbs(rootRelative) {
-		return result, errors.Join(err, errors.New("YUM compatibility target escapes repository root"))
-	}
-	rootRelative = filepath.ToSlash(rootRelative)
-	result.Target = rootRelative
-	packagesReader, err := os.Open(packagesPath)
-	if err != nil {
-		return result, err
-	}
-	result.Packages, err = pool.MaterializeWithOptions(ctx, packagesReader, rootRelative, repository.MaterializeOptions{Workers: values.workers})
-	closeErr := packagesReader.Close()
-	if err != nil || closeErr != nil {
-		return result, errors.Join(err, closeErr)
-	}
-	aliasesReader, err := os.Open(aliasesPath)
-	if err != nil {
-		return result, err
-	}
-	result.Aliases, err = pool.MaterializeWithOptions(ctx, aliasesReader, rootRelative, repository.MaterializeOptions{Workers: values.workers})
-	closeErr = aliasesReader.Close()
-	if err != nil || closeErr != nil {
-		return result, errors.Join(err, closeErr)
-	}
-	if err := requireMaterializationRepositoryTrust(values, cfg, privateKey, materializeTrustPayloadAfter); err != nil {
-		return result, err
-	}
-	physicalRoot := filepath.Join(cfg.Root, filepath.FromSlash(rootRelative))
-	if err := verifyYUMPackageManifest(ctx, packagesPath, physicalRoot, packageKeyring, timeNowUTC(), values.workers); err != nil {
-		return result, fmt.Errorf("RPM compatibility package trust preflight: %w", err)
-	}
-	iterator, file, err := openYUMManifestIterator(packagesPath, physicalRoot)
-	if err != nil {
-		return result, err
-	}
-	options := yumrepo.Options{ELMajor: 0, Frozen: true, Compatibility: true, Compression: yumrepo.CompressionGzip, Revision: commitTime.Unix(), Signer: signer}
-	generationDir := filepath.Join(txDir, "yum-compat-"+projection.ID+"-generation")
-	result.Generation, err = yumrepo.Generate(ctx, generationDir, options, iterator)
-	closeErr = file.Close()
-	if err != nil || closeErr != nil {
-		return result, errors.Join(err, closeErr)
-	}
-	live := filepath.Join(physicalRoot, "repodata")
-	staged := filepath.Join(physicalRoot, ".sow-repodata-"+admission.sourceCommit.String()[:16])
-	if err := installYUMStagedGeneration(ctx, generationDir, staged, yumrepo.CompressionGzip, signer, result.Generation.RepomdSHA256); err != nil {
-		return result, err
-	}
-	guard := func(phase yumrepo.ActivationPhase) error {
-		boundary := materializeTrustYUMActivationBefore
-		if phase == yumrepo.ActivationAfterExchange {
-			boundary = materializeTrustYUMActivationAfter
-		}
-		return requireMaterializationRepositoryTrust(values, cfg, privateKey, boundary)
-	}
-	if _, statErr := os.Lstat(live); errors.Is(statErr, os.ErrNotExist) {
-		err = yumrepo.ActivateInitialLocalGuarded(ctx, live, staged, yumrepo.CompressionGzip, signer, result.Generation.RepomdSHA256, guard)
-	} else if statErr != nil {
-		return result, statErr
-	} else {
-		err = yumrepo.ActivateLocalGuarded(ctx, live, staged, yumrepo.CompressionGzip, signer, result.Generation.RepomdSHA256, yumrepo.NativeDirectoryExchanger{}, guard)
-	}
-	if err != nil {
-		return result, err
-	}
-	if err := os.RemoveAll(staged); err != nil {
-		return result, err
-	}
-	metadataPath := filepath.Join(txDir, "yum-compat-"+projection.ID+"-metadata.tsv")
-	if _, err := manifest.Scan(ctx, physicalRoot, manifest.Scope{Path: "repodata"}, metadataPath, manifest.ScanOptions{Workers: values.workers, ChunkEntries: values.chunk, TempDir: filepath.Join(cfg.StatePath(), "tmp")}); err != nil {
-		return result, err
-	}
-	exactPath := filepath.Join(txDir, "yum-compat-"+projection.ID+"-exact.tsv")
-	if err := mergeManifestFiles(payloadPath, metadataPath, exactPath); err != nil {
-		return result, err
-	}
-	if err := requireMaterializationRepositoryTrust(values, cfg, privateKey, materializeTrustExactReconcileBefore); err != nil {
-		return result, err
-	}
-	result.Reconciled, err = pool.ReconcileExact(ctx, exactPath, rootRelative, values.workers, values.chunk)
-	if err != nil {
-		return result, err
-	}
-	if err := requireMaterializationRepositoryTrust(values, cfg, privateKey, materializeTrustExactReconcileAfter); err != nil {
-		return result, err
-	}
-	if err := requireMaterializationRepositoryTrust(values, cfg, privateKey, materializeTrustServingPublishBefore); err != nil {
-		return result, err
-	}
-	if err := serving.PublishHostableTree(physicalRoot); err != nil {
-		return result, fmt.Errorf("publish hostable YUM compatibility tree: %w", err)
-	}
-	if err := requireMaterializationRepositoryTrust(values, cfg, privateKey, materializeTrustServingPublishAfter); err != nil {
-		return result, err
-	}
-	active, err := yumrepo.ValidateDirectory(ctx, live, yumrepo.CompressionGzip, signer)
-	if err != nil || !yumGenerationMatchesExpected(active, result.Generation, -1) {
-		return result, errors.Join(err, errors.New("active YUM compatibility generation identity mismatch"))
-	}
-	return result, nil
 }
 
 func fileSHA256AndSize(filename string) (string, int64, error) {

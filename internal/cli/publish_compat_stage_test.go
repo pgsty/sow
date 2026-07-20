@@ -343,12 +343,6 @@ func copyCompatibilityTestTree(t *testing.T, source, destination string) {
 	}
 }
 
-func compatibilityEntryFromObject(name string, object repository.Object) manifest.Entry {
-	entry := manifest.Entry{Path: name, Size: object.Size}
-	copy(entry.SHA256[:], object.SHA256[:])
-	return entry
-}
-
 func readCompatibilityTestManifest(t *testing.T, filename string) []manifest.Entry {
 	t.Helper()
 	file, err := os.Open(filename)

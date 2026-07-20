@@ -342,10 +342,6 @@ type primaryPackage struct {
 	seenVersion, seenSize, seenLocation bool
 }
 
-func parsePrimary(reader io.Reader, base *url.URL, maxDepth int, accept func(syncer.Candidate) error) error {
-	return parsePrimaryLimited(reader, base, maxDepth, 1_000_000, accept)
-}
-
 func parsePrimaryLimited(reader io.Reader, base *url.URL, maxDepth, maxPackages int, accept func(syncer.Candidate) error) error {
 	if maxPackages <= 0 {
 		return fmt.Errorf("%w: invalid package count limit", ErrInvalidMetadata)

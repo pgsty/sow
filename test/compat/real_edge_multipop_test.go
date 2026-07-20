@@ -192,34 +192,6 @@ type realEdgeActiveArtifactSeal struct {
 	Size   int64  `json:"size"`
 }
 
-// assertRealCloudEdgeMultiPoPPreflight must run before the destructive
-// real-cloud acceptance performs any remote mutation. It validates every
-// observer/proxy indirection and proves a new external artifact can be created
-// safely, while refusing to overwrite prior evidence or a stale writer lock.
-func assertRealCloudEdgeMultiPoPPreflight(t *testing.T, environment realCloudEnvironment, runIdentity realCloudRunIdentity, forbidden []string) {
-	t.Helper()
-	if err := preflightRealCloudEdgeMultiPoPInputs(os.Getenv); err != nil {
-		t.Fatalf("real edge multi-PoP preflight: %v", err)
-	}
-	artifactPath := strings.TrimSpace(os.Getenv(realEdgeActiveArtifactEnv))
-	release, err := acquireRealEdgeRunReservation(artifactPath, runIdentity.RunID)
-	if err != nil {
-		t.Fatalf("reserve real edge multi-PoP run: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := release(); err != nil {
-			t.Errorf("release real edge multi-PoP run reservation: %v", err)
-		}
-	})
-	observers, err := loadRealEdgeObservers(os.Getenv)
-	if err != nil {
-		t.Fatalf("reload real edge observer set after reservation: %v", err)
-	}
-	if err := preflightRealEdgeObserverConnectivity(t.Context(), observers, environment, forbidden); err != nil {
-		t.Fatalf("real edge observer connectivity preflight: %v", err)
-	}
-}
-
 // preflightRealEdgeObserverConnectivity is the last read-only gate before the
 // destructive acceptance may touch either bucket. Every configured egress
 // proves proxy authentication, CONNECT/SOCKS transport, end-to-end TLS, and
@@ -1601,11 +1573,6 @@ func sameRealEdgeRunBinding(left, right realEdgeMultiPoPVendorStage) bool {
 
 func realEdgeArtifactRecordKey(record realEdgeActiveArtifactRecord) string {
 	return fmt.Sprintf("%020d/%s/%s", record.Generation, record.Vendor, record.TransactionID)
-}
-
-func validateRealEdgeExternalPath(path, environmentName string) error {
-	_, err := canonicalRealEdgeExternalPath(path, environmentName)
-	return err
 }
 
 func canonicalRealEdgeExternalPath(path, environmentName string) (string, error) {

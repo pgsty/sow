@@ -352,15 +352,6 @@ type yumPackageSample struct {
 	Epoch   int64
 }
 
-func parseYUMPrimary(ctx context.Context, input io.Reader, spool, identities *manifestSpool) (int64, error) {
-	_, count, err := parseYUMPrimaryDetailed(ctx, input, spool, identities, nil, "")
-	return count, err
-}
-
-func parseYUMPrimaryWithSample(ctx context.Context, input io.Reader, spool, identities *manifestSpool) (yumPackageSample, int64, error) {
-	return parseYUMPrimaryDetailed(ctx, input, spool, identities, nil, "")
-}
-
 func parseYUMPrimaryWithSampleForArch(ctx context.Context, input io.Reader, spool, identities *manifestSpool, architecture string) (yumPackageSample, int64, error) {
 	return parseYUMPrimaryDetailed(ctx, input, spool, identities, nil, architecture)
 }

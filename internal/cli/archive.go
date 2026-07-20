@@ -65,14 +65,6 @@ var archiveDirectorySync = syncBoundArchiveDirectory
 // Linux and Darwin production implementations compare st_dev.
 var archiveFilesystemIdentity = sameArchiveFilesystem
 
-// allowInsideRoot is reserved for callers that have already applied the
-// repository-aware archive destination validator. Even then, the exact
-// manifest is checked below so an existing destination can never archive
-// itself.
-func writeDeterministicTGZ(ctx context.Context, materializedRoot, manifestPath, destination string, allowInsideRoot bool) (archiveResult, error) {
-	return writeDeterministicTGZWithPrecommit(ctx, materializedRoot, manifestPath, destination, allowInsideRoot, filepath.Dir(manifestPath), "", nil)
-}
-
 // writeDeterministicTGZWithPrecommit keeps the completed archive in the private
 // state transaction until precommit has durably recorded its digest-level
 // taint. The final cross-directory hard-link install is atomic and no-clobber;

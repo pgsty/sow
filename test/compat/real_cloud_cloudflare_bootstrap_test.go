@@ -3058,8 +3058,8 @@ func TestRealCloudCloudflareStaticBootstrapRuntimeDefersSecretUntilUnsealedMutat
 	resource, plan := realCloudCloudflareStaticBootstrapPlanFixture(t)
 	secret := realCloudCloudflareStaticEntitlementsFixture(t, plan)
 	values := map[string]string{
-		realCloudStorageCredentialCF: `{"access_key_id":"static-bootstrap-access","secret_access_key":"static-bootstrap-storage-secret"}`,
-		realCloudCDNCredentialCF:     `{"api_token":"static-bootstrap-api-token"}`,
+		realCloudStorageCredentialCF: `{"access_key_id":"static-bootstrap-access","secret_access_key":"fixture-secret-access-key-value"}`,
+		realCloudCDNCredentialCF:     `{"api_token":"replace-with-cloudflare-token-value"}`,
 		plan.TokenVerifierSecret:     secret,
 	}
 	reads := make(map[string]int)

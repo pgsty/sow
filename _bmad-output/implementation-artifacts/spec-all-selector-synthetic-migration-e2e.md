@@ -2,8 +2,8 @@
 title: '33-selector 合成物理仓库迁移 E2E'
 type: 'feature'
 created: '2026-07-14'
-status: 'in-review'
-review_loop_iteration: 0
+status: 'done'
+review_loop_iteration: 1
 baseline_commit: '84800a60e01aaaf8dc5b189c3ddb1380930f4865'
 context:
   - '{project-root}/docs/migration/fixtures/selector-matrix.yaml'

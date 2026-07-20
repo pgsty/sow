@@ -579,11 +579,6 @@ type aptPackageSample struct {
 	Component    string
 }
 
-func parsePackagesStream(ctx context.Context, input io.Reader, component, architecture string, spool *manifestSpool) error {
-	_, err := parsePackagesStreamDetailed(ctx, input, "identity-suite", component, architecture, spool, nil, nil)
-	return err
-}
-
 func parsePackagesStreamWithSample(ctx context.Context, input io.Reader, component, architecture string, spool *manifestSpool) (aptPackageSample, error) {
 	return parsePackagesStreamDetailed(ctx, input, "identity-suite", component, architecture, spool, nil, nil)
 }

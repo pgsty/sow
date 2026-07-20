@@ -164,17 +164,6 @@ type packageRepositoryLifecycleState struct {
 	suiteFrozen map[string]bool
 }
 
-func (s packageRepositoryLifecycleState) copy() packageRepositoryLifecycleState {
-	result := packageRepositoryLifecycleState{osFrozen: s.osFrozen}
-	if len(s.suiteFrozen) != 0 {
-		result.suiteFrozen = make(map[string]bool, len(s.suiteFrozen))
-		for suite, frozen := range s.suiteFrozen {
-			result.suiteFrozen[suite] = frozen
-		}
-	}
-	return result
-}
-
 func (s *packageRepositoryLifecycleState) merge(other packageRepositoryLifecycleState) {
 	s.osFrozen = s.osFrozen || other.osFrozen
 	if len(other.suiteFrozen) == 0 {

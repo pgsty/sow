@@ -3,7 +3,6 @@ package compat_test
 import (
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -345,11 +344,6 @@ func serveLegacyAPT(t *testing.T, selectResponse func(*http.Request) (root, sour
 		_ = server.Shutdown(ctx)
 	}
 	return log, port, stop
-}
-
-func readBodyLimited(response *http.Response) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
-	_ = response.Body.Close()
 }
 
 const legacyAPTConfig = `schema: sow/v1

@@ -39,10 +39,6 @@ type rpmMaterializationOwnerPlan struct {
 	leaves []viewLeaf
 }
 
-func runAddRPM(ctx context.Context, cfg *config.Config, selected []config.Repo, inputs []string, values commonFlags, privateKeyFile, passphraseFile string, stdout, stderr io.Writer) error {
-	return runAddRPMExpected(ctx, cfg, selected, inputs, nil, values, privateKeyFile, passphraseFile, stdout, stderr)
-}
-
 func runAddRPMExpected(ctx context.Context, cfg *config.Config, selected []config.Repo, inputs []string, expected map[string]repository.Object, values commonFlags, privateKeyFile, passphraseFile string, stdout, stderr io.Writer) (resultErr error) {
 	inputDir, err := os.MkdirTemp("", "sow-add-rpm-input-")
 	if err != nil {

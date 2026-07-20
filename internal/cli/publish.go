@@ -1700,19 +1700,6 @@ func viewLeafExists(canonical *state.Store, viewName string, leaf viewLeaf) bool
 	return err == nil && exists
 }
 
-func repoViewExists(canonical *state.Store, cfg *config.Config, viewName string, repo config.Repo, values commonFlags) bool {
-	leaves := selectedLeaves([]config.Repo{repo}, values)
-	if repo.Type == "apt" {
-		leaves = suiteClosedSelectedLeaves(cfg, []config.Repo{repo}, values)
-	}
-	for _, leaf := range leaves {
-		if viewLeafExists(canonical, viewName, leaf) {
-			return true
-		}
-	}
-	return false
-}
-
 // suiteClosedSelectedLeaves treats an APT architecture selector as a suite
 // transaction trigger. InRelease/Release is shared by every configured
 // architecture, so publish preflight and verification must both observe every

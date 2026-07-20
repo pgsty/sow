@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -155,8 +154,4 @@ func writeFile(t *testing.T, filename, body string) {
 	if err := os.WriteFile(filename, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func dumpReport(report Report) string {
-	return fmt.Sprintf("%+v", report)
 }

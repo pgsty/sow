@@ -262,7 +262,6 @@ internal/cli/yum_compat_rename_other.go
 internal/cli/yum_compat_stage.go
 internal/cli/yum_compat_stage_audit.go
 internal/cli/yum_compat_stage_hostability_test.go
-internal/cli/yum_compat_verify.go
 internal/cli/yum_compat_workflow.go
 internal/cli/yum_compat_workflow_state_test.go
 internal/cli/yum_consumer_preflight.go
@@ -459,6 +458,7 @@ internal/yumrepo/types.go
 internal/yumrepo/validate.go
 internal/yumrepo/xml.go
 sow.example.yaml
+staticcheck.conf
 test/compat/apt_legacy_alias_test.go
 test/compat/cleandelivery/delivery-extra-files.txt
 test/compat/cleandelivery/main.go

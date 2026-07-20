@@ -641,17 +641,3 @@ func redactPublishError(err error) string {
 	}
 	return value
 }
-
-func copyFileExclusive(sourcePath, destinationPath string) error {
-	source, err := os.Open(sourcePath)
-	if err != nil {
-		return err
-	}
-	destination, err := os.OpenFile(destinationPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		source.Close()
-		return err
-	}
-	_, copyErr := io.Copy(destination, source)
-	return errors.Join(copyErr, source.Close(), destination.Sync(), destination.Close())
-}

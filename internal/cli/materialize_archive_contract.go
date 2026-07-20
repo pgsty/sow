@@ -1112,22 +1112,6 @@ func validOfflineArchivePath(value string) bool {
 		!strings.HasPrefix(value, "../") && !strings.ContainsAny(value, "%?#\\\x00\t\r\n")
 }
 
-func prepareOfflineArchiveAdoption(
-	cfg *config.Config,
-	canonical *state.Store,
-	source materializeCanonicalSource,
-	leaves []viewLeaf,
-	destinationRepo config.Repo,
-	destinationRelative string,
-) (offlineArchiveAdoptionPreflight, error) {
-	var preflight offlineArchiveAdoptionPreflight
-	sourceProof, err := deriveOfflineArchiveSourceProof(cfg, canonical, source, leaves)
-	if err != nil {
-		return preflight, fmt.Errorf("derive canonical archive source: %w", err)
-	}
-	return prepareOfflineArchiveAdoptionFromProof(cfg, sourceProof, destinationRepo, destinationRelative)
-}
-
 func prepareOfflineArchiveAdoptionFromProof(
 	cfg *config.Config,
 	sourceProof offlineArchiveSourceProof,

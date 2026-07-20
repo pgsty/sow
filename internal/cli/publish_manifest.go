@@ -356,17 +356,6 @@ func nextManifestEntryOutsideScopes(reader *manifest.Reader, scopes []string) (m
 	}
 }
 
-func nextSelectedManifestEntry(reader *manifest.Reader, scopes []string) (manifest.Entry, error) {
-	entry, err := reader.Next()
-	if err != nil {
-		return manifest.Entry{}, err
-	}
-	if !manifestEntryInScopes(entry.Path, scopes) {
-		return manifest.Entry{}, fmt.Errorf("selected manifest entry %q is outside selected scopes", entry.Path)
-	}
-	return entry, nil
-}
-
 func nextSelectedManifestEntryInSelection(reader *manifest.Reader, replace, upsert []string) (manifest.Entry, error) {
 	entry, err := reader.Next()
 	if err != nil {

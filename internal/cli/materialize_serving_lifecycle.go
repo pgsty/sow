@@ -464,30 +464,6 @@ func pruneCanonicalServingGenerationLedgersWithChannelDeletes(ctx context.Contex
 	return expired, nil
 }
 
-func stageServingTargetIdentity(target serving.TargetIdentity, view, directory string) (string, error) {
-	body, err := target.Canonical(view)
-	if err != nil {
-		return "", err
-	}
-	filename := directory + string(os.PathSeparator) + "serving-target.json"
-	if err := writeExclusiveBytes(filename, body); err != nil {
-		return "", err
-	}
-	return filename, nil
-}
-
-func channelSlicesEqual(left, right []serving.GenerationPin) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
-}
-
 func targetMatchesChannel(target serving.TargetIdentity, channel serving.Channel) bool {
 	return target.ID == channel.TargetID && target.Root == channel.TargetRoot && target.BaseURL == channel.BaseURL
 }

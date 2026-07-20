@@ -799,14 +799,6 @@ func configuredPublicationLeaves(cfg *config.Config, view, snapshot string) (map
 	return configured, nil
 }
 
-func configuredPublicationLeavesAt(canonical *state.Store, commit plumbing.Hash, runtime *config.Config, view, snapshot string) (map[string]viewLeaf, error) {
-	committed, err := canonicalConfigurationAt(canonical, commit, runtime)
-	if err != nil {
-		return nil, err
-	}
-	return configuredPublicationLeaves(committed, view, snapshot)
-}
-
 func canonicalConfigurationAt(canonical *state.Store, commit plumbing.Hash, runtime *config.Config) (*config.Config, error) {
 	if canonical == nil || commit.IsZero() {
 		return nil, errors.New("committed parent configuration is unavailable")

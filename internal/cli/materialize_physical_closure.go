@@ -80,33 +80,6 @@ func sameViewLeafSet(left, right []viewLeaf) bool {
 	return true
 }
 
-// materializedYUMPhysicalClosureLeaves widens only YUM repo+arch ownership.
-// Remote APT publication deliberately retains its suite-level selector model,
-// while YUM aliases share the exact same repodata directory and can never be
-// prepared independently without destructive last-writer-wins behavior.
-func materializedYUMPhysicalClosureLeaves(cfg *config.Config, canonical *state.Store, source materializeCanonicalSource, requested []viewLeaf) ([]viewLeaf, error) {
-	ordinary := make([]viewLeaf, 0, len(requested))
-	yumRequested := make([]viewLeaf, 0, len(requested))
-	for _, leaf := range requested {
-		if leaf.repo.Type == "yum" {
-			yumRequested = append(yumRequested, leaf)
-		} else {
-			ordinary = append(ordinary, leaf)
-		}
-	}
-	if len(yumRequested) != 0 {
-		closed, err := materializedRoutePhysicalClosureLeaves(cfg, canonical, source, yumRequested)
-		if err != nil {
-			return nil, err
-		}
-		ordinary = append(ordinary, closed...)
-	}
-	sort.Slice(ordinary, func(i, j int) bool {
-		return servingLeafKey(ordinary[i].repo.ID, ordinary[i].os, ordinary[i].arch) < servingLeafKey(ordinary[j].repo.ID, ordinary[j].os, ordinary[j].arch)
-	})
-	return ordinary, nil
-}
-
 // materializedRoutePhysicalRepos restores canonical repo contracts while
 // retaining only the touched YUM architectures. Clearing CLI OS/arch filters
 // against this detached slice makes working-tree preparation rebuild the

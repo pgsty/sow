@@ -31,13 +31,6 @@ type debInputPlan struct {
 
 type debLeafPlan = packageAddLeafPlan
 
-// runAddDEB adopts existing Debian binary packages. It deliberately refuses
-// to guess when repository, component, suite, or architecture selection is
-// ambiguous: a wrong guess would create a durable but misleading APT index.
-func runAddDEB(ctx context.Context, cfg *config.Config, selected []config.Repo, inputs []string, values commonFlags, componentFlag, privateKeyFile, passphraseFile string, stdout, stderr io.Writer) error {
-	return runAddDEBExpected(ctx, cfg, selected, inputs, nil, values, componentFlag, privateKeyFile, passphraseFile, stdout, stderr)
-}
-
 func runAddDEBExpected(ctx context.Context, cfg *config.Config, selected []config.Repo, inputs []string, expected map[string]repository.Object, values commonFlags, componentFlag, privateKeyFile, passphraseFile string, stdout, stderr io.Writer) (resultErr error) {
 	inputDir, err := os.MkdirTemp("", "sow-add-deb-input-")
 	if err != nil {

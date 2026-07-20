@@ -570,17 +570,6 @@ func sortedKeys(values map[string]bool) []string {
 	return result
 }
 
-func differenceStrings(left, right []string) []string {
-	rightSet := migrationStringSet(right)
-	var result []string
-	for _, value := range left {
-		if !rightSet[value] {
-			result = append(result, value)
-		}
-	}
-	return result
-}
-
 func containsString(values []string, wanted string) bool {
 	for _, value := range values {
 		if value == wanted {

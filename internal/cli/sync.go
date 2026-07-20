@@ -812,11 +812,6 @@ func (artifact *stableCASArtifact) Close() error {
 	return nil
 }
 
-func loadUpstreamKeyring(configPath, relative string) (openpgp.EntityList, error) {
-	entities, _, err := loadPublicOnlyKeyring(configPath, relative, "upstream")
-	return entities, err
-}
-
 // loadPublicOnlyKeyring returns both parsed entities and the digest of the
 // exact trust-bundle bytes. The digest is a provenance input; filenames alone
 // are not stable trust identities across key rotation.

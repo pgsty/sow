@@ -62,6 +62,10 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
 
 其余证据报告与验收入口如下；每项是否实跑、源码日期及外部边界以自身正文为准：
 
+- `2026-07-20-dead-code-static-analysis-closure.md`：删除 42 个 `U1000` 不可达声明与
+  768 行旧 wrapper/compatibility auditor，保留唯一 CLI 接线路径；默认 Staticcheck
+  正确性检查、六片 ordinary/race、非 CLI ordinary/race、四平台静态构建、47 项边缘
+  合同、七套迁移和离线 clean-delivery 全绿。全程真实云/上游开关为 0。
 - `2026-07-20-config-input-and-rpm-provenance-hardening.md`：所有外部与 canonical-history
   配置入口在 YAML 前统一实施 8 MiB + 1-byte sentinel，覆盖精确边界、空仓/存量仓
   `ExitConfig` 零状态变更与 reachable-history 负例；vendored RPM fixture 恢复固定

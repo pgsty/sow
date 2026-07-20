@@ -2881,17 +2881,6 @@ func loadYUMCompatibilityCutoverStateAt(canonical *state.Store, commit plumbing.
 	return result, nil
 }
 
-func requireActiveYUMCompatibilityCutoverAt(canonical *state.Store, commit plumbing.Hash, id string) (yumCompatibilityCutoverState, error) {
-	result, err := loadYUMCompatibilityCutoverStateAt(canonical, commit, id)
-	if err != nil {
-		return result, err
-	}
-	if !result.Active {
-		return result, fmt.Errorf("YUM compatibility projection %s is not S3-active", id)
-	}
-	return result, nil
-}
-
 func stageYUMCompatibilityFreezeWitness(canonical *state.Store, admission yumCompatibilityAdmission, witnessManifest string, trust yumCompatibilityPackageTrust, packages, bytesTotal int64, txDir string) (string, error) {
 	manifestSHA, manifestGit, manifestSize, err := fileSHA256AndGitBlob(witnessManifest)
 	if err != nil {
@@ -3137,10 +3126,6 @@ func writeYUMCompatibilityCutoverJournal(cfg *config.Config, journal yumCompatib
 		return err
 	}
 	return syncLocalDirectory(filepath.Dir(destination))
-}
-
-func readYUMCompatibilityCutoverJournal(cfg *config.Config, id string) (yumCompatibilityCutoverJournal, bool, error) {
-	return readYUMCompatibilityCutoverJournalAt(yumCompatibilityCutoverJournalPath(cfg, id), id)
 }
 
 var errPartialYUMCompatibilityCutoverJournalEncoding = errors.New("partial cutover journal encoding")

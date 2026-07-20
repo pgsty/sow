@@ -143,10 +143,6 @@ func auditYUMCompatibilityStageWithBinding(ctx context.Context, cfg *config.Conf
 	return cutover.Stage, nil
 }
 
-func requireNoYUMCompatibilityCutoverJournal(cfg *config.Config, id string) error {
-	return requireNoYUMCompatibilityCutoverJournalWithBinding(cfg, id, nil)
-}
-
 func requireNoYUMCompatibilityCutoverJournalWithBinding(cfg *config.Config, id string, binding *yumCompatibilityReadBinding) error {
 	name := yumCompatibilityCutoverJournalPath(cfg, id)
 	for _, candidate := range []string{name, name + ".next"} {
@@ -291,10 +287,6 @@ func auditYUMCompatibilityServingLinkAtRoot(cfg *config.Config, journal yumCompa
 		return errors.Join(err, errors.New("repository root was replaced during compatibility admission"))
 	}
 	return nil
-}
-
-func auditYUMCompatibilityCandidateTree(ctx context.Context, cfg *config.Config, canonical *state.Store, pool *repository.Store, frozen yumCompatibilityFrozenState, txDir string, values commonFlags) error {
-	return auditYUMCompatibilityCandidateTreeWithBinding(ctx, cfg, canonical, pool, frozen, txDir, values, nil)
 }
 
 func auditYUMCompatibilityCandidateTreeWithBinding(ctx context.Context, cfg *config.Config, canonical *state.Store, pool *repository.Store, frozen yumCompatibilityFrozenState, txDir string, values commonFlags, binding *yumCompatibilityReadBinding) (resultErr error) {

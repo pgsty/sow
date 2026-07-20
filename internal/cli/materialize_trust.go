@@ -157,15 +157,6 @@ func (snapshot *materializationTrustSnapshot) runHook(boundary materializationTr
 	snapshot.hookMu.Unlock()
 }
 
-func (snapshot *materializationTrustSnapshot) requireRepository(cfg *config.Config, _ []byte, boundary materializationTrustBoundary) error {
-	if snapshot == nil {
-		return nil
-	}
-	snapshot.runHook(boundary)
-	err := snapshot.rawRequireRepository(cfg, boundary)
-	return snapshot.handleMaterializationTrustResult(cfg, "", boundary, err)
-}
-
 func (snapshot *materializationTrustSnapshot) requireYUM(cfg *config.Config, repo config.Repo, privateKey []byte, boundary materializationTrustBoundary) (openpgp.KeyRing, error) {
 	if snapshot == nil {
 		keyring, _, err := loadRPMPackageKeyring(cfg.Path, repo.YUM.PackageKeyring)
@@ -192,15 +183,6 @@ func (snapshot *materializationTrustSnapshot) requireYUM(cfg *config.Config, rep
 		return nil, handled
 	}
 	return frozen.keyring, nil
-}
-
-func (snapshot *materializationTrustSnapshot) requireAll(cfg *config.Config, _ []byte, boundary materializationTrustBoundary) error {
-	if snapshot == nil {
-		return nil
-	}
-	snapshot.runHook(boundary)
-	err := snapshot.rawRequireAll(cfg, boundary)
-	return snapshot.handleMaterializationTrustResult(cfg, "", boundary, err)
 }
 
 func (snapshot *materializationTrustSnapshot) rawRequireRepository(cfg *config.Config, boundary materializationTrustBoundary) error {
@@ -241,10 +223,6 @@ func (snapshot *materializationTrustSnapshot) rawRequireAll(cfg *config.Config, 
 		}
 	}
 	return nil
-}
-
-func requireMaterializationRepositoryPublicIdentity(cfg *config.Config, expected string) error {
-	return requireMaterializationRepositoryPublicIdentityAt(cfg, expected, time.Now().UTC())
 }
 
 func requireMaterializationRepositoryPublicIdentityAt(cfg *config.Config, expected string, at time.Time) error {

@@ -267,34 +267,6 @@ func validateGenerationCompatibilityAt(cfg *config.Config, canonical *state.Stor
 	return nil
 }
 
-// validateDesiredGenerationCompatibilityCompleteness is a write-side gate.
-// Unlike validation of an existing parent, a newly constructed generation
-// must carry every frozen projection owned by this target. Calling it only
-// after desired state construction avoids deadlocking first introduction and
-// incremental expansion while still making omissions fail closed.
-func validateDesiredGenerationCompatibilityCompleteness(cfg *config.Config, target string, generation pub.TargetGeneration) error {
-	if cfg == nil {
-		return errors.New("desired compatibility completeness requires configuration")
-	}
-	seen := make(map[string]struct{}, len(generation.Compatibility))
-	for _, identity := range generation.Compatibility {
-		if _, duplicate := seen[identity.ID]; duplicate {
-			return fmt.Errorf("duplicate compatibility publication identity %s", identity.ID)
-		}
-		seen[identity.ID] = struct{}{}
-	}
-	for _, projection := range cfg.CompatibilityProjections {
-		owner, exists := cfg.RepoByName(projection.Source.Repo)
-		if !exists || !owner.PublishesToTarget(target) {
-			continue
-		}
-		if _, exists := seen[projection.ID]; !exists {
-			return fmt.Errorf("target %s generation omits configured frozen compatibility identity %s", target, projection.ID)
-		}
-	}
-	return nil
-}
-
 func compatibilityStateAtGeneration(generation pub.TargetGeneration, id string) (pub.CompatibilityState, bool) {
 	for _, identity := range generation.Compatibility {
 		if identity.ID == id {

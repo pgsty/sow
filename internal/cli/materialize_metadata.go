@@ -418,10 +418,6 @@ func buildAPTMaterializeIndexes(ctx context.Context, canonical *state.Store, rep
 	return indexes, publicationTime.UTC().Truncate(time.Second), cleanup, nil
 }
 
-func materializeYUMMetadata(ctx context.Context, cfg *config.Config, canonical *state.Store, repo config.Repo, leaf viewLeaf, source materializeCanonicalSource, targetRoot, txDir string, privateKey, passphrase []byte, values commonFlags) error {
-	return materializeYUMMetadataOwner(ctx, cfg, canonical, repo, []viewLeaf{leaf}, source, targetRoot, txDir, privateKey, passphrase, values, nil)
-}
-
 func materializedYUMMetadataManifestPath(txDir, repoID string, leaves []viewLeaf) string {
 	arch, label := "unknown", "all"
 	if len(leaves) != 0 {

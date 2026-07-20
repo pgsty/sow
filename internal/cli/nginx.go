@@ -449,14 +449,6 @@ func validateRawNginxCompatibilityHostability(ctx context.Context, canonical *st
 	})
 }
 
-// validateActiveNginxCompatibilityClosure is read-only. It proves that the
-// active S3 ledger has been materialized into the exact target-partitioned
-// generation/channel, mirrorlist and two frozen trust hardlinks that the
-// generated Nginx and edge contracts are about to expose.
-func validateActiveNginxCompatibilityClosure(ctx context.Context, cfg *config.Config, canonical *state.Store, pool *repository.Store, projection config.YUMCompatibilityProjection, targetRoot, txDir string, values commonFlags) error {
-	return validateActiveNginxCompatibilityClosureWithBinding(ctx, cfg, canonical, pool, projection, targetRoot, txDir, values, nil)
-}
-
 func validateActiveNginxCompatibilityClosureWithBinding(ctx context.Context, cfg *config.Config, canonical *state.Store, pool *repository.Store, projection config.YUMCompatibilityProjection, targetRoot, txDir string, values commonFlags, binding *yumCompatibilityReadBinding) error {
 	evidence, err := loadFrozenYUMCompatibilityServingEvidence(cfg, canonical, projection)
 	if err != nil {
@@ -557,25 +549,6 @@ func validateActiveNginxCompatibilityClosureWithBinding(ctx context.Context, cfg
 	return nil
 }
 
-func validateNginxIncludeTrust(cfg *config.Config, repos []config.Repo, viewName string) error {
-	keyrings, packageSelected, err := selectedNginxIncludeTrust(cfg, repos, viewName)
-	if err != nil {
-		return err
-	}
-	for _, keyring := range keyrings {
-		if _, _, err := loadRPMPackageKeyring(cfg.Path, keyring); err != nil {
-			return fmt.Errorf("RPM package keyring %s: %w", keyring, err)
-		}
-	}
-	if !packageSelected {
-		return nil
-	}
-	if _, _, err := loadRepositoryPublicTrustAnchor(cfg.Path, cfg.GPG.PublicKey); err != nil {
-		return fmt.Errorf("repository public key: %w", err)
-	}
-	return nil
-}
-
 func validateNginxIncludeTrustWithSession(cfg *config.Config, repos []config.Repo, viewName string, session *localReadAdmission) error {
 	if session == nil {
 		return errors.New("Nginx trust read admission is unavailable")
@@ -641,10 +614,6 @@ func selectedNginxIncludeTrust(cfg *config.Config, repos []config.Repo, viewName
 		return nil, false, errors.New("gpg.public_key is required for selected package repositories")
 	}
 	return keyrings, true, nil
-}
-
-func writeNginxIncludeAtomically(cfg *config.Config, targetRoot, outputPath string, body []byte) error {
-	return writeNginxIncludeAtomicallyWithHook(cfg, targetRoot, outputPath, body, nil)
 }
 
 func writeNginxIncludeAtomicallyWithHook(cfg *config.Config, targetRoot, outputPath string, body []byte, beforeRename func()) (resultErr error) {

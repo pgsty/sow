@@ -21,49 +21,6 @@ import (
 
 const maximumYUMCompatibilityWitnessBytes = 64 << 10
 
-func requireAllYUMCompatibilityFrozen(cfg *config.Config, canonical *state.Store) error {
-	for _, projection := range config.SortedYUMCompatibilityProjections(cfg.CompatibilityProjections) {
-		witnessPath, err := state.YUMCompatibilityProjectionPath(projection.ID)
-		if err != nil {
-			return err
-		}
-		body, exists, err := readOptionalCanonical(canonical, witnessPath)
-		if err != nil || !exists {
-			return errors.Join(err, fmt.Errorf("YUM compatibility projection %s is not explicitly frozen; run the compatibility candidate/freeze workflow first", projection.ID))
-		}
-		witness, err := decodeYUMCompatibilityWitness(body)
-		if err != nil {
-			return err
-		}
-		if err := requireYUMCompatibilityWitnessMatchesProjection(witness, projection); err != nil {
-			return err
-		}
-		compatRef, _ := state.YUMCompatibilityRef(projection.ID)
-		freezeCommit, exists, err := canonical.Ref(compatRef)
-		if err != nil || !exists || freezeCommit.IsZero() {
-			return errors.Join(err, fmt.Errorf("YUM compatibility projection %s frozen ref is missing or changed", projection.ID))
-		}
-		sourceRef, _ := state.YUMCompatibilitySourceRef(projection.ID)
-		sourceCommit, sourceExists, err := canonical.Ref(sourceRef)
-		if err != nil || !sourceExists || sourceCommit.String() != witness.SourceCommit {
-			return errors.Join(err, fmt.Errorf("YUM compatibility projection %s source ref does not pin witness S1 commit", projection.ID))
-		}
-		if descendant, ancestryErr := canonical.IsAncestor(sourceCommit, freezeCommit); ancestryErr != nil || !descendant {
-			return errors.Join(ancestryErr, fmt.Errorf("YUM compatibility projection %s S2 freeze does not descend from S1 source", projection.ID))
-		}
-		for _, required := range []func(string) (string, error){state.YUMCompatibilityProjectionPath, state.YUMCompatibilityManifestPath, state.YUMCompatibilityCandidateManifestPath, state.YUMCompatibilityCandidateReceiptPath, state.YUMCompatibilityPackageTrustPath, state.YUMCompatibilityRepositoryTrustPath, state.YUMCompatibilitySourcePath, state.YUMCompatibilityAdoptionPath} {
-			canonicalPath, pathErr := required(projection.ID)
-			if pathErr != nil {
-				return pathErr
-			}
-			if _, present, identityErr := canonical.BlobIdentityAt(freezeCommit, canonicalPath); identityErr != nil || !present {
-				return errors.Join(identityErr, fmt.Errorf("YUM compatibility projection %s S2 freeze is missing %s", projection.ID, canonicalPath))
-			}
-		}
-	}
-	return nil
-}
-
 // validateCanonicalYUMCompatibilityContracts is an ordinary command-load
 // gate. Once a projection witness has existed in canonical history, its ID,
 // physical root, source coordinate, pinned commit, mode and flat-alias promise
