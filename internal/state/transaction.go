@@ -40,6 +40,21 @@ type FileIdentity struct {
 // never initializes a missing repository, so callers cannot mistake another
 // transaction's pre-commit AtomicCopy window for committed canonical state.
 func (s *Store) FileIdentityAtHead(relative string) (FileIdentity, bool, error) {
+	return s.fileIdentityAtHead(relative, 0)
+}
+
+// FileIdentityAtHeadBounded is FileIdentityAtHead with a fail-closed byte
+// ceiling. It checks the immutable Git blob size before opening the stream and
+// still limits the actual read to maximum+1, so a corrupt object cannot turn a
+// small declared blob into an unbounded baseline hash.
+func (s *Store) FileIdentityAtHeadBounded(relative string, maximum int64) (FileIdentity, bool, error) {
+	if maximum <= 0 || maximum >= 1<<62 {
+		return FileIdentity{}, false, errors.New("canonical identity byte limit must be positive and bounded")
+	}
+	return s.fileIdentityAtHead(relative, maximum)
+}
+
+func (s *Store) fileIdentityAtHead(relative string, maximum int64) (FileIdentity, bool, error) {
 	if err := validateStatePath(relative); err != nil {
 		return FileIdentity{}, false, err
 	}
@@ -82,13 +97,23 @@ func (s *Store) FileIdentityAtHead(relative string) (FileIdentity, bool, error) 
 	if err != nil {
 		return FileIdentity{}, false, fmt.Errorf("open canonical state %s at %s: %w", relative, head, err)
 	}
+	if maximum > 0 && file.Blob.Size > maximum {
+		return FileIdentity{}, false, fmt.Errorf("canonical state %s at %s exceeds %d bytes", relative, head, maximum)
+	}
 	reader, err := file.Reader()
 	if err != nil {
 		return FileIdentity{}, false, fmt.Errorf("read canonical state %s at %s: %w", relative, head, err)
 	}
 	hasher := sha256.New()
-	size, copyErr := io.Copy(hasher, reader)
+	var source io.Reader = reader
+	if maximum > 0 {
+		source = io.LimitReader(reader, maximum+1)
+	}
+	size, copyErr := io.Copy(hasher, source)
 	closeErr := reader.Close()
+	if maximum > 0 && size > maximum {
+		return FileIdentity{}, false, errors.Join(closeErr, fmt.Errorf("canonical state %s at %s exceeds %d bytes", relative, head, maximum))
+	}
 	if copyErr != nil || closeErr != nil {
 		return FileIdentity{}, false, errors.Join(copyErr, closeErr)
 	}

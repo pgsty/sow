@@ -5,8 +5,20 @@ readonly module='github.com/cavaliergopher/rpm'
 readonly version='v1.3.0'
 readonly expected_sum='h1:UHX46sasX8MesUXXQ+UbkFLUX4eUWTlEcX8jcnRBIgI='
 readonly local_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly upstream_cache="$(mktemp -d "${TMPDIR:-/tmp}/sow-rpm-upstream.XXXXXX")"
 
-metadata="$(GOWORK=off go mod download -json "${module}@${version}")"
+cleanup() {
+  chmod -R u+w "$upstream_cache" 2>/dev/null || true
+  rm -rf -- "$upstream_cache"
+}
+trap cleanup EXIT
+
+# The pinned h1 sum below is the provenance authority for this hermetic gate.
+# A fresh extraction prevents a mutable reused module directory from becoming
+# a second, unauthenticated source of truth. Disable the network checksum
+# service so a local read-only module proxy can reproduce the comparison; the
+# downloaded zip must still match the fixed h1 before bytewise verification.
+metadata="$(GOWORK=off GOSUMDB=off GOMODCACHE="$upstream_cache" go mod download -json "${module}@${version}")"
 upstream_root="$(printf '%s\n' "$metadata" | sed -n 's/^[[:space:]]*"Dir": "\(.*\)",$/\1/p')"
 actual_sum="$(printf '%s\n' "$metadata" | sed -n 's/^[[:space:]]*"Sum": "\(.*\)",$/\1/p')"
 if [[ -z "$upstream_root" || ! -d "$upstream_root" ]]; then

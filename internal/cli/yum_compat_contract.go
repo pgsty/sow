@@ -175,7 +175,7 @@ func canonicalConfigAtForYUMCompatibility(canonical *state.Store, gitHistory *hi
 	if cached := cache[identity.Hash]; cached != nil {
 		return cached, nil
 	}
-	body, exists, err := readCanonicalBytesAt(canonical, commit, "config/sow.yaml", 16<<20)
+	body, exists, err := readCanonicalConfigBytesAt(canonical, commit)
 	if err != nil || !exists {
 		return nil, errors.Join(err, fmt.Errorf("read canonical config at YUM compatibility descendant %s", commit))
 	}

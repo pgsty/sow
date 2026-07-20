@@ -1071,14 +1071,15 @@ type canonicalConfigBaseline struct {
 }
 
 // readCanonicalConfigBaseline snapshots committed canonical state before the
-// external YAML is opened. FileIdentityAtHead binds the read to one Git commit
-// rather than the mutable worktree used while another writer is committing.
+// external YAML is opened. The bounded identity read binds one Git commit
+// rather than the mutable worktree used while another writer is committing,
+// while rejecting an unreadable canonical config before hashing its body.
 func readCanonicalConfigBaseline(configPath, rootOverride string) (canonicalConfigBaseline, error) {
 	_, root, err := config.ResolvePaths(configPath, rootOverride)
 	if err != nil {
 		return canonicalConfigBaseline{}, err
 	}
-	identity, exists, err := state.New(filepath.Join(root, config.StateDirectory)).FileIdentityAtHead("config/sow.yaml")
+	identity, exists, err := state.New(filepath.Join(root, config.StateDirectory)).FileIdentityAtHeadBounded("config/sow.yaml", config.MaxConfigBytes)
 	if err != nil {
 		return canonicalConfigBaseline{}, fmt.Errorf("read canonical config baseline from Git HEAD: %w", err)
 	}

@@ -1187,6 +1187,22 @@ func TestFileIdentityAtHeadIgnoresUncommittedWorktreeBytes(t *testing.T) {
 	}
 }
 
+func TestFileIdentityAtHeadBoundedRejectsOversizedCanonicalBlob(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	stage := transactionTestStage(t, stateDir, "config-large.yaml", strings.Repeat("x", 33))
+	if _, _, err := store.Apply(t.Context(), "init", "large config", map[string]string{"config/sow.yaml": stage}, nil, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if identity, exists, err := store.FileIdentityAtHeadBounded("config/sow.yaml", 32); err == nil || exists || identity != (FileIdentity{}) || !strings.Contains(err.Error(), "exceeds 32 bytes") {
+		t.Fatalf("bounded identity=%+v exists=%v err=%v", identity, exists, err)
+	}
+	identity, exists, err := store.FileIdentityAtHead("config/sow.yaml")
+	if err != nil || !exists || identity.Size != 33 {
+		t.Fatalf("unbounded compatibility identity=%+v exists=%v err=%v", identity, exists, err)
+	}
+}
+
 func TestFileIdentityAtHeadDoesNotInitializeMissingRepository(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), ".sow")
 	identity, exists, err := New(stateDir).FileIdentityAtHead("config/sow.yaml")

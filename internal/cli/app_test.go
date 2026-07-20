@@ -400,6 +400,121 @@ func TestCLIRejectsUnboundedWorkersBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestCLIRejectsOversizedConfigurationBeforeMutation(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sow.yaml")
+	writeOversizedConfig(t, configPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
+
+	var stdout, stderr bytes.Buffer
+	code := Main([]string{"init", "--config", configPath}, &stdout, &stderr)
+	if code != ExitConfig || !strings.Contains(stderr.String(), "config exceeds 8388608-byte safety limit") {
+		t.Fatalf("oversized config code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, config.StateDirectory)); !os.IsNotExist(err) {
+		t.Fatalf("oversized configuration mutated state: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, config.PoolDirectory)); !os.IsNotExist(err) {
+		t.Fatalf("oversized configuration mutated CAS: %v", err)
+	}
+}
+
+func TestCLIRejectsOversizedConfigurationWithoutChangingInitializedRepository(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "asset"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "sow.yaml")
+	if err := os.WriteFile(configPath, []byte(testConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := Main([]string{"init", "--config", configPath}, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("initial init code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	canonical := state.New(filepath.Join(root, config.StateDirectory))
+	headBefore, err := canonical.HeadHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateCanary := filepath.Join(root, config.StateDirectory, "oversized-config-canary")
+	poolCanary := filepath.Join(root, config.PoolDirectory, "oversized-config-canary")
+	for _, name := range []string{stateCanary, poolCanary} {
+		if err := os.WriteFile(name, []byte("must-survive\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeOversizedConfig(t, configPath, os.O_WRONLY|os.O_TRUNC)
+
+	stdout.Reset()
+	stderr.Reset()
+	code := Main([]string{"init", "--config", configPath}, &stdout, &stderr)
+	if code != ExitConfig || !strings.Contains(stderr.String(), "config exceeds 8388608-byte safety limit") {
+		t.Fatalf("oversized config replay code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	headAfter, err := canonical.HeadHash()
+	if err != nil || headAfter != headBefore {
+		t.Fatalf("oversized configuration changed canonical HEAD: before=%s after=%s err=%v", headBefore, headAfter, err)
+	}
+	for _, name := range []string{stateCanary, poolCanary} {
+		body, err := os.ReadFile(name)
+		if err != nil || string(body) != "must-survive\n" {
+			t.Fatalf("oversized configuration changed canary %s: body=%q err=%v", name, body, err)
+		}
+	}
+}
+
+func writeOversizedConfig(t *testing.T, name string, flags int) {
+	t.Helper()
+	file, err := os.OpenFile(name, flags, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(config.MaxConfigBytes + 1); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCanonicalConfigReaderUsesSharedSizeLimit(t *testing.T) {
+	root := t.TempDir()
+	stage := filepath.Join(root, "oversized-canonical-config.yaml")
+	writeOversizedConfig(t, stage, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
+	canonical := state.New(filepath.Join(root, config.StateDirectory))
+	commit, changed, err := canonical.InstallPaths(map[string]string{"config/sow.yaml": stage}, "test oversized canonical config")
+	if err != nil || !changed {
+		t.Fatalf("install oversized canonical config changed=%v err=%v", changed, err)
+	}
+	body, exists, err := readCanonicalConfigBytesAt(canonical, commit)
+	if err == nil || exists || body != nil || !strings.Contains(err.Error(), "config/sow.yaml exceeds 8388608 bytes") {
+		t.Fatalf("oversized canonical config body=%d exists=%v err=%v", len(body), exists, err)
+	}
+}
+
+func TestCanonicalConfigBaselineUsesSharedSizeLimit(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sow.yaml")
+	if err := os.WriteFile(configPath, []byte(testConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stage := filepath.Join(root, "oversized-baseline-config.yaml")
+	writeOversizedConfig(t, stage, os.O_CREATE|os.O_EXCL|os.O_WRONLY)
+	canonical := state.New(filepath.Join(root, config.StateDirectory))
+	head, changed, err := canonical.InstallPaths(map[string]string{"config/sow.yaml": stage}, "test oversized canonical baseline")
+	if err != nil || !changed {
+		t.Fatalf("install oversized baseline changed=%v err=%v", changed, err)
+	}
+	if _, err := readCanonicalConfigBaseline(configPath, ""); err == nil || !strings.Contains(err.Error(), "config/sow.yaml") || !strings.Contains(err.Error(), "exceeds 8388608 bytes") {
+		t.Fatalf("oversized canonical baseline error = %v", err)
+	}
+	after, err := canonical.HeadHash()
+	if err != nil || after != head {
+		t.Fatalf("bounded baseline changed HEAD: before=%s after=%s err=%v", head, after, err)
+	}
+}
+
 func TestInitAndFSCKExpandMultiArchitectureYUMPath(t *testing.T) {
 	root := t.TempDir()
 	for arch, contents := range map[string]string{"x86_64": "x86", "aarch64": "arm"} {

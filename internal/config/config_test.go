@@ -2,6 +2,8 @@ package config
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -17,6 +19,74 @@ func TestExampleConfigMatchesSchema(t *testing.T) {
 	if _, err := Decode(f); err != nil {
 		t.Fatalf("example config is invalid: %v", err)
 	}
+}
+
+func TestDecodeRejectsOversizedConfigBeforeYAMLParsing(t *testing.T) {
+	input := strings.NewReader(strings.Repeat("#", MaxConfigBytes+4096))
+	if _, err := Decode(input); err == nil || !strings.Contains(err.Error(), "config exceeds 8388608-byte safety limit") {
+		t.Fatalf("oversized configuration error = %v", err)
+	}
+	if want := 4095; input.Len() != want {
+		t.Fatalf("oversized configuration consumed %d bytes; want exactly limit+1", MaxConfigBytes+4096-input.Len())
+	}
+}
+
+func TestDecodePrefersOversizeErrorWhenSentinelReadAlsoFails(t *testing.T) {
+	input := &terminalErrorReader{remaining: MaxConfigBytes + 1, terminal: errors.New("terminal read failure")}
+	if _, err := Decode(input); err == nil || err.Error() != "config exceeds 8388608-byte safety limit" {
+		t.Fatalf("sentinel read error precedence = %v", err)
+	}
+}
+
+func TestDecodeRejectsCanonicalExpansionBeyondLimit(t *testing.T) {
+	input := strings.Replace(validYAML(""), "    asset: {kind: bin}", "    include: []\n    asset: {kind: bin}", 1)
+	padding := MaxConfigBytes - len(input)
+	if padding <= 0 {
+		t.Fatalf("canonical expansion fixture base=%d", len(input))
+	}
+	input = strings.Replace(input, "include: []", "include: ["+strings.Repeat("a", padding)+"]", 1)
+	if len(input) != MaxConfigBytes {
+		t.Fatalf("canonical expansion fixture size=%d want=%d", len(input), MaxConfigBytes)
+	}
+	if _, err := Decode(strings.NewReader(input)); err == nil || !strings.Contains(err.Error(), "canonical config exceeds 8388608-byte safety limit") {
+		t.Fatalf("canonical expansion error = %v", err)
+	}
+}
+
+func TestDecodeAcceptsValidConfigAtSizeLimit(t *testing.T) {
+	input := []byte(validYAML(""))
+	padding := MaxConfigBytes - len(input)
+	if padding < 2 {
+		t.Fatalf("test config unexpectedly exceeds boundary: %d bytes", len(input))
+	}
+	input = append(input, '\n', '#')
+	input = append(input, bytes.Repeat([]byte{'x'}, padding-2)...)
+	if len(input) != MaxConfigBytes {
+		t.Fatalf("boundary fixture size=%d want=%d", len(input), MaxConfigBytes)
+	}
+	if _, err := Decode(bytes.NewReader(input)); err != nil {
+		t.Fatalf("valid configuration at size limit was rejected: %v", err)
+	}
+}
+
+type terminalErrorReader struct {
+	remaining int
+	terminal  error
+}
+
+func (r *terminalErrorReader) Read(destination []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	count := min(len(destination), r.remaining)
+	for index := 0; index < count; index++ {
+		destination[index] = '#'
+	}
+	r.remaining -= count
+	if r.remaining == 0 {
+		return count, r.terminal
+	}
+	return count, nil
 }
 
 func TestShippedPGDGUpstreamExampleMatchesSchema(t *testing.T) {

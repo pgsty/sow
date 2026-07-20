@@ -1,5 +1,6 @@
 README.md
 _bmad-output/brainstorming/brainstorm-sow-repo-cli-2026-07-11/brainstorm-intent.md
+_bmad-output/implementation-artifacts/spec-config-input-and-rpm-provenance-hardening.md
 _bmad-output/implementation-artifacts/spec-real-r2-publication-storage-transaction.md
 _bmad-output/implementation-artifacts/spec-remote-fsck-storage-only-authority.md
 _bmad-output/implementation-artifacts/spec-route-wire-canonicalization.md
@@ -127,6 +128,7 @@ docs/evidence/2026-07-19-r2-resource-stable-lease-rotation.md
 docs/evidence/2026-07-19-route-safe-caret-url-canonicalization.md
 docs/evidence/2026-07-19-state-lock-atomic-publication.md
 docs/evidence/2026-07-19-yum-consumer-lock-release.md
+docs/evidence/2026-07-20-config-input-and-rpm-provenance-hardening.md
 docs/evidence/2026-07-20-r2-publication-storage-transaction.md
 docs/evidence/README.md
 docs/examples/sow-pgdg.yaml

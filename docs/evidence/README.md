@@ -62,6 +62,14 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
 
 其余证据报告与验收入口如下；每项是否实跑、源码日期及外部边界以自身正文为准：
 
+- `2026-07-20-config-input-and-rpm-provenance-hardening.md`：所有外部与 canonical-history
+  配置入口在 YAML 前统一实施 8 MiB + 1-byte sentinel，覆盖精确边界、空仓/存量仓
+  `ExitConfig` 零状态变更与 reachable-history 负例；vendored RPM fixture 恢复固定
+  v1.3.0 上游原字节，且 clean-delivery 抽取树以固定 h1、离线可重放方式重跑 provenance
+  gate。审查又关闭 canonical 展开自锁、无界 HEAD baseline、sentinel error precedence、
+  mutable module-cache 自证和 CRLF 改写路径；697 个 CLI ordinary/race、全部 non-CLI
+  ordinary/race、静态/模块与七套迁移门禁已通过。post-document 双份 clean-delivery 身份
+  只记录在交付根外 handoff，全程未触云或生产资源。
 - `2026-07-19-basic-auth-wire-canonicalization.md`：Cloudflare/EdgeOne 共享
   Basic fallback 收紧为 case-insensitive scheme、literal SP、规范 padded Base64 与最长
   1024 字节 printable US-ASCII `user:password`；alias/CTL/DEL/UTF-8/超长负例均在

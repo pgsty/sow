@@ -1690,3 +1690,95 @@ archive digest above. This is the current V-14/V-37 delivery identity. It does
 not upgrade real Worker/CDN/purge/provider-log evidence, real COS/EdgeOne,
 production migration or operational metrics; the long-term Goal remains
 active.
+
+## 2026-07-20 V-39 bounded configuration and RPM provenance delivery identity
+
+This section supersedes V-37 after every external and reachable-history
+`sow/v1` configuration path was bounded to 8 MiB before YAML/schema/default
+processing, canonical expansion was bounded to the same contract, and the
+canonical HEAD baseline gained a Git blob-size plus `limit+1` streaming guard.
+The CLI negative paths preserve `ExitConfig`, canonical HEAD and `.sow/.pool`
+canaries. The vendored `cavaliergopher/rpm@v1.3.0` key fixture was restored to
+the exact upstream bytes; `.gitattributes` protects those bytes from text
+conversion, and the provenance gate now downloads into a fresh module cache so
+a mutable extracted cache cannot authenticate itself.
+
+The frozen source passed all 697 CLI tests in six ordinary and six race shards,
+all non-CLI packages ordinary/race, both vet profiles, both repository
+Staticcheck profiles, root and nested module integrity, nested RPM tests/vet,
+fresh-cache RPM provenance, four static Linux/macOS builds, seven migration
+suites and fixed `govulncheck` scans. The migration family suite closed 44
+families, five mutation negatives and 16 real CLI E2E cases. Detailed commands,
+shard counts, timings, build hashes and evidence boundaries are recorded in
+`docs/evidence/2026-07-20-config-input-and-rpm-provenance-hardening.md` and
+V-01/V-02/V-03/V-14 of the traceability matrix.
+
+After delivery content was frozen, the following command was run twice with
+distinct output roots; each run created a fresh HOME/GOMODCACHE/GOCACHE and
+used only the local read-only Go module download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-clean-config-rpm-v39-a
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-clean-config-rpm-v39-b
+
+PRODUCT_SOURCE_SHA256=ff30c58cfadf598096b282952ca4f219d5a8552dd426e433a44e58ab6ef1a9b8
+PRODUCT_SOURCE_FILES=541
+DELIVERY_CONTENT_SHA256=9bc96183a1657d508e74df73daf803c0fc254b6fe7f5be3959e72ce6cb6f058d
+DELIVERY_FILES=708
+ARCHIVE_SHA256=456b6b5e940ef7bfdaabf0fc0685d0c0cee1bcc6ff30d8affd01c8242e2f13d4
+```
+
+Archives:
+
+- `/tmp/sow-clean-config-rpm-v39-a/sow-delivery-9bc96183a1657d50.tgz`
+- `/tmp/sow-clean-config-rpm-v39-b/sow-delivery-9bc96183a1657d50.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. The extracted-delivery RPM provenance gate passed with
+the pinned v1.3.0 sum and only the pre-existing allowlisted drift. No network
+provider, bucket, CDN, Worker, Zone, COS/EdgeOne or production repository was
+read or written; the only dependency source was the local module proxy. This
+V-39 identity is an in-review checkpoint; a later entry must supersede it if
+the final workflow changes any delivery-managed file. The long-term Goal
+remains active.
+
+## 2026-07-20 V-40 final bounded-config/RPM-provenance delivery identity
+
+This section supersedes V-39 after the Quick Dev spec was marked `done`, its
+clickable Suggested Review Order was appended, and V-14/V-38 were reconciled
+with the completed acceptance evidence. Those delivery-managed documentation
+changes did not alter the 541-file product-source identity, but they did change
+the delivery-content and archive identities. No delivery-managed file changed
+after the following runs.
+
+Two independent invocations created separate fresh HOME/GOMODCACHE/GOCACHE
+trees and used only the local read-only Go module download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-clean-config-rpm-v40-a
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-clean-config-rpm-v40-b
+
+PRODUCT_SOURCE_SHA256=ff30c58cfadf598096b282952ca4f219d5a8552dd426e433a44e58ab6ef1a9b8
+PRODUCT_SOURCE_FILES=541
+DELIVERY_CONTENT_SHA256=5465c0ee155d960c65d6e8857055dd5de174b30e72e477822b9f9ec6d828ac66
+DELIVERY_FILES=708
+ARCHIVE_SHA256=16f9791a9ad9fcf09b3556f86aec72d0edc379812a9d4d84c18314f26b4cc9d7
+```
+
+Archives:
+
+- `/tmp/sow-clean-config-rpm-v40-a/sow-delivery-5465c0ee155d960c.tgz`
+- `/tmp/sow-clean-config-rpm-v40-b/sow-delivery-5465c0ee155d960c.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. Each clean build extracted the delivery and passed the
+fresh-cache RPM provenance gate with the pinned v1.3.0 h1 and unchanged patch
+allowlist. This external handoff file is absent from the clean-delivery product
+and extra-file manifests, so recording V-40 does not perturb the identity it
+records. No cloud, bucket, CDN, Worker, Zone, COS/EdgeOne or production
+repository request was made. V-40 is the current V-14 delivery identity; it
+does not close the remaining long-term Goal items.

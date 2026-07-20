@@ -672,7 +672,7 @@ func validateYUMCompatibilityAdoptedStateWithPoolAndHook(ctx context.Context, wo
 	// The config committed with S1 is part of the adoption contract.  This
 	// catches an orphaned/repaired source ref whose receipt happens to decode
 	// under a different current topology.
-	configBody, configExists, err := readCanonicalBytesAt(canonical, sourceCommit, "config/sow.yaml", 16<<20)
+	configBody, configExists, err := readCanonicalConfigBytesAt(canonical, sourceCommit)
 	if err != nil || !configExists {
 		return result, errors.Join(err, errors.New("S1 commit has no canonical configuration"))
 	}

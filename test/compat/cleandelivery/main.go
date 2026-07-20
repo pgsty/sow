@@ -304,6 +304,7 @@ func build(root, out string) (buildResult, error) {
 		{"go", "mod", "tidy", "-diff"},
 		{"go", "mod", "download"},
 		{"go", "mod", "verify"},
+		{"bash", "third_party/cavaliergopher-rpm/verify-upstream.sh"},
 		{"go", "test", "-count=1", "./test/compat/cleandelivery"},
 		{"go", "test", "-count=1", "./internal/config", "-run", "TestExampleConfigMatchesSchema|TestShippedPGDGUpstreamExampleMatchesSchema"},
 		{"go", "build", "-trimpath", "-o", filepath.Join(work, "sow"), "./cmd/sow"},

@@ -157,7 +157,10 @@ Basic 回退边界见 [Nginx 直接托管](docs/nginx-hosting.md)。
 
 配置合同是严格的 `schema: sow/v1`，可从 [sow.example.yaml](sow.example.yaml)
 开始。未知字段、明文 secret、错误 provider union、同主机 beta/latest、未确认
-的 COS versioning 状态都会失败。生产 target 的关键字段如下：
+的 COS versioning 状态都会失败。配置文件上限为 8 MiB；超限输入在 YAML 解析和
+任何仓库状态创建前以配置错误退出。默认展开/规范化后的 canonical YAML 也必须留在
+同一上限内；canonical HEAD baseline 与 history 读取会先检查声明大小并最多流式读取
+`8 MiB + 1 byte`。生产 target 的关键字段如下：
 
 基础范例故意使用 `upstreams: []`，因此不会在一次误执行中联网。需要 `sync` 时，复制
 [完整 PGDG upstream 范例](docs/examples/sow-pgdg.yaml) 到仓库根之外的受保护配置目录，

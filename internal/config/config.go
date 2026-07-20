@@ -37,6 +37,7 @@ const (
 	YUMNoarchSeparate             = "separate"
 	StorageDeleteConditional      = "conditional"
 	StorageDeleteCheckpointFenced = "checkpoint-fenced"
+	MaxConfigBytes                = 8 << 20
 )
 
 var namePattern = regexp.MustCompile(`^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$`)
@@ -359,7 +360,10 @@ func ResolvePaths(configPath, rootOverride string) (string, string, error) {
 }
 
 func Decode(r io.Reader) (*Config, error) {
-	data, err := io.ReadAll(r)
+	data, err := io.ReadAll(io.LimitReader(r, MaxConfigBytes+1))
+	if len(data) > MaxConfigBytes {
+		return nil, fmt.Errorf("config exceeds %d-byte safety limit", MaxConfigBytes)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
@@ -398,6 +402,9 @@ func Decode(r io.Reader) (*Config, error) {
 	}
 	cfg.applyDefaults()
 	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if _, err := cfg.Canonical(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
@@ -1635,6 +1642,9 @@ func (c *Config) Canonical() ([]byte, error) {
 	encoded, err := yaml.Marshal(&clone)
 	if err != nil {
 		return nil, fmt.Errorf("encode canonical config: %w", err)
+	}
+	if len(encoded) > MaxConfigBytes {
+		return nil, fmt.Errorf("canonical config exceeds %d-byte safety limit", MaxConfigBytes)
 	}
 	return encoded, nil
 }

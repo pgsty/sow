@@ -73,6 +73,16 @@ type packageRepositoryContractFixture struct {
 	head       plumbing.Hash
 }
 
+func TestPackageRepositoryHistoryRejectsOversizedCanonicalConfig(t *testing.T) {
+	fixture := newPackageRepositoryContractFixture(t, "manifests")
+	commitPackageRepositoryState(t, fixture, "oversized historical config", map[string][]byte{
+		"config/sow.yaml": bytes.Repeat([]byte{'#'}, config.MaxConfigBytes+1),
+	})
+	if _, err := loadReachablePackageRepositoryHistory(fixture.canonical); err == nil || !strings.Contains(err.Error(), "maximum 8388608") {
+		t.Fatalf("oversized package history config error = %v", err)
+	}
+}
+
 func TestPackageRepositoryContractFrozenFieldMatrix(t *testing.T) {
 	tests := []struct {
 		name    string

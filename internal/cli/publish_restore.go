@@ -415,6 +415,10 @@ func readCanonicalBytesAt(canonical *state.Store, commit plumbing.Hash, name str
 	return body, true, nil
 }
 
+func readCanonicalConfigBytesAt(canonical *state.Store, commit plumbing.Hash) ([]byte, bool, error) {
+	return readCanonicalBytesAt(canonical, commit, "config/sow.yaml", config.MaxConfigBytes)
+}
+
 func hashCanonicalPathOptionalAt(canonical *state.Store, commit plumbing.Hash, name string) (string, bool, error) {
 	reader, err := canonical.OpenPathAt(commit, name)
 	if errors.Is(err, object.ErrFileNotFound) {
@@ -807,7 +811,7 @@ func canonicalConfigurationAt(canonical *state.Store, commit plumbing.Hash, runt
 	if canonical == nil || commit.IsZero() {
 		return nil, errors.New("committed parent configuration is unavailable")
 	}
-	body, exists, err := readCanonicalBytesAt(canonical, commit, "config/sow.yaml", 16<<20)
+	body, exists, err := readCanonicalConfigBytesAt(canonical, commit)
 	if err != nil || !exists {
 		return nil, errors.Join(err, errors.New("committed parent config/sow.yaml is missing"))
 	}

@@ -219,7 +219,7 @@ func historicalAssetProjectionOwners(canonical *state.Store) (historicalAssetPro
 		cacheKey := configIdentity.Hash.String()
 		committed := decodedConfigs[cacheKey]
 		if committed == nil {
-			body, exists, err := readCanonicalBytesAt(canonical, commit, "config/sow.yaml", 16<<20)
+			body, exists, err := readCanonicalConfigBytesAt(canonical, commit)
 			if err != nil {
 				return result, err
 			}

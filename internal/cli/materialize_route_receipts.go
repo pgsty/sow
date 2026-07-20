@@ -53,8 +53,6 @@ type materializedRouteExpected struct {
 	payloadPath string
 }
 
-const materializedRouteConfigMaxBytes = 16 << 20
-
 // materializedRouteCleanupScope states how an exact materialization replaces
 // canonical Nginx route receipts. A partial write to a fixed mutable view must
 // preserve untouched owners; a full fixed-view replacement retires stale
@@ -91,7 +89,7 @@ func loadMaterializedRouteConfigAnchor(canonical *state.Store, head plumbing.Has
 	if err != nil || !reachable {
 		return nil, errors.Join(err, fmt.Errorf("materialized route config commit %s is not reachable from canonical HEAD", commit))
 	}
-	body, exists, err := readCanonicalBytesAt(canonical, commit, "config/sow.yaml", materializedRouteConfigMaxBytes)
+	body, exists, err := readCanonicalConfigBytesAt(canonical, commit)
 	if err != nil || !exists {
 		return nil, errors.Join(err, fmt.Errorf("materialized route config commit %s has no canonical config", commit))
 	}

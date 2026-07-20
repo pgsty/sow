@@ -20,8 +20,6 @@ import (
 	"github.com/pgsty/sow/internal/state"
 )
 
-const maximumHistoricalPackageConfigBytes = 16 << 20
-
 // validateCanonicalPackageRepositoryContracts freezes the physical package
 // repository contract after any canonical manifest, view, snapshot, or local
 // YUM generation has owned bytes. The audit is deliberately local/read-only
@@ -483,7 +481,7 @@ func loadReachablePackageRepositoryHistory(canonical *state.Store) (*packageRepo
 	}
 	decoded := make(map[plumbing.Hash]*config.Config)
 	for _, hash := range graph.order {
-		body, identity, exists, err := graph.readBlobAt(hash, "config/sow.yaml", maximumHistoricalPackageConfigBytes)
+		body, identity, exists, err := graph.readBlobAt(hash, "config/sow.yaml", config.MaxConfigBytes)
 		if err != nil {
 			return nil, fmt.Errorf("read config/sow.yaml at %s: %w", hash, err)
 		}

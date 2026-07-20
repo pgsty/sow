@@ -9,3 +9,11 @@
   evidence: `recoverExpiredRealCloudCloudflareBootstrapLease` CAS-retires the remote live lease before the caller durably writes its local recovery receipt; a crash plus another holder acquiring the idle marker can prevent exact provenance replay even though ordinary apply/rollback now cannot bypass `recover-lease`.
   status: resolved
   resolution: V-26 replaces direct retirement with exact `live -> owning pending -> durable receipt -> recovery idle` CAS fencing; same-run phase/response-loss replay and cross-run/plan/readiness/forgery negatives are covered by `docs/evidence/2026-07-19-r2-bootstrap-two-phase-recovery.md`.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-config-input-and-rpm-provenance-hardening.md`
+  summary: Reachable-history contract scanners retain every distinct decoded canonical config and need an aggregate-memory bound independent of the per-blob 8 MiB ceiling.
+  evidence: `historicalAssetProjectionOwners` and `loadReachablePackageRepositoryHistory` cache decoded configs by blob identity across all reachable commits, so many unique near-limit blobs can still grow memory with history length.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-config-input-and-rpm-provenance-hardening.md`
+  summary: Config default propagation and validation need explicit cardinality or complexity bounds for large repo/upstream arch and component sets.
+  evidence: `applyDefaults` copies repo arches/components into matching upstreams and uses repeated linear membership checks, allowing a syntactically sub-limit config to drive superlinear CPU and multiplicative canonical memory.
