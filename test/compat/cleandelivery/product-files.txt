@@ -88,6 +88,8 @@ internal/cli/gc.go
 internal/cli/gc_serving.go
 internal/cli/gc_serving_test.go
 internal/cli/gc_test.go
+internal/cli/historical_config_cache.go
+internal/cli/historical_config_cache_test.go
 internal/cli/legacy_prune_audit.go
 internal/cli/materialize.go
 internal/cli/materialize_archive_adoption.go

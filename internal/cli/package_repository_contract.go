@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -40,7 +39,10 @@ func validateCanonicalPackageRepositoryContracts(cfg *config.Config) error {
 	owners := make(map[string][]packageRepositoryOwner)
 	roots := make(map[string]packageRepositoryOwner)
 	for _, commit := range graph.order {
-		committed := graph.configs[commit]
+		committed, err := graph.configAt(commit)
+		if err != nil {
+			return fmt.Errorf("decode historical package repository config at %s: %w", commit, err)
+		}
 		packages := packageRepositoriesByID(committed)
 		repoIDs := sortedPackageEvidenceIDs(graph.evidence[commit])
 		for _, repoID := range repoIDs {
@@ -48,11 +50,11 @@ func validateCanonicalPackageRepositoryContracts(cfg *config.Config) error {
 			if !exists {
 				return fmt.Errorf("package repository ownership evidence %s names repo %s without an APT/YUM config", graph.evidence[commit][repoID], repoID)
 			}
-			owner := packageRepositoryOwner{commit: commit, repo: repo, location: graph.evidence[commit][repoID]}
 			if !repo.IsActive() && !isYUMCompatibilityCarrier(repo) {
-				return fmt.Errorf("package repository %s is populated at %s and therefore may not set active=false", repoID, owner.location)
+				return fmt.Errorf("package repository %s is populated at %s and therefore may not set active=false", repoID, graph.evidence[commit][repoID])
 			}
-			owners[repoID] = append(owners[repoID], owner)
+			owner := packageRepositoryOwner{commit: commit, repo: detachHistoricalRepository(repo), location: graph.evidence[commit][repoID]}
+			owners[repoID] = retainPackageRepositoryImmutableContract(owners[repoID], owner)
 			root := canonicalPackageRepositoryRoot(repo.Path)
 			if prior, exists := roots[root]; exists && prior.repo.ID != repo.ID {
 				return fmt.Errorf("package repository root %s has populated ownership by both %s at %s and %s at %s; an explicit physical migration is required", root, prior.repo.ID, prior.location, repo.ID, owner.location)
@@ -84,7 +86,15 @@ func validateCanonicalPackageRepositoryContracts(cfg *config.Config) error {
 				return fmt.Errorf("historical package repository %s %s contract differs between %s and %s; an explicit physical migration is required", repoID, field, baseline.location, record.location)
 			}
 		}
-		findings, lifecycle := auditPackageRepositoryLineage(graph, baseline)
+	}
+	lineages, err := auditPackageRepositoryLineages(graph, repoIDs, owners)
+	if err != nil {
+		return fmt.Errorf("audit package repository lineage: %w", err)
+	}
+	for _, repoID := range repoIDs {
+		baseline := owners[repoID][0]
+		lineage := lineages[repoID]
+		findings := lineage.findings
 		if len(findings) != 0 {
 			sort.Slice(findings, func(i, j int) bool {
 				if findings[i].priority == findings[j].priority {
@@ -108,7 +118,7 @@ func validateCanonicalPackageRepositoryContracts(cfg *config.Config) error {
 		if field := packageRepositoryLifecycleDifference(baseline.repo, current); field != "" {
 			return fmt.Errorf("package repository %s %s may only transition active to frozen; ownership is frozen at %s", repoID, field, baseline.location)
 		}
-		if field := lifecycle.rejectCurrent(current); field != "" {
+		if field := lineage.lifecycle.rejectCurrent(current); field != "" {
 			return fmt.Errorf("package repository %s %s was frozen in reachable canonical history and cannot be reactivated", repoID, field)
 		}
 		if _, packageTyped := currentPackages[repoID]; !packageTyped {
@@ -116,6 +126,22 @@ func validateCanonicalPackageRepositoryContracts(cfg *config.Config) error {
 		}
 	}
 	return nil
+}
+
+func hasPackageRepositoryImmutableContract(records []packageRepositoryOwner, candidate config.Repo) bool {
+	for _, record := range records {
+		if packageRepositoryImmutableDifference(record.repo, candidate) == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func retainPackageRepositoryImmutableContract(records []packageRepositoryOwner, candidate packageRepositoryOwner) []packageRepositoryOwner {
+	if hasPackageRepositoryImmutableContract(records, candidate.repo) || len(records) >= 2 {
+		return records
+	}
+	return append(records, candidate)
 }
 
 func isYUMCompatibilityCarrier(repo config.Repo) bool {
@@ -199,70 +225,115 @@ type packageRepositoryLineageState struct {
 	lifecycle packageRepositoryLifecycleState
 }
 
-// auditPackageRepositoryLineage propagates ownership through the Git DAG in
-// parents-first order. This catches delete/reintroduce and frozen-to-active
-// transitions without relying on committer timestamps or an O(n^2) ancestry
-// comparison over a long linear history.
-func auditPackageRepositoryLineage(graph *packageRepositoryHistory, owner packageRepositoryOwner) ([]packageRepositoryFinding, packageRepositoryLifecycleState) {
-	states := make(map[plumbing.Hash]packageRepositoryLineageState, len(graph.order))
-	var findings []packageRepositoryFinding
-	var ever packageRepositoryLifecycleState
+type packageRepositoryLineageAudit struct {
+	findings  []packageRepositoryFinding
+	lifecycle packageRepositoryLifecycleState
+}
+
+func (a *packageRepositoryLineageAudit) addFinding(candidate packageRepositoryFinding) {
+	if a == nil {
+		return
+	}
+	if len(a.findings) == 0 || candidate.priority < a.findings[0].priority ||
+		(candidate.priority == a.findings[0].priority && candidate.message < a.findings[0].message) {
+		a.findings = []packageRepositoryFinding{candidate}
+	}
+}
+
+// auditPackageRepositoryLineages propagates every populated repository through
+// the Git DAG in one parents-first config pass. Frontier states are released
+// after their last child consumes them, so a linear history retains one commit
+// state rather than commit×repo history. Most importantly, each config blob is
+// decoded at most once in this phase regardless of repository count.
+func auditPackageRepositoryLineages(graph *packageRepositoryHistory, repoIDs []string, owners map[string][]packageRepositoryOwner) (map[string]*packageRepositoryLineageAudit, error) {
+	results := make(map[string]*packageRepositoryLineageAudit, len(repoIDs))
+	for _, repoID := range repoIDs {
+		results[repoID] = &packageRepositoryLineageAudit{}
+	}
+	remainingChildren := make(map[plumbing.Hash]int, len(graph.order))
+	for _, hash := range graph.order {
+		for _, parent := range graph.commits[hash].ParentHashes {
+			remainingChildren[parent]++
+		}
+	}
+	states := make(map[plumbing.Hash][]packageRepositoryLineageState)
 	for _, hash := range graph.order {
 		commit := graph.commits[hash]
-		var lineage packageRepositoryLineageState
+		committed, err := graph.configAt(hash)
+		if err != nil {
+			return nil, fmt.Errorf("decode config/sow.yaml at %s: %w", hash, err)
+		}
+		committedByID := repositoriesByID(committed)
+		rootOwners := make(map[string][]string)
+		for _, repo := range committed.Repos {
+			root := canonicalPackageRepositoryRoot(repo.Path)
+			rootOwners[root] = append(rootOwners[root], repo.ID)
+		}
+		currentStates := make([]packageRepositoryLineageState, len(repoIDs))
+		for index, repoID := range repoIDs {
+			owner := owners[repoID][0]
+			var lineage packageRepositoryLineageState
+			for _, parent := range commit.ParentHashes {
+				parentStates := states[parent]
+				if len(parentStates) != len(repoIDs) {
+					return nil, fmt.Errorf("canonical parent %s lineage state is unavailable at child %s", parent, hash)
+				}
+				prior := parentStates[index]
+				lineage.owned = lineage.owned || prior.owned
+				lineage.removed = lineage.removed || prior.removed
+				lineage.lifecycle.merge(prior.lifecycle)
+			}
+			if _, establishes := graph.evidence[hash][repoID]; establishes {
+				lineage.owned = true
+			}
+			if lineage.owned {
+				location := hash.String() + ":config/sow.yaml"
+				root := canonicalPackageRepositoryRoot(owner.repo.Path)
+				for _, otherID := range rootOwners[root] {
+					if otherID == repoID {
+						continue
+					}
+					results[repoID].addFinding(packageRepositoryFinding{priority: 0, message: fmt.Sprintf("package repository root %s owned by %s at %s was reused by repo %s at %s", root, repoID, owner.location, otherID, location)})
+				}
+				candidate, exists := committedByID[repoID]
+				if !exists {
+					lineage.removed = true
+					results[repoID].addFinding(packageRepositoryFinding{priority: 30, message: fmt.Sprintf("populated package repository %s owned at %s was removed at %s", repoID, owner.location, location)})
+				} else {
+					if lineage.removed {
+						results[repoID].addFinding(packageRepositoryFinding{priority: 10, message: fmt.Sprintf("populated package repository %s owned at %s was removed and later reintroduced at %s", repoID, owner.location, location)})
+					}
+					if field := packageRepositoryImmutableDifference(owner.repo, candidate); field != "" {
+						results[repoID].addFinding(packageRepositoryFinding{priority: 20, message: fmt.Sprintf("historical package repository %s %s contract owned at %s changed at %s", repoID, field, owner.location, location)})
+					}
+					if !candidate.IsActive() && !isYUMCompatibilityCarrier(candidate) {
+						results[repoID].addFinding(packageRepositoryFinding{priority: 20, message: fmt.Sprintf("populated package repository %s was deactivated at %s", repoID, location)})
+					}
+					if candidate.Type == owner.repo.Type {
+						if field := lineage.lifecycle.rejectCurrent(candidate); field != "" {
+							results[repoID].addFinding(packageRepositoryFinding{priority: 15, message: fmt.Sprintf("historical package repository %s %s changed from frozen back to active at %s", repoID, field, location)})
+						}
+						if field := packageRepositoryLifecycleDifference(owner.repo, candidate); field != "" {
+							results[repoID].addFinding(packageRepositoryFinding{priority: 15, message: fmt.Sprintf("historical package repository %s %s violates the active-to-frozen lifecycle contract at %s", repoID, field, location)})
+						}
+						lineage.lifecycle.observe(candidate)
+					}
+				}
+				results[repoID].lifecycle.merge(lineage.lifecycle)
+			}
+			currentStates[index] = lineage
+		}
+		if remainingChildren[hash] != 0 {
+			states[hash] = currentStates
+		}
 		for _, parent := range commit.ParentHashes {
-			prior := states[parent]
-			lineage.owned = lineage.owned || prior.owned
-			lineage.removed = lineage.removed || prior.removed
-			lineage.lifecycle.merge(prior.lifecycle)
-		}
-		if _, establishes := graph.evidence[hash][owner.repo.ID]; establishes {
-			lineage.owned = true
-		}
-		if !lineage.owned {
-			states[hash] = lineage
-			continue
-		}
-		location := hash.String() + ":config/sow.yaml"
-		// Root transfer is independently unsafe even when the original ID is
-		// absent in this tree. Check it before the removal branch returns so a
-		// transient replacement cannot disappear in a later commit and be
-		// misclassified as a plain deletion.
-		for _, other := range graph.configs[hash].Repos {
-			if other.ID == owner.repo.ID || canonicalPackageRepositoryRoot(other.Path) != canonicalPackageRepositoryRoot(owner.repo.Path) {
-				continue
+			remainingChildren[parent]--
+			if remainingChildren[parent] == 0 {
+				delete(states, parent)
 			}
-			findings = append(findings, packageRepositoryFinding{priority: 0, message: fmt.Sprintf("package repository root %s owned by %s at %s was reused by repo %s at %s", canonicalPackageRepositoryRoot(owner.repo.Path), owner.repo.ID, owner.location, other.ID, location)})
 		}
-		candidate, exists := repositoriesByID(graph.configs[hash])[owner.repo.ID]
-		if !exists {
-			lineage.removed = true
-			findings = append(findings, packageRepositoryFinding{priority: 30, message: fmt.Sprintf("populated package repository %s owned at %s was removed at %s", owner.repo.ID, owner.location, location)})
-			states[hash] = lineage
-			continue
-		}
-		if lineage.removed {
-			findings = append(findings, packageRepositoryFinding{priority: 10, message: fmt.Sprintf("populated package repository %s owned at %s was removed and later reintroduced at %s", owner.repo.ID, owner.location, location)})
-		}
-		if field := packageRepositoryImmutableDifference(owner.repo, candidate); field != "" {
-			findings = append(findings, packageRepositoryFinding{priority: 20, message: fmt.Sprintf("historical package repository %s %s contract owned at %s changed at %s", owner.repo.ID, field, owner.location, location)})
-		}
-		if !candidate.IsActive() && !isYUMCompatibilityCarrier(candidate) {
-			findings = append(findings, packageRepositoryFinding{priority: 20, message: fmt.Sprintf("populated package repository %s was deactivated at %s", owner.repo.ID, location)})
-		}
-		if candidate.Type == owner.repo.Type {
-			if field := lineage.lifecycle.rejectCurrent(candidate); field != "" {
-				findings = append(findings, packageRepositoryFinding{priority: 15, message: fmt.Sprintf("historical package repository %s %s changed from frozen back to active at %s", owner.repo.ID, field, location)})
-			}
-			if field := packageRepositoryLifecycleDifference(owner.repo, candidate); field != "" {
-				findings = append(findings, packageRepositoryFinding{priority: 15, message: fmt.Sprintf("historical package repository %s %s violates the active-to-frozen lifecycle contract at %s", owner.repo.ID, field, location)})
-			}
-			lineage.lifecycle.observe(candidate)
-		}
-		ever.merge(lineage.lifecycle)
-		states[hash] = lineage
 	}
-	return findings, ever
+	return results, nil
 }
 
 func packageRepositoriesByID(cfg *config.Config) map[string]config.Repo {
@@ -407,12 +478,29 @@ func sortedPackageEvidenceIDs(values map[string]string) []string {
 }
 
 type packageRepositoryHistory struct {
-	repository *git.Repository
-	commits    map[plumbing.Hash]*object.Commit
-	order      []plumbing.Hash
-	configs    map[plumbing.Hash]*config.Config
-	evidence   map[plumbing.Hash]map[string]string
-	trees      map[plumbing.Hash]*object.Tree
+	repository       *git.Repository
+	commits          map[plumbing.Hash]*object.Commit
+	order            []plumbing.Hash
+	configIdentities map[plumbing.Hash]state.BlobIdentity
+	configCache      *historicalConfigCache
+	evidence         map[plumbing.Hash]map[string]string
+}
+
+func (g *packageRepositoryHistory) configAt(hash plumbing.Hash) (*config.Config, error) {
+	if g == nil || g.repository == nil || g.configCache == nil {
+		return nil, errors.New("package repository history config index is unavailable")
+	}
+	identity, exists := g.configIdentities[hash]
+	if !exists {
+		return nil, fmt.Errorf("reachable canonical commit %s is missing a config blob identity", hash)
+	}
+	committed, err := g.configCache.get(identity, func() ([]byte, error) {
+		return readHistoricalConfigBlob(g.repository, identity)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("blob %s: %w", identity.Hash, err)
+	}
+	return committed, nil
 }
 
 func loadReachablePackageRepositoryHistory(canonical *state.Store) (*packageRepositoryHistory, error) {
@@ -433,11 +521,11 @@ func loadReachablePackageRepositoryHistory(canonical *state.Store) (*packageRepo
 		return nil, err
 	}
 	graph := &packageRepositoryHistory{
-		repository: repository,
-		commits:    make(map[plumbing.Hash]*object.Commit),
-		configs:    make(map[plumbing.Hash]*config.Config),
-		evidence:   make(map[plumbing.Hash]map[string]string),
-		trees:      make(map[plumbing.Hash]*object.Tree),
+		repository:       repository,
+		commits:          make(map[plumbing.Hash]*object.Commit),
+		configIdentities: make(map[plumbing.Hash]state.BlobIdentity),
+		configCache:      newHistoricalConfigCache(),
+		evidence:         make(map[plumbing.Hash]map[string]string),
 	}
 	roots, err := packageRepositoryHistoryRoots(repository)
 	if err != nil {
@@ -479,24 +567,19 @@ func loadReachablePackageRepositoryHistory(canonical *state.Store) (*packageRepo
 			return nil, err
 		}
 	}
-	decoded := make(map[plumbing.Hash]*config.Config)
 	for _, hash := range graph.order {
-		body, identity, exists, err := graph.readBlobAt(hash, "config/sow.yaml", config.MaxConfigBytes)
+		identity, exists, err := graph.blobIdentityAt(hash, "config/sow.yaml", config.MaxConfigBytes)
 		if err != nil {
 			return nil, fmt.Errorf("read config/sow.yaml at %s: %w", hash, err)
 		}
 		if !exists {
 			return nil, fmt.Errorf("reachable canonical commit %s is missing config/sow.yaml; refusing to bypass package repository ownership", hash)
 		}
-		committed := decoded[identity]
-		if committed == nil {
-			committed, err = config.Decode(bytes.NewReader(body))
-			if err != nil {
-				return nil, fmt.Errorf("decode config/sow.yaml at %s: %w", hash, err)
-			}
-			decoded[identity] = committed
+		graph.configIdentities[hash] = identity
+		committed, err := graph.configAt(hash)
+		if err != nil {
+			return nil, fmt.Errorf("decode config/sow.yaml at %s: %w", hash, err)
 		}
-		graph.configs[hash] = committed
 		evidence, err := graph.ownershipEvidenceAt(hash, committed)
 		if err != nil {
 			return nil, err
@@ -547,9 +630,6 @@ func packageRepositoryHistoryRoots(repository *git.Repository) ([]plumbing.Hash,
 }
 
 func (g *packageRepositoryHistory) treeAt(hash plumbing.Hash) (*object.Tree, error) {
-	if tree := g.trees[hash]; tree != nil {
-		return tree, nil
-	}
 	commit := g.commits[hash]
 	if commit == nil {
 		return nil, fmt.Errorf("commit %s is outside reachable package history", hash)
@@ -558,45 +638,32 @@ func (g *packageRepositoryHistory) treeAt(hash plumbing.Hash) (*object.Tree, err
 	if err != nil {
 		return nil, err
 	}
-	g.trees[hash] = tree
 	return tree, nil
 }
 
-func (g *packageRepositoryHistory) readBlobAt(hash plumbing.Hash, relative string, maximum int64) ([]byte, plumbing.Hash, bool, error) {
+func (g *packageRepositoryHistory) blobIdentityAt(hash plumbing.Hash, relative string, maximum int64) (state.BlobIdentity, bool, error) {
 	tree, err := g.treeAt(hash)
 	if err != nil {
-		return nil, plumbing.ZeroHash, false, err
+		return state.BlobIdentity{}, false, err
 	}
 	entry, err := tree.FindEntry(relative)
 	if errors.Is(err, object.ErrEntryNotFound) || errors.Is(err, object.ErrDirectoryNotFound) {
-		return nil, plumbing.ZeroHash, false, nil
+		return state.BlobIdentity{}, false, nil
 	}
 	if err != nil {
-		return nil, plumbing.ZeroHash, false, err
+		return state.BlobIdentity{}, false, err
 	}
 	if !isPackageRepositoryHistoryBlob(entry.Mode) {
-		return nil, plumbing.ZeroHash, false, fmt.Errorf("canonical state path %s is not a regular file (mode %s)", relative, entry.Mode)
+		return state.BlobIdentity{}, false, fmt.Errorf("canonical state path %s is not a regular file (mode %s)", relative, entry.Mode)
 	}
-	blob, err := g.repository.BlobObject(entry.Hash)
+	size, err := g.repository.Storer.EncodedObjectSize(entry.Hash)
 	if err != nil {
-		return nil, plumbing.ZeroHash, false, err
+		return state.BlobIdentity{}, false, err
 	}
-	if blob.Size > maximum {
-		return nil, plumbing.ZeroHash, false, fmt.Errorf("canonical state path %s is %d bytes (maximum %d)", relative, blob.Size, maximum)
+	if size > maximum {
+		return state.BlobIdentity{}, false, fmt.Errorf("canonical state path %s is %d bytes (maximum %d)", relative, size, maximum)
 	}
-	reader, err := blob.Reader()
-	if err != nil {
-		return nil, plumbing.ZeroHash, false, err
-	}
-	body, readErr := io.ReadAll(io.LimitReader(reader, maximum+1))
-	closeErr := reader.Close()
-	if readErr != nil || closeErr != nil {
-		return nil, plumbing.ZeroHash, false, errors.Join(readErr, closeErr)
-	}
-	if int64(len(body)) != blob.Size {
-		return nil, plumbing.ZeroHash, false, fmt.Errorf("canonical state path %s size changed while reading", relative)
-	}
-	return body, entry.Hash, true, nil
+	return state.BlobIdentity{Hash: entry.Hash, Size: size}, true, nil
 }
 
 func (g *packageRepositoryHistory) ownershipEvidenceAt(hash plumbing.Hash, committed *config.Config) (map[string]string, error) {

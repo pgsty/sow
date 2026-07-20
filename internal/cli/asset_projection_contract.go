@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -189,6 +188,30 @@ type historicalAssetProjectionRegistry struct {
 	byID           map[string][]historicalAssetProjectionRecord
 	byPhysicalRoot map[string][]historicalAssetProjectionRecord
 	continuity     []string
+	configCache    historicalConfigCacheStats
+}
+
+type historicalAssetProjectionConfigIndex struct {
+	gitHistory *historicalAssetProjectionGit
+	identities map[plumbing.Hash]state.BlobIdentity
+	cache      *historicalConfigCache
+}
+
+func (i *historicalAssetProjectionConfigIndex) configAt(commit plumbing.Hash) (*config.Config, bool, error) {
+	if i == nil || i.gitHistory == nil || i.cache == nil {
+		return nil, false, errors.New("historical asset config index is unavailable")
+	}
+	identity, exists := i.identities[commit]
+	if !exists {
+		return nil, false, nil
+	}
+	committed, err := i.cache.get(identity, func() ([]byte, error) {
+		return readHistoricalConfigBlob(i.gitHistory.repository, identity)
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("decode canonical config at %s from blob %s: %w", commit, identity.Hash, err)
+	}
+	return committed, true, nil
 }
 
 func historicalAssetProjectionOwners(canonical *state.Store) (historicalAssetProjectionRegistry, error) {
@@ -204,10 +227,16 @@ func historicalAssetProjectionOwners(canonical *state.Store) (historicalAssetPro
 	if err != nil {
 		return result, err
 	}
-	decodedConfigs := make(map[string]*config.Config)
-	configsAtCommit := make(map[string]*config.Config, len(history))
-	evidenceAtCommit := make(map[string]map[string]string, len(history))
-	seen := make(map[string]struct{})
+	configs := &historicalAssetProjectionConfigIndex{
+		gitHistory: gitHistory,
+		identities: make(map[plumbing.Hash]state.BlobIdentity, len(history)),
+		cache:      newHistoricalConfigCache(),
+	}
+	ancestry := &historicalAssetProjectionAncestry{
+		gitHistory: gitHistory,
+		cache:      make(map[historicalAssetProjectionAncestryKey]bool),
+	}
+	var anchors []historicalAssetProjectionAnchor
 	for _, commit := range history {
 		configIdentity, exists, err := gitHistory.blobIdentityAt(commit, "config/sow.yaml")
 		if err != nil {
@@ -216,46 +245,83 @@ func historicalAssetProjectionOwners(canonical *state.Store) (historicalAssetPro
 		if !exists {
 			continue
 		}
-		cacheKey := configIdentity.Hash.String()
-		committed := decodedConfigs[cacheKey]
-		if committed == nil {
-			body, exists, err := readCanonicalConfigBytesAt(canonical, commit)
-			if err != nil {
-				return result, err
-			}
-			if !exists {
-				return result, fmt.Errorf("config blob %s disappeared at commit %s", cacheKey, commit)
-			}
-			committed, err = config.Decode(bytes.NewReader(body))
-			if err != nil {
-				return result, fmt.Errorf("decode canonical config at %s: %w", commit, err)
-			}
-			decodedConfigs[cacheKey] = committed
+		configs.identities[commit] = configIdentity
+		committed, stillExists, err := configs.configAt(commit)
+		if err != nil {
+			return result, err
 		}
-		configsAtCommit[commit.String()] = committed
+		if !stillExists {
+			return result, fmt.Errorf("config blob %s disappeared at commit %s", configIdentity.Hash, commit)
+		}
 		evidence, err := assetOwnershipEvidenceAt(gitHistory, commit, committed)
 		if err != nil {
 			return result, err
 		}
-		evidenceAtCommit[commit.String()] = evidence
 		assets := assetReposByID(committed)
 		for repoID, location := range evidence {
-			repo := assets[repoID]
-			contractKey := repo.ID + "\x00" + configIdentity.Hash.String()
-			if _, duplicate := seen[contractKey]; duplicate {
+			repo := detachHistoricalRepository(assets[repoID])
+			record := historicalAssetProjectionRecord{repo: repo, location: location}
+			records, retained := retainHistoricalAssetProjectionContract(result.byID[repo.ID], record)
+			result.byID[repo.ID] = records
+			if retained {
+				result.byPhysicalRoot[repo.Path] = append(result.byPhysicalRoot[repo.Path], record)
+			}
+			if len(records) == 2 && !sameAssetProjectionContract(records[0].repo, records[1].repo) {
+				anchors = removeHistoricalAssetProjectionAnchors(anchors, repo.ID)
 				continue
 			}
-			seen[contractKey] = struct{}{}
-			record := historicalAssetProjectionRecord{repo: repo, location: location}
-			result.byID[repo.ID] = append(result.byID[repo.ID], record)
-			result.byPhysicalRoot[repo.Path] = append(result.byPhysicalRoot[repo.Path], record)
+			for _, stored := range records {
+				if sameAssetProjectionContract(stored.repo, repo) {
+					repo = stored.repo
+					break
+				}
+			}
+			anchors, err = retainHistoricalAssetProjectionAnchor(anchors, historicalAssetProjectionAnchor{
+				commit: commit, repo: repo, location: location,
+			}, ancestry)
+			if err != nil {
+				return result, err
+			}
 		}
 	}
-	result.continuity, err = auditHistoricalAssetProjectionContinuity(gitHistory, history, configsAtCommit, evidenceAtCommit)
+	sort.Slice(anchors, func(i, j int) bool {
+		if anchors[i].repo.ID == anchors[j].repo.ID {
+			return anchors[i].commit.String() < anchors[j].commit.String()
+		}
+		return anchors[i].repo.ID < anchors[j].repo.ID
+	})
+	result.continuity, err = auditHistoricalAssetProjectionContinuity(history, configs, anchors, ancestry)
 	if err != nil {
 		return result, err
 	}
+	result.configCache = configs.cache.snapshot()
 	return result, nil
+}
+
+func hasHistoricalAssetProjectionContract(records []historicalAssetProjectionRecord, candidate config.Repo) bool {
+	for _, record := range records {
+		if sameAssetProjectionContract(record.repo, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func retainHistoricalAssetProjectionContract(records []historicalAssetProjectionRecord, candidate historicalAssetProjectionRecord) ([]historicalAssetProjectionRecord, bool) {
+	if hasHistoricalAssetProjectionContract(records, candidate.repo) || len(records) >= 2 {
+		return records, false
+	}
+	return append(records, candidate), true
+}
+
+func removeHistoricalAssetProjectionAnchors(anchors []historicalAssetProjectionAnchor, repoID string) []historicalAssetProjectionAnchor {
+	retained := make([]historicalAssetProjectionAnchor, 0, len(anchors))
+	for _, anchor := range anchors {
+		if anchor.repo.ID != repoID {
+			retained = append(retained, anchor)
+		}
+	}
+	return retained
 }
 
 // assetOwnershipEvidenceAt treats a non-empty repository manifest, view leaf,
@@ -313,7 +379,6 @@ func assetOwnershipEvidenceAt(gitHistory *historicalAssetProjectionGit, commit p
 // addresses the canonical worktree repository directly.
 type historicalAssetProjectionGit struct {
 	repository *git.Repository
-	trees      map[plumbing.Hash]*object.Tree
 }
 
 func openHistoricalAssetProjectionGit(canonical *state.Store) (*historicalAssetProjectionGit, error) {
@@ -324,7 +389,7 @@ func openHistoricalAssetProjectionGit(canonical *state.Store) (*historicalAssetP
 	if err != nil {
 		return nil, fmt.Errorf("open canonical Git metadata for asset projection: %w", err)
 	}
-	return &historicalAssetProjectionGit{repository: repository, trees: make(map[plumbing.Hash]*object.Tree)}, nil
+	return &historicalAssetProjectionGit{repository: repository}, nil
 }
 
 // reachableCanonicalCommits returns the union of aggregate HEAD ancestry and
@@ -394,9 +459,6 @@ func (g *historicalAssetProjectionGit) reachableCanonicalCommits() ([]plumbing.H
 }
 
 func (g *historicalAssetProjectionGit) treeAt(commit plumbing.Hash) (*object.Tree, error) {
-	if tree := g.trees[commit]; tree != nil {
-		return tree, nil
-	}
 	commitObject, err := g.repository.CommitObject(commit)
 	if err != nil {
 		return nil, err
@@ -405,7 +467,6 @@ func (g *historicalAssetProjectionGit) treeAt(commit plumbing.Hash) (*object.Tre
 	if err != nil {
 		return nil, err
 	}
-	g.trees[commit] = tree
 	return tree, nil
 }
 
@@ -542,27 +603,47 @@ func (a *historicalAssetProjectionAncestry) isAncestor(ancestor, descendant plum
 	return result, nil
 }
 
+type historicalAssetProjectionRemoval struct {
+	owner    historicalAssetProjectionAnchor
+	commit   plumbing.Hash
+	location string
+}
+
 // auditHistoricalAssetProjectionContinuity catches legacy histories that
 // changed a populated contract while its manifest happened to be empty,
 // removed and later reintroduced the same ID, or reused its physical root.
-// The reachable union has no meaningful slice order in the presence of clock
-// skew, merges, or off-HEAD preservation refs. Every transition is therefore
-// judged by Git ancestry instead of slice position. Blob identities remain the
-// only ownership evidence; manifest/view/snapshot payloads are never inflated.
-func auditHistoricalAssetProjectionContinuity(gitHistory *historicalAssetProjectionGit, history []plumbing.Hash, configsAtCommit map[string]*config.Config, evidenceAtCommit map[string]map[string]string) ([]string, error) {
+// The commit loop is deliberately outermost: every immutable config is decoded
+// at most once in this phase, even when many ownership anchors exist. Compact
+// commit hashes retain presence for the later reintroduction check; decoded
+// config pointers never escape an iteration.
+func auditHistoricalAssetProjectionContinuity(history []plumbing.Hash, configs *historicalAssetProjectionConfigIndex, anchors []historicalAssetProjectionAnchor, ancestry *historicalAssetProjectionAncestry) ([]string, error) {
 	commits := append([]plumbing.Hash(nil), history...)
 	sort.Slice(commits, func(i, j int) bool { return commits[i].String() < commits[j].String() })
-	ancestry := &historicalAssetProjectionAncestry{
-		gitHistory: gitHistory,
-		cache:      make(map[historicalAssetProjectionAncestryKey]bool),
-	}
-	anchors, err := minimalHistoricalAssetProjectionAnchors(commits, configsAtCommit, evidenceAtCommit, ancestry)
-	if err != nil {
-		return nil, err
-	}
 	findings := make(map[string]string)
-	for _, owner := range anchors {
-		for _, commit := range commits {
+	removals := make(map[string]historicalAssetProjectionRemoval)
+	presentByRepo := make(map[string][]plumbing.Hash)
+	anchoredRepoIDs := make(map[string]struct{}, len(anchors))
+	for _, anchor := range anchors {
+		anchoredRepoIDs[anchor.repo.ID] = struct{}{}
+	}
+	for _, commit := range commits {
+		location := commit.String() + ":config/sow.yaml"
+		committed, configExists, err := configs.configAt(commit)
+		if err != nil {
+			return nil, err
+		}
+		present := make(map[string]config.Repo)
+		roots := make(map[string][]string)
+		if configExists {
+			present = assetReposByID(committed)
+			for repoID, repo := range present {
+				if _, anchored := anchoredRepoIDs[repoID]; anchored {
+					presentByRepo[repoID] = append(presentByRepo[repoID], commit)
+				}
+				roots[repo.Path] = append(roots[repo.Path], repoID)
+			}
+		}
+		for _, owner := range anchors {
 			descendant, err := ancestry.isAncestor(owner.commit, commit)
 			if err != nil {
 				return nil, fmt.Errorf("check historical asset ownership ancestry %s -> %s: %w", owner.commit, commit, err)
@@ -570,37 +651,37 @@ func auditHistoricalAssetProjectionContinuity(gitHistory *historicalAssetProject
 			if !descendant || commit == owner.commit {
 				continue
 			}
-			location := commit.String() + ":config/sow.yaml"
-			committed := configsAtCommit[commit.String()]
-			if committed == nil {
+			if !configExists {
 				key := "config-missing\x00" + owner.repo.ID + "\x00" + commit.String()
 				findings[key] = fmt.Sprintf("populated asset repo %s owned at %s lost canonical config at %s", owner.repo.ID, owner.location, location)
 				continue
 			}
-			present := assetReposByID(committed)
 			repo, exists := present[owner.repo.ID]
 			if !exists {
 				key := "removed\x00" + owner.repo.ID + "\x00" + commit.String()
-				reintroducedAt, reintroduced, err := historicalAssetProjectionReintroduction(commit, owner.repo.ID, commits, configsAtCommit, ancestry)
-				if err != nil {
-					return nil, err
-				}
-				if reintroduced {
-					findings[key] = fmt.Sprintf("populated asset repo %s owned at %s was removed at %s and later reintroduced at %s", owner.repo.ID, owner.location, location, reintroducedAt.String()+":config/sow.yaml")
-				} else {
-					findings[key] = fmt.Sprintf("populated asset repo %s owned at %s was removed at %s", owner.repo.ID, owner.location, location)
-				}
+				removals[key] = historicalAssetProjectionRemoval{owner: owner, commit: commit, location: location}
 			} else if !sameAssetProjectionContract(owner.repo, repo) {
 				key := "contract\x00" + owner.repo.ID + "\x00" + commit.String()
 				findings[key] = fmt.Sprintf("populated asset repo %s contract owned at %s changed at %s", owner.repo.ID, owner.location, location)
 			}
-			for _, candidate := range committed.Repos {
-				if candidate.Type != "asset" || candidate.ID == owner.repo.ID || candidate.Path != owner.repo.Path {
+			for _, candidateID := range roots[owner.repo.Path] {
+				if candidateID == owner.repo.ID {
 					continue
 				}
-				key := "root\x00" + owner.repo.ID + "\x00" + candidate.ID + "\x00" + commit.String()
-				findings[key] = fmt.Sprintf("populated asset root %s owned by repo %s at %s was later reused by repo %s at %s", owner.repo.Path, owner.repo.ID, owner.location, candidate.ID, location)
+				key := "root\x00" + owner.repo.ID + "\x00" + candidateID + "\x00" + commit.String()
+				findings[key] = fmt.Sprintf("populated asset root %s owned by repo %s at %s was later reused by repo %s at %s", owner.repo.Path, owner.repo.ID, owner.location, candidateID, location)
 			}
+		}
+	}
+	for key, removal := range removals {
+		reintroducedAt, reintroduced, err := historicalAssetProjectionReintroduction(removal.commit, presentByRepo[removal.owner.repo.ID], ancestry)
+		if err != nil {
+			return nil, err
+		}
+		if reintroduced {
+			findings[key] = fmt.Sprintf("populated asset repo %s owned at %s was removed at %s and later reintroduced at %s", removal.owner.repo.ID, removal.owner.location, removal.location, reintroducedAt.String()+":config/sow.yaml")
+		} else {
+			findings[key] = fmt.Sprintf("populated asset repo %s owned at %s was removed at %s", removal.owner.repo.ID, removal.owner.location, removal.location)
 		}
 	}
 	result := make([]string, 0, len(findings))
@@ -611,83 +692,38 @@ func auditHistoricalAssetProjectionContinuity(gitHistory *historicalAssetProject
 	return result, nil
 }
 
-// minimalHistoricalAssetProjectionAnchors retains the oldest populated
-// ownership commit on each ancestry branch for an unchanged contract. A
-// linear history therefore needs one descendant sweep rather than one per
-// commit, while incomparable merge parents remain independently audited.
-func minimalHistoricalAssetProjectionAnchors(commits []plumbing.Hash, configsAtCommit map[string]*config.Config, evidenceAtCommit map[string]map[string]string, ancestry *historicalAssetProjectionAncestry) ([]historicalAssetProjectionAnchor, error) {
-	var candidates []historicalAssetProjectionAnchor
-	for _, commit := range commits {
-		committed := configsAtCommit[commit.String()]
-		if committed == nil {
+// retainHistoricalAssetProjectionAnchor incrementally keeps only the oldest
+// populated owner on each ancestry branch for one unchanged detached contract.
+func retainHistoricalAssetProjectionAnchor(anchors []historicalAssetProjectionAnchor, candidate historicalAssetProjectionAnchor, ancestry *historicalAssetProjectionAncestry) ([]historicalAssetProjectionAnchor, error) {
+	for index := 0; index < len(anchors); {
+		existing := anchors[index]
+		if existing.repo.ID != candidate.repo.ID || !sameAssetProjectionContract(existing.repo, candidate.repo) {
+			index++
 			continue
 		}
-		assets := assetReposByID(committed)
-		repoIDs := make([]string, 0, len(evidenceAtCommit[commit.String()]))
-		for repoID := range evidenceAtCommit[commit.String()] {
-			repoIDs = append(repoIDs, repoID)
+		existingAncestor, err := ancestry.isAncestor(existing.commit, candidate.commit)
+		if err != nil {
+			return nil, fmt.Errorf("compare historical asset ownership anchors %s -> %s: %w", existing.commit, candidate.commit, err)
 		}
-		sort.Strings(repoIDs)
-		for _, repoID := range repoIDs {
-			repo, exists := assets[repoID]
-			if !exists {
-				return nil, fmt.Errorf("historical asset ownership evidence for unconfigured repo %s at %s", repoID, commit)
-			}
-			candidates = append(candidates, historicalAssetProjectionAnchor{
-				commit: commit, repo: repo, location: evidenceAtCommit[commit.String()][repoID],
-			})
+		if existingAncestor {
+			return anchors, nil
 		}
+		candidateAncestor, err := ancestry.isAncestor(candidate.commit, existing.commit)
+		if err != nil {
+			return nil, fmt.Errorf("compare historical asset ownership anchors %s -> %s: %w", candidate.commit, existing.commit, err)
+		}
+		if candidateAncestor {
+			anchors = append(anchors[:index], anchors[index+1:]...)
+			continue
+		}
+		index++
 	}
-	var anchors []historicalAssetProjectionAnchor
-	for _, candidate := range candidates {
-		redundant := false
-		for index := 0; index < len(anchors); {
-			existing := anchors[index]
-			if existing.repo.ID != candidate.repo.ID || !sameAssetProjectionContract(existing.repo, candidate.repo) {
-				index++
-				continue
-			}
-			existingAncestor, err := ancestry.isAncestor(existing.commit, candidate.commit)
-			if err != nil {
-				return nil, fmt.Errorf("compare historical asset ownership anchors %s -> %s: %w", existing.commit, candidate.commit, err)
-			}
-			if existingAncestor {
-				redundant = true
-				break
-			}
-			candidateAncestor, err := ancestry.isAncestor(candidate.commit, existing.commit)
-			if err != nil {
-				return nil, fmt.Errorf("compare historical asset ownership anchors %s -> %s: %w", candidate.commit, existing.commit, err)
-			}
-			if candidateAncestor {
-				anchors = append(anchors[:index], anchors[index+1:]...)
-				continue
-			}
-			index++
-		}
-		if !redundant {
-			anchors = append(anchors, candidate)
-		}
-	}
-	sort.Slice(anchors, func(i, j int) bool {
-		if anchors[i].repo.ID == anchors[j].repo.ID {
-			return anchors[i].commit.String() < anchors[j].commit.String()
-		}
-		return anchors[i].repo.ID < anchors[j].repo.ID
-	})
-	return anchors, nil
+	return append(anchors, candidate), nil
 }
 
-func historicalAssetProjectionReintroduction(removed plumbing.Hash, repoID string, commits []plumbing.Hash, configsAtCommit map[string]*config.Config, ancestry *historicalAssetProjectionAncestry) (plumbing.Hash, bool, error) {
-	for _, commit := range commits {
+func historicalAssetProjectionReintroduction(removed plumbing.Hash, presentCommits []plumbing.Hash, ancestry *historicalAssetProjectionAncestry) (plumbing.Hash, bool, error) {
+	for _, commit := range presentCommits {
 		if commit == removed {
-			continue
-		}
-		committed := configsAtCommit[commit.String()]
-		if committed == nil {
-			continue
-		}
-		if _, present := assetReposByID(committed)[repoID]; !present {
 			continue
 		}
 		descendant, err := ancestry.isAncestor(removed, commit)

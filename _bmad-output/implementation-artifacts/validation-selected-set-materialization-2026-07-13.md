@@ -1782,3 +1782,57 @@ and extra-file manifests, so recording V-40 does not perturb the identity it
 records. No cloud, bucket, CDN, Worker, Zone, COS/EdgeOne or production
 repository request was made. V-40 is the current V-14 delivery identity; it
 does not close the remaining long-term Goal items.
+
+## 2026-07-20 V-42 bounded reachable-history configuration delivery identity
+
+This section supersedes V-40 after reachable asset and APT/YUM ownership audits
+stopped retaining one decoded `sow.yaml` and Git tree per reachable commit.
+Both paths now retain commit-to-blob identities plus a shared two-entry/16 MiB
+canonical-input LRU, reopen and revalidate evicted immutable objects, deep-copy
+the minimal frozen owner contract, and scan continuity/lineage in linear config
+passes. The targeted fault tests prove that an early unsafe config is evicted,
+reloaded and still rejected without mutating canonical HEAD; loader, size, hash
+and decode failures remain retryable and uncached.
+
+The frozen source passed all 706 CLI tests in six ordinary and six race shards,
+all non-CLI packages ordinary/race, both vet profiles, both repository
+Staticcheck profiles, root and nested module integrity, nested RPM tests/vet,
+fresh-cache RPM provenance, fixed govulncheck scans, four static Linux/macOS
+builds and all seven migration suites. The migration family gate reported 44
+families, five mutation negatives and 16 real CLI E2E cases with external
+network disabled and no production mutation. Detailed shard timings, build
+hashes and evidence boundaries are recorded in
+`docs/evidence/2026-07-20-reachable-history-config-memory-bound.md` and V-39 of
+the traceability matrix.
+
+After every delivery-managed source, test, spec and evidence file was frozen,
+two independent invocations created separate fresh HOME/GOMODCACHE/GOCACHE
+trees and used only the local read-only Go module download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-clean-history-config-v42-a
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-clean-history-config-v42-b
+
+PRODUCT_SOURCE_SHA256=2a85a9e076210f19ef84dee00d8c1f48a7cfd02841d131aed2dc42d42579535f
+PRODUCT_SOURCE_FILES=543
+DELIVERY_CONTENT_SHA256=7ad00792faabc40f799a6f0ddf69bc893773f812bd4c8a8fb983dfc9429a0e77
+DELIVERY_FILES=712
+ARCHIVE_SHA256=cf8fe035aad2f1c22536b46127b30c9ee5c1762e20c99440ad65682160df544b
+```
+
+Archives:
+
+- `/tmp/sow-clean-history-config-v42-a/sow-delivery-7ad00792faabc40f.tgz`
+- `/tmp/sow-clean-history-config-v42-b/sow-delivery-7ad00792faabc40f.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. Each extracted delivery passed the fresh-cache RPM
+provenance gate with the pinned v1.3.0 sum and unchanged patch allowlist. This
+external handoff file is absent from both release manifests, so recording V-42
+does not perturb the identity it records. Every real-cloud/upstream opt-in was
+zero, AWS config files were disabled and the Cloudflare API token was empty;
+no bucket, CDN, Worker, Zone, CO/COS, EdgeOne or production repository was read
+or written. V-42 is the current V-14 delivery identity, while the long-term
+Goal remains active.

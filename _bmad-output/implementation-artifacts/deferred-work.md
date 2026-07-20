@@ -13,6 +13,8 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-config-input-and-rpm-provenance-hardening.md`
   summary: Reachable-history contract scanners retain every distinct decoded canonical config and need an aggregate-memory bound independent of the per-blob 8 MiB ceiling.
   evidence: `historicalAssetProjectionOwners` and `loadReachablePackageRepositoryHistory` cache decoded configs by blob identity across all reachable commits, so many unique near-limit blobs can still grow memory with history length.
+  status: resolved
+  resolution: V-39 replaces both commit-to-config maps with commit-to-blob-identity indexes and a shared two-entry/16 MiB canonical-input LRU; misses revalidate immutable blob type/size/hash, failures are never cached, owner evidence retains at most the sufficient conflicting pair, and eviction/off-HEAD/merge history remains fail closed. See `_bmad-output/implementation-artifacts/spec-reachable-history-config-memory-bound.md` and `docs/evidence/2026-07-20-reachable-history-config-memory-bound.md`.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-config-input-and-rpm-provenance-hardening.md`
   summary: Config default propagation and validation need explicit cardinality or complexity bounds for large repo/upstream arch and component sets.

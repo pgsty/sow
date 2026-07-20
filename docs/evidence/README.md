@@ -70,6 +70,10 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   mutable module-cache 自证和 CRLF 改写路径；697 个 CLI ordinary/race、全部 non-CLI
   ordinary/race、静态/模块与七套迁移门禁已通过。post-document 双份 clean-delivery 身份
   只记录在交付根外 handoff，全程未触云或生产资源。
+- `2026-07-20-reachable-history-config-memory-bound.md`：asset 与 package reachable-history
+  扫描由 commit→decoded-config 改为 commit→blob identity，并共用 2-entry/16 MiB
+  canonical-input LRU；淘汰前置、miss 重验、失败不缓存、owner 冲突证据压缩及真实 Git
+  早期违规回归均通过 ordinary/race。只读本地验证，不触云或生产资源。
 - `2026-07-19-basic-auth-wire-canonicalization.md`：Cloudflare/EdgeOne 共享
   Basic fallback 收紧为 case-insensitive scheme、literal SP、规范 padded Base64 与最长
   1024 字节 printable US-ASCII `user:password`；alias/CTL/DEL/UTF-8/超长负例均在
