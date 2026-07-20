@@ -318,6 +318,17 @@ func TestRenderNginxCompatibilityRequiresExplicitValidatedEnablement(t *testing.
 	}
 }
 
+func TestRenderNginxCompatibilityIndexPreservesDuplicateIDFailure(t *testing.T) {
+	cfg := nginxFixtureConfig(t)
+	cfg.CompatibilityProjections = append(cfg.CompatibilityProjections, cfg.CompatibilityProjections[0])
+	_, err := RenderNginxInclude(cfg, cfg.Repos, NginxIncludeOptions{
+		View: "latest", Root: t.TempDir(), RawCompatibilityIDs: []string{"infra-legacy-x86-64"},
+	})
+	if err == nil || !strings.Contains(err.Error(), `duplicate YUM compatibility projection ID "infra-legacy-x86-64"`) {
+		t.Fatalf("indexed compatibility lookup weakened duplicate rejection: %v", err)
+	}
+}
+
 func TestRenderNginxCompatibilityRawBridgeSurvivesWithoutActiveCutover(t *testing.T) {
 	cfg := nginxFixtureConfig(t)
 	body, err := RenderNginxInclude(cfg, cfg.Repos, NginxIncludeOptions{

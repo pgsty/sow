@@ -1836,3 +1836,58 @@ zero, AWS config files were disabled and the Cloudflare API token was empty;
 no bucket, CDN, Worker, Zone, CO/COS, EdgeOne or production repository was read
 or written. V-42 is the current V-14 delivery identity, while the long-term
 Goal remains active.
+
+## 2026-07-20 V-43 bounded configuration topology delivery identity
+
+This section supersedes V-42 after schema-v1 configuration validation gained
+independent pre-default ceilings of 65,536 structural work units and 64 MiB of
+derived string bytes. The accounting covers decoded members, copied defaults,
+APT/YUM/view selector and metadata coordinates, templated paths, long default
+values and canonical repetition while deliberately excluding streamed package
+rows. Validation, compatibility, edge and Nginx projections now use indexed,
+one-pass or deterministic sorting-based traversal within that accepted budget.
+
+The first flat-cardinality candidate and all evidence produced from it were
+discarded after adversarial review found long-string amplification and residual
+quadratic scans. The corrected source passed clean Blind Hunter and Edge Case
+Hunter follow-ups, all 707 CLI tests in six ordinary and six race shards, all
+non-CLI packages ordinary/race, both vet and Staticcheck profiles, root and
+nested module integrity, nested RPM tests/vet and fresh-cache upstream
+provenance, fixed `govulncheck@v1.6.0`, four `CGO_ENABLED=0 -trimpath`
+Linux/macOS builds, and all seven hermetic migration suites. The migration
+family gate reported 44 families, five mutation negatives, 16 real CLI E2E,
+`external_network=disabled` and `production_mutation=none`. Detailed timings,
+hashes and the invalidated-candidate boundary are recorded in
+`docs/evidence/2026-07-20-config-topology-complexity-bound.md` and V-41 of the
+traceability matrix.
+
+After every delivery-managed source, test, spec and evidence file was frozen,
+two independent invocations created distinct fresh HOME/GOMODCACHE/GOCACHE
+trees and used only the local read-only Go module download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-clean-config-complexity-v43-a-20260720
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-clean-config-complexity-v43-b-20260720
+
+PRODUCT_SOURCE_SHA256=07b2963214df2b118b82220ecebb86cfead907daa75f6aed3977f4274e368163
+PRODUCT_SOURCE_FILES=546
+DELIVERY_CONTENT_SHA256=2205a96c4d15746ea7d6d1e8d89f13ad702baf424653938829cc6b9a0353c1bc
+DELIVERY_FILES=718
+ARCHIVE_SHA256=0fd6ec724bda8590af001c21d910eba2acbc6e677445ca9fabaf97a634561e20
+```
+
+Archives:
+
+- `/tmp/sow-clean-config-complexity-v43-a-20260720/sow-delivery-2205a96c4d15746e.tgz`
+- `/tmp/sow-clean-config-complexity-v43-b-20260720/sow-delivery-2205a96c4d15746e.tgz`
+
+Independent `cmp` returned 0 and both independently calculated SHA-256 values
+matched the archive digest above. Each extracted delivery passed the complete
+clean-delivery program, including the pinned RPM upstream provenance gate.
+This external handoff file is absent from both delivery manifests, so recording
+V-43 does not perturb the identity it records. No request was made to the
+authorized `pro` test bucket, any other bucket, CDN, Worker, Zone, CO/COS,
+EdgeOne or production repository. V-43 is the current V-14 delivery identity;
+the long-term Goal remains active.

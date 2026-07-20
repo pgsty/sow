@@ -84,14 +84,28 @@ type YUMCompatibilitySource struct {
 // witness or serving bytes can be written.
 func ValidateYUMCompatibilityProjections(projections []YUMCompatibilityProjection, repos []Repo, groups map[string][]string, views map[string]View) error {
 	repoByID := make(map[string]Repo, len(repos))
+	repoArches := make(map[string]map[string]struct{}, len(repos))
 	paths := make([]string, 0, len(repos)+len(projections))
 	for _, repo := range repos {
 		repoByID[repo.ID] = repo
+		arches := make(map[string]struct{}, len(repo.Arches))
+		for _, arch := range repo.Arches {
+			arches[arch] = struct{}{}
+		}
+		repoArches[repo.ID] = arches
 		expanded, err := repo.ExpandedPaths()
 		if err != nil {
 			return fmt.Errorf("expand repo %s while validating compatibility projections: %w", repo.ID, err)
 		}
 		paths = append(paths, expanded...)
+	}
+	viewRepos := make(map[string]map[string]struct{}, len(views))
+	for name, view := range views {
+		members := make(map[string]struct{}, len(view.Repos))
+		for _, repo := range view.Repos {
+			members[repo] = struct{}{}
+		}
+		viewRepos[name] = members
 	}
 	seenIDs := make(map[string]struct{}, len(projections))
 	seenSources := make(map[string]string, len(projections))
@@ -129,7 +143,7 @@ func ValidateYUMCompatibilityProjections(projections []YUMCompatibilityProjectio
 		if projection.Mode != YUMCompatibilityModeFrozenCrossEL {
 			return fmt.Errorf("compatibility_projections[%d].mode must be %s", index, YUMCompatibilityModeFrozenCrossEL)
 		}
-		if err := validateYUMCompatibilitySource(index, projection.Source, repoByID, views); err != nil {
+		if err := validateYUMCompatibilitySource(index, projection.Source, repoByID, repoArches, views, viewRepos); err != nil {
 			return err
 		}
 		carrier, carrierExists := repoByID[projection.Carrier]
@@ -152,7 +166,12 @@ func ValidateYUMCompatibilityProjections(projections []YUMCompatibilityProjectio
 		if filepath.Base(projection.Root) != projection.Source.Arch {
 			return fmt.Errorf("compatibility_projections[%d].root architecture leaf %q must equal source.arch %q", index, filepath.Base(projection.Root), projection.Source.Arch)
 		}
-		carrierRoot, err := carrier.PathForArch(projection.Source.Arch)
+		_, carrierHasArch := repoArches[projection.Carrier][projection.Source.Arch]
+		_, err := carrier.validatePathTemplate()
+		var carrierRoot string
+		if err == nil && carrierHasArch {
+			carrierRoot, err = carrier.pathForConfiguredArch(projection.Source.Arch)
+		}
 		if err != nil || carrierRoot != projection.Root {
 			return fmt.Errorf("compatibility_projections[%d].root must exactly equal carrier leaf %q", index, carrierRoot)
 		}
@@ -175,7 +194,14 @@ func ValidateYUMCompatibilityProjections(projections []YUMCompatibilityProjectio
 	return nil
 }
 
-func validateYUMCompatibilitySource(index int, source YUMCompatibilitySource, repos map[string]Repo, views map[string]View) error {
+func validateYUMCompatibilitySource(
+	index int,
+	source YUMCompatibilitySource,
+	repos map[string]Repo,
+	repoArches map[string]map[string]struct{},
+	views map[string]View,
+	viewRepos map[string]map[string]struct{},
+) error {
 	field := fmt.Sprintf("compatibility_projections[%d].source", index)
 	repo, exists := repos[source.Repo]
 	if !exists {
@@ -202,13 +228,16 @@ func validateYUMCompatibilitySource(index int, source YUMCompatibilitySource, re
 	if !exists || view.Access != "public" {
 		return fmt.Errorf("%s.view must reference the configured public latest view", field)
 	}
-	if len(view.Repos) != 0 && !containsString(view.Repos, source.Repo) {
-		return fmt.Errorf("%s.repo must be included by the configured public latest view", field)
+	if len(view.Repos) != 0 {
+		if _, exists := viewRepos[source.View][source.Repo]; !exists {
+			return fmt.Errorf("%s.repo must be included by the configured public latest view", field)
+		}
 	}
 	if source.OS != "cross-el" {
 		return fmt.Errorf("%s.os must be cross-el; compatibility bytes are not an EL9/10 source leaf", field)
 	}
-	if source.Arch == "noarch" || !containsString(repo.Arches, source.Arch) {
+	_, configuredArch := repoArches[source.Repo][source.Arch]
+	if source.Arch == "noarch" || !configuredArch {
 		return fmt.Errorf("%s.arch must be one configured non-noarch source architecture", field)
 	}
 	if source.Commit != YUMCompatibilityPinAtFirstFreeze &&

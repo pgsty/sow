@@ -104,9 +104,39 @@ func RenderNginxInclude(cfg *config.Config, repos []config.Repo, options NginxIn
 		return nil, fmt.Errorf("view %s has unsupported access %q", options.View, view.Access)
 	}
 
+	viewRepos := make(map[string]struct{}, len(view.Repos))
+	for _, repoID := range view.Repos {
+		viewRepos[repoID] = struct{}{}
+	}
+	viewIncludesRepo := func(repoID string) bool {
+		if len(view.Repos) == 0 {
+			return true
+		}
+		_, exists := viewRepos[repoID]
+		return exists
+	}
+	repoByID := make(map[string]config.Repo, len(cfg.Repos))
+	for _, repo := range cfg.Repos {
+		if _, exists := repoByID[repo.ID]; !exists {
+			// RepoByName historically returned the first match for a manually
+			// assembled invalid Config. Preserve that behavior; validated configs
+			// have already rejected duplicate IDs.
+			repoByID[repo.ID] = repo
+		}
+	}
+	projectionByID := make(map[string]config.YUMCompatibilityProjection, len(cfg.CompatibilityProjections))
+	duplicateProjectionIDs := make(map[string]struct{})
+	for _, projection := range cfg.CompatibilityProjections {
+		if _, exists := projectionByID[projection.ID]; exists {
+			duplicateProjectionIDs[projection.ID] = struct{}{}
+			continue
+		}
+		projectionByID[projection.ID] = projection
+	}
+
 	selected := make(map[string]config.Repo, len(repos))
 	for _, repo := range repos {
-		if !repo.IsActive() || !nginxViewIncludesRepo(view, repo.ID) {
+		if !repo.IsActive() || !viewIncludesRepo(repo.ID) {
 			continue
 		}
 		if _, duplicate := selected[repo.ID]; duplicate {
@@ -119,10 +149,10 @@ func RenderNginxInclude(cfg *config.Config, repos []config.Repo, options NginxIn
 		if _, duplicate := rawCompatibility[id]; duplicate {
 			return nil, fmt.Errorf("Nginx include raw compatibility projection %q is enabled more than once", id)
 		}
-		projection, found, lookupErr := config.YUMCompatibilityProjectionByID(cfg.CompatibilityProjections, id)
-		if lookupErr != nil {
-			return nil, fmt.Errorf("Nginx include compatibility projection %q: %w", id, lookupErr)
+		if _, duplicate := duplicateProjectionIDs[id]; duplicate {
+			return nil, fmt.Errorf("Nginx include compatibility projection %q: duplicate YUM compatibility projection ID %q", id, id)
 		}
+		projection, found := projectionByID[id]
 		if !found {
 			return nil, fmt.Errorf("Nginx include compatibility projection %q is not configured", id)
 		}
@@ -215,11 +245,12 @@ func RenderNginxInclude(cfg *config.Config, repos []config.Repo, options NginxIn
 			if _, servingErr := cfg.ServingBaseURL(options.View); servingErr != nil {
 				return nil, fmt.Errorf("Nginx include repo %s: %w", repo.ID, servingErr)
 			}
-			for _, arch := range repo.Arches {
-				leaf, leafErr := repo.PathForArch(arch)
-				if leafErr != nil {
-					return nil, fmt.Errorf("Nginx include repo %s: %w", repo.ID, leafErr)
-				}
+			expanded, expandErr := repo.ExpandedPaths()
+			if expandErr != nil {
+				return nil, fmt.Errorf("Nginx include repo %s: %w", repo.ID, expandErr)
+			}
+			for archIndex, arch := range repo.Arches {
+				leaf := expanded[archIndex]
 				if err := add(nginxPrefixRoute, leaf, leaf); err != nil {
 					return nil, fmt.Errorf("Nginx include repo %s: %w", repo.ID, err)
 				}
@@ -245,7 +276,7 @@ func RenderNginxInclude(cfg *config.Config, repos []config.Repo, options NginxIn
 		if projection.Source.View != options.View {
 			continue
 		}
-		owner, exists := cfg.RepoByName(projection.Source.Repo)
+		owner, exists := repoByID[projection.Source.Repo]
 		if !exists || owner.Type != "yum" || owner.YUM == nil {
 			return nil, fmt.Errorf("Nginx include compatibility projection %s has no configured YUM affinity owner", projection.ID)
 		}
@@ -452,17 +483,4 @@ func nginxQuote(value string) string {
 func nginxEscape(value string) string {
 	replacer := strings.NewReplacer(`\`, `\\`, `"`, `\"`, `$`, `\$`)
 	return replacer.Replace(value)
-}
-
-func nginxViewIncludesRepo(view config.View, repo string) bool {
-	return len(view.Repos) == 0 || containsNginxValue(view.Repos, repo)
-}
-
-func containsNginxValue(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
 }

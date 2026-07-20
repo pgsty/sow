@@ -100,6 +100,27 @@ func TestValidateYUMCompatibilityProjectionsFreezesExplicitLeafOwnership(t *test
 	}
 }
 
+func TestValidateYUMCompatibilityProjectionPreservesSingleArchCarrierPath(t *testing.T) {
+	owner := Repo{
+		ID: "infra-el9", Type: "yum", Path: "yum/infra/el9/x86_64", DefaultPool: "public",
+		OS: OSConfig{Family: "el", Major: 9, Lifecycle: "active"}, Arches: []string{"x86_64"},
+		YUM: &YUMConfig{Compression: "zstd"},
+	}
+	carrier := Repo{
+		ID: "infra-carrier", Type: "yum", Path: "yum/infra/x86_64", Active: configTestBoolPointer(false), DefaultPool: "public",
+		OS: OSConfig{Family: "cross-el", Lifecycle: "frozen"}, Arches: []string{"x86_64"},
+		YUM: &YUMConfig{Compression: "gzip", CompatibilityCarrier: true},
+	}
+	projection := YUMCompatibilityProjection{
+		ID: "infra-legacy-x86-64", Root: carrier.Path, Mode: YUMCompatibilityModeFrozenCrossEL, Carrier: carrier.ID,
+		Source: YUMCompatibilitySource{Repo: owner.ID, View: "latest", OS: "cross-el", Arch: "x86_64", Commit: strings.Repeat("a", 40)},
+	}
+	views := map[string]View{"latest": {Access: "public", Repos: []string{owner.ID}}}
+	if err := ValidateYUMCompatibilityProjections([]YUMCompatibilityProjection{projection}, []Repo{owner, carrier}, nil, views); err != nil {
+		t.Fatalf("single-arch carrier's existing non-templated path contract regressed: %v", err)
+	}
+}
+
 func TestValidateYUMCompatibilityProjectionsRejectsAmbiguousOrMutableContracts(t *testing.T) {
 	baseRepo := Repo{ID: "infra-el9", Type: "yum", Path: "yum/infra/el9/{arch}", DefaultPool: "public", OS: OSConfig{Family: "el", Major: 9, Lifecycle: "active"}, Arches: []string{"aarch64", "x86_64"}, YUM: &YUMConfig{Compression: "zstd"}}
 	carrierRepo := Repo{ID: "infra-carrier", Type: "yum", Path: "yum/infra/{arch}", Active: configTestBoolPointer(false), DefaultPool: "public", OS: OSConfig{Family: "cross-el", Lifecycle: "frozen"}, Arches: []string{"aarch64", "x86_64"}, YUM: &YUMConfig{Compression: "gzip", CompatibilityCarrier: true}}

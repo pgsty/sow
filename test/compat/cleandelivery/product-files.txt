@@ -77,6 +77,7 @@ internal/cli/asset_projection_intent.go
 internal/cli/asset_projection_test.go
 internal/cli/audit_fixes_test.go
 internal/cli/catalog.go
+internal/cli/config_complexity_test.go
 internal/cli/edge_contract.go
 internal/cli/edge_contract_test.go
 internal/cli/errors.go
@@ -266,6 +267,8 @@ internal/cli/yum_compat_workflow.go
 internal/cli/yum_compat_workflow_state_test.go
 internal/cli/yum_consumer_preflight.go
 internal/cli/yum_consumer_preflight_test.go
+internal/config/complexity.go
+internal/config/complexity_test.go
 internal/config/config.go
 internal/config/config_test.go
 internal/config/edge.go

@@ -709,6 +709,11 @@ func TestYUMPackageTrustBundleDefaultsAndRejectsUnsafePaths(t *testing.T) {
 	if got := cfg.Repos[0].YUM.PackageKeyring; got != "keys/test-package-trust.asc" {
 		t.Fatalf("default package keyring=%q", got)
 	}
+	explicitEmpty := strings.Replace(validYAML(repoBlock), "yum: {compression: zstd}", "yum: {compression: zstd, package_keyring: ''}", 1)
+	cfg, err = Decode(strings.NewReader(explicitEmpty))
+	if err != nil || cfg.Repos[0].YUM.PackageKeyring != "keys/test-package-trust.asc" || !cfg.Repos[0].YUM.packageKeyringDefaulted {
+		t.Fatalf("explicit-empty package keyring did not preserve default provenance: value=%q defaulted=%t err=%v", cfg.Repos[0].YUM.PackageKeyring, cfg.Repos[0].YUM.packageKeyringDefaulted, err)
+	}
 	explicit := strings.Replace(validYAML(repoBlock), "yum: {compression: zstd}", "yum: {compression: zstd, package_keyring: keys/vendor-and-pigsty.asc}", 1)
 	cfg, err = Decode(strings.NewReader(explicit))
 	if err != nil || cfg.Repos[0].YUM.PackageKeyring != "keys/vendor-and-pigsty.asc" {

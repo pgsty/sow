@@ -70,6 +70,13 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   mutable module-cache 自证和 CRLF 改写路径；697 个 CLI ordinary/race、全部 non-CLI
   ordinary/race、静态/模块与七套迁移门禁已通过。post-document 双份 clean-delivery 身份
   只记录在交付根外 handoff，全程未触云或生产资源。
+- `2026-07-20-config-topology-complexity-bound.md`：在任何 upstream arches/components
+  序列默认复制和派生叶分配前实施 65,536-work-unit 与 64 MiB derived-string 双预算；
+  溢出安全地计入显式成员、default copy、长路径/keyring 重复与 APT/YUM/selector logical
+  leaves，包行不计入。成员/路径/edge/Nginx 投影改为索引、一遍 arch 展开或确定性
+  `O(n log n)`；第一候选的结果因盲审发现字符串放大和残留二次扫描而作废，修正版经两路
+  clean review、707 个 CLI ordinary/race、全部 non-CLI、静态/模块/迁移与 V-43 双份
+  clean-delivery 后关闭 V-41。全程仅本地，无云或生产访问。
 - `2026-07-20-reachable-history-config-memory-bound.md`：asset 与 package reachable-history
   扫描由 commit→decoded-config 改为 commit→blob identity，并共用 2-entry/16 MiB
   canonical-input LRU；淘汰前置、miss 重验、失败不缓存、owner 冲突证据压缩及真实 Git

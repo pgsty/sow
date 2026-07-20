@@ -368,6 +368,37 @@ func (c *Config) edgePublicRouteAllowlists(targetName string, admission EdgeComp
 		AssetRoots: []string{}, AssetKeys: []string{}, Projections: []edgeCompatibilityProjection{}, Snapshots: []EdgeSnapshotAdmission{}, Raw: []string{}, Active: []string{},
 	}
 	keyClaims := make(map[string]string)
+	repoByID := make(map[string]Repo, len(c.Repos))
+	for _, repo := range c.Repos {
+		repoByID[repo.ID] = repo
+	}
+	viewRepos := make(map[string]map[string]struct{}, len(c.Views))
+	for name, view := range c.Views {
+		members := make(map[string]struct{}, len(view.Repos))
+		for _, repoID := range view.Repos {
+			members[repoID] = struct{}{}
+		}
+		viewRepos[name] = members
+	}
+	repoInView := func(viewName, repoID string) bool {
+		view, exists := c.Views[viewName]
+		if !exists {
+			return false
+		}
+		if len(view.Repos) == 0 {
+			return true
+		}
+		_, exists = viewRepos[viewName][repoID]
+		return exists
+	}
+	repoInAnyView := func(repoID string) bool {
+		for _, viewName := range []string{"beta", "latest", "stable"} {
+			if repoInView(viewName, repoID) {
+				return true
+			}
+		}
+		return false
+	}
 	appendExactKey := func(key, claim string, sharedMutableTrust bool) error {
 		if previous, exists := keyClaims[key]; exists {
 			if sharedMutableTrust && previous == "mutable-trust" {
@@ -384,7 +415,7 @@ func (c *Config) edgePublicRouteAllowlists(targetName string, admission EdgeComp
 		return nil
 	}
 	for _, repo := range c.Repos {
-		if !repo.IsActive() || !repo.PublishesToTarget(targetName) || !c.repoInAnyConfiguredView(repo.ID) ||
+		if !repo.IsActive() || !repo.PublishesToTarget(targetName) || !repoInAnyView(repo.ID) ||
 			repo.Type == "yum" && repo.YUM != nil && repo.YUM.CompatibilityCarrier {
 			continue
 		}
@@ -425,15 +456,12 @@ func (c *Config) edgePublicRouteAllowlists(targetName string, admission EdgeComp
 			runtime.YUMRepos = append(runtime.YUMRepos, repo.ID)
 			runtime.YUMRoots = append(runtime.YUMRoots, expanded...)
 			for _, viewName := range []string{"beta", "latest", "stable"} {
-				if !c.repoInConfiguredView(viewName, repo.ID) {
+				if !repoInView(viewName, repo.ID) {
 					continue
 				}
 				for _, osName := range repo.OSSelectorValues() {
-					for _, arch := range repo.Arches {
-						root, err := repo.PathForArch(arch)
-						if err != nil {
-							return "", "", "", fmt.Errorf("edge YUM channel root for repo %s/%s: %w", repo.ID, arch, err)
-						}
+					for archIndex, arch := range repo.Arches {
+						root := expanded[archIndex]
 						runtime.YUMChannels = append(runtime.YUMChannels, edgeYUMChannel{View: viewName, Repo: repo.ID, OS: osName, Arch: arch, Root: root})
 					}
 				}
@@ -443,7 +471,7 @@ func (c *Config) edgePublicRouteAllowlists(targetName string, admission EdgeComp
 
 	configured := make(map[string]YUMCompatibilityProjection)
 	for _, projection := range c.CompatibilityProjections {
-		owner, exists := c.RepoByName(projection.Source.Repo)
+		owner, exists := repoByID[projection.Source.Repo]
 		if !exists || owner.Type != "yum" {
 			return "", "", "", fmt.Errorf("edge public routes for compatibility projection %s: source owner %s is unavailable", projection.ID, projection.Source.Repo)
 		}
@@ -483,7 +511,16 @@ func (c *Config) edgePublicRouteAllowlists(targetName string, admission EdgeComp
 	sort.Slice(runtime.YUMChannels, func(i, j int) bool {
 		left := runtime.YUMChannels[i]
 		right := runtime.YUMChannels[j]
-		return strings.Join([]string{left.View, left.Repo, left.OS, left.Arch}, "\x00") < strings.Join([]string{right.View, right.Repo, right.OS, right.Arch}, "\x00")
+		if left.View != right.View {
+			return left.View < right.View
+		}
+		if left.Repo != right.Repo {
+			return left.Repo < right.Repo
+		}
+		if left.OS != right.OS {
+			return left.OS < right.OS
+		}
+		return left.Arch < right.Arch
 	})
 	sort.Strings(runtime.APTRoots)
 	sort.Strings(runtime.YUMRepos)
@@ -519,24 +556,6 @@ func (c *Config) edgePublicRouteAllowlists(targetName string, admission EdgeComp
 		return "", "", "", fmt.Errorf("validate encoded edge compatibility admission: %w", err)
 	}
 	return string(prefixJSON), string(keyJSON), string(compatibilityJSON), nil
-}
-
-// repoInAnyConfiguredView closes the target-wide edge route contract over the
-// exact union the target may publish. An empty view.repos means all active
-// repositories; an explicitly excluded repository must not become reachable
-// merely because it remains declared in sow.yaml or owns the target.
-func (c *Config) repoInAnyConfiguredView(repoID string) bool {
-	for _, name := range []string{"beta", "latest", "stable"} {
-		if c.repoInConfiguredView(name, repoID) {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *Config) repoInConfiguredView(viewName, repoID string) bool {
-	view, exists := c.Views[viewName]
-	return exists && (len(view.Repos) == 0 || containsString(view.Repos, repoID))
 }
 
 var edgeSnapshotIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9+._-]*-[0-9]{8}$`)

@@ -161,17 +161,24 @@ func (a *APTConfig) hasSuiteLifecycle() bool {
 // declared. The returned slice is detached so selector and recovery code can
 // narrow it without mutating the canonical configuration.
 func (a *APTConfig) ComponentsForSuite(suite string) []string {
+	return append([]string(nil), a.componentsForSuite(suite)...)
+}
+
+// componentsForSuite is the allocation-free internal form. Validation and
+// topology preflight only inspect canonical configuration and must not create
+// one detached slice per membership check.
+func (a *APTConfig) componentsForSuite(suite string) []string {
 	if a == nil {
 		return nil
 	}
 	if a.hasSuiteComponents() {
-		return append([]string(nil), a.SuiteComponents[suite]...)
+		return a.SuiteComponents[suite]
 	}
-	return append([]string(nil), a.Components...)
+	return a.Components
 }
 
 func (a *APTConfig) HasComponent(suite, component string) bool {
-	return containsString(a.ComponentsForSuite(suite), component)
+	return containsString(a.componentsForSuite(suite), component)
 }
 
 // NarrowSuites makes a deep, self-contained APT selection. In particular, a
@@ -227,7 +234,8 @@ type YUMConfig struct {
 	// An omitted noarch_mode preserves the schema-v1 replication contract.
 	// Explicit empty/null values are invalid rather than silently selecting a
 	// package-routing policy the operator did not actually declare.
-	noarchModePresent bool `yaml:"-"`
+	noarchModePresent       bool `yaml:"-"`
+	packageKeyringDefaulted bool `yaml:"-"`
 }
 
 type AssetConfig struct {
@@ -477,7 +485,8 @@ func markRepoOptionalFieldPresence(document *yaml.Node, cfg *Config) {
 					}
 					yumNode := repoNode.Content[field+1]
 					for yumField := 0; yumField+1 < len(yumNode.Content); yumField += 2 {
-						if yumNode.Content[yumField].Value == "noarch_mode" {
+						switch yumNode.Content[yumField].Value {
+						case "noarch_mode":
 							cfg.Repos[repoIndex].YUM.noarchModePresent = true
 						}
 					}
@@ -592,6 +601,7 @@ func (c *Config) applyDefaults() {
 		// retained by this append-only repository.
 		if c.Repos[index].YUM != nil && c.Repos[index].YUM.PackageKeyring == "" {
 			c.Repos[index].YUM.PackageKeyring = c.GPG.PublicKey
+			c.Repos[index].YUM.packageKeyringDefaulted = true
 		}
 		if c.Repos[index].YUM != nil && !c.Repos[index].YUM.noarchModePresent && c.Repos[index].YUM.NoarchMode == "" {
 			c.Repos[index].YUM.NoarchMode = YUMNoarchReplicate
@@ -602,6 +612,12 @@ func (c *Config) applyDefaults() {
 func (c *Config) Validate() error {
 	if c.Schema != Schema {
 		return fmt.Errorf("unsupported schema %q (want %s)", c.Schema, Schema)
+	}
+	// This preflight is deliberately the first schema-v1 validation. In
+	// particular it runs before validateUpstreams copies omitted arches or
+	// components and before path/suite validation allocates derived topology.
+	if _, err := configComplexityUsageFor(c); err != nil {
+		return err
 	}
 	if c.State.SnapshotMaterializationMonths < 1 {
 		return errors.New("state.snapshot_materialization_months must be positive")
@@ -1033,26 +1049,53 @@ func validatePublicOwnership(prefixes []publicPrefixOwner, rootKeyOwners map[str
 		}
 		return prefixes[i].path < prefixes[j].path
 	})
+	paths := make([]string, len(prefixes))
+	for index := range prefixes {
+		paths[index] = prefixes[index].path
+	}
 	for i := range prefixes {
-		for j := i + 1; j < len(prefixes); j++ {
-			left, right := prefixes[i], prefixes[j]
-			if left.path == right.path || strings.HasPrefix(left.path, right.path+"/") || strings.HasPrefix(right.path, left.path+"/") {
-				return fmt.Errorf("public repo prefixes overlap: repo %q owns %q and repo %q owns %q", left.repo, left.path, right.repo, right.path)
-			}
+		if conflict, exists := firstSortedPathConflict(paths, i); exists {
+			left, right := prefixes[i], prefixes[conflict]
+			return fmt.Errorf("public repo prefixes overlap: repo %q owns %q and repo %q owns %q", left.repo, left.path, right.repo, right.path)
 		}
 	}
-	for key, exactOwner := range rootKeyOwners {
-		for _, prefix := range prefixes {
-			// An exact object `pkg` and a strict child prefix `pkg/pig` are
-			// representable together in object storage and by exact Nginx alias.
-			// A same-name prefix (or a prefix ancestor of a future multi-segment
-			// exact key) is ambiguous and therefore rejected globally.
-			if key == prefix.path || strings.HasPrefix(key, prefix.path+"/") {
+	prefixByPath := make(map[string]publicPrefixOwner, len(prefixes))
+	for _, prefix := range prefixes {
+		if _, exists := prefixByPath[prefix.path]; !exists {
+			prefixByPath[prefix.path] = prefix
+		}
+	}
+	for _, key := range sortedStringMapKeys(rootKeyOwners) {
+		exactOwner := rootKeyOwners[key]
+		// An exact object `pkg` and a strict child prefix `pkg/pig` are
+		// representable together in object storage and by exact Nginx alias.
+		// A same-name prefix (or a prefix ancestor of a future multi-segment
+		// exact key) is ambiguous and therefore rejected globally.
+		for end := strings.IndexByte(key, '/'); ; end = nextPathSeparator(key, end) {
+			candidate := key
+			if end >= 0 {
+				candidate = key[:end]
+			}
+			if prefix, exists := prefixByPath[candidate]; exists {
 				return fmt.Errorf("public root exact key %q from repo %q conflicts with prefix %q from repo %q", key, exactOwner, prefix.path, prefix.repo)
+			}
+			if end < 0 {
+				break
 			}
 		}
 	}
 	return nil
+}
+
+func nextPathSeparator(value string, current int) int {
+	if current < 0 || current+1 >= len(value) {
+		return -1
+	}
+	next := strings.IndexByte(value[current+1:], '/')
+	if next < 0 {
+		return -1
+	}
+	return current + 1 + next
 }
 
 func validateAPTSuiteContracts(repoIndex int, apt *APTConfig) error {
@@ -1067,8 +1110,13 @@ func validateAPTSuiteContracts(repoIndex int, apt *APTConfig) error {
 		if len(apt.SuiteComponents) != len(apt.Suites) {
 			return fmt.Errorf("repos[%d].apt.suite_components must cover every configured suite exactly", repoIndex)
 		}
+		componentOrder := make(map[string]int, len(apt.Components))
+		for order, component := range apt.Components {
+			componentOrder[component] = order
+		}
 		componentUnion := make(map[string]struct{}, len(apt.Components))
-		for suite, components := range apt.SuiteComponents {
+		for _, suite := range sortedStringMapKeys(apt.SuiteComponents) {
+			components := apt.SuiteComponents[suite]
 			if _, exists := suites[suite]; !exists {
 				return fmt.Errorf("repos[%d].apt.suite_components contains unknown suite %q", repoIndex, suite)
 			}
@@ -1079,21 +1127,19 @@ func validateAPTSuiteContracts(repoIndex int, apt *APTConfig) error {
 			if err := validateRouteStringList(field, components); err != nil {
 				return err
 			}
-			allowed := make(map[string]struct{}, len(components))
 			for _, component := range components {
-				if !containsString(apt.Components, component) {
+				if _, exists := componentOrder[component]; !exists {
 					return fmt.Errorf("%s contains component %q outside apt.components", field, component)
 				}
-				allowed[component] = struct{}{}
 				componentUnion[component] = struct{}{}
 			}
-			// Preserve the declared global order in each suite's Release contract.
-			normalized := make([]string, 0, len(components))
-			for _, component := range apt.Components {
-				if _, exists := allowed[component]; exists {
-					normalized = append(normalized, component)
-				}
-			}
+			// Preserve the declared global order without scanning every global
+			// component for every sparse suite. The precomputed order index turns
+			// this into O(total suite members log max-suite-members).
+			normalized := append([]string(nil), components...)
+			sort.Slice(normalized, func(left, right int) bool {
+				return componentOrder[normalized[left]] < componentOrder[normalized[right]]
+			})
 			apt.SuiteComponents[suite] = normalized
 		}
 		for _, suite := range apt.Suites {
@@ -1190,6 +1236,32 @@ func validateLifecycle(repo Repo) error {
 }
 
 func (c *Config) validateUpstreams(repoIDs map[string]struct{}) error {
+	type repoIndex struct {
+		repo            *Repo
+		arches          map[string]struct{}
+		suiteComponents map[string]map[string]struct{}
+	}
+	indexedRepos := make(map[string]repoIndex, len(c.Repos))
+	for index := range c.Repos {
+		repo := &c.Repos[index]
+		arches := make(map[string]struct{}, len(repo.Arches))
+		for _, arch := range repo.Arches {
+			arches[arch] = struct{}{}
+		}
+		suiteComponents := make(map[string]map[string]struct{})
+		if repo.APT != nil {
+			suiteComponents = make(map[string]map[string]struct{}, len(repo.APT.Suites))
+			for _, suite := range repo.APT.Suites {
+				components := repo.APT.componentsForSuite(suite)
+				componentSet := make(map[string]struct{}, len(components))
+				for _, component := range components {
+					componentSet[component] = struct{}{}
+				}
+				suiteComponents[suite] = componentSet
+			}
+		}
+		indexedRepos[repo.ID] = repoIndex{repo: repo, arches: arches, suiteComponents: suiteComponents}
+	}
 	seen := make(map[string]struct{})
 	for i := range c.Upstreams {
 		upstream := &c.Upstreams[i]
@@ -1206,7 +1278,8 @@ func (c *Config) validateUpstreams(repoIDs map[string]struct{}) error {
 		if _, exists := repoIDs[upstream.Repo]; !exists {
 			return fmt.Errorf("upstreams[%d]: unknown repo %q", i, upstream.Repo)
 		}
-		repo, _ := c.RepoByName(upstream.Repo)
+		indexed := indexedRepos[upstream.Repo]
+		repo := indexed.repo
 		if repo.Type != upstream.Type {
 			return fmt.Errorf("upstreams[%d]: type %s does not match target repo %s type %s", i, upstream.Type, repo.ID, repo.Type)
 		}
@@ -1226,7 +1299,7 @@ func (c *Config) validateUpstreams(repoIDs map[string]struct{}) error {
 			return err
 		}
 		for _, arch := range upstream.Arches {
-			if !containsString(repo.Arches, arch) {
+			if _, exists := indexed.arches[arch]; !exists {
 				return fmt.Errorf("upstreams[%d]: arch %q is not configured by repo %s", i, arch, repo.ID)
 			}
 		}
@@ -1234,17 +1307,18 @@ func (c *Config) validateUpstreams(repoIDs map[string]struct{}) error {
 			if upstream.Suite == "" && len(repo.APT.Suites) == 1 {
 				upstream.Suite = repo.APT.Suites[0]
 			}
-			if !containsString(repo.APT.Suites, upstream.Suite) {
+			componentSet, suiteExists := indexed.suiteComponents[upstream.Suite]
+			if !suiteExists {
 				return fmt.Errorf("upstreams[%d]: suite %q is not configured by repo %s", i, upstream.Suite, repo.ID)
 			}
 			if len(upstream.Components) == 0 {
-				upstream.Components = repo.APT.ComponentsForSuite(upstream.Suite)
+				upstream.Components = append([]string(nil), repo.APT.componentsForSuite(upstream.Suite)...)
 			}
 			if err := validateStringList(fmt.Sprintf("upstreams[%d].components", i), upstream.Components); err != nil {
 				return err
 			}
 			for _, component := range upstream.Components {
-				if !repo.APT.HasComponent(upstream.Suite, component) {
+				if _, exists := componentSet[component]; !exists {
 					return fmt.Errorf("upstreams[%d]: component %q is not configured by repo %s suite %s", i, component, repo.ID, upstream.Suite)
 				}
 			}
@@ -1569,14 +1643,37 @@ func hasPathNamespace(value, namespace string) bool {
 func validateNonOverlapping(paths []string) error {
 	sort.Strings(paths)
 	for i := range paths {
-		for j := i + 1; j < len(paths); j++ {
-			left, right := strings.TrimSuffix(paths[i], "/"), strings.TrimSuffix(paths[j], "/")
-			if left == right || strings.HasPrefix(left, right+"/") || strings.HasPrefix(right, left+"/") {
-				return fmt.Errorf("repo paths overlap: %q and %q", paths[i], paths[j])
-			}
+		if conflict, exists := firstSortedPathConflict(paths, i); exists {
+			return fmt.Errorf("repo paths overlap: %q and %q", paths[i], paths[conflict])
 		}
 	}
 	return nil
+}
+
+// firstSortedPathConflict preserves the old nested-loop choice (lowest left
+// index, then lowest conflicting right index) while using the lexical prefix
+// interval of a normalized path. Callers sort once before querying.
+func firstSortedPathConflict(paths []string, leftIndex int) (int, bool) {
+	if leftIndex < 0 || leftIndex+1 >= len(paths) {
+		return 0, false
+	}
+	left := strings.TrimSuffix(paths[leftIndex], "/")
+	if strings.TrimSuffix(paths[leftIndex+1], "/") == left {
+		return leftIndex + 1, true
+	}
+	prefix := left + "/"
+	offset := sort.Search(len(paths)-leftIndex-1, func(relative int) bool {
+		candidate := strings.TrimSuffix(paths[leftIndex+1+relative], "/")
+		return candidate >= prefix
+	})
+	if offset == len(paths)-leftIndex-1 {
+		return 0, false
+	}
+	candidateIndex := leftIndex + 1 + offset
+	if strings.HasPrefix(strings.TrimSuffix(paths[candidateIndex], "/"), prefix) {
+		return candidateIndex, true
+	}
+	return 0, false
 }
 
 func containsReservedComponent(value string) bool {
@@ -1760,12 +1857,9 @@ func (r Repo) ArchSelectorValues() []string {
 // multi-architecture YUM family must state the legacy URL shape explicitly via
 // {arch}; single-leaf and all non-YUM repositories use their exact path.
 func (r Repo) PathForArch(arch string) (string, error) {
-	placeholder := strings.Count(r.Path, "{arch}")
-	if placeholder > 1 || (placeholder == 1 && r.Type != "yum") || (placeholder == 0 && strings.ContainsAny(r.Path, "{}")) {
-		return "", errors.New("only YUM paths may contain one {arch} placeholder")
-	}
-	if r.Type == "yum" && len(r.Arches) > 1 && placeholder != 1 {
-		return "", errors.New("multi-architecture YUM repo path must contain {arch}")
+	placeholder, err := r.validatePathTemplate()
+	if err != nil {
+		return "", err
 	}
 	if placeholder == 0 {
 		return r.Path, nil
@@ -1773,6 +1867,24 @@ func (r Repo) PathForArch(arch string) (string, error) {
 	if !containsString(r.Arches, arch) {
 		return "", fmt.Errorf("arch %q is not configured for repo %s", arch, r.ID)
 	}
+	return r.pathForConfiguredArch(arch)
+}
+
+func (r Repo) validatePathTemplate() (int, error) {
+	placeholder := strings.Count(r.Path, "{arch}")
+	if placeholder > 1 || (placeholder == 1 && r.Type != "yum") || (placeholder == 0 && strings.ContainsAny(r.Path, "{}")) {
+		return 0, errors.New("only YUM paths may contain one {arch} placeholder")
+	}
+	if r.Type == "yum" && len(r.Arches) > 1 && placeholder != 1 {
+		return 0, errors.New("multi-architecture YUM repo path must contain {arch}")
+	}
+	return placeholder, nil
+}
+
+// pathForConfiguredArch expands an architecture already proven to belong to
+// the repository. ExpandedPaths uses it after one list validation so it never
+// re-scans the same arches slice once per member.
+func (r Repo) pathForConfiguredArch(arch string) (string, error) {
 	value := strings.Replace(r.Path, "{arch}", arch, 1)
 	if err := validateRelativePath(value); err != nil {
 		return "", err
@@ -1781,13 +1893,17 @@ func (r Repo) PathForArch(arch string) (string, error) {
 }
 
 func (r Repo) ExpandedPaths() ([]string, error) {
-	if strings.Contains(r.Path, "{arch}") {
-		if r.Type != "yum" || len(r.Arches) == 0 {
+	placeholder, err := r.validatePathTemplate()
+	if err != nil {
+		return nil, err
+	}
+	if placeholder == 1 {
+		if len(r.Arches) == 0 {
 			return nil, errors.New("only YUM paths may contain one {arch} placeholder")
 		}
 		paths := make([]string, 0, len(r.Arches))
 		for _, arch := range r.Arches {
-			value, err := r.PathForArch(arch)
+			value, err := r.pathForConfiguredArch(arch)
 			if err != nil {
 				return nil, err
 			}
@@ -1795,17 +1911,7 @@ func (r Repo) ExpandedPaths() ([]string, error) {
 		}
 		return paths, nil
 	}
-	if _, err := r.PathForArch(firstOrEmpty(r.Arches)); err != nil {
-		return nil, err
-	}
 	return []string{r.Path}, nil
-}
-
-func firstOrEmpty(values []string) string {
-	if len(values) == 0 {
-		return ""
-	}
-	return values[0]
 }
 
 func containsString(values []string, target string) bool {

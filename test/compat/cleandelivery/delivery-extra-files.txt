@@ -1,5 +1,6 @@
 README.md
 _bmad-output/brainstorming/brainstorm-sow-repo-cli-2026-07-11/brainstorm-intent.md
+_bmad-output/implementation-artifacts/spec-config-cardinality-complexity-bounds.md
 _bmad-output/implementation-artifacts/spec-config-input-and-rpm-provenance-hardening.md
 _bmad-output/implementation-artifacts/spec-reachable-history-config-memory-bound.md
 _bmad-output/implementation-artifacts/spec-real-r2-publication-storage-transaction.md
@@ -47,6 +48,7 @@ docs/adr/0036-provider-delete-capability-and-checkpoint-fenced-fallback.md
 docs/adr/0037-pre-upload-confidential-edge-denial-attestation.md
 docs/adr/0038-yum-consumer-preflight-receipt.md
 docs/adr/0039-caret-url-wire-canonicalization.md
+docs/adr/0040-bounded-configuration-topology.md
 docs/architecture.md
 docs/client-installation.md
 docs/evidence/2026-07-11-client-compat.md
@@ -130,6 +132,7 @@ docs/evidence/2026-07-19-route-safe-caret-url-canonicalization.md
 docs/evidence/2026-07-19-state-lock-atomic-publication.md
 docs/evidence/2026-07-19-yum-consumer-lock-release.md
 docs/evidence/2026-07-20-config-input-and-rpm-provenance-hardening.md
+docs/evidence/2026-07-20-config-topology-complexity-bound.md
 docs/evidence/2026-07-20-r2-publication-storage-transaction.md
 docs/evidence/2026-07-20-reachable-history-config-memory-bound.md
 docs/evidence/README.md
