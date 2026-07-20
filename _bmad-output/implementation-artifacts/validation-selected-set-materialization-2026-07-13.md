@@ -1631,3 +1631,62 @@ archive digest above. This is the current V-14/V-35 delivery identity. It does
 not upgrade real Worker/CDN/purge/provider-log evidence, real COS/EdgeOne,
 production migration or operational metrics; the long-term Goal remains
 active.
+
+## 2026-07-20 V-37 real R2 publication-storage transaction delivery identity
+
+This section supersedes V-35 after the product CLI, rather than a synthetic
+storage fixture, completed an R2 publication transaction in the exact
+owner-designated empty non-production Cloudflare `pro` bucket. Run
+`sow-r2-publication-20260720-06` executed `add`, `promote`, `publish`, publish
+replay, remote adoption, adoption replay, full fsck, run-owned CAS drift,
+canonical Git HEAD preservation, exact CAS restore and identity-bound cleanup.
+The real R2 data plane observed eight PUTs; the only purge and CDN operations
+were a process-local protocol adapter and local TLS server. The test explicitly
+reported `real_cf_control_plane=false` and `real_custom_domain=false`, passed in
+162.380s package time, and an independent `rclone lsf cf:pro` returned exit 0
+with empty stdout afterward. No CO/COS, production repository, Worker, Zone,
+real purge, custom-domain or EdgeOne request was made.
+
+Blind Hunter and Edge Case Hunter review then hardened the acceptance firewall:
+the real transport is proxy-free and exact-authority dial-bound, independent
+Host overrides fail closed, every non-lease mutation re-proves the live lease,
+only explicit 2xx responses grant ownership, product DELETE is disabled, and
+cleanup requires a one-shot exact body+ETag capability. Exact remote/CDN key
+sets and lock/upload/flip/purge/verify/commit ordering are asserted. Hardened
+run `...-06` supersedes the earlier `...-05` success. The harness explicitly
+does not claim defer cleanup across timeout, SIGKILL, or process crash.
+
+The new always-offline network-boundary test passed ordinary/race, as did all
+non-CLI packages ordinary/race. The full CLI test package compiled, both vet
+profiles and both repository Staticcheck profiles were clean, both modules
+passed tidy/verify and the nested RPM tests/vet, four static Linux/macOS builds
+completed, `git diff --check` passed, and the clean-delivery policy included the
+new opt-in test, spec, evidence and traceability updates. Product CLI source was
+unchanged, so the V-35 exhaustive CLI shards and real apt/YUM/DNF/Nginx evidence
+remain the current product-path result rather than being falsely described as
+rerun in this test-only batch. Detailed boundaries are in
+`docs/evidence/2026-07-20-r2-publication-storage-transaction.md` and V-36 of the
+traceability matrix.
+
+After delivery content was frozen, two independent fresh HOME/GOMODCACHE/
+GOCACHE reconstructions used only the local read-only Go module download cache
+and returned exactly:
+
+```text
+PRODUCT_SOURCE_SHA256=d975501e4d745f02fedb43ce78efd4e574c1c9cf940e71f625b9dfa4330a171a
+PRODUCT_SOURCE_FILES=540
+DELIVERY_CONTENT_SHA256=2bf0b7e677329d0f630227eda4db98f1b911aa007ec3e8fda74078e5d1fec404
+DELIVERY_FILES=705
+ARCHIVE_SHA256=3fa221b3c5d92e0a12a302c9013b9506ae47b0f96ffb459cd5b0cd7dd34898a0
+```
+
+Archives:
+
+- `/tmp/sow-clean-delivery-r2-publication-v37-hardened-a-20260720/sow-delivery-2bf0b7e677329d0f.tgz`
+- `/tmp/sow-clean-delivery-r2-publication-v37-hardened-b-20260720/sow-delivery-2bf0b7e677329d0f.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This is the current V-14/V-37 delivery identity. It does
+not upgrade real Worker/CDN/purge/provider-log evidence, real COS/EdgeOne,
+production migration or operational metrics; the long-term Goal remains
+active.

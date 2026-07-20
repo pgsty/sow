@@ -244,14 +244,14 @@ func exerciseRealCloudR2StorageProtocol(
 		return "", errors.Join(staleDeleteErr, getErr, errors.New("R2 conditional-delete probe returned an indeterminate result"))
 	}
 
-	if err := cleanupRealCloudR2OwnedObject(ctx, client, owned, leaseKey, objectKey); err != nil {
+	if err := cleanupRealCloudR2OwnedObject(ctx, client, owned, leaseKey, objectKey, nil); err != nil {
 		return "", fmt.Errorf("R2 identity-bound unconditional cleanup of CAS winner: %w", err)
 	}
 	customDomainAfterDelete, err := exerciseRealCloudR2CustomDomainDataPlane(ctx, realCloudProviderHTTPClient(), environment, objectKey, winner.body, winner.etag, false)
 	if err != nil {
 		return "", fmt.Errorf("R2 main/beta custom-domain post-delete observation: %w", err)
 	}
-	if err := cleanupRealCloudR2OwnedObject(ctx, client, owned, leaseKey, leaseKey); err != nil {
+	if err := cleanupRealCloudR2OwnedObject(ctx, client, owned, leaseKey, leaseKey, nil); err != nil {
 		return "", fmt.Errorf("R2 identity-bound unconditional cleanup of acceptance lease: %w", err)
 	}
 
@@ -666,6 +666,7 @@ func cleanupRealCloudR2OwnedObject(
 	client *publish.R2CloudflareControlHTTP,
 	owned realCloudR2OwnedObjects,
 	leaseKey, key string,
+	authorize func(string, publish.ObjectInfo) error,
 ) error {
 	first, exists, err := proveRealCloudR2OwnedObject(ctx, client, owned, key)
 	if err != nil {
@@ -674,6 +675,7 @@ func cleanupRealCloudR2OwnedObject(
 	if !exists {
 		return nil
 	}
+	deleteIdentity := first
 	if key != leaseKey {
 		if _, exists, err := proveRealCloudR2OwnedObject(ctx, client, owned, leaseKey); err != nil || !exists {
 			return errors.Join(err, errors.New("run-owned cleanup lease is absent or changed before deletion"))
@@ -681,6 +683,12 @@ func cleanupRealCloudR2OwnedObject(
 		current, exists, err := proveRealCloudR2OwnedObject(ctx, client, owned, key)
 		if err != nil || !exists || current != first {
 			return errors.Join(err, fmt.Errorf("run-owned object %s changed across its lease proof", key))
+		}
+		deleteIdentity = current
+	}
+	if authorize != nil {
+		if err := authorize(key, deleteIdentity); err != nil {
+			return fmt.Errorf("authorize identity-bound cleanup for %s: %w", key, err)
 		}
 	}
 	removeErr := client.R2DeleteCheckpointFenced(ctx, key)
@@ -697,6 +705,16 @@ func cleanupRealCloudR2OwnedObject(
 }
 
 func cleanupRealCloudR2OwnedObjects(ctx context.Context, client *publish.R2CloudflareControlHTTP, owned realCloudR2OwnedObjects, leaseKey string) error {
+	return cleanupRealCloudR2OwnedObjectsWithAuthorizer(ctx, client, owned, leaseKey, nil)
+}
+
+func cleanupRealCloudR2OwnedObjectsWithAuthorizer(
+	ctx context.Context,
+	client *publish.R2CloudflareControlHTTP,
+	owned realCloudR2OwnedObjects,
+	leaseKey string,
+	authorize func(string, publish.ObjectInfo) error,
+) error {
 	keys := make([]string, 0, len(owned))
 	for key := range owned {
 		if key != leaseKey {
@@ -706,7 +724,7 @@ func cleanupRealCloudR2OwnedObjects(ctx context.Context, client *publish.R2Cloud
 	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
 	var resultErr error
 	for _, key := range keys {
-		if err := cleanupRealCloudR2OwnedObject(ctx, client, owned, leaseKey, key); err != nil {
+		if err := cleanupRealCloudR2OwnedObject(ctx, client, owned, leaseKey, key, authorize); err != nil {
 			resultErr = errors.Join(resultErr, fmt.Errorf("cleanup %s: %w", key, err))
 		}
 	}
@@ -715,7 +733,7 @@ func cleanupRealCloudR2OwnedObjects(ctx context.Context, client *publish.R2Cloud
 	if resultErr != nil {
 		return resultErr
 	}
-	if err := cleanupRealCloudR2OwnedObject(ctx, client, owned, leaseKey, leaseKey); err != nil {
+	if err := cleanupRealCloudR2OwnedObject(ctx, client, owned, leaseKey, leaseKey, authorize); err != nil {
 		return fmt.Errorf("cleanup lease %s: %w", leaseKey, err)
 	}
 	return resultErr

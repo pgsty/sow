@@ -164,6 +164,12 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   publisher。owner 授权的空非生产 `pro` 桶真实完成首次采纳、幂等重放、CAS 漂移拒绝且
   Git HEAD 不变、精确恢复与身份绑定清理；测试后独立 `rclone` 清单为空。没有 CDN token、
   control-plane/custom-domain 请求或生产写；不关闭 COS/EdgeOne、purge 或完整 POC-06。
+- `2026-07-20-r2-publication-storage-transaction.md`：实际产品 `add/promote/publish/fsck`
+  在 owner 授权的空非生产 `pro` 桶完成 R2 checkpoint/generation、物理 no-op 重放、已发布
+  inventory adoption、full fsck、CAS 漂移拒绝且 Git HEAD 不变、精确恢复与身份绑定清理；
+  测试后独立 `rclone` 清单为空。对象存储与 SigV4/TLS 为真实 R2，purge/CDN 是严格本地
+  adapter，明确没有请求真实 Cloudflare control plane/custom domain，也不关闭 COS/EdgeOne
+  或完整 POC-06。
 - `2026-07-17-builder-handoff.md`：`sow add --expected-object` 把外部 builder
   的 SHA-256/size 声明逐输入绑定到 asset、DEB 与 RPM 的真实 CLI/CAS/Git
   路径；摘要错误在新 CAS/view 写入前拒绝，聚焦 E2E `4.237s` PASS。后续 shared
