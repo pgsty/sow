@@ -27,15 +27,18 @@ YUM compatibility materializer/auditor，以及未使用的测试 helper。保�
 
 - 删除 42 个不可达声明和整个旧 `internal/cli/yum_compat_verify.go`。
 - 新增 `staticcheck.conf`，保留 `U1000` 与其余正确性检查。
+- GitHub CI 在 Linux/macOS 主矩阵中安装固定 `v0.6.1` 并执行同一默认
+  `staticcheck ./...` 配置；工具安装不污染产品 `go.mod`。
 - 将 Cloudflare 测试凭据哨兵改成明确的 fixture/replace-with 值，使交付秘密扫描不需要例外。
 - 修正 clean-delivery 产品/交付文件集合，纳入最近两项 Cloudflare spec/evidence。
 
 ## Verification
 
 - `staticcheck ./...`
+- 从空 `GOBIN` 以只读本地 module proxy 安装固定 Staticcheck 后重跑同一命令；
+  `go mod tidy -diff` 保持产品模块不变。
 - `go vet ./...`、`go test -run '^$' ./...`、`git diff --check`
 - 六个互斥 `internal/cli` ordinary shard 与六个 race shard。
 - 非 CLI 全包 ordinary/race、nested RPM module test/vet。
 - 四平台 `CGO_ENABLED=0` 静态构建；edge build + 47/47 contract。
 - 七套迁移/回滚门禁；clean-delivery 使用空模块缓存和本机 `file://` module proxy。
-

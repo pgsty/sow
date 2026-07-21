@@ -10,6 +10,9 @@
   auditor；最终补丁删除 768 行旧代码（写入本证据前统计）。
 - `staticcheck.conf` 只豁免 `ST1000/ST1003/ST1005/ST1020` 展示约定；`U1000` 与全部
   正确性检查仍启用，最终 `staticcheck ./...` 退出 0。
+- `.github/workflows/ci.yml` 现在在 Linux/macOS 主矩阵中安装固定 Staticcheck
+  `v0.6.1` 并执行默认配置。固定工具从空 `/tmp` `GOBIN`、只读本地 module proxy
+  安装后实跑通过；工具不进入产品 `go.mod`，`go mod tidy -diff` 仍为空。
 - clean-delivery 高置信秘密扫描发现新 Cloudflare fixture 的字段形状像真实 secret；测试值
   改为 `fixture-*` / `replace-with-*` 哨兵，没有放宽扫描器。
 

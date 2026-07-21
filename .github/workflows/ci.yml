@@ -75,6 +75,11 @@ jobs:
         shell: bash
         run: (cd third_party/cavaliergopher-rpm && go test -count=1 ./...)
       - run: go vet ./...
+      - name: Staticcheck production and test reachability
+        shell: bash
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.6.1
+          "$(go env GOPATH)/bin/staticcheck" ./...
       - name: Legacy physical contract, ledger, adoption rollback, and writer-fence regressions
         if: runner.os == 'Linux'
         shell: bash
