@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -21,11 +23,6 @@ func TestAssetProjectionCompletionPreservesConcurrentIntentReplacement(t *testin
 
 func TestAssetProjectionCompletionRemovesExactIntentAndStages(t *testing.T) {
 	stateRoot, intent := writeTestAssetProjectionIntent(t)
-	for _, relative := range []string{intent.StageRelative, intent.ConfigStage} {
-		if err := os.WriteFile(filepath.Join(stateRoot, relative), []byte("frozen"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
 	if err := removeAssetProjectionIntent(stateRoot, intent); err != nil {
 		t.Fatalf("remove exact asset projection intent: %v", err)
 	}
@@ -36,7 +33,57 @@ func TestAssetProjectionCompletionRemovesExactIntentAndStages(t *testing.T) {
 	}
 }
 
+func TestAssetProjectionCompletionPreservesConcurrentStageReplacement(t *testing.T) {
+	stateRoot, intent := writeTestAssetProjectionIntent(t)
+	stage := filepath.Join(stateRoot, intent.StageRelative)
+	assertProjectionStageReplacementPreserved(t, stage, func() error {
+		previous := projectionStageCleanupHook
+		projectionStageCleanupHook = func(relative string) error {
+			if relative != intent.StageRelative {
+				return nil
+			}
+			return replaceProjectionStageWithCanary(stage)
+		}
+		t.Cleanup(func() { projectionStageCleanupHook = previous })
+		return removeAssetProjectionIntent(stateRoot, intent)
+	})
+	projectionStageCleanupHook = nil
+}
+
+func TestAssetProjectionCompletionRemovesEmptyExactStage(t *testing.T) {
+	stateRoot, intent := writeTestAssetProjectionIntentWithStage(t, nil)
+	if intent.ManifestSize != 0 {
+		t.Fatalf("empty manifest size=%d", intent.ManifestSize)
+	}
+	if err := removeAssetProjectionIntent(stateRoot, intent); err != nil {
+		t.Fatalf("remove empty exact asset stage: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(stateRoot, intent.StageRelative)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty exact asset stage remains: %v", err)
+	}
+}
+
+func TestAssetProjectionCompletionPreservesDigestMismatchedStage(t *testing.T) {
+	stateRoot, intent := writeTestAssetProjectionIntent(t)
+	stage := filepath.Join(stateRoot, intent.StageRelative)
+	corrupt := bytes.Repeat([]byte("x"), int(intent.ManifestSize))
+	if err := os.WriteFile(stage, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeAssetProjectionIntent(stateRoot, intent); err != nil {
+		t.Fatalf("post-commit mismatched stage cleanup leaked an error: %v", err)
+	}
+	body, err := os.ReadFile(stage)
+	if err != nil || !bytes.Equal(body, corrupt) {
+		t.Fatalf("digest-mismatched stage was deleted or changed body=%q err=%v", body, err)
+	}
+}
+
 func writeTestAssetProjectionIntent(t *testing.T) (string, assetProjectionIntent) {
+	return writeTestAssetProjectionIntentWithStage(t, []byte("owned projection stage"))
+}
+
+func writeTestAssetProjectionIntentWithStage(t *testing.T, stageBody []byte) (string, assetProjectionIntent) {
 	t.Helper()
 	stateRoot := t.TempDir()
 	transactionID := strings.Repeat("1", 32)
@@ -58,6 +105,13 @@ func writeTestAssetProjectionIntent(t *testing.T) (string, assetProjectionIntent
 		TargetSHA256: strings.Repeat("5", 64), ManifestSHA256: strings.Repeat("6", 64),
 		StageRelative: assetProjectionStagePrefix + transactionID + ".tsv",
 	}
+	configBody := []byte("frozen projection config")
+	stageDigest := sha256.Sum256(stageBody)
+	configDigest := sha256.Sum256(configBody)
+	intent.ManifestSHA256 = hex.EncodeToString(stageDigest[:])
+	intent.ManifestSize = int64(len(stageBody))
+	intent.ConfigSHA256 = hex.EncodeToString(configDigest[:])
+	intent.ConfigSize = int64(len(configBody))
 	intent.ID, err = assetProjectionIntentID(intent)
 	if err != nil {
 		t.Fatal(err)
@@ -65,10 +119,44 @@ func writeTestAssetProjectionIntent(t *testing.T) (string, assetProjectionIntent
 	if err := writeAssetProjectionIntent(stateRoot, intent); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(stateRoot, intent.StageRelative), stageBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateRoot, intent.ConfigStage), configBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	return stateRoot, intent
 }
 
 func TestPackageProjectionCompletionPreservesConcurrentIntentReplacement(t *testing.T) {
+	stateRoot, intent := writeTestCompletedPackageProjection(t)
+	assertProjectionIntentReplacementPreserved(t, stateRoot, packageProjectionIntentRelative, func() error {
+		return removePackageProjectionIntent(stateRoot, intent)
+	})
+}
+
+func TestPackageProjectionCompletionPreservesConcurrentStageReplacement(t *testing.T) {
+	stateRoot, intent := writeTestCompletedPackageProjection(t)
+	if len(intent.Units) != 1 {
+		t.Fatalf("package projection units=%d", len(intent.Units))
+	}
+	stage := filepath.Join(stateRoot, intent.Units[0].StageRelative)
+	previous := projectionStageCleanupHook
+	projectionStageCleanupHook = func(relative string) error {
+		if relative != intent.Units[0].StageRelative {
+			return nil
+		}
+		return replaceProjectionStageWithCanary(stage)
+	}
+	t.Cleanup(func() { projectionStageCleanupHook = previous })
+	assertProjectionStageReplacementPreserved(t, stage, func() error {
+		return removePackageProjectionIntent(stateRoot, intent)
+	})
+	projectionStageCleanupHook = nil
+}
+
+func writeTestCompletedPackageProjection(t *testing.T) (string, packageProjectionIntent) {
+	t.Helper()
 	root, configPath, packagePath, keyPath := preparePackageNoopDEB(t)
 	previousMutation := packageProjectionMutationHook
 	packageProjectionMutationHook = func(phase string) error {
@@ -95,9 +183,7 @@ func TestPackageProjectionCompletionPreservesConcurrentIntentReplacement(t *test
 	if _, err := ensurePackageProjectionCanonical(t.Context(), cfg, state.New(stateRoot), intent); err != nil {
 		t.Fatalf("complete replacement-boundary canonical transaction: %v", err)
 	}
-	assertProjectionIntentReplacementPreserved(t, stateRoot, packageProjectionIntentRelative, func() error {
-		return removePackageProjectionIntent(stateRoot, intent)
-	})
+	return stateRoot, intent
 }
 
 func assertProjectionIntentReplacementPreserved(t *testing.T, stateRoot, relative string, remove func() error) {
@@ -128,4 +214,26 @@ func assertProjectionIntentReplacementPreserved(t *testing.T, stateRoot, relativ
 		t.Fatalf("test did not retain the original intent: %v", statErr)
 	}
 	projectionIntentRemovalHook = nil
+}
+
+func replaceProjectionStageWithCanary(path string) error {
+	if err := os.Rename(path, path+".test-original"); err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte("foreign stage replacement must survive"), 0o600)
+}
+
+func assertProjectionStageReplacementPreserved(t *testing.T, path string, remove func() error) {
+	t.Helper()
+	if err := remove(); err != nil {
+		t.Fatalf("post-commit projection cleanup leaked an error: %v", err)
+	}
+	want := []byte("foreign stage replacement must survive")
+	body, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(body, want) {
+		t.Fatalf("projection cleanup deleted or changed replacement body=%q err=%v", body, err)
+	}
+	if _, err := os.Lstat(path + ".test-original"); err != nil {
+		t.Fatalf("test did not retain original projection stage: %v", err)
+	}
 }

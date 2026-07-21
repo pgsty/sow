@@ -633,11 +633,11 @@ func removePackageProjectionIntent(stateRoot string, intent packageProjectionInt
 	}
 	removed := false
 	for _, unit := range intent.Units {
-		if err := os.Remove(filepath.Join(stateRoot, unit.StageRelative)); err == nil {
+		if exact, _ := removeExactProjectionStage(stateRoot, unit.StageRelative, unit.ManifestSize, unit.ManifestSHA256); exact {
 			removed = true
 		}
 	}
-	if err := os.Remove(filepath.Join(stateRoot, intent.ConfigStage)); err == nil {
+	if exact, _ := removeExactProjectionStage(stateRoot, intent.ConfigStage, intent.ConfigSize, intent.ConfigSHA256); exact {
 		removed = true
 	}
 	if removed {

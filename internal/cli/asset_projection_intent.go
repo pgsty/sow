@@ -36,6 +36,7 @@ var assetProjectionMutationHook func(string) error
 // validating a durable projection intent and committing its removal. The
 // pathname remains production state; only this callback is test-only.
 var projectionIntentRemovalHook func(string) error
+var projectionStageCleanupHook func(string) error
 
 type assetProjectionIntent struct {
 	Schema          string                          `json:"schema"`
@@ -278,14 +279,12 @@ func removeAssetProjectionIntent(stateRoot string, intent assetProjectionIntent)
 	}); err != nil {
 		return err
 	}
-	stage := filepath.Join(stateRoot, intent.StageRelative)
-	if err := os.Remove(stage); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if err := os.Remove(filepath.Join(stateRoot, intent.ConfigStage)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return syncLocalDirectory(stateRoot)
+	// Intent removal is the completion commit. Stage/config cleanup is exact,
+	// private garbage collection; a mismatch remains for --recover and must not
+	// turn the completed projection back into a reported transaction failure.
+	_, _ = removeExactProjectionStage(stateRoot, intent.StageRelative, intent.ManifestSize, intent.ManifestSHA256)
+	_, _ = removeExactProjectionStage(stateRoot, intent.ConfigStage, intent.ConfigSize, intent.ConfigSHA256)
+	return nil
 }
 
 func decodeAssetProjectionIntent(body []byte) (assetProjectionIntent, error) {

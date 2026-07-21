@@ -2,9 +2,12 @@ package cli
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 
@@ -42,6 +45,70 @@ func removeExactProjectionIntent(stateRoot, relative string, maximum int64, vali
 		return err
 	}
 	defer directory.Close()
+	return commitExactProjectionStateRemoval(root, directory, file, identity, relative, func() error {
+		lastBody, readErr := readExactOpenProjectionIntent(file, identity, maximum)
+		if readErr != nil || !bytes.Equal(body, lastBody) {
+			return errors.Join(readErr, errors.New("projection intent bytes changed before completion commit"))
+		}
+		return nil
+	})
+}
+
+func removeExactProjectionStage(stateRoot, relative string, expectedSize int64, expectedSHA256 string) (bool, error) {
+	if filepath.Base(relative) != relative || relative == "." || relative == "" ||
+		expectedSize < 0 || expectedSize == math.MaxInt64 || !validMaterializationTrustSHA256(expectedSHA256) {
+		return false, errors.New("projection stage cleanup capability is invalid")
+	}
+	root, err := os.OpenRoot(stateRoot)
+	if err != nil {
+		return false, err
+	}
+	defer root.Close()
+	if _, err := root.Lstat(relative); errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	file, identity, err := bindExactProjectionStage(root, relative, expectedSize)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	firstDigest, err := hashExactOpenProjectionStage(file, identity, expectedSize, expectedSHA256)
+	if err != nil {
+		return false, err
+	}
+	current, err := root.Lstat(relative)
+	if err != nil || !os.SameFile(identity, current) {
+		return false, errors.Join(err, errors.New("projection stage coordinate changed while hashing"))
+	}
+	if projectionStageCleanupHook != nil {
+		if err := projectionStageCleanupHook(relative); err != nil {
+			return false, err
+		}
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return false, err
+	}
+	defer directory.Close()
+	err = commitExactProjectionStateRemoval(root, directory, file, identity, relative, func() error {
+		lastDigest, verifyErr := hashExactOpenProjectionStage(file, identity, expectedSize, expectedSHA256)
+		if verifyErr != nil || firstDigest != lastDigest {
+			return errors.Join(verifyErr, errors.New("projection stage bytes changed before cleanup commit"))
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func commitExactProjectionStateRemoval(root *os.Root, directory, file *os.File, identity os.FileInfo, relative string, verify func() error) error {
+	if root == nil || directory == nil || file == nil || identity == nil || verify == nil {
+		return errors.New("projection state removal binding is incomplete")
+	}
 	nonce, err := state.NewTransactionID()
 	if err != nil {
 		return err
@@ -54,7 +121,7 @@ func removeExactProjectionIntent(stateRoot, relative string, maximum int64, vali
 		restoreErr := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), quarantine, relative)
 		syncErr := directory.Sync()
 		if restoreErr != nil {
-			return errors.Join(cause, restoreErr, syncErr, fmt.Errorf("projection intent replacement retained at %s", quarantine))
+			return errors.Join(cause, restoreErr, syncErr, fmt.Errorf("projection state replacement retained at %s", quarantine))
 		}
 		return errors.Join(cause, syncErr)
 	}
@@ -63,22 +130,58 @@ func removeExactProjectionIntent(stateRoot, relative string, maximum int64, vali
 	if lstatErr != nil || statErr != nil || quarantined == nil || opened == nil ||
 		quarantined.Mode()&os.ModeSymlink != 0 || !quarantined.Mode().IsRegular() ||
 		!os.SameFile(identity, quarantined) || !os.SameFile(identity, opened) {
-		return restore(errors.Join(lstatErr, statErr, errors.New("projection intent changed before completion commit")))
+		return restore(errors.Join(lstatErr, statErr, errors.New("projection state file changed before removal commit")))
 	}
-	lastBody, readErr := readExactOpenProjectionIntent(file, identity, maximum)
-	if readErr != nil || !bytes.Equal(body, lastBody) {
-		return restore(errors.Join(readErr, errors.New("projection intent bytes changed before completion commit")))
+	if err := verify(); err != nil {
+		return restore(err)
 	}
 	if err := directory.Sync(); err != nil {
-		return restore(fmt.Errorf("sync projection intent completion commit: %w", err))
+		return restore(fmt.Errorf("sync projection state removal commit: %w", err))
 	}
-	// The preceding directory sync is the completion commit. A later failure
-	// can only leave a private, recognizable residue for --recover; it must not
-	// turn a completed transaction back into a reported transaction failure.
+	// The preceding directory sync commits disappearance of the exact file. A
+	// later failure can only leave a private, recognizable --recover residue.
 	if err := root.Remove(quarantine); err == nil {
 		_ = directory.Sync()
 	}
 	return nil
+}
+
+func bindExactProjectionStage(root *os.Root, relative string, expectedSize int64) (*os.File, os.FileInfo, error) {
+	before, err := root.Lstat(relative)
+	if err != nil || !privateExactProjectionStage(before, expectedSize) {
+		return nil, nil, errors.Join(err, errors.New("projection stage is not an exact private regular file"))
+	}
+	file, err := root.Open(relative)
+	if err != nil {
+		return nil, nil, err
+	}
+	opened, statErr := file.Stat()
+	current, lstatErr := root.Lstat(relative)
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		!os.SameFile(before, opened) || !os.SameFile(before, current) ||
+		!privateExactProjectionStage(opened, expectedSize) || !privateExactProjectionStage(current, expectedSize) {
+		file.Close()
+		return nil, nil, errors.Join(statErr, lstatErr, errors.New("projection stage changed while binding its inode"))
+	}
+	return file, opened, nil
+}
+
+func hashExactOpenProjectionStage(file *os.File, identity os.FileInfo, expectedSize int64, expectedSHA256 string) ([sha256.Size]byte, error) {
+	var result [sha256.Size]byte
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return result, err
+	}
+	hasher := sha256.New()
+	written, readErr := io.CopyBuffer(hasher, io.LimitReader(file, expectedSize+1), make([]byte, 256*1024))
+	after, statErr := file.Stat()
+	copy(result[:], hasher.Sum(nil))
+	if readErr != nil || statErr != nil || after == nil || written != expectedSize ||
+		!os.SameFile(identity, after) || after.Size() != identity.Size() ||
+		!after.ModTime().Equal(identity.ModTime()) || after.Mode() != identity.Mode() ||
+		hex.EncodeToString(result[:]) != expectedSHA256 {
+		return result, errors.Join(readErr, statErr, errors.New("projection stage differs from its frozen identity"))
+	}
+	return result, nil
 }
 
 func bindExactProjectionIntent(root *os.Root, relative string, maximum int64) (*os.File, os.FileInfo, []byte, error) {
@@ -134,4 +237,9 @@ func readExactOpenProjectionIntent(file *os.File, identity os.FileInfo, maximum 
 func privateExactProjectionIntent(info os.FileInfo, maximum int64) bool {
 	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() &&
 		info.Mode().Perm()&0o077 == 0 && info.Size() > 0 && info.Size() <= maximum
+}
+
+func privateExactProjectionStage(info os.FileInfo, expectedSize int64) bool {
+	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() &&
+		info.Mode().Perm()&0o077 == 0 && info.Size() == expectedSize
 }

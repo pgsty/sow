@@ -157,6 +157,7 @@ docs/evidence/2026-07-20-yum-compatibility-bound-cutover-recovery.md
 docs/evidence/2026-07-22-materialization-target-hostability-preflight.md
 docs/evidence/2026-07-22-materialize-temporary-cleanup-identity.md
 docs/evidence/2026-07-22-projection-intent-removal-identity.md
+docs/evidence/2026-07-22-projection-stage-cleanup-identity.md
 docs/evidence/2026-07-22-reconcile-prune-identity.md
 docs/evidence/2026-07-22-upstream-proof-order-determinism.md
 docs/evidence/README.md
