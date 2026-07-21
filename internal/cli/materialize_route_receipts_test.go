@@ -199,6 +199,81 @@ func TestMaterializeRouteReceiptCommitCrashRecoversBeforeSelectedSetCleanup(t *t
 	}
 }
 
+func TestMaterializePreflightsSymlinkedRepositoryRootBeforeMutation(t *testing.T) {
+	root, configPath := newAssetMaterializeHardeningFixture(t)
+	const destination = "mutable/payload.bin"
+	addAssetMaterializeFixture(t, configPath, destination, "latest payload that must not be installed after failed preflight\n", false)
+	runCLISuccessForTest(t, "promote", "beta", "latest", "--config", configPath, "--repo", "asset")
+
+	canonical := state.New(filepath.Join(root, ".sow"))
+	headBefore, err := canonical.HeadHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workingPath := filepath.Join(root, "asset", filepath.FromSlash(destination))
+	if _, err := os.Lstat(workingPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("working payload unexpectedly exists before materialize: %v", err)
+	}
+
+	tmpInfo, err := os.Lstat("/tmp")
+	if err != nil || tmpInfo.Mode()&os.ModeSymlink == 0 {
+		t.Skip("platform /tmp is not a symlink")
+	}
+	aliasRoot := filepath.Join("/tmp", filepath.Base(root))
+	resolvedAlias, err := filepath.EvalSymlinks(aliasRoot)
+	if err != nil || filepath.Clean(resolvedAlias) != filepath.Clean(root) {
+		t.Fatalf("test /tmp alias does not resolve to repository root alias=%s resolved=%s root=%s err=%v", aliasRoot, resolvedAlias, root, err)
+	}
+	var stdout, stderr bytes.Buffer
+	err = runMaterialize(t.Context(), []string{
+		"latest", "--config", filepath.Join(aliasRoot, "sow.yaml"), "--repo", "asset", "--workers", "1", "--chunk-entries", "1",
+	}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "preflight directly hostable materialization target") || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlinked repository root was not rejected before materialization err=%v stdout=%s stderr=%s", err, stdout.String(), stderr.String())
+	}
+
+	headAfter, err := canonical.HeadHash()
+	if err != nil || headAfter != headBefore {
+		t.Fatalf("failed root preflight advanced canonical HEAD %s -> %s err=%v", headBefore, headAfter, err)
+	}
+	if _, err := os.Lstat(workingPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed root preflight installed working payload: %v", err)
+	}
+	if _, exists, err := readMaterializationSelectionJournal(filepath.Join(root, ".sow")); err != nil || exists {
+		t.Fatalf("failed root preflight created selected-set journal exists=%t err=%v", exists, err)
+	}
+	if incomplete, err := canonical.IncompleteTransactions(); err != nil || len(incomplete) != 0 {
+		t.Fatalf("failed root preflight created canonical transaction=%v err=%v", incomplete, err)
+	}
+}
+
+func TestMaterializeHostabilityPreflightAllowsMissingTargetBelowSafeAncestor(t *testing.T) {
+	root := nginxWorkerTempDir(t)
+	target := filepath.Join(root, "not-created", "nested", "export")
+	if err := preflightMaterializedRouteTargetHostability(target); err != nil {
+		t.Fatalf("missing target below safe ancestor was rejected: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "not-created")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only hostability preflight created target state: %v", err)
+	}
+}
+
+func TestMaterializeHostabilityPreflightRejectsSymlinkAncestor(t *testing.T) {
+	root := nginxWorkerTempDir(t)
+	realParent := filepath.Join(root, "real-parent")
+	if err := os.Mkdir(realParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias-parent")
+	if err := os.Symlink(filepath.Base(realParent), alias); err != nil {
+		t.Fatal(err)
+	}
+	err := preflightMaterializedRouteTargetHostability(filepath.Join(alias, "future-export"))
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("symlinked target ancestor was admitted: %v", err)
+	}
+}
+
 func TestMaterializeRouteReceiptRejectsStrayFileInsteadOfCanonizingIt(t *testing.T) {
 	root, configPath := newAssetMaterializeHardeningFixture(t)
 	addAssetMaterializeFixture(t, configPath, "payload.bin", "route receipt exact payload\n", false)

@@ -2136,3 +2136,43 @@ archive digest above. This validation ledger remains outside both manifests,
 so recording V-58 does not perturb the identity it records. No Cloudflare,
 CO/COS, EdgeOne or production repository was read or written. V-58 closes the
 local V-57 delivery gate only; the long-term Goal remains active.
+
+## 2026-07-22 V-60 materialization target hostability delivery
+
+V-60 supersedes V-58 after `sow materialize` was changed to reject a
+non-hostable target path before the state lock, selected-set journal, payload
+installation or canonical commit. The real macOS `/tmp` symlink regression now
+leaves HEAD, the working tree and recovery state unchanged, while a missing
+target below a safe existing ancestor remains a valid first export.
+
+Focused ordinary/race, all materialize ordinary/race, final G-M ordinary/race,
+vet, Staticcheck, a real asset CLI/CAS-hardlink smoke and clean-delivery policy
+passed. External network and all real-cloud opt-ins remained disabled.
+
+After the spec, traceability row, dated evidence and delivery allowlist were
+frozen, two isolated clean deliveries used only the local read-only module
+download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /private/tmp/sow-v60-materialize-preflight-final-c-20260722
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /private/tmp/sow-v60-materialize-preflight-final-d-20260722
+
+PRODUCT_SOURCE_SHA256=64e682ffeb2b12e41a1871ac3f6ebd01821e6603acb0e38be36583c6980a971e
+PRODUCT_SOURCE_FILES=547
+DELIVERY_CONTENT_SHA256=ea3d9adb9e34767674c5009fe23eb66c3be725820b364d786a5770e94d4dbc27
+DELIVERY_FILES=739
+ARCHIVE_SHA256=ab4fb9ab0f8b2a7aaffe2cd1a337ccfa4d406141cd02a3f6b32c7852ee474797
+```
+
+Archives:
+
+- `/private/tmp/sow-v60-materialize-preflight-final-c-20260722/sow-delivery-ea3d9adb9e347676.tgz`
+- `/private/tmp/sow-v60-materialize-preflight-final-d-20260722/sow-delivery-ea3d9adb9e347676.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This validation ledger remains outside both manifests,
+so recording V-60 does not perturb the identity it records. No Cloudflare,
+CO/COS, EdgeOne or production repository was read or written. V-60 closes the
+local V-59 delivery gate only; the long-term Goal remains active.

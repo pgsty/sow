@@ -456,5 +456,10 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   官方 SDK/签名协议夹具覆盖分页、逐对象读取与前后 TOCTOU bracket；但当前 exact
   non-production registry 仍为空，且未运行真实云或 provider logs，因此 PoC 仍受阻，
   不能升级为通过。
+- `2026-07-22-materialization-target-hostability-preflight.md`：真实 macOS `/tmp`
+  symlink 路径曾在 payload/HEAD/journal 改写后才被 Nginx route receipt 拒绝；V-59
+  将只读 hostability 检查前移到 state lock 之前，允许安全的缺失目标，并保留
+  capability-bound 末端校验。聚焦、全部 materialize、G-M ordinary/race 与真实
+  asset CLI/CAS hardlink 闭环通过；不替代云/CDN 或生产迁移证据。
 
 这些文件分别证明不同层；不得把任一子系统的 50k 结果替代真实双云/CDN PoC。

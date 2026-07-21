@@ -1061,6 +1061,44 @@ type boundMaterializedRouteTarget struct {
 	identity os.FileInfo
 }
 
+// preflightMaterializedRouteTargetHostability validates the deepest existing
+// ancestor of a target that materialization may create. It is deliberately
+// read-only and runs before any state or payload mutation. Missing descendants
+// are allowed because the installer creates them with the product-owned public
+// directory policy; the completed target is capability-bound and revalidated
+// by openBoundMaterializedRouteTarget before a receipt can be committed.
+func preflightMaterializedRouteTargetHostability(targetPath string) error {
+	abs, err := filepath.Abs(filepath.Clean(targetPath))
+	if err != nil {
+		return err
+	}
+	current := abs
+	for {
+		info, err := os.Lstat(current)
+		switch {
+		case err == nil:
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("materialization target existing ancestor %s is a symlink; Nginx routes require a real symlink-free directory chain", current)
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("materialization target existing ancestor %s is not a directory", current)
+			}
+			if err := serving.ValidateWorkerTraversableAbsoluteDirectory(current); err != nil {
+				return fmt.Errorf("materialization target existing ancestor %s is not a symlink-free Nginx-worker traversable directory: %w", current, err)
+			}
+			return nil
+		case errors.Is(err, os.ErrNotExist):
+			parent := filepath.Dir(current)
+			if parent == current {
+				return errors.New("materialization target has no existing directory ancestor")
+			}
+			current = parent
+		default:
+			return fmt.Errorf("inspect materialization target existing ancestor %s: %w", current, err)
+		}
+	}
+}
+
 func openBoundMaterializedRouteTarget(target string) (*boundMaterializedRouteTarget, error) {
 	abs, err := filepath.Abs(filepath.Clean(target))
 	if err != nil {

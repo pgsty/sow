@@ -161,6 +161,13 @@ func runMaterialize(ctx context.Context, args []string, stdout, stderr io.Writer
 	if err != nil {
 		return withExitCode(ExitConfig, "%v", err)
 	}
+	// Exact local route receipts make every materialization target an Nginx
+	// serving root. Reject an existing symlink/private/non-directory ancestor
+	// before acquiring the state lock or creating a selected-set journal. The
+	// retained-root admission after installation remains the TOCTOU fence.
+	if err := preflightMaterializedRouteTargetHostability(targetAbs); err != nil {
+		return withExitCode(ExitVerification, "preflight directly hostable materialization target: %v", err)
+	}
 	lock, err := state.AcquireLock(cfg.StatePath(), "materialize", values.recover)
 	if err != nil {
 		return withExitCode(ExitConflict, "%v", err)

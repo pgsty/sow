@@ -7,6 +7,7 @@ _bmad-output/implementation-artifacts/spec-dead-code-static-analysis-closure.md
 _bmad-output/implementation-artifacts/spec-full-provider-checkpoint-fenced-delete.md
 _bmad-output/implementation-artifacts/spec-gc-provenance-canonical-identity.md
 _bmad-output/implementation-artifacts/spec-local-serving-atomic-parent-rollback.md
+_bmad-output/implementation-artifacts/spec-materialization-target-hostability-preflight.md
 _bmad-output/implementation-artifacts/spec-offline-archive-preintent-cleanup-failure.md
 _bmad-output/implementation-artifacts/spec-reachable-history-config-memory-bound.md
 _bmad-output/implementation-artifacts/spec-real-r2-publication-storage-transaction.md
@@ -153,6 +154,7 @@ docs/evidence/2026-07-20-reachable-history-config-memory-bound.md
 docs/evidence/2026-07-20-retained-yum-authority-and-verifier-credential.md
 docs/evidence/2026-07-20-static-provider-attestation.md
 docs/evidence/2026-07-20-yum-compatibility-bound-cutover-recovery.md
+docs/evidence/2026-07-22-materialization-target-hostability-preflight.md
 docs/evidence/README.md
 docs/examples/sow-pgdg.yaml
 docs/migration/audit-legacy-targets.sh
