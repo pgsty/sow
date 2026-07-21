@@ -1922,59 +1922,331 @@ func writeChannelSource(cfg *config.Config, target string, channel pub.ChannelSt
 	return filepath.ToSlash(filepath.Join(".sow", stateRelative)), body, nil
 }
 
-func writeDerivedStateFile(stateRoot, relative string, body []byte) error {
+var derivedStateWriteHook func(string) error
+var derivedStateBeforeInstallHook func(string) error
+var derivedStateAfterVerifyHook func(string) error
+
+func isDerivedStateTemporaryName(name, canonical string) bool {
+	suffix, ok := strings.CutPrefix(name, canonical)
+	if !ok || suffix == "" {
+		return false
+	}
+	if index := strings.Index(suffix, ".tmp-remove-"); index >= 0 {
+		if !exactLowerHex(suffix[index+len(".tmp-remove-"):], 32) {
+			return false
+		}
+		suffix = suffix[:index]
+	}
+	if value, ok := strings.CutPrefix(suffix, ".tmp-install-"); ok {
+		return exactLowerHex(value, 32)
+	}
+	if value, ok := strings.CutPrefix(suffix, ".tmp-"); ok {
+		return exactLowerHex(value, 16, 32)
+	}
+	return false
+}
+
+func exactLowerHex(value string, lengths ...int) bool {
+	validLength := false
+	for _, length := range lengths {
+		if len(value) == length {
+			validLength = true
+			break
+		}
+	}
+	if !validLength {
+		return false
+	}
+	for _, current := range []byte(value) {
+		if (current < '0' || current > '9') && (current < 'a' || current > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr error) {
 	if relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return errors.New("unsafe derived state path")
+	}
+	expectedDigest := sha256.Sum256(body)
+	expectedSize := len(body)
+	stateRoot, err := filepath.Abs(stateRoot)
+	if err != nil {
+		return err
+	}
+	rootBefore, err := os.Lstat(stateRoot)
+	if err != nil || rootBefore.Mode()&os.ModeSymlink != 0 || !rootBefore.IsDir() {
+		return errors.Join(err, errors.New("derived state root is not a real directory"))
 	}
 	root, err := os.OpenRoot(stateRoot)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
+	rootIdentity, err := root.Stat(".")
+	if err != nil || rootIdentity == nil || !os.SameFile(rootBefore, rootIdentity) {
+		return errors.Join(err, errors.New("derived state root changed while binding"))
+	}
+	if err := verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity); err != nil {
+		return err
+	}
 	directory := filepath.Dir(relative)
 	if err := root.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
 	prefix := ""
+	var directoryIdentity os.FileInfo
 	for _, component := range strings.Split(directory, string(filepath.Separator)) {
 		prefix = filepath.Join(prefix, component)
 		info, err := root.Lstat(prefix)
 		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return errors.Join(err, fmt.Errorf("derived state directory %s is not a real directory", prefix))
 		}
+		directoryIdentity = info
 	}
-	digest := sha256.Sum256(body)
-	temporary := relative + ".tmp-" + hex.EncodeToString(digest[:8])
-	_ = root.Remove(temporary)
-	file, err := root.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	parent, err := root.OpenRoot(directory)
 	if err != nil {
 		return err
+	}
+	defer parent.Close()
+	directoryHandle, err := bindDerivedStateDirectory(root, parent, directory, directoryIdentity)
+	if err != nil {
+		return err
+	}
+	defer directoryHandle.Close()
+	nonce, err := state.NewTransactionID()
+	if err != nil {
+		return err
+	}
+	destination := filepath.Base(relative)
+	temporary := destination + ".tmp-" + nonce
+	file, err := parent.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	identity, err := file.Stat()
+	if err != nil || identity == nil || identity.Mode()&os.ModeSymlink != 0 || !identity.Mode().IsRegular() || identity.Mode().Perm()&0o077 != 0 {
+		file.Close()
+		return errors.Join(err, errors.New("derived state temporary is not a private regular file"))
 	}
 	committed := false
 	defer func() {
 		if !committed {
-			file.Close()
-			_ = root.Remove(temporary)
+			cleanupErr := removeExactDerivedStateTemporary(parent, temporary, identity)
+			closeErr := file.Close()
+			if errors.Is(closeErr, os.ErrClosed) {
+				closeErr = nil
+			}
+			if closeErr != nil || cleanupErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("clean failed derived state temporary: %w", errors.Join(closeErr, cleanupErr)))
+			}
 		}
 	}()
-	if _, err := file.Write(body); err != nil {
-		return err
+	if derivedStateWriteHook != nil {
+		if err := derivedStateWriteHook(filepath.Join(directory, temporary)); err != nil {
+			return err
+		}
+	}
+	written, err := file.Write(body)
+	if err != nil || written != expectedSize {
+		return errors.Join(err, errors.New("derived state temporary write was incomplete"))
 	}
 	if err := file.Sync(); err != nil {
 		return err
 	}
-	if err := file.Close(); err != nil {
+	after, statErr := file.Stat()
+	current, lstatErr := parent.Lstat(temporary)
+	if statErr != nil || lstatErr != nil || after == nil || current == nil ||
+		!os.SameFile(identity, after) || !os.SameFile(identity, current) || after.Size() != int64(expectedSize) {
+		return errors.Join(statErr, lstatErr, errors.New("derived state temporary changed while writing"))
+	}
+	identity = after
+	if derivedStateBeforeInstallHook != nil {
+		if err := derivedStateBeforeInstallHook(filepath.Join(directory, temporary)); err != nil {
+			return err
+		}
+	}
+	if err := errors.Join(
+		verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
+		verifyBoundDerivedStateDirectory(root, directoryHandle, directory, directoryIdentity),
+	); err != nil {
 		return err
 	}
-	if err := root.Rename(temporary, relative); err != nil {
+	installed, err := installExactDerivedStateTemporary(parent, directoryHandle, file, identity, expectedDigest, temporary, destination)
+	committed = installed
+	return errors.Join(
+		err,
+		verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
+		verifyBoundDerivedStateDirectory(root, directoryHandle, directory, directoryIdentity),
+	)
+}
+
+func verifyBoundDerivedStateRoot(root *os.Root, path string, expected os.FileInfo) error {
+	if root == nil || path == "" || expected == nil {
+		return errors.New("derived state root verification binding is invalid")
+	}
+	opened, statErr := root.Stat(".")
+	current, lstatErr := os.Lstat(path)
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		opened.Mode()&os.ModeSymlink != 0 || current.Mode()&os.ModeSymlink != 0 ||
+		!opened.IsDir() || !current.IsDir() ||
+		!os.SameFile(expected, opened) || !os.SameFile(expected, current) ||
+		opened.Mode() != expected.Mode() || current.Mode() != expected.Mode() {
+		return errors.Join(statErr, lstatErr, errors.New("derived state root coordinate changed"))
+	}
+	return nil
+}
+
+func bindDerivedStateDirectory(root, parent *os.Root, relative string, expected os.FileInfo) (*os.File, error) {
+	if root == nil || parent == nil || expected == nil || relative == "" || !expected.IsDir() || expected.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("derived state directory binding is invalid")
+	}
+	directory, err := parent.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyBoundDerivedStateDirectory(root, directory, relative, expected); err != nil {
+		directory.Close()
+		return nil, err
+	}
+	return directory, nil
+}
+
+func verifyBoundDerivedStateDirectory(root *os.Root, directory *os.File, relative string, expected os.FileInfo) error {
+	if root == nil || directory == nil || expected == nil || relative == "" {
+		return errors.New("derived state directory verification binding is invalid")
+	}
+	opened, statErr := directory.Stat()
+	current, lstatErr := root.Lstat(relative)
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		opened.Mode()&os.ModeSymlink != 0 || current.Mode()&os.ModeSymlink != 0 ||
+		!opened.IsDir() || !current.IsDir() ||
+		!os.SameFile(expected, opened) || !os.SameFile(expected, current) ||
+		opened.Mode() != expected.Mode() || current.Mode() != expected.Mode() {
+		return errors.Join(statErr, lstatErr, errors.New("derived state directory coordinate changed"))
+	}
+	return nil
+}
+
+func installExactDerivedStateTemporary(parent *os.Root, directory, file *os.File, expected os.FileInfo, expectedDigest [sha256.Size]byte, source, destination string) (bool, error) {
+	if parent == nil || directory == nil || file == nil || expected == nil ||
+		filepath.Base(source) != source || filepath.Base(destination) != destination || source == destination || source == "" || destination == "" {
+		return false, errors.New("derived state install binding is invalid")
+	}
+	nonce, err := state.NewTransactionID()
+	if err != nil {
+		return false, err
+	}
+	isolation := destination + ".tmp-install-" + nonce
+	if err := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), source, isolation); err != nil {
+		return false, err
+	}
+	restore := func(cause error) (bool, error) {
+		restoreErr := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), isolation, source)
+		syncErr := directory.Sync()
+		if restoreErr != nil {
+			return false, errors.Join(cause, restoreErr, syncErr, fmt.Errorf("derived state install candidate retained at %s", isolation))
+		}
+		return false, errors.Join(cause, syncErr)
+	}
+	isolated, lstatErr := parent.Lstat(isolation)
+	opened, statErr := file.Stat()
+	if lstatErr != nil || statErr != nil || isolated == nil || opened == nil ||
+		isolated.Mode()&os.ModeSymlink != 0 || !isolated.Mode().IsRegular() ||
+		!os.SameFile(expected, isolated) || !os.SameFile(expected, opened) ||
+		opened.Size() != expected.Size() || opened.Mode() != expected.Mode() || !opened.ModTime().Equal(expected.ModTime()) {
+		return restore(errors.Join(lstatErr, statErr, errors.New("derived state install candidate changed before publication")))
+	}
+	if err := verifyExactDerivedStateBytes(file, expected, expectedDigest); err != nil {
+		return restore(err)
+	}
+	if derivedStateAfterVerifyHook != nil {
+		if err := derivedStateAfterVerifyHook(isolation); err != nil {
+			return restore(err)
+		}
+	}
+	isolated, lstatErr = parent.Lstat(isolation)
+	opened, statErr = file.Stat()
+	if lstatErr != nil || statErr != nil || isolated == nil || opened == nil ||
+		isolated.Mode()&os.ModeSymlink != 0 || !isolated.Mode().IsRegular() ||
+		!os.SameFile(expected, isolated) || !os.SameFile(expected, opened) ||
+		opened.Size() != expected.Size() || opened.Mode() != expected.Mode() || !opened.ModTime().Equal(expected.ModTime()) {
+		return restore(errors.Join(lstatErr, statErr, errors.New("derived state install candidate changed after verification")))
+	}
+	if err := verifyExactDerivedStateBytes(file, expected, expectedDigest); err != nil {
+		return restore(err)
+	}
+	if err := parent.Rename(isolation, destination); err != nil {
+		return restore(err)
+	}
+	installed, lstatErr := parent.Lstat(destination)
+	opened, statErr = file.Stat()
+	verifyErr := verifyExactDerivedStateBytes(file, expected, expectedDigest)
+	closeErr := file.Close()
+	if lstatErr != nil || statErr != nil || installed == nil || opened == nil ||
+		!os.SameFile(expected, installed) || !os.SameFile(expected, opened) || verifyErr != nil || closeErr != nil {
+		return true, errors.Join(lstatErr, statErr, verifyErr, closeErr, errors.New("derived state destination changed during installation"))
+	}
+	return true, directory.Sync()
+}
+
+func verifyExactDerivedStateBytes(file *os.File, expected os.FileInfo, expectedDigest [sha256.Size]byte) error {
+	if file == nil || expected == nil || expected.Size() < 0 {
+		return errors.New("derived state byte verification binding is invalid")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	committed = true
-	directoryHandle, err := root.Open(directory)
+	hasher := sha256.New()
+	written, readErr := io.CopyBuffer(hasher, io.LimitReader(file, expected.Size()+1), make([]byte, 256*1024))
+	after, statErr := file.Stat()
+	var actual [sha256.Size]byte
+	copy(actual[:], hasher.Sum(nil))
+	if readErr != nil || statErr != nil || after == nil || written != expected.Size() || actual != expectedDigest ||
+		!os.SameFile(expected, after) || after.Size() != expected.Size() ||
+		after.Mode() != expected.Mode() || !after.ModTime().Equal(expected.ModTime()) {
+		return errors.Join(readErr, statErr, errors.New("derived state install candidate bytes changed before publication"))
+	}
+	return nil
+}
+
+func removeExactDerivedStateTemporary(parent *os.Root, name string, expected os.FileInfo) error {
+	if parent == nil || expected == nil || filepath.Base(name) != name || name == "" || name == "." {
+		return errors.New("derived state temporary cleanup binding is invalid")
+	}
+	current, err := parent.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
+		current.Mode().Perm()&0o077 != 0 || !os.SameFile(expected, current) {
+		return errors.Join(err, errors.New("derived state temporary was replaced; refuse cleanup"))
+	}
+	file, err := parent.Open(name)
 	if err != nil {
 		return err
 	}
-	return errors.Join(directoryHandle.Sync(), directoryHandle.Close())
+	defer file.Close()
+	opened, statErr := file.Stat()
+	current, lstatErr := parent.Lstat(name)
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		!os.SameFile(expected, opened) || !os.SameFile(expected, current) {
+		return errors.Join(statErr, lstatErr, errors.New("derived state temporary changed before cleanup"))
+	}
+	directory, err := parent.Open(".")
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return commitExactPrivateStateFileRemoval(parent, directory, file, expected, name, func() error {
+		after, err := file.Stat()
+		if err != nil || after == nil || !os.SameFile(expected, after) ||
+			after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() || after.Mode().Perm()&0o077 != 0 {
+			return errors.Join(err, errors.New("derived state temporary changed during cleanup"))
+		}
+		return nil
+	})
 }
 
 func hashReader(reader io.ReadCloser) (string, error) {

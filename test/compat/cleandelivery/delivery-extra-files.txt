@@ -4,6 +4,7 @@ _bmad-output/implementation-artifacts/spec-cloudflare-static-entitlement-bootstr
 _bmad-output/implementation-artifacts/spec-config-cardinality-complexity-bounds.md
 _bmad-output/implementation-artifacts/spec-config-input-and-rpm-provenance-hardening.md
 _bmad-output/implementation-artifacts/spec-dead-code-static-analysis-closure.md
+_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md
 _bmad-output/implementation-artifacts/spec-full-provider-checkpoint-fenced-delete.md
 _bmad-output/implementation-artifacts/spec-gc-provenance-canonical-identity.md
 _bmad-output/implementation-artifacts/spec-local-serving-atomic-parent-rollback.md
@@ -154,6 +155,7 @@ docs/evidence/2026-07-20-reachable-history-config-memory-bound.md
 docs/evidence/2026-07-20-retained-yum-authority-and-verifier-credential.md
 docs/evidence/2026-07-20-static-provider-attestation.md
 docs/evidence/2026-07-20-yum-compatibility-bound-cutover-recovery.md
+docs/evidence/2026-07-22-derived-state-residue-removal-identity.md
 docs/evidence/2026-07-22-materialization-target-hostability-preflight.md
 docs/evidence/2026-07-22-materialize-temporary-cleanup-identity.md
 docs/evidence/2026-07-22-projection-intent-removal-identity.md

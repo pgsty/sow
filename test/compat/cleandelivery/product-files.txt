@@ -78,6 +78,7 @@ internal/cli/asset_projection_test.go
 internal/cli/audit_fixes_test.go
 internal/cli/catalog.go
 internal/cli/config_complexity_test.go
+internal/cli/derived_state_recovery_contract_test.go
 internal/cli/edge_contract.go
 internal/cli/edge_contract_test.go
 internal/cli/errors.go

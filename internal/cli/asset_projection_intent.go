@@ -37,6 +37,7 @@ var assetProjectionMutationHook func(string) error
 // pathname remains production state; only this callback is test-only.
 var projectionIntentRemovalHook func(string) error
 var projectionStageCleanupHook func(string) error
+var projectionResidueCleanupHook func(string) error
 
 type assetProjectionIntent struct {
 	Schema          string                          `json:"schema"`
@@ -324,14 +325,11 @@ func cleanupAssetProjectionIntentResidue(stateRoot string, recover bool) error {
 		if !recover {
 			return errors.New("interrupted pending asset projection residue requires --recover")
 		}
-		info, err := os.Lstat(filepath.Join(stateRoot, name))
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		exact, err := removeExactProjectionResidue(stateRoot, name)
+		if err != nil {
 			return errors.Join(err, fmt.Errorf("unsafe pending asset projection residue %s", name))
 		}
-		if err := os.Remove(filepath.Join(stateRoot, name)); err != nil {
-			return err
-		}
-		removed = true
+		removed = removed || exact
 	}
 	if removed {
 		return syncLocalDirectory(stateRoot)

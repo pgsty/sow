@@ -21,3 +21,23 @@
   evidence: `applyDefaults` copies repo arches/components into matching upstreams and uses repeated linear membership checks, allowing a syntactically sub-limit config to drive superlinear CPU and multiplicative canonical memory.
   status: resolved
   resolution: Review loop 1 replaced the invalid flat-count candidate with independent pre-default ceilings of 65,536 structural work units and 64 MiB derived string bytes, plus indexed/one-pass validation and projection paths. The corrected source passed two clean adversarial reviews, all 707 CLI ordinary/race tests, all non-CLI ordinary/race packages, static/module/provenance/vulnerability/build gates, seven migration suites and the V-43 dual clean-delivery reconstruction. See `_bmad-output/implementation-artifacts/spec-config-cardinality-complexity-bounds.md`, `docs/adr/0040-bounded-configuration-topology.md`, and `docs/evidence/2026-07-20-config-topology-complexity-bound.md`.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md`
+  summary: Non-journal derived-state consumers need a generic scanner and recovery contract for random write, install-isolation, and removal-quarantine residues.
+  evidence: `writeDerivedStateFile` also writes generated publish sources, completion receipts, projection configuration stages, and serving journals outside the three strict journal directories fixed by V-75; a crash can leave a safe but currently unaudited random residue in those locations.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md`
+  summary: Offline-archive projection temporary cleanup still needs exact-inode deletion instead of a pathname check followed by pathname removal.
+  evidence: `cleanupOfflineArchiveProjectionIntentTemps` in `internal/cli/offline_archive_projection_intent.go` retains the pre-existing `Lstat(path) -> os.Remove(path)` race and can delete a replacement after validation.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md`
+  summary: Shared derived-state directory creation needs a recursively durable mkdir protocol.
+  evidence: `writeDerivedStateFile` uses `Root.MkdirAll` and fsyncs only the leaf after file installation; transaction-specific callers sometimes pre-create and fsync one parent, but arbitrary newly created ancestor entries are not generically proven durable.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md`
+  summary: Canonical derived-state replacement needs an explicit committed-versus-rolled-back result for destination and fsync failures.
+  evidence: The pre-existing final rename model can return a directory-sync error after the exact new destination is already installed; the error-only API cannot distinguish rollback-safe failure from a committed state that must be replayed, and it does not preserve a prior destination for rollback.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md`
+  summary: Derived-state admission should freeze directory ownership/writeability and reject foreign hardlink aliases when the threat model includes same-host hostile writers.
+  evidence: Root and leaf identity checks reject coordinate replacement but do not reject group/other-writable directories or require link count one, so another principal with write access could retain an alias and mutate the installed inode after verification.

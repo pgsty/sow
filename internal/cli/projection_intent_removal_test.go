@@ -237,3 +237,76 @@ func assertProjectionStageReplacementPreserved(t *testing.T, path string, remove
 		t.Fatalf("test did not retain original projection stage: %v", err)
 	}
 }
+
+func TestAssetProjectionRecoveryPreservesConcurrentResidueReplacement(t *testing.T) {
+	stateRoot := t.TempDir()
+	name := assetProjectionStagePrefix + strings.Repeat("7", 32) + ".tsv"
+	assertProjectionResidueReplacementPreserved(t, stateRoot, name, func() error {
+		return cleanupAssetProjectionIntentResidue(stateRoot, true)
+	})
+}
+
+func TestPackageProjectionRecoveryPreservesConcurrentResidueReplacement(t *testing.T) {
+	stateRoot := t.TempDir()
+	name := packageProjectionStagePrefix + strings.Repeat("8", 32) + "-000.tsv"
+	assertProjectionResidueReplacementPreserved(t, stateRoot, name, func() error {
+		return cleanupPackageProjectionIntentResidue(stateRoot, true)
+	})
+}
+
+func TestProjectionRecoveryRemovesExactEmptyResidues(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		relative string
+		cleanup  func(string) error
+	}{
+		{
+			name: "asset", relative: assetProjectionStagePrefix + strings.Repeat("9", 32) + ".tsv",
+			cleanup: func(root string) error { return cleanupAssetProjectionIntentResidue(root, true) },
+		},
+		{
+			name: "package", relative: packageProjectionStagePrefix + strings.Repeat("a", 32) + "-000.tsv",
+			cleanup: func(root string) error { return cleanupPackageProjectionIntentResidue(root, true) },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stateRoot := t.TempDir()
+			path := filepath.Join(stateRoot, tc.relative)
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.cleanup(stateRoot); err != nil {
+				t.Fatalf("remove exact empty projection residue: %v", err)
+			}
+			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("exact empty projection residue remains: %v", err)
+			}
+		})
+	}
+}
+
+func assertProjectionResidueReplacementPreserved(t *testing.T, stateRoot, name string, cleanup func() error) {
+	t.Helper()
+	path := filepath.Join(stateRoot, name)
+	if err := os.WriteFile(path, []byte("owned orphan residue"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := projectionResidueCleanupHook
+	projectionResidueCleanupHook = func(relative string) error {
+		if relative != name {
+			return nil
+		}
+		return replaceProjectionStageWithCanary(path)
+	}
+	t.Cleanup(func() { projectionResidueCleanupHook = previous })
+	err := cleanup()
+	if err == nil {
+		t.Fatal("projection recovery accepted a replacement residue pathname")
+	}
+	want := []byte("foreign stage replacement must survive")
+	body, readErr := os.ReadFile(path)
+	if readErr != nil || !bytes.Equal(body, want) {
+		t.Fatalf("projection recovery deleted or changed replacement body=%q err=%v", body, readErr)
+	}
+	projectionResidueCleanupHook = nil
+}

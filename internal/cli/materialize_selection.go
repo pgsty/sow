@@ -38,7 +38,6 @@ const (
 var materializationOperationPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
 var materializationCommitPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var materializationUnitKindPattern = regexp.MustCompile(`^(apt|yum|yum-compat|asset|serving)$`)
-var materializationJournalTempPattern = regexp.MustCompile(`^active\.json\.tmp-[0-9a-f]{16}$`)
 
 type materializationSelectionKeyring struct {
 	Repo   string `json:"repo"`
@@ -1101,7 +1100,7 @@ func readMaterializationSelectionJournal(stateRoot string) (materializationSelec
 			active = true
 			continue
 		}
-		if materializationJournalTempPattern.MatchString(entry.Name()) {
+		if isDerivedStateTemporaryName(entry.Name(), "active.json") {
 			return journal, false, errors.New("interrupted materialization journal write requires --recover")
 		}
 		return journal, false, fmt.Errorf("unsafe materialization journal entry %q", entry.Name())
@@ -1159,17 +1158,14 @@ func cleanupMaterializationSelectionJournalTemps(stateRoot string) error {
 	}
 	removed := false
 	for _, entry := range entries {
-		if !materializationJournalTempPattern.MatchString(entry.Name()) {
+		if !isDerivedStateTemporaryName(entry.Name(), "active.json") {
 			continue
 		}
-		info, err := os.Lstat(filepath.Join(directory, entry.Name()))
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || info.Size() > materializationSelectionJournalMaxBytes {
+		exact, err := removeExactProjectionResidueBounded(directory, entry.Name(), materializationSelectionJournalMaxBytes)
+		if err != nil {
 			return errors.Join(err, fmt.Errorf("unsafe materialization journal temporary %q", entry.Name()))
 		}
-		if err := os.Remove(filepath.Join(directory, entry.Name())); err != nil {
-			return err
-		}
-		removed = true
+		removed = removed || exact
 	}
 	if removed {
 		return syncLocalDirectory(directory)

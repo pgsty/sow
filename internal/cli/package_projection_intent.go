@@ -473,14 +473,11 @@ func cleanupPackageProjectionIntentResidue(stateRoot string, recover bool) error
 		if !recover {
 			return errors.New("interrupted pending package projection residue requires --recover")
 		}
-		info, err := os.Lstat(filepath.Join(stateRoot, name))
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		exact, err := removeExactProjectionResidue(stateRoot, name)
+		if err != nil {
 			return errors.Join(err, errors.New("unsafe pending package projection residue"))
 		}
-		if err := os.Remove(filepath.Join(stateRoot, name)); err != nil {
-			return err
-		}
-		removed = true
+		removed = removed || exact
 	}
 	if removed {
 		return syncLocalDirectory(stateRoot)

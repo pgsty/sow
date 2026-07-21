@@ -29,7 +29,6 @@ const (
 
 var (
 	localServingRemovalNamePattern = regexp.MustCompile(`^[0-9a-f]{32}\.json$`)
-	localServingRemovalTempPattern = regexp.MustCompile(`^[0-9a-f]{32}\.json\.tmp-[0-9a-f]{16}$`)
 )
 
 type localServingRemovalPhase string
@@ -400,22 +399,25 @@ func cleanupLocalServingRemovalTemps(stateRoot string) error {
 	}
 	removed := false
 	for _, entry := range entries {
-		if !localServingRemovalTempPattern.MatchString(entry.Name()) {
+		if !isLocalServingRemovalTemporaryName(entry.Name()) {
 			continue
 		}
-		info, err := os.Lstat(filepath.Join(directory, entry.Name()))
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > localServingRemovalLimit {
+		exact, err := removeExactProjectionResidueBounded(directory, entry.Name(), localServingRemovalLimit)
+		if err != nil {
 			return errors.Join(err, fmt.Errorf("unsafe local serving removal temporary entry %q", entry.Name()))
 		}
-		if err := os.Remove(filepath.Join(directory, entry.Name())); err != nil {
-			return err
-		}
-		removed = true
+		removed = removed || exact
 	}
 	if removed {
 		return syncLocalDirectory(directory)
 	}
 	return nil
+}
+
+func isLocalServingRemovalTemporaryName(name string) bool {
+	const canonicalBytes = 32 + len(".json")
+	return len(name) > canonicalBytes && localServingRemovalNamePattern.MatchString(name[:canonicalBytes]) &&
+		isDerivedStateTemporaryName(name, name[:canonicalBytes])
 }
 
 func requireNoLocalServingTopologyRemovals(stateRoot string) error {

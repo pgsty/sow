@@ -34,7 +34,6 @@ const localServingCanonicalManifestMaxBytes = 1 << 30
 
 var (
 	localServingJournalNamePattern = regexp.MustCompile(`^[0-9a-f]{32}\.json$`)
-	localServingJournalTempPattern = regexp.MustCompile(`^[0-9a-f]{32}\.json\.tmp-[0-9a-f]{16}$`)
 )
 
 type localServingPhase string
@@ -1541,22 +1540,25 @@ func cleanupLocalServingJournalTemps(stateRoot string) error {
 	}
 	removed := false
 	for _, entry := range entries {
-		if !localServingJournalTempPattern.MatchString(entry.Name()) {
+		if !isLocalServingJournalTemporaryName(entry.Name()) {
 			continue
 		}
-		info, err := os.Lstat(filepath.Join(directory, entry.Name()))
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > localServingJournalMaxBytes {
+		exact, err := removeExactProjectionResidueBounded(directory, entry.Name(), localServingJournalMaxBytes)
+		if err != nil {
 			return errors.Join(err, fmt.Errorf("unsafe local serving journal temporary entry %q", entry.Name()))
 		}
-		if err := os.Remove(filepath.Join(directory, entry.Name())); err != nil {
-			return err
-		}
-		removed = true
+		removed = removed || exact
 	}
 	if removed {
 		return syncLocalDirectory(directory)
 	}
 	return nil
+}
+
+func isLocalServingJournalTemporaryName(name string) bool {
+	const canonicalBytes = 32 + len(".json")
+	return len(name) > canonicalBytes && localServingJournalNamePattern.MatchString(name[:canonicalBytes]) &&
+		isDerivedStateTemporaryName(name, name[:canonicalBytes])
 }
 
 func requireNoLocalServingTransactions(stateRoot string) error {

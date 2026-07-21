@@ -1,6 +1,10 @@
 package cli
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,6 +55,284 @@ func TestDerivedPublicationStateRejectsSymlinkAndReplaysAtomically(t *testing.T)
 	if _, err := os.Stat(filepath.Join(other, "channel.json")); !os.IsNotExist(err) {
 		t.Fatalf("symlink escape wrote outside state root: %v", err)
 	}
+}
+
+func TestDerivedStateWritePreservesLegacyDeterministicTemporary(t *testing.T) {
+	stateRoot := t.TempDir()
+	relative := filepath.Join("generated", "channel.json")
+	body := []byte("new derived state")
+	if err := os.MkdirAll(filepath.Join(stateRoot, "generated"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(body)
+	legacy := filepath.Join(stateRoot, relative+".tmp-"+hex.EncodeToString(digest[:8]))
+	canary := []byte("foreign deterministic temporary")
+	if err := os.WriteFile(legacy, canary, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDerivedStateFile(stateRoot, relative, body); err != nil {
+		t.Fatalf("write derived state beside legacy temporary: %v", err)
+	}
+	current, err := os.ReadFile(legacy)
+	if err != nil || !bytes.Equal(current, canary) {
+		t.Fatalf("derived write deleted or changed legacy temporary body=%q err=%v", current, err)
+	}
+}
+
+func TestDerivedStateWriteFailureCleanupPreservesConcurrentReplacement(t *testing.T) {
+	stateRoot := t.TempDir()
+	relative := filepath.Join("generated", "channel.json")
+	if err := os.MkdirAll(filepath.Join(stateRoot, "generated"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var temporary string
+	canary := []byte("foreign temporary replacement")
+	previous := derivedStateWriteHook
+	derivedStateWriteHook = func(current string) error {
+		temporary = filepath.Join(stateRoot, current)
+		if err := os.Rename(temporary, temporary+".test-original"); err != nil {
+			return err
+		}
+		if err := os.WriteFile(temporary, canary, 0o600); err != nil {
+			return err
+		}
+		return errors.New("inject derived state write failure")
+	}
+	t.Cleanup(func() { derivedStateWriteHook = previous })
+	err := writeDerivedStateFile(stateRoot, relative, []byte("body"))
+	if err == nil {
+		t.Fatal("injected derived state write failure unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "temporary was replaced") {
+		t.Fatalf("derived state cleanup failure was not reported: %v", err)
+	}
+	current, err := os.ReadFile(temporary)
+	if err != nil || !bytes.Equal(current, canary) {
+		t.Fatalf("failure cleanup deleted or changed replacement body=%q err=%v", current, err)
+	}
+	derivedStateWriteHook = nil
+}
+
+func TestDerivedStateWriteFailureCleansExactTemporary(t *testing.T) {
+	stateRoot := t.TempDir()
+	var temporary string
+	previous := derivedStateWriteHook
+	derivedStateWriteHook = func(current string) error {
+		temporary = filepath.Join(stateRoot, current)
+		return errors.New("inject exact derived state cleanup")
+	}
+	t.Cleanup(func() { derivedStateWriteHook = previous })
+	if err := writeDerivedStateFile(stateRoot, filepath.Join("generated", "channel.json"), []byte("body")); err == nil {
+		t.Fatal("injected exact derived state failure unexpectedly succeeded")
+	}
+	if _, err := os.Lstat(temporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("exact derived state temporary remains after cleanup: %v", err)
+	}
+	derivedStateWriteHook = nil
+}
+
+func TestDerivedStateWriteInstallFailureCleansExactTemporary(t *testing.T) {
+	stateRoot := t.TempDir()
+	directory := filepath.Join(stateRoot, "generated")
+	destination := filepath.Join(directory, "channel.json")
+	if err := os.MkdirAll(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeDerivedStateFile(stateRoot, filepath.Join("generated", "channel.json"), []byte("body")); err == nil {
+		t.Fatal("derived state file unexpectedly replaced a destination directory")
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "channel.json.tmp-") {
+			t.Fatalf("derived state install failure retained temporary %s", entry.Name())
+		}
+	}
+	info, err := os.Stat(destination)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("derived state install failure changed destination directory: %v", err)
+	}
+}
+
+func TestDerivedStateWriteRefusesConcurrentTemporaryReplacementBeforeInstall(t *testing.T) {
+	stateRoot := t.TempDir()
+	relative := filepath.Join("generated", "channel.json")
+	destination := filepath.Join(stateRoot, relative)
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	prior := []byte("prior canonical state")
+	if err := os.WriteFile(destination, prior, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var temporary string
+	canary := []byte("foreign install replacement")
+	previous := derivedStateBeforeInstallHook
+	derivedStateBeforeInstallHook = func(current string) error {
+		temporary = filepath.Join(stateRoot, current)
+		if err := os.Rename(temporary, temporary+".test-original"); err != nil {
+			return err
+		}
+		return os.WriteFile(temporary, canary, 0o600)
+	}
+	t.Cleanup(func() { derivedStateBeforeInstallHook = previous })
+	if err := writeDerivedStateFile(stateRoot, relative, []byte("new canonical state")); err == nil {
+		t.Fatal("derived state writer installed a replacement temporary")
+	}
+	current, err := os.ReadFile(destination)
+	if err != nil || !bytes.Equal(current, prior) {
+		t.Fatalf("derived state destination changed body=%q err=%v", current, err)
+	}
+	replacement, err := os.ReadFile(temporary)
+	if err != nil || !bytes.Equal(replacement, canary) {
+		t.Fatalf("derived state replacement was deleted or changed body=%q err=%v", replacement, err)
+	}
+	derivedStateBeforeInstallHook = nil
+}
+
+func TestDerivedStateWriteRefusesInPlaceMutationWithRestoredMetadata(t *testing.T) {
+	stateRoot := t.TempDir()
+	relative := filepath.Join("generated", "channel.json")
+	destination := filepath.Join(stateRoot, relative)
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	prior := []byte("prior canonical state")
+	if err := os.WriteFile(destination, prior, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("new canonical state")
+	previous := derivedStateBeforeInstallHook
+	derivedStateBeforeInstallHook = func(current string) error {
+		temporary := filepath.Join(stateRoot, current)
+		identity, err := os.Stat(temporary)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(temporary, bytes.Repeat([]byte{'x'}, len(body)), 0o600); err != nil {
+			return err
+		}
+		return os.Chtimes(temporary, identity.ModTime(), identity.ModTime())
+	}
+	t.Cleanup(func() { derivedStateBeforeInstallHook = previous })
+	if err := writeDerivedStateFile(stateRoot, relative, body); err == nil {
+		t.Fatal("derived state writer installed in-place mutated bytes with restored metadata")
+	}
+	current, err := os.ReadFile(destination)
+	if err != nil || !bytes.Equal(current, prior) {
+		t.Fatalf("derived state destination changed body=%q err=%v", current, err)
+	}
+	derivedStateBeforeInstallHook = nil
+}
+
+func TestDerivedStateWriteFreezesExpectedBodyBeforeHooks(t *testing.T) {
+	stateRoot := t.TempDir()
+	relative := filepath.Join("generated", "channel.json")
+	destination := filepath.Join(stateRoot, relative)
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	prior := []byte("prior canonical state")
+	if err := os.WriteFile(destination, prior, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("new canonical state")
+	mutated := bytes.Repeat([]byte{'m'}, len(body))
+	previous := derivedStateBeforeInstallHook
+	derivedStateBeforeInstallHook = func(current string) error {
+		temporary := filepath.Join(stateRoot, current)
+		identity, err := os.Stat(temporary)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(temporary, mutated, 0o600); err != nil {
+			return err
+		}
+		if err := os.Chtimes(temporary, identity.ModTime(), identity.ModTime()); err != nil {
+			return err
+		}
+		copy(body, mutated)
+		return nil
+	}
+	t.Cleanup(func() { derivedStateBeforeInstallHook = previous })
+	if err := writeDerivedStateFile(stateRoot, relative, body); err == nil {
+		t.Fatal("derived state writer accepted hook-mutated expected bytes")
+	}
+	current, err := os.ReadFile(destination)
+	if err != nil || !bytes.Equal(current, prior) {
+		t.Fatalf("derived state destination changed body=%q err=%v", current, err)
+	}
+	derivedStateBeforeInstallHook = nil
+}
+
+func TestDerivedStateWriteRejectsReplacedParentDirectoryBeforeInstall(t *testing.T) {
+	stateRoot := t.TempDir()
+	directory := filepath.Join(stateRoot, "generated")
+	relative := filepath.Join("generated", "channel.json")
+	destination := filepath.Join(stateRoot, relative)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	prior := []byte("prior canonical state")
+	if err := os.WriteFile(destination, prior, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replacement := []byte("replacement directory state")
+	previous := derivedStateBeforeInstallHook
+	derivedStateBeforeInstallHook = func(string) error {
+		if err := os.Rename(directory, directory+".test-original"); err != nil {
+			return err
+		}
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(destination, replacement, 0o600)
+	}
+	t.Cleanup(func() { derivedStateBeforeInstallHook = previous })
+	if err := writeDerivedStateFile(stateRoot, relative, []byte("new canonical state")); err == nil {
+		t.Fatal("derived state writer accepted a replaced parent directory coordinate")
+	}
+	current, err := os.ReadFile(destination)
+	if err != nil || !bytes.Equal(current, replacement) {
+		t.Fatalf("replacement parent destination changed body=%q err=%v", current, err)
+	}
+	derivedStateBeforeInstallHook = nil
+}
+
+func TestDerivedStateWriteRejectsReplacedStateRootBeforeInstall(t *testing.T) {
+	parent := t.TempDir()
+	stateRoot := filepath.Join(parent, "state")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	relative := "channel.json"
+	destination := filepath.Join(stateRoot, relative)
+	prior := []byte("prior canonical state")
+	if err := os.WriteFile(destination, prior, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replacement := []byte("replacement state root")
+	previous := derivedStateBeforeInstallHook
+	derivedStateBeforeInstallHook = func(string) error {
+		if err := os.Rename(stateRoot, stateRoot+".test-original"); err != nil {
+			return err
+		}
+		if err := os.Mkdir(stateRoot, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(destination, replacement, 0o600)
+	}
+	t.Cleanup(func() { derivedStateBeforeInstallHook = previous })
+	if err := writeDerivedStateFile(stateRoot, relative, []byte("new canonical state")); err == nil {
+		t.Fatal("derived state writer accepted a replaced state root coordinate")
+	}
+	current, err := os.ReadFile(destination)
+	if err != nil || !bytes.Equal(current, replacement) {
+		t.Fatalf("replacement state-root destination changed body=%q err=%v", current, err)
+	}
+	derivedStateBeforeInstallHook = nil
 }
 
 func TestProviderBucketBaseURLAndBasicCredentialGate(t *testing.T) {
