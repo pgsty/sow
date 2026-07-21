@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"runtime"
 	"strings"
 
@@ -398,6 +399,10 @@ func addLocalServingGenerationRoots(canonical *state.Store, commit plumbing.Hash
 }
 
 func addLegacyProvenanceRoots(canonical *state.Store, commit plumbing.Hash, canonicalPath string, roots *repository.ReferenceSet) error {
+	expectedRepo, err := canonicalProvenanceLedgerRepo(canonicalPath, "provenance/legacy/")
+	if err != nil {
+		return err
+	}
 	reader, err := canonical.OpenPathAt(commit, canonicalPath)
 	if err != nil {
 		return err
@@ -412,6 +417,9 @@ func addLegacyProvenanceRoots(canonical *state.Store, commit plumbing.Hash, cano
 		if err != nil {
 			return err
 		}
+		if receipt.Repo != expectedRepo {
+			return fmt.Errorf("legacy adoption repo %q differs from canonical ledger repo %q", receipt.Repo, expectedRepo)
+		}
 		digest, err := repository.ParseDigest(receipt.ArtifactSHA256)
 		if err != nil {
 			return err
@@ -423,6 +431,10 @@ func addLegacyProvenanceRoots(canonical *state.Store, commit plumbing.Hash, cano
 }
 
 func validateLegacyIndexPruneLedger(canonical *state.Store, commit plumbing.Hash, canonicalPath string) error {
+	expectedRepo, err := canonicalProvenanceLedgerRepo(canonicalPath, "provenance/legacy-pruned/")
+	if err != nil {
+		return err
+	}
 	reader, err := canonical.OpenPathAt(commit, canonicalPath)
 	if err != nil {
 		return err
@@ -430,12 +442,27 @@ func validateLegacyIndexPruneLedger(canonical *state.Store, commit plumbing.Hash
 	defer reader.Close()
 	ledger := provenance.NewLegacyIndexPruneReader(reader)
 	for {
-		if _, err := ledger.Next(); errors.Is(err, io.EOF) {
+		receipt, err := ledger.Next()
+		if errors.Is(err, io.EOF) {
 			return nil
 		} else if err != nil {
 			return err
 		}
+		if receipt.Repo != expectedRepo {
+			return fmt.Errorf("legacy prune repo %q differs from canonical ledger repo %q", receipt.Repo, expectedRepo)
+		}
 	}
+}
+
+func canonicalProvenanceLedgerRepo(canonicalPath, prefix string) (string, error) {
+	if !strings.HasPrefix(canonicalPath, prefix) || !strings.HasSuffix(canonicalPath, ".jsonl") {
+		return "", fmt.Errorf("canonical provenance ledger path %q has the wrong namespace", canonicalPath)
+	}
+	repo := strings.TrimSuffix(strings.TrimPrefix(canonicalPath, prefix), ".jsonl")
+	if repo == "" || strings.Contains(repo, "/") {
+		return "", fmt.Errorf("canonical provenance ledger path %q does not identify one repo", canonicalPath)
+	}
+	return repo, nil
 }
 
 func isRemoteSourceManifest(canonicalPath string) bool {
@@ -518,6 +545,10 @@ func addProvenanceRoot(canonical *state.Store, commit plumbing.Hash, canonicalPa
 	receipt, err := provenance.Decode(data)
 	if err != nil {
 		return err
+	}
+	expectedPath := path.Join("provenance", receipt.Format, receipt.ArtifactSHA256+".json")
+	if canonicalPath != expectedPath {
+		return fmt.Errorf("canonical provenance path %q differs from receipt identity %q", canonicalPath, expectedPath)
 	}
 	digest, err := repository.ParseDigest(receipt.ArtifactSHA256)
 	if err != nil {

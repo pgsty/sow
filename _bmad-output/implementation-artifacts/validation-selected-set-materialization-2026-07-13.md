@@ -1928,3 +1928,42 @@ archive digest above. This validation ledger remains outside both manifests,
 so recording V-48 does not perturb the identity it records. No Cloudflare,
 CO/COS, EdgeOne or production repository was read or written. V-48 closes the
 local V-47 delivery gate only; the long-term Goal remains active.
+
+## 2026-07-20 V-50 GC provenance canonical identity delivery
+
+V-50 supersedes V-48 after canonical GC root collection bound ordinary
+DEB/RPM receipt format and artifact digest, plus legacy adoption/prune repo
+identity, to the exact Git path carrying the evidence. The exact destructive
+`gc --apply` negative, all 712 CLI tests in six ordinary and six race shards,
+all non-CLI packages ordinary/race, nested RPM tests/provenance/vulnerability,
+compile/vet/Staticcheck, four static cross-builds, 47/47 edge contracts, seven
+hermetic migration suites and all 50k performance gates passed. Real cloud,
+upstream and Docker opt-ins were zero throughout.
+
+After the spec, traceability row, dated evidence and delivery allowlist were
+frozen, two isolated clean deliveries used only the local read-only module
+download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v50-gc-final-a-20260720
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v50-gc-final-b-20260720
+
+PRODUCT_SOURCE_SHA256=e53929a3f6c243bfda2db111d7b25f8c56d75c613d2a8c4998aec029d7efa848
+PRODUCT_SOURCE_FILES=547
+DELIVERY_CONTENT_SHA256=40f5e47d9a16753ddec81cd853ec1cc4468e134522a1c187b444d7579f2cd92e
+DELIVERY_FILES=729
+ARCHIVE_SHA256=95ad6b02a2f0fef86123758aff5e1889f3bad09ca04d84295d7e9ee0b6f8941c
+```
+
+Archives:
+
+- `/tmp/sow-v50-gc-final-a-20260720/sow-delivery-40f5e47d9a16753d.tgz`
+- `/tmp/sow-v50-gc-final-b-20260720/sow-delivery-40f5e47d9a16753d.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This validation ledger remains outside both manifests,
+so recording V-50 does not perturb the identity it records. No Cloudflare,
+CO/COS, EdgeOne or production repository was read or written. V-50 closes the
+local V-49 delivery gate only; the long-term Goal remains active.

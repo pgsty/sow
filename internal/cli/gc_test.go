@@ -11,11 +11,13 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/pgsty/sow/internal/config"
 	"github.com/pgsty/sow/internal/manifest"
+	"github.com/pgsty/sow/internal/provenance"
 	"github.com/pgsty/sow/internal/repository"
 	"github.com/pgsty/sow/internal/state"
 	"github.com/pgsty/sow/internal/views"
@@ -427,5 +429,241 @@ func TestYUMCompatibilityRefCASRootsRejectContentUnboundFrozenReceipt(t *testing
 	}
 	if _, err := addYUMCompatibilityRefCASRoots(fixture.canonical, &repository.ReferenceSet{}); err == nil || !strings.Contains(err.Error(), "package trust bytes changed") {
 		t.Fatalf("content-unbound frozen receipt was admitted as CAS roots: %v", err)
+	}
+}
+
+func TestGCCanonicalProvenanceRootsBindReceiptIdentity(t *testing.T) {
+	root := t.TempDir()
+	pool, err := repository.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	debObject, err := pool.Put(t.Context(), strings.NewReader("gc-deb-provenance-root"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rpmObject, err := pool.Put(t.Context(), strings.NewReader("gc-rpm-provenance-root"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyObject, err := pool.Put(t.Context(), strings.NewReader("gc-legacy-provenance-root"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := pool.Put(t.Context(), strings.NewReader("gc-unreferenced-object"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	observed := time.Date(2026, 7, 20, 1, 2, 3, 0, time.UTC)
+	proofHash := strings.Repeat("1", 64)
+	debReceipt := provenance.NewDEB(debObject.HashString(), debObject.Size, "https://apt.example.invalid/pkg.deb", observed, provenance.DEBProof{
+		PackagesEntrySHA256: proofHash, PackagesEvidenceSHA256: strings.Repeat("2", 64),
+		SignedReleaseSHA256: strings.Repeat("3", 64), SignedReleaseKind: "InRelease",
+	})
+	debBody, err := debReceipt.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rpmReceipt := provenance.Receipt{
+		Schema: provenance.LegacySchema, Format: "rpm", ArtifactSHA256: rpmObject.HashString(), ArtifactSize: rpmObject.Size,
+		UpstreamURL: "https://yum.example.invalid/pkg.rpm", ObservedAt: observed,
+		RPM: &provenance.RPMProof{
+			IndexURL: "https://yum.example.invalid/repodata/primary.xml.gz", IndexSHA256: strings.Repeat("4", 64), IndexSize: 10,
+			OriginalRPMSHA: rpmObject.HashString(), SignaturePolicy: "preserve-upstream",
+		},
+	}
+	rpmBody, err := rpmReceipt.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyReceipt := provenance.LegacyAdoptionReceipt{
+		Schema: provenance.LegacyAdoptionSchema, Format: "asset", Repo: "legacy_assets",
+		SourcePath: "legacy/payload.bin", CanonicalPath: "asset/payload.bin", ArtifactSize: legacyObject.Size,
+		ArtifactSHA256: legacyObject.HashString(), Pool: "public", AdoptedAt: observed, ConfigCommit: strings.Repeat("a", 40),
+	}
+	var legacyBody bytes.Buffer
+	if err := provenance.WriteLegacyAdoption(&legacyBody, legacyReceipt); err != nil {
+		t.Fatal(err)
+	}
+	pruneIdentity := provenance.LegacyIndexPruneIdentity{
+		Repo: "legacy_yum", Path: "yum/legacy/missing.rpm", Name: "missing", Version: "1-1", Arch: "x86_64",
+		ArtifactSize: 99, ArtifactSHA256: strings.Repeat("5", 64),
+	}
+	confirmation, err := provenance.LegacyIndexPruneSetSHA256([]provenance.LegacyIndexPruneIdentity{pruneIdentity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pruneReceipt := provenance.LegacyIndexPruneReceipt{
+		Schema: provenance.LegacyIndexPruneSchema, Repo: pruneIdentity.Repo, Path: pruneIdentity.Path,
+		Name: pruneIdentity.Name, Version: pruneIdentity.Version, Arch: pruneIdentity.Arch,
+		ArtifactSize: pruneIdentity.ArtifactSize, ArtifactSHA256: pruneIdentity.ArtifactSHA256,
+		Reason: "indexed-body-missing", ConfirmationSHA256: confirmation, RecordedAt: observed, BaselineCommit: strings.Repeat("b", 40),
+	}
+	var pruneBody bytes.Buffer
+	if err := provenance.WriteLegacyIndexPrune(&pruneBody, pruneReceipt); err != nil {
+		t.Fatal(err)
+	}
+	staged := map[string]string{}
+	for canonicalPath, body := range map[string][]byte{
+		"provenance/deb/" + debObject.HashString() + ".json": debBody,
+		"provenance/rpm/" + rpmObject.HashString() + ".json": rpmBody,
+		"provenance/legacy/legacy_assets.jsonl":              legacyBody.Bytes(),
+		"provenance/legacy-pruned/legacy_yum.jsonl":          pruneBody.Bytes(),
+	} {
+		filename := filepath.Join(t.TempDir(), filepath.Base(canonicalPath))
+		if err := os.WriteFile(filename, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		staged[canonicalPath] = filename
+	}
+	canonical := state.New(filepath.Join(root, ".sow"))
+	if _, _, err := canonical.InstallPaths(staged, "seed exact provenance GC roots"); err != nil {
+		t.Fatal(err)
+	}
+	roots, files, err := collectCanonicalRoots(t.Context(), canonical, pool, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if files != 4 || roots.Len() != 3 || roots.Count(debObject.SHA256) != 1 || roots.Count(rpmObject.SHA256) != 1 || roots.Count(legacyObject.SHA256) != 1 {
+		t.Fatalf("provenance GC roots files=%d roots=%d deb=%d rpm=%d legacy=%d", files, roots.Len(), roots.Count(debObject.SHA256), roots.Count(rpmObject.SHA256), roots.Count(legacyObject.SHA256))
+	}
+	report, err := pool.Audit(t.Context(), roots)
+	if err != nil || report.Stats.MissingObjects != 0 || report.Stats.OrphanObjects != 1 || len(report.Orphans) != 1 || report.Orphans[0].SHA256 != orphan.SHA256 {
+		t.Fatalf("provenance GC partition=%+v err=%v", report, err)
+	}
+}
+
+func TestGCCanonicalProvenanceRootsRejectPathIdentityMismatch(t *testing.T) {
+	observed := time.Date(2026, 7, 20, 1, 2, 3, 0, time.UTC)
+	artifactSHA := strings.Repeat("a", 64)
+	debReceipt := provenance.NewDEB(artifactSHA, 10, "https://apt.example.invalid/pkg.deb", observed, provenance.DEBProof{
+		PackagesEntrySHA256: strings.Repeat("1", 64), PackagesEvidenceSHA256: strings.Repeat("2", 64),
+		SignedReleaseSHA256: strings.Repeat("3", 64), SignedReleaseKind: "InRelease",
+	})
+	debBody, err := debReceipt.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyReceipt := provenance.LegacyAdoptionReceipt{
+		Schema: provenance.LegacyAdoptionSchema, Format: "asset", Repo: "actual_repo",
+		SourcePath: "legacy/payload.bin", CanonicalPath: "asset/payload.bin", ArtifactSize: 10,
+		ArtifactSHA256: artifactSHA, Pool: "public", AdoptedAt: observed, ConfigCommit: strings.Repeat("b", 40),
+	}
+	var legacyBody bytes.Buffer
+	if err := provenance.WriteLegacyAdoption(&legacyBody, legacyReceipt); err != nil {
+		t.Fatal(err)
+	}
+	pruneIdentity := provenance.LegacyIndexPruneIdentity{
+		Repo: "actual_repo", Path: "yum/legacy/missing.rpm", Name: "missing", Version: "1-1", Arch: "x86_64",
+		ArtifactSize: 10, ArtifactSHA256: artifactSHA,
+	}
+	confirmation, err := provenance.LegacyIndexPruneSetSHA256([]provenance.LegacyIndexPruneIdentity{pruneIdentity})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pruneReceipt := provenance.LegacyIndexPruneReceipt{
+		Schema: provenance.LegacyIndexPruneSchema, Repo: pruneIdentity.Repo, Path: pruneIdentity.Path,
+		Name: pruneIdentity.Name, Version: pruneIdentity.Version, Arch: pruneIdentity.Arch,
+		ArtifactSize: pruneIdentity.ArtifactSize, ArtifactSHA256: pruneIdentity.ArtifactSHA256,
+		Reason: "indexed-body-missing", ConfirmationSHA256: confirmation, RecordedAt: observed, BaselineCommit: strings.Repeat("c", 40),
+	}
+	var pruneBody bytes.Buffer
+	if err := provenance.WriteLegacyIndexPrune(&pruneBody, pruneReceipt); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name          string
+		canonicalPath string
+		body          []byte
+		want          string
+	}{
+		{name: "artifact-digest", canonicalPath: "provenance/deb/" + strings.Repeat("d", 64) + ".json", body: debBody, want: "canonical provenance path"},
+		{name: "artifact-format", canonicalPath: "provenance/rpm/" + artifactSHA + ".json", body: debBody, want: "canonical provenance path"},
+		{name: "legacy-repo", canonicalPath: "provenance/legacy/other_repo.jsonl", body: legacyBody.Bytes(), want: "legacy adoption repo"},
+		{name: "prune-repo", canonicalPath: "provenance/legacy-pruned/other_repo.jsonl", body: pruneBody.Bytes(), want: "legacy prune repo"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			filename := filepath.Join(root, "receipt")
+			if err := os.WriteFile(filename, test.body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			canonical := state.New(filepath.Join(root, ".sow"))
+			if _, _, err := canonical.InstallPaths(map[string]string{test.canonicalPath: filename}, "seed mismatched provenance identity"); err != nil {
+				t.Fatal(err)
+			}
+			pool, err := repository.NewStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := collectCanonicalRoots(t.Context(), canonical, pool, 1); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("mismatched provenance path %s was accepted: %v", test.canonicalPath, err)
+			}
+		})
+	}
+}
+
+func TestGCCLIApplyRejectsMismatchedProvenanceBeforeCASPlanning(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sow.yaml")
+	if err := os.WriteFile(configPath, []byte(testConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := repository.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := pool.Put(t.Context(), strings.NewReader("gc-cli-provenance-artifact"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := pool.Put(t.Context(), strings.NewReader("gc-cli-orphan"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := provenance.NewDEB(artifact.HashString(), artifact.Size, "https://apt.example.invalid/pkg.deb",
+		time.Date(2026, 7, 20, 1, 2, 3, 0, time.UTC), provenance.DEBProof{
+			PackagesEntrySHA256: strings.Repeat("1", 64), PackagesEvidenceSHA256: strings.Repeat("2", 64),
+			SignedReleaseSHA256: strings.Repeat("3", 64), SignedReleaseKind: "InRelease",
+		})
+	body, err := receipt.CanonicalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := filepath.Join(root, "mismatched-receipt.json")
+	if err := os.WriteFile(receiptPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	canonical := state.New(filepath.Join(root, ".sow"))
+	if _, _, err := canonical.InstallPaths(map[string]string{
+		"config/sow.yaml": configPath,
+		"provenance/deb/" + strings.Repeat("f", 64) + ".json": receiptPath,
+	}, "seed mismatched provenance GC state"); err != nil {
+		t.Fatal(err)
+	}
+	// Bind the destructive invocation to the exact plan the old, path-unbound
+	// implementation would have accepted. This makes the negative prove that
+	// identity admission, rather than a stale confirmation, prevents deletion.
+	wouldBeRoots := &repository.ReferenceSet{}
+	if err := wouldBeRoots.Add(artifact); err != nil {
+		t.Fatal(err)
+	}
+	wouldBePlan, err := pool.GC(t.Context(), wouldBeRoots, repository.GCOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wouldBePlan.Report.Orphans) != 1 || wouldBePlan.Report.Orphans[0].SHA256 != orphan.SHA256 {
+		t.Fatalf("unexpected pre-fix deletion plan: %+v", wouldBePlan.Report)
+	}
+	var stdout, stderr bytes.Buffer
+	code := Main([]string{"gc", "--config", configPath, "--apply", "--confirm", wouldBePlan.Report.OrphanSetSHA256}, &stdout, &stderr)
+	if code != ExitVerification || !strings.Contains(stderr.String(), "canonical provenance path") {
+		t.Fatalf("mismatched provenance CLI code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	for _, object := range []repository.Object{artifact, orphan} {
+		if _, err := os.Stat(pool.ObjectPath(object.SHA256)); err != nil {
+			t.Fatalf("failed GC admission changed CAS object %s: %v", object.HashString(), err)
+		}
 	}
 }

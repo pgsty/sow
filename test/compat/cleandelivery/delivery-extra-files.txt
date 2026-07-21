@@ -4,6 +4,7 @@ _bmad-output/implementation-artifacts/spec-cloudflare-static-entitlement-bootstr
 _bmad-output/implementation-artifacts/spec-config-cardinality-complexity-bounds.md
 _bmad-output/implementation-artifacts/spec-config-input-and-rpm-provenance-hardening.md
 _bmad-output/implementation-artifacts/spec-dead-code-static-analysis-closure.md
+_bmad-output/implementation-artifacts/spec-gc-provenance-canonical-identity.md
 _bmad-output/implementation-artifacts/spec-reachable-history-config-memory-bound.md
 _bmad-output/implementation-artifacts/spec-real-r2-publication-storage-transaction.md
 _bmad-output/implementation-artifacts/spec-remote-fsck-storage-only-authority.md
@@ -139,6 +140,7 @@ docs/evidence/2026-07-20-cloudflare-static-entitlement-bootstrap.md
 docs/evidence/2026-07-20-config-input-and-rpm-provenance-hardening.md
 docs/evidence/2026-07-20-config-topology-complexity-bound.md
 docs/evidence/2026-07-20-dead-code-static-analysis-closure.md
+docs/evidence/2026-07-20-gc-provenance-canonical-identity.md
 docs/evidence/2026-07-20-r2-publication-storage-transaction.md
 docs/evidence/2026-07-20-reachable-history-config-memory-bound.md
 docs/evidence/2026-07-20-static-provider-attestation.md

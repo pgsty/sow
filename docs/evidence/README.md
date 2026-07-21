@@ -62,6 +62,11 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
 
 其余证据报告与验收入口如下；每项是否实跑、源码日期及外部边界以自身正文为准：
 
+- `2026-07-20-gc-provenance-canonical-identity.md`：GC 现在把普通 DEB/RPM
+  provenance 的 format/digest 及 legacy adoption/prune 的 repo 与 canonical Git 路径
+  逐条绑定；四类错配在任何 CAS 计划前失败。真实 `gc --apply` 即使收到旧实现会接受的
+  精确删除摘要也退出验证错误并保留全部对象。712 个 CLI ordinary/race、全包静态/
+  迁移/性能与双份 clean-delivery 已通过。仅使用临时 Git/CAS，不触云或生产资源。
 - `2026-07-20-yum-compatibility-bound-cutover-recovery.md`：实际 CLI 使用的锁与
   `os.Root` capability-bound YUM cutover recovery 现在覆盖 S2/S3 半写、孤儿、已提交及
   无 canonical authority 的拒绝路径；post-flip 故障恢复原链接或原缺失状态。709 个 CLI
