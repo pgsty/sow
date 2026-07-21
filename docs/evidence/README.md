@@ -62,6 +62,11 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
 
 其余证据报告与验收入口如下；每项是否实跑、源码日期及外部边界以自身正文为准：
 
+- `2026-07-20-full-provider-checkpoint-fenced-delete.md`：完整
+  `R2CloudflareHTTP`/`COSEdgeOneHTTP` 现由真实 TLS 回环直接证明 checkpoint-fenced
+  DELETE 的精确 key、无伪条件头、两家临时凭据 SigV4、错误分类和非法 key 零请求；三层
+  wrapper coverage 均为 100%，完整 publish ordinary/race 与双份 clean-delivery 通过。
+  仅本地协议证据，不触云且不替代真供应商验收。
 - `2026-07-20-gc-provenance-canonical-identity.md`：GC 现在把普通 DEB/RPM
   provenance 的 format/digest 及 legacy adoption/prune 的 repo 与 canonical Git 路径
   逐条绑定；四类错配在任何 CAS 计划前失败。真实 `gc --apply` 即使收到旧实现会接受的

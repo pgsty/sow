@@ -201,6 +201,91 @@ func TestR2CheckpointFencedDeleteIsExplicitlyUnconditionalAndSigned(t *testing.T
 	}
 }
 
+func TestFullProvidersCheckpointFencedDeleteIsExactSignedAndFailClosed(t *testing.T) {
+	t.Parallel()
+	for _, dialect := range []string{"r2", "cos"} {
+		dialect := dialect
+		t.Run(dialect, func(t *testing.T) {
+			statuses := []int{http.StatusNoContent, http.StatusNotFound, http.StatusPreconditionFailed, http.StatusNotImplemented}
+			var requests atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				index := int(requests.Add(1)) - 1
+				if index >= len(statuses) {
+					t.Errorf("%s checkpoint-fenced delete issued an unexpected request %d", dialect, index+1)
+					writer.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				if request.Method != http.MethodDelete || request.URL.Path != "/bucket/.sow/publication/retired.json" || request.URL.RawQuery != "x-id=DeleteObject" {
+					t.Errorf("unexpected %s checkpoint-fenced request: %s %s", dialect, request.Method, request.URL.String())
+					writer.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if request.Header.Get("If-Match") != "" || request.Header.Get("If-None-Match") != "" {
+					t.Errorf("%s checkpoint-fenced delete advertised a false object precondition: %#v", dialect, request.Header)
+				}
+				authorization := request.Header.Get("Authorization")
+				if !strings.HasPrefix(authorization, "AWS4-HMAC-SHA256 ") || strings.Contains(strings.ToLower(authorization), "if-match") {
+					t.Errorf("%s checkpoint-fenced delete has the wrong SigV4 contract: %q", dialect, authorization)
+				}
+				switch dialect {
+				case "r2":
+					if !strings.Contains(authorization, "Credential=r2-access/") || !strings.Contains(authorization, "/auto/s3/aws4_request") ||
+						request.Header.Get("X-Amz-Security-Token") != "r2-session-token" || request.Header.Get("X-Cos-Security-Token") != "" ||
+						!strings.Contains(authorization, "x-amz-security-token") {
+						t.Errorf("R2 checkpoint-fenced delete lost its exact credential scope: headers=%#v", request.Header)
+					}
+				case "cos":
+					if !strings.Contains(authorization, "Credential=cos-access/") || !strings.Contains(authorization, "/ap-shanghai/s3/aws4_request") ||
+						request.Header.Get("X-Cos-Security-Token") != "cos-session-token" || request.Header.Get("X-Amz-Security-Token") != "" ||
+						!strings.Contains(authorization, "x-cos-security-token") {
+						t.Errorf("COS checkpoint-fenced delete lost its exact credential scope: headers=%#v", request.Header)
+					}
+				}
+				writer.WriteHeader(statuses[index])
+			}))
+			defer server.Close()
+
+			var remove func(context.Context, string) error
+			if dialect == "r2" {
+				provider, err := NewR2CloudflareHTTP(R2CloudflareHTTPConfig{
+					Bucket: "bucket", ObjectBaseURL: server.URL + "/bucket", CDNBaseURL: "https://cdn.example/",
+					Credentials: S3Credentials{AccessKeyID: "r2-access", SecretAccessKey: "r2-secret", SessionToken: "r2-session-token", Region: "auto"},
+					ZoneID:      "zone", APIToken: "cf-token", CloudflareAPIURL: server.URL, Client: server.Client(),
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				remove = provider.R2DeleteCheckpointFenced
+			} else {
+				provider, err := NewCOSEdgeOneHTTP(COSEdgeOneHTTPConfig{
+					Bucket: "bucket", ObjectBaseURL: server.URL + "/bucket", CDNBaseURL: "https://cdn.example/",
+					ObjectCredentials:  S3Credentials{AccessKeyID: "cos-access", SecretAccessKey: "cos-secret", SessionToken: "cos-session-token", Region: "ap-shanghai"},
+					TencentCredentials: TencentCredentials{SecretID: "tc-id", SecretKey: "tc-secret"},
+					ZoneID:             "zone", EdgeOneAPIURL: server.URL, Client: server.Client(), UnversionedBucketConfirmed: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				remove = provider.COSDeleteCheckpointFenced
+			}
+
+			key := ".sow/publication/retired.json"
+			for index, want := range []error{nil, ErrNotFound, ErrConflict, ErrCapability} {
+				err := remove(context.Background(), key)
+				if want == nil && err != nil || want != nil && !errors.Is(err, want) {
+					t.Fatalf("%s checkpoint-fenced response %d err=%v want=%v", dialect, statuses[index], err, want)
+				}
+			}
+			if err := remove(context.Background(), "../escape"); err == nil || !strings.Contains(err.Error(), "invalid checkpoint-fenced") {
+				t.Fatalf("%s checkpoint-fenced delete accepted an unsafe key: %v", dialect, err)
+			}
+			if requests.Load() != int32(len(statuses)) {
+				t.Fatalf("%s checkpoint-fenced delete requests=%d want=%d", dialect, requests.Load(), len(statuses))
+			}
+		})
+	}
+}
+
 func TestCloudflarePurgeResponseLossRequiresExplicitExactReplay(t *testing.T) {
 	t.Parallel()
 	wantURLs := []string{
