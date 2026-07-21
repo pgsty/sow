@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -144,7 +145,10 @@ func (s *candidateStore) add(candidate syncer.Candidate, proof candidateProof) e
 	if prior.Candidate != candidate {
 		return fmt.Errorf("%w: SHA256 %s has multiple identities", ErrConflictingPackage, candidate.SHA256)
 	}
-	preferred := preferredCandidateProof(prior.Proof, proof)
+	preferred, err := preferredCandidateProof(candidate.Format, prior.Proof, proof)
+	if err != nil {
+		return err
+	}
 	if proofsEqual(preferred, prior.Proof) {
 		return nil
 	}
@@ -334,12 +338,37 @@ func decodeCandidateProof(format string, rpm, deb []byte) (candidateProof, error
 	return proof, nil
 }
 
-func preferredCandidateProof(current, candidate candidateProof) candidateProof {
-	if current.deb != nil && candidate.deb != nil &&
-		candidate.deb.PackagesEvidenceSHA256 < current.deb.PackagesEvidenceSHA256 {
-		return candidate
+func preferredCandidateProof(format string, current, candidate candidateProof) (candidateProof, error) {
+	currentRPM, currentDEB, err := encodeCandidateProof(format, current)
+	if err != nil {
+		return candidateProof{}, err
 	}
-	return current
+	candidateRPM, candidateDEB, err := encodeCandidateProof(format, candidate)
+	if err != nil {
+		return candidateProof{}, err
+	}
+	currentCanonical, candidateCanonical := currentRPM, candidateRPM
+	currentRoot, candidateRoot := "", ""
+	if format == "rpm" {
+		currentRoot, candidateRoot = current.rpm.IndexSHA256, candidate.rpm.IndexSHA256
+	} else {
+		currentCanonical, candidateCanonical = currentDEB, candidateDEB
+		currentRoot, candidateRoot = current.deb.PackagesEvidenceSHA256, candidate.deb.PackagesEvidenceSHA256
+	}
+	// Prefer the lexically smallest signed metadata root, preserving the
+	// established APT rule and making RPM duplicates order-independent too.
+	// Equal roots still need a total order: the complete stored JSON proof is
+	// canonical for these map-free structs and closes release/URL tie cases.
+	if candidateRoot < currentRoot {
+		return candidate, nil
+	}
+	if candidateRoot > currentRoot {
+		return current, nil
+	}
+	if bytes.Compare(candidateCanonical, currentCanonical) < 0 {
+		return candidate, nil
+	}
+	return current, nil
 }
 
 func proofsEqual(left, right candidateProof) bool {
