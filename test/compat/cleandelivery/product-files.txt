@@ -150,6 +150,8 @@ internal/cli/package_repository_contract_test.go
 internal/cli/physical_migration_fixture_test.go
 internal/cli/projection_intent_audit.go
 internal/cli/projection_intent_audit_test.go
+internal/cli/projection_intent_removal_test.go
+internal/cli/projection_intent_remove.go
 internal/cli/promote.go
 internal/cli/promote_test.go
 internal/cli/publish.go
@@ -392,6 +394,7 @@ internal/syncer/plan.go
 internal/syncer/syncer_test.go
 internal/upstream/apt.go
 internal/upstream/candidate_store.go
+internal/upstream/candidate_store_test.go
 internal/upstream/compression.go
 internal/upstream/download.go
 internal/upstream/execute.go

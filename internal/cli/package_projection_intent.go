@@ -324,16 +324,25 @@ func readPackageProjectionIntent(stateRoot string) (packageProjectionIntent, boo
 	if err != nil {
 		return intent, false, err
 	}
+	intent, err = decodePackageProjectionIntent(body)
+	if err != nil {
+		return intent, false, err
+	}
+	return intent, true, intent.validate()
+}
+
+func decodePackageProjectionIntent(body []byte) (packageProjectionIntent, error) {
+	var intent packageProjectionIntent
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&intent); err != nil {
-		return intent, false, err
+		return intent, err
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return intent, false, errors.New("pending package projection has trailing content")
+		return intent, errors.New("pending package projection has trailing content")
 	}
-	return intent, true, intent.validate()
+	return intent, nil
 }
 
 func packageProjectionCompletionReceiptID(receipt packageProjectionCompletionReceipt) (string, error) {
@@ -599,7 +608,16 @@ func removePackageProjectionIntent(stateRoot string, intent packageProjectionInt
 	if _, err := writePackageProjectionCompletionReceipt(stateRoot, intent); err != nil {
 		return err
 	}
-	if err := os.Remove(filepath.Join(stateRoot, packageProjectionIntentRelative)); err != nil {
+	if err := removeExactProjectionIntent(stateRoot, packageProjectionIntentRelative, packageProjectionIntentMaxBytes, func(body []byte) error {
+		current, err := decodePackageProjectionIntent(body)
+		if err != nil {
+			return errors.Join(err, errors.New("pending package projection changed before completion"))
+		}
+		if err := current.validate(); err != nil || current.ID != intent.ID {
+			return errors.Join(err, errors.New("pending package projection changed before completion"))
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	// Intent removal is the completion commit. Make that directory update

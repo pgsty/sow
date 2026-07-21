@@ -32,6 +32,11 @@ var assetProjectionTransactionIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 // durable intent is production state; only this callback is test-only.
 var assetProjectionMutationHook func(string) error
 
+// projectionIntentRemovalHook is a deterministic replacement seam between
+// validating a durable projection intent and committing its removal. The
+// pathname remains production state; only this callback is test-only.
+var projectionIntentRemovalHook func(string) error
+
 type assetProjectionIntent struct {
 	Schema          string                          `json:"schema"`
 	ID              string                          `json:"id"`
@@ -259,30 +264,18 @@ func readAssetProjectionIntent(stateRoot string) (assetProjectionIntent, bool, e
 	if err != nil {
 		return intent, false, err
 	}
-	decoder := json.NewDecoder(strings.NewReader(string(body)))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&intent); err != nil {
-		return assetProjectionIntent{}, false, err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return assetProjectionIntent{}, false, errors.New("pending asset projection intent has trailing content")
-	}
-	if err := intent.validate(); err != nil {
-		return assetProjectionIntent{}, false, err
-	}
-	return intent, true, nil
+	intent, err = decodeAssetProjectionIntent(body)
+	return intent, err == nil, err
 }
 
 func removeAssetProjectionIntent(stateRoot string, intent assetProjectionIntent) error {
-	current, exists, err := readAssetProjectionIntent(stateRoot)
-	if err != nil || !exists || current.ID != intent.ID {
-		return errors.Join(err, errors.New("pending asset projection intent changed before completion"))
-	}
-	if err := os.Remove(filepath.Join(stateRoot, assetProjectionIntentRelative)); err != nil {
-		return err
-	}
-	if err := syncLocalDirectory(stateRoot); err != nil {
+	if err := removeExactProjectionIntent(stateRoot, assetProjectionIntentRelative, assetProjectionIntentMaxBytes, func(body []byte) error {
+		current, err := decodeAssetProjectionIntent(body)
+		if err != nil || current.ID != intent.ID {
+			return errors.Join(err, errors.New("pending asset projection intent changed before completion"))
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
 	stage := filepath.Join(stateRoot, intent.StageRelative)
@@ -293,6 +286,20 @@ func removeAssetProjectionIntent(stateRoot string, intent assetProjectionIntent)
 		return err
 	}
 	return syncLocalDirectory(stateRoot)
+}
+
+func decodeAssetProjectionIntent(body []byte) (assetProjectionIntent, error) {
+	var intent assetProjectionIntent
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&intent); err != nil {
+		return assetProjectionIntent{}, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return assetProjectionIntent{}, errors.New("pending asset projection intent has trailing content")
+	}
+	return intent, intent.validate()
 }
 
 func cleanupAssetProjectionIntentResidue(stateRoot string, recover bool) error {
