@@ -782,29 +782,28 @@ func (s *Store) materializeOne(ctx context.Context, binding *materializationBind
 	temporary := filepath.Join(parent.path, temporaryName)
 	temporaryFile, _, proofErr := openVerifiedMaterializeEntry(parent.file, temporaryName, sourceInfo)
 	if proofErr != nil {
-		cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, nil)
+		cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, sourceIdentity, nil)
 		return 0, errors.Join(
 			fmt.Errorf("materialize %q: %w: replacement link is not the verified CAS inode: %v", relativePath, ErrObjectCorrupt, proofErr),
 			cleanupErr,
 		)
 	}
 	if err := temporaryFile.Close(); err != nil {
-		temporaryIdentity, _ := lstatMaterializeAt(parent.file, temporaryName)
-		cleanupErr := quarantineRemoveMaterializeEntry(parent.file, parent.path, temporaryName, temporaryIdentity, nil)
+		cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, sourceIdentity, nil)
 		return 0, errors.Join(fmt.Errorf("materialize %q: close replacement link: %w", relativePath, err), cleanupErr)
 	}
 	if testHook != nil {
 		if err := testHook(materializeTestAfterReplacementTempProof, temporary, destination); err != nil {
-			cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, nil)
+			cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, sourceIdentity, nil)
 			return 0, errors.Join(fmt.Errorf("materialize %q: post-temp test hook: %w", relativePath, err), cleanupErr)
 		}
 	}
 	if err := verifyMaterializeEntryIdentity(parent.file, temporaryName, sourceInfo); err != nil {
-		cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, nil)
+		cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, sourceIdentity, nil)
 		return 0, errors.Join(fmt.Errorf("materialize %q: %w: replacement temporary changed before exchange", relativePath, ErrMaterializeConflict), err, cleanupErr)
 	}
 	if err := verifyMaterializeEntryIdentity(parent.file, destinationName, destinationInfo); err != nil {
-		cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, nil)
+		cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, sourceIdentity, nil)
 		return 0, errors.Join(
 			fmt.Errorf("materialize %q: %w: destination changed during relink", relativePath, ErrMaterializeConflict),
 			cleanupErr,
@@ -813,7 +812,7 @@ func (s *Store) materializeOne(ctx context.Context, binding *materializationBind
 	preTemporaryIdentity, tempIdentityErr := lstatMaterializeAt(parent.file, temporaryName)
 	preDestinationIdentity, destinationIdentityErr := lstatMaterializeAt(parent.file, destinationName)
 	if tempIdentityErr != nil || destinationIdentityErr != nil {
-		cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, nil)
+		cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, sourceIdentity, nil)
 		return 0, errors.Join(
 			fmt.Errorf("materialize %q: %w: bind exchange inputs", relativePath, ErrMaterializeConflict),
 			tempIdentityErr, destinationIdentityErr, cleanupErr,
@@ -821,12 +820,12 @@ func (s *Store) materializeOne(ctx context.Context, binding *materializationBind
 	}
 	if testHook != nil {
 		if err := testHook(materializeTestBeforeReplacementExchange, temporary, destination); err != nil {
-			cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, nil)
+			cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, sourceIdentity, nil)
 			return 0, errors.Join(fmt.Errorf("materialize %q: pre-exchange test hook: %w", relativePath, err), cleanupErr)
 		}
 	}
 	if err := exchangeMaterializeAt(parent.file, temporaryName, destinationName); err != nil {
-		cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, nil)
+		cleanupErr := cleanupMaterializeTemporary(parent.file, parent.path, temporaryName, sourceIdentity, nil)
 		return 0, errors.Join(fmt.Errorf("materialize %q: descriptor-bound atomic exchange: %w", relativePath, err), cleanupErr)
 	}
 	installedIdentity, installedIdentityErr := lstatMaterializeAt(parent.file, destinationName)
@@ -914,15 +913,8 @@ func verifyMaterializeEntryIdentity(parent *os.File, name string, expected os.Fi
 	return err
 }
 
-func cleanupMaterializeTemporary(parent *os.File, parentPath, name string, testHook materializeTestHook) error {
-	identity, err := lstatMaterializeAt(parent, name)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	return quarantineRemoveMaterializeEntry(parent, parentPath, name, identity, testHook)
+func cleanupMaterializeTemporary(parent *os.File, parentPath, name string, expected materializeFileIdentity, testHook materializeTestHook) error {
+	return quarantineRemoveMaterializeEntry(parent, parentPath, name, expected, testHook)
 }
 
 // quarantineRemoveMaterializeEntry first moves a name to an unpredictable

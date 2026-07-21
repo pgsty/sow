@@ -385,6 +385,93 @@ func TestMaterializeExchangePreservesConcurrentDestinationReplacement(t *testing
 	assertMaterializeCanaryAndNoTemporaryLinks(t, canary, filepath.Dir(destination))
 }
 
+func TestMaterializeFailureCleanupRemovesOwnedTemporary(t *testing.T) {
+	store := newTestStore(t, t.TempDir())
+	object := putString(t, store, "wanted")
+	destination := filepath.Join(store.Root(), "repo", "package")
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, []byte("legacy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	content := manifestBytes(t, manifest.Entry{Path: "repo/package", Size: object.Size, SHA256: [32]byte(object.SHA256)})
+	injected := errors.New("injected failure after replacement proof")
+
+	var temporary string
+	_, err := store.materializeWithOptions(context.Background(), bytes.NewReader(content), "", MaterializeOptions{
+		Workers: 1, AllowReplacePath: func(string) bool { return true },
+	}, func(phase materializeTestPhase, source, _ string) error {
+		if phase != materializeTestAfterReplacementTempProof {
+			return nil
+		}
+		temporary = source
+		return injected
+	})
+	if !errors.Is(err, injected) || errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("wanted primary failure with successful owned cleanup, got %v", err)
+	}
+	if temporary == "" {
+		t.Fatal("post-proof failure hook was not invoked")
+	}
+	if _, statErr := os.Lstat(temporary); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("owned replacement temporary survived failure cleanup: %v", statErr)
+	}
+	body, readErr := os.ReadFile(destination)
+	if readErr != nil || string(body) != "legacy" {
+		t.Fatalf("destination changed before failed replacement: body=%q err=%v", body, readErr)
+	}
+	assertNoMaterializeTransactionNames(t, filepath.Dir(destination))
+}
+
+func TestMaterializeFailureCleanupPreservesConcurrentTemporaryReplacement(t *testing.T) {
+	store := newTestStore(t, t.TempDir())
+	object := putString(t, store, "wanted")
+	destination := filepath.Join(store.Root(), "repo", "package")
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(destination, []byte("legacy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	canary := filepath.Join(store.Root(), "temporary-cleanup-canary")
+	if err := os.WriteFile(canary, []byte("CANARY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	savedVerifiedLink := filepath.Join(store.Root(), "saved-cleanup-verified-link")
+	content := manifestBytes(t, manifest.Entry{Path: "repo/package", Size: object.Size, SHA256: [32]byte(object.SHA256)})
+	injected := errors.New("injected failure after replacement proof")
+
+	var replacedTemporary string
+	_, err := store.materializeWithOptions(context.Background(), bytes.NewReader(content), "", MaterializeOptions{
+		Workers: 1, AllowReplacePath: func(string) bool { return true },
+	}, func(phase materializeTestPhase, temporary, _ string) error {
+		if phase != materializeTestAfterReplacementTempProof || replacedTemporary != "" {
+			return nil
+		}
+		replacedTemporary = temporary
+		if err := os.Rename(temporary, savedVerifiedLink); err != nil {
+			return err
+		}
+		if err := os.Link(canary, temporary); err != nil {
+			return err
+		}
+		return injected
+	})
+	if !errors.Is(err, injected) || !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("wanted primary failure plus inode-safe cleanup rejection, got %v", err)
+	}
+	if replacedTemporary == "" {
+		t.Fatal("post-proof temporary replacement hook was not invoked")
+	}
+	assertSameFile(t, canary, replacedTemporary)
+	assertSameFile(t, store.ObjectPath(object.SHA256), savedVerifiedLink)
+	body, readErr := os.ReadFile(destination)
+	if readErr != nil || string(body) != "legacy" {
+		t.Fatalf("destination changed before rejected cleanup: body=%q err=%v", body, readErr)
+	}
+}
+
 func TestMaterializeExchangeRejectsTemporaryReplacementBeforeInstall(t *testing.T) {
 	store := newTestStore(t, t.TempDir())
 	object := putString(t, store, "wanted")
