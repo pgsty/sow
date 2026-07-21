@@ -2050,3 +2050,45 @@ archive digest above. This validation ledger remains outside both manifests,
 so recording V-54 does not perturb the identity it records. No Cloudflare,
 CO/COS, EdgeOne or production repository was read or written. V-54 closes the
 local V-53 delivery gate only; the long-term Goal remains active.
+
+## 2026-07-20 V-56 retained authority and verifier credential delivery
+
+V-56 supersedes V-54 after retained YUM materialization was made fail-closed
+when canonical generation authority is unavailable, and L3/L4 verification
+was changed to report a stable, redacted credential finding while preserving
+the network/auth exit code. Adjacent boundary tests bind exact selected YUM
+archive scope, manifest-only `default_pool` continuity and byte-identical APT
+by-hash duplicate stages.
+
+Focused ordinary/race tests, final A-F/G-M/R-V ordinary/race CLI shards,
+compile/vet/Staticcheck, module integrity, the 44-family migration E2E suite,
+local adoption rollback and clean-delivery policy passed. External network and
+all real-cloud opt-ins remained disabled.
+
+After the spec, traceability row, dated evidence and delivery allowlist were
+frozen, two isolated clean deliveries used only the local read-only module
+download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v56-retained-authority-final-a-20260720
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v56-retained-authority-final-b-20260720
+
+PRODUCT_SOURCE_SHA256=00fb880184696c78e6000b235b8f6cc8341d5e224e855608f8b3e235b9f659f4
+PRODUCT_SOURCE_FILES=547
+DELIVERY_CONTENT_SHA256=e8aa2abaf10ab9e25dfc971fb0b29626d4e4355944dd14bb7791ec83dc65e5c6
+DELIVERY_FILES=735
+ARCHIVE_SHA256=3d9038e2185f3606702d7a7875d3172973177f60878fea7aa62e025af9f79e37
+```
+
+Archives:
+
+- `/tmp/sow-v56-retained-authority-final-a-20260720/sow-delivery-e8aa2abaf10ab9e2.tgz`
+- `/tmp/sow-v56-retained-authority-final-b-20260720/sow-delivery-e8aa2abaf10ab9e2.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This validation ledger remains outside both manifests,
+so recording V-56 does not perturb the identity it records. No Cloudflare,
+CO/COS, EdgeOne or production repository was read or written. V-56 closes the
+local V-55 delivery gate only; the long-term Goal remains active.

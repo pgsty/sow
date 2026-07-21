@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pgsty/sow/internal/config"
 	"github.com/pgsty/sow/internal/manifest"
 	"github.com/pgsty/sow/internal/views"
 )
@@ -41,6 +42,71 @@ func TestValidateRetainedYUMPayloadPathsConfinesCanonicalRPMs(t *testing.T) {
 				t.Fatalf("unsafe retained payload accepted: %s", invalid)
 			}
 		})
+	}
+}
+
+func TestMergeRetainedYUMPackageClosureRejectsMissingCanonicalAuthority(t *testing.T) {
+	root := t.TempDir()
+	current := filepath.Join(root, "current.tsv")
+	writeServingCompatManifest(t, current, manifest.Entry{
+		Path: "yum/test/x86_64/Packages/p/package.rpm", Size: 1, SHA256: sha256.Sum256([]byte("x")),
+	})
+	destination := filepath.Join(root, "retained.tsv")
+	if err := mergeRetainedYUMPackageClosure(nil, nil, 1, current, destination, root); err == nil || !strings.Contains(err.Error(), "canonical authority") {
+		t.Fatalf("missing retained-generation authority was accepted: %v", err)
+	}
+	if _, err := os.Lstat(destination); !os.IsNotExist(err) {
+		t.Fatalf("failed-closed retained closure left a destination behind: %v", err)
+	}
+}
+
+func TestSelectedMaterializationArchiveExactExcludesPhysicalOwnerSiblings(t *testing.T) {
+	root := t.TempDir()
+	repo := config.Repo{
+		ID: "rpm-test", Type: "yum", Path: "yum/test/x86_64", Arches: []string{"x86_64"},
+		DefaultPool: "public", YUM: &config.YUMConfig{Compression: "zstd"},
+	}
+	cfg := &config.Config{Repos: []config.Repo{repo}}
+	entry := func(name, content string) manifest.Entry {
+		return manifest.Entry{Path: name, Size: int64(len(content)), SHA256: sha256.Sum256([]byte(content))}
+	}
+	payload := filepath.Join(root, "requested.tsv")
+	writeServingCompatManifest(t, payload, entry("yum/test/x86_64/Packages/r/rocky.rpm", "rocky"))
+	metadata := filepath.Join(root, "physical-owner.tsv")
+	writeServingCompatManifest(t, metadata,
+		entry("yum/other/x86_64/repodata/repomd.xml", "sibling"),
+		entry("yum/test/x86_64/repodata/repomd.xml", "selected"),
+		entry("yum/test/x86_64/repodata/repomd.xml.asc", "signature"),
+	)
+
+	exact, err := selectedMaterializationArchiveExact(cfg, materializeCanonicalSource{ID: "latest"}, []viewLeaf{{repo: repo, os: "rocky", arch: "x86_64"}}, payload, []string{metadata}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(exact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	reader := manifest.NewReader(file)
+	var paths []string
+	for {
+		value, readErr := reader.Next()
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		paths = append(paths, value.Path)
+	}
+	want := []string{
+		"yum/test/x86_64/Packages/r/rocky.rpm",
+		"yum/test/x86_64/repodata/repomd.xml",
+		"yum/test/x86_64/repodata/repomd.xml.asc",
+	}
+	if strings.Join(paths, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("selected archive paths=%v want=%v", paths, want)
 	}
 }
 

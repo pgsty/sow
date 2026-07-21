@@ -77,6 +77,11 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   expected-child 原子替换恢复精确父或首发前缺失；错误 URL 与“同字节、错 target-root”
   的合法 channel 均在修改前拒绝。受影响普通/race、迁移与双份 clean-delivery 全绿，
   仅临时本地 serving tree。
+- `2026-07-20-retained-yum-authority-and-verifier-credential.md`：retained YUM
+  closure 在 canonical authority 或 generation pins 缺失时不再复制当前 manifest
+  伪装成功；L3/L4 缺凭据现在输出稳定、脱敏且可行动的 finding，并保持 network/auth
+  退出码。selected export、manifest-only pool continuity 与 APT by-hash 冲突负例同步
+  收口；仅使用本地真实 CLI/文件系统。
 - `2026-07-20-yum-compatibility-bound-cutover-recovery.md`：实际 CLI 使用的锁与
   `os.Root` capability-bound YUM cutover recovery 现在覆盖 S2/S3 半写、孤儿、已提交及
   无 canonical authority 的拒绝路径；post-flip 故障恢复原链接或原缺失状态。709 个 CLI

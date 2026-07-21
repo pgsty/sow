@@ -32,7 +32,7 @@ func mergeRetainedYUMPackageClosure(canonical *state.Store, channel *serving.Cha
 		return errors.New("YUM generation previous retention must be positive")
 	}
 	if canonical == nil || channel == nil {
-		return copyManifestExclusive(currentManifest, destination)
+		return errors.New("retained YUM package closure canonical authority is unavailable")
 	}
 	if err := channel.Validate(); err != nil {
 		return err
@@ -142,7 +142,7 @@ func mergeRetainedYUMPackageClosure(canonical *state.Store, channel *serving.Cha
 		inputs = append(inputs, views.ProjectionInput{Label: jsonPath, Reader: project})
 	}
 	if len(inputs) == 0 {
-		return copyManifestExclusive(currentManifest, destination)
+		return errors.New("retained YUM package closure has no canonical generation pins")
 	}
 	retainedPath := filepath.Join(tempDir, "retained-yum-packages.tsv")
 	retained, err := os.OpenFile(retainedPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -177,30 +177,6 @@ func validateRetainedYUMPayloadPaths(reader io.Reader, legacyRoot string) error 
 			return fmt.Errorf("retained YUM payload path %q is not canonical", entry.Path)
 		}
 	}
-}
-
-func copyManifestExclusive(sourcePath, destination string) (resultErr error) {
-	source, err := os.Open(sourcePath)
-	if err != nil {
-		return err
-	}
-	destinationFile, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		_ = source.Close()
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = os.Remove(destination)
-		}
-	}()
-	_, copyErr := io.Copy(destinationFile, source)
-	resultErr = errors.Join(copyErr, source.Close(), destinationFile.Sync(), destinationFile.Close())
-	if resultErr == nil {
-		committed = true
-	}
-	return resultErr
 }
 
 func mergeCompatibleManifestFiles(leftPath, rightPath, destinationPath string) (resultErr error) {

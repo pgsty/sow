@@ -29,6 +29,27 @@ import (
 
 const verifyTestProToken = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
 
+func TestNetworkCredentialCheckReportsActionableOperationalFinding(t *testing.T) {
+	var networkFailure atomic.Bool
+	report := verify.Run(t.Context(), verify.Request{
+		Layers: []verify.Layer{verify.LayerL3}, Workers: 1,
+		Checks: []verify.Check{networkCredentialCheck("cdn/cf/stable", verify.LayerL3, &networkFailure)},
+	})
+	if report.Outcome != verify.OutcomeIncomplete || report.Exit != verify.ExitOperational || !networkFailure.Load() {
+		t.Fatalf("credential report=%+v network_failure=%t", report, networkFailure.Load())
+	}
+	if len(report.Findings) != 1 || report.Findings[0].Code != "CDN_VERIFICATION_CREDENTIAL_UNAVAILABLE" || report.Findings[0].Category != verify.CategoryOperational {
+		t.Fatalf("credential finding is not actionable: %+v", report.Findings)
+	}
+	var output bytes.Buffer
+	if err := emitVerifyReport(&output, false, report, networkFailure.Load()); exitCode(err) != ExitNetworkAuth {
+		t.Fatalf("credential exit=%d err=%v report=%s", exitCode(err), err, output.String())
+	}
+	if !strings.Contains(output.String(), "CDN_VERIFICATION_CREDENTIAL_UNAVAILABLE") || strings.Contains(output.String(), "VERIFY_CHECK_OPERATIONAL") {
+		t.Fatalf("credential report lost its safe reason: %s", output.String())
+	}
+}
+
 func TestBuildCompatibilityL4ChecksBindsIndependentGenerationAndRawRoutes(t *testing.T) {
 	root := nginxWorkerTempDir(t)
 	privatePath, _ := writeLegacySigningKey(t, root)
@@ -628,6 +649,20 @@ func TestVerifyCLIStableUsesRuntimeTokenWithoutPersistingOrLoggingIt(t *testing.
 	transport.mutex.Unlock()
 	if basicAfterFallback <= basicAfterToken {
 		t.Fatal("stable Basic fallback did not authenticate any verification requests")
+	}
+
+	t.Setenv("SOW_TEST_CF", "")
+	for _, invocation := range [][]string{
+		{"verify", "--layer", "L3", "--view", "stable", "--target", "cf", "--config", configPath, "--workers", "2"},
+		{"verify", "--layer", "L4", "--view", "stable", "--target", "cf", "--repo", "rpm-test", "--config", configPath, "--gpg-public-key-file", publicKeyPath, "--workers", "2", "--chunk-entries", "1"},
+	} {
+		code, stdout, stderr := run(invocation...)
+		if code != ExitNetworkAuth || !strings.Contains(stdout, "CDN_VERIFICATION_CREDENTIAL_UNAVAILABLE") || !strings.Contains(stderr, "remote verification incomplete") {
+			t.Fatalf("missing stable credential code=%d stdout=%s stderr=%s", code, stdout, stderr)
+		}
+		if strings.Contains(stdout+stderr, verifyTestProToken) || strings.Contains(stdout+stderr, "verify-secret") || strings.Contains(stdout, "VERIFY_CHECK_OPERATIONAL") {
+			t.Fatalf("missing stable credential report leaked or lost its reason: stdout=%s stderr=%s", stdout, stderr)
+		}
 	}
 }
 

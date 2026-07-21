@@ -1055,9 +1055,16 @@ func verificationStateCheck(id string, layer verify.Layer, target string, err er
 }
 
 func networkCredentialCheck(id string, layer verify.Layer, networkFailure *atomic.Bool) verify.Check {
-	return verify.CheckFunc{CheckID: id, CheckLayer: layer, Run: func(context.Context, *verify.Recorder) error {
-		networkFailure.Store(true)
-		return errors.New("CDN verification credential is unavailable")
+	return verify.CheckFunc{CheckID: id, CheckLayer: layer, Run: func(_ context.Context, recorder *verify.Recorder) error {
+		if networkFailure != nil {
+			networkFailure.Store(true)
+		}
+		recorder.Add(verify.Finding{
+			Layer: layer, Severity: verify.SeverityCritical, Category: verify.CategoryOperational,
+			Code: "CDN_VERIFICATION_CREDENTIAL_UNAVAILABLE", Subject: id,
+			Message: "CDN verification credential is unavailable or invalid",
+		})
+		return nil
 	}}
 }
 

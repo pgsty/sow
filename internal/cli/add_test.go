@@ -252,6 +252,35 @@ func TestDefaultPoolCannotReclassifyHistoricalPublicEntry(t *testing.T) {
 	}
 }
 
+func TestDefaultPoolCannotReclassifyAdoptedManifestWithoutView(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sow.yaml")
+	publicConfig := strings.Replace(gatedAssetTestConfig, "default_pool: gated", "default_pool: public", 1)
+	if err := os.WriteFile(configPath, []byte(publicConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assetRoot := filepath.Join(root, "assets", "private")
+	if err := os.MkdirAll(assetRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(assetRoot, "adopted.bin"), []byte("public baseline"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := Main([]string{"init", "--config", configPath, "--workers", "1", "--chunk-entries", "1"}, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("adopt public manifest code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if err := os.WriteFile(configPath, []byte(gatedAssetTestConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code := Main([]string{"fsck", "--config", configPath, "--workers", "1", "--chunk-entries", "1"}, &stdout, &stderr)
+	if code != ExitConflict || !strings.Contains(stderr.String(), "default_pool is frozen as public") || !strings.Contains(stderr.String(), "manifests/private-assets.tsv") {
+		t.Fatalf("adopted manifest reclassification code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+}
+
 func TestDebugPackagesRouteOnlyToStableView(t *testing.T) {
 	public := config.Repo{DefaultPool: "public"}
 	gated := config.Repo{DefaultPool: "gated"}

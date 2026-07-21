@@ -16,6 +16,28 @@ import (
 	"github.com/pgsty/sow/internal/state"
 )
 
+func TestMergeAPTByHashStagesRequiresByteIdenticalDuplicate(t *testing.T) {
+	root := t.TempDir()
+	left := filepath.Join(root, "left.json")
+	equal := filepath.Join(root, "equal.json")
+	conflict := filepath.Join(root, "conflict.json")
+	for filename, body := range map[string]string{left: "same", equal: "same", conflict: "changed"} {
+		if err := os.WriteFile(filename, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stages := map[string]string{"retention/apt-by-hash/view/repo/suite.json": left}
+	if err := mergeAPTByHashStages(stages, map[string]string{"retention/apt-by-hash/view/repo/suite.json": equal}); err != nil {
+		t.Fatalf("identical duplicate stage rejected: %v", err)
+	}
+	if got := stages["retention/apt-by-hash/view/repo/suite.json"]; got != left {
+		t.Fatalf("identical duplicate replaced the first stage: %s", got)
+	}
+	if err := mergeAPTByHashStages(stages, map[string]string{"retention/apt-by-hash/view/repo/suite.json": conflict}); err == nil || !strings.Contains(err.Error(), "conflicting APT by-hash ledger") {
+		t.Fatalf("conflicting duplicate stage accepted: %v", err)
+	}
+}
+
 func TestCLIAPTByHashRetentionKeepsTwoGenerationsAndFailsClosed(t *testing.T) {
 	root := nginxWorkerTempDir(t)
 	configPath := filepath.Join(root, "sow.yaml")

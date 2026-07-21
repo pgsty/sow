@@ -10,6 +10,7 @@ _bmad-output/implementation-artifacts/spec-local-serving-atomic-parent-rollback.
 _bmad-output/implementation-artifacts/spec-reachable-history-config-memory-bound.md
 _bmad-output/implementation-artifacts/spec-real-r2-publication-storage-transaction.md
 _bmad-output/implementation-artifacts/spec-remote-fsck-storage-only-authority.md
+_bmad-output/implementation-artifacts/spec-retained-yum-authority-and-verifier-credential.md
 _bmad-output/implementation-artifacts/spec-route-wire-canonicalization.md
 _bmad-output/implementation-artifacts/spec-static-verifier-provider-attestation.md
 _bmad-output/implementation-artifacts/spec-yum-compatibility-bound-cutover-recovery.md
@@ -147,6 +148,7 @@ docs/evidence/2026-07-20-gc-provenance-canonical-identity.md
 docs/evidence/2026-07-20-local-serving-atomic-parent-rollback.md
 docs/evidence/2026-07-20-r2-publication-storage-transaction.md
 docs/evidence/2026-07-20-reachable-history-config-memory-bound.md
+docs/evidence/2026-07-20-retained-yum-authority-and-verifier-credential.md
 docs/evidence/2026-07-20-static-provider-attestation.md
 docs/evidence/2026-07-20-yum-compatibility-bound-cutover-recovery.md
 docs/evidence/README.md
