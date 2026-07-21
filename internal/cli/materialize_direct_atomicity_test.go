@@ -338,7 +338,7 @@ func TestDedicatedPartialPublicMaterializeDropsOutOfScopeGatedServingTree(t *tes
 }
 
 func TestFullSnapshotReplayRemovesManualServingNamespaceDrift(t *testing.T) {
-	root := t.TempDir()
+	root := nginxWorkerTempDir(t)
 	configPath := filepath.Join(root, "sow.yaml")
 	if err := os.WriteFile(configPath, []byte(snapshotAPTConfig), 0o600); err != nil {
 		t.Fatal(err)

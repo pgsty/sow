@@ -233,7 +233,7 @@ func TestFSCKReportsUnsafeNonRootAssetPathAsVerificationDrift(t *testing.T) {
 }
 
 func TestForgedRootMappedAssetViewFailsMaterializeAndPublishBeforeNetwork(t *testing.T) {
-	root := t.TempDir()
+	root := nginxWorkerTempDir(t)
 	configPath := filepath.Join(root, "sow.yaml")
 	configText := strings.Replace(publishAssetConfig,
 		"    path: pkg\n    default_pool: public\n    asset:\n      kind: release\n      mutable_paths: [latest]",
