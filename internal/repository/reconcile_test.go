@@ -3,6 +3,7 @@ package repository
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -57,5 +58,41 @@ func TestReconcileExactPrunesStaleFilesAndKeepsHardlinks(t *testing.T) {
 	targetInfo, _ := os.Stat(filepath.Join(root, "export", "pkg", "wanted"))
 	if !os.SameFile(poolInfo, targetInfo) {
 		t.Fatal("desired file is not a CAS hardlink")
+	}
+}
+
+func TestReconcilePrunePreservesConcurrentPathReplacement(t *testing.T) {
+	root := t.TempDir()
+	stale := filepath.Join(root, "stale")
+	if err := os.WriteFile(stale, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	backup := filepath.Join(root, "stale-scanned-backup")
+	canary := filepath.Join(root, "reconcile-canary")
+	if err := os.WriteFile(canary, []byte("CANARY"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	replaced := false
+	err := removeMaterializedPathWithHook(root, "stale", func(path string) error {
+		replaced = true
+		if path != stale {
+			return errors.New("unexpected prune path")
+		}
+		if err := os.Rename(stale, backup); err != nil {
+			return err
+		}
+		return os.Link(canary, stale)
+	})
+	if !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("wanted inode-safe stale-path conflict, got %v", err)
+	}
+	if !replaced {
+		t.Fatal("stale-path replacement hook was not invoked")
+	}
+	assertSameFile(t, canary, stale)
+	body, readErr := os.ReadFile(backup)
+	if readErr != nil || string(body) != "old" {
+		t.Fatalf("scanned stale inode was not preserved: body=%q err=%v", body, readErr)
 	}
 }

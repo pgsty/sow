@@ -93,22 +93,58 @@ func (s *Store) ReconcileExact(ctx context.Context, desiredManifest, targetRoot 
 }
 
 func removeMaterializedPath(root, relative string) error {
+	return removeMaterializedPathWithHook(root, relative, nil)
+}
+
+func removeMaterializedPathWithHook(root, relative string, beforeRemove func(string) error) (resultErr error) {
 	if err := validateMaterializedPath(relative); err != nil {
 		return err
 	}
-	path := filepath.Join(root, filepath.FromSlash(relative))
-	if _, err := relativeInside(root, path); err != nil {
+	fullPath := filepath.Join(root, filepath.FromSlash(relative))
+	if _, err := relativeInside(root, fullPath); err != nil {
 		return err
 	}
-	info, err := os.Lstat(path)
+	binding, err := bindMaterializationTarget(root, root, false)
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("%w: refuse to prune non-regular path %q", ErrUnsafePath, relative)
+	defer func() { resultErr = errors.Join(resultErr, binding.close()) }()
+	parentRel := filepath.Dir(filepath.FromSlash(relative))
+	if parentRel == "." {
+		parentRel = ""
 	}
-	if err := os.Remove(path); err != nil {
-		return fmt.Errorf("prune stale materialized path %q: %w", relative, err)
+	parentFile, err := openMaterializeDirectoryPathAt(binding.target, parentRel, false)
+	if err != nil {
+		return fmt.Errorf("%w: open stale materialization parent %q: %v", ErrUnsafePath, parentRel, err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, parentFile.Close()) }()
+	parentInfo, err := parentFile.Stat()
+	if err != nil || !parentInfo.IsDir() {
+		return errors.Join(err, fmt.Errorf("%w: stale materialization parent %q is not a directory", ErrUnsafePath, parentRel))
+	}
+	parent := &materializationParent{
+		file: parentFile, info: parentInfo, path: filepath.Join(root, parentRel), rel: parentRel, binding: binding,
+	}
+	name := filepath.Base(filepath.FromSlash(relative))
+	file, _, err := openMaterializeRegularAt(parentFile, name)
+	if err != nil {
+		return fmt.Errorf("%w: refuse to prune unsafe path %q: %v", ErrUnsafePath, relative, err)
+	}
+	expected, identityErr := fstatMaterialize(file)
+	closeErr := file.Close()
+	if identityErr != nil || closeErr != nil {
+		return errors.Join(identityErr, closeErr, fmt.Errorf("identify stale materialized path %q", relative))
+	}
+	if beforeRemove != nil {
+		if err := beforeRemove(fullPath); err != nil {
+			return err
+		}
+	}
+	removeErr := quarantineRemoveMaterializeEntry(parentFile, parent.path, name, expected, nil)
+	syncErr := parentFile.Sync()
+	coordinateErr := errors.Join(parent.verifyCoordinate(), binding.verifyCoordinate())
+	if removeErr != nil || syncErr != nil || coordinateErr != nil {
+		return fmt.Errorf("prune stale materialized path %q: %w", relative, errors.Join(removeErr, syncErr, coordinateErr))
 	}
 	return nil
 }
