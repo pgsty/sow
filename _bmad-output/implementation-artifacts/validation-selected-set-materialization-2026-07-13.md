@@ -2222,3 +2222,27 @@ so recording V-62 does not perturb the identity it records. The long-term Goal
 remains active because real Cloudflare Worker/purge/cache-log, COS/EdgeOne, and
 production migration evidence are still open; production resources remain
 forbidden test targets.
+
+## 2026-07-22 V-64 final status-copy delivery
+
+V-64 supersedes V-62 after the README status sentence was corrected to stop
+describing unsupported apt before 1.2 as an open compatibility gate. The
+product-source identity is unchanged; only the delivery documentation identity
+changed. Two final isolated clean deliveries used the local read-only module
+download cache:
+
+```text
+PRODUCT_SOURCE_SHA256=281ba4509ca6bf3a60b31ca35ed104b6bcbdc887e522bfcc33a2006cb8d051d5
+PRODUCT_SOURCE_FILES=547
+DELIVERY_CONTENT_SHA256=b5934f4e55e02187dbd263d1aa43efbc0d3035b45dccdee80a225cb7d180a837
+DELIVERY_FILES=739
+ARCHIVE_SHA256=dc625a61aa53c21a8a69d7edf9711eb4bcbf99e4e647e2b32a08b07aebd01792
+```
+
+Archives:
+
+- `/private/tmp/sow-v64-status-final-a-20260722/sow-delivery-b5934f4e55e02187.tgz`
+- `/private/tmp/sow-v64-status-final-b-20260722/sow-delivery-b5934f4e55e02187.tgz`
+
+Independent `cmp` returned 0 and both SHA-256 values matched. This ledger is
+outside both delivery manifests and does not perturb the recorded identity.

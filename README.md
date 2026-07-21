@@ -2,8 +2,10 @@
 
 `sow` 是 Pigsty 制品仓库的 Git 式管理器：一个纯 Go CLI，以 Git ref
 保存 APT、YUM 与 asset 仓库视图，以 SHA-256 CAS 保存制品，并把发布作为
-可恢复的双目标事务执行。产品仍在依据冻结 PRD 做最终验收；真实云与旧版
-apt 兼容门禁尚未通过时，不应把当前开发版标记为 production-ready。
+可恢复的双目标事务执行。当前开发版已通过本地真 apt/dnf、真实非生产 R2
+storage/publish/fsck 与可复现交付门禁，但真实 Cloudflare Worker/purge/cache-log、
+COS/EdgeOne 和生产迁移仍未闭合，因此尚不标记为 production-ready。最低支持
+APT 版本已冻结为 1.2；更旧客户端明确不支持，不是待实现的兼容路径。
 
 当前可执行命令面：
 
