@@ -7,6 +7,7 @@ _bmad-output/implementation-artifacts/spec-dead-code-static-analysis-closure.md
 _bmad-output/implementation-artifacts/spec-full-provider-checkpoint-fenced-delete.md
 _bmad-output/implementation-artifacts/spec-gc-provenance-canonical-identity.md
 _bmad-output/implementation-artifacts/spec-local-serving-atomic-parent-rollback.md
+_bmad-output/implementation-artifacts/spec-offline-archive-preintent-cleanup-failure.md
 _bmad-output/implementation-artifacts/spec-reachable-history-config-memory-bound.md
 _bmad-output/implementation-artifacts/spec-real-r2-publication-storage-transaction.md
 _bmad-output/implementation-artifacts/spec-remote-fsck-storage-only-authority.md
@@ -146,6 +147,7 @@ docs/evidence/2026-07-20-dead-code-static-analysis-closure.md
 docs/evidence/2026-07-20-full-provider-checkpoint-fenced-delete.md
 docs/evidence/2026-07-20-gc-provenance-canonical-identity.md
 docs/evidence/2026-07-20-local-serving-atomic-parent-rollback.md
+docs/evidence/2026-07-20-offline-archive-preintent-cleanup-failure.md
 docs/evidence/2026-07-20-r2-publication-storage-transaction.md
 docs/evidence/2026-07-20-reachable-history-config-memory-bound.md
 docs/evidence/2026-07-20-retained-yum-authority-and-verifier-credential.md

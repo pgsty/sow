@@ -2092,3 +2092,47 @@ archive digest above. This validation ledger remains outside both manifests,
 so recording V-56 does not perturb the identity it records. No Cloudflare,
 CO/COS, EdgeOne or production repository was read or written. V-56 closes the
 local V-55 delivery gate only; the long-term Goal remains active.
+
+## 2026-07-20 V-58 offline archive pre-intent cleanup delivery
+
+V-58 supersedes V-56 after both offline-archive pre-intent rollback windows
+were made operator-visible and durable. Stage-install and intent-write errors
+now join any failure to remove their private hard-link stage, explicitly
+require `--recover`, and use the exact bound stage directory for removal and
+directory fsync.
+
+Red fault injection proved that the old code returned only the initiating
+stage-fsync or intent-write error while an unowned private stage remained.
+The corrected tests cover mode-000/mode-0777 directory drift, successful
+cleanup, absent intent/receipt/visible destination and convergent real CLI
+recovery. Focused and complete offline-archive ordinary/race, final N-O
+ordinary/race, compile/vet/Staticcheck, module integrity and clean-delivery
+policy passed. External network and all real-cloud opt-ins remained disabled.
+
+After the spec, traceability row, dated evidence and delivery allowlist were
+frozen, two isolated clean deliveries used only the local read-only module
+download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v58-offline-cleanup-final-a-20260720
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v58-offline-cleanup-final-b-20260720
+
+PRODUCT_SOURCE_SHA256=0d7d6becc69c358bad1b74c487f85896566258af277f7f9bf891701f913a9b91
+PRODUCT_SOURCE_FILES=547
+DELIVERY_CONTENT_SHA256=2d20981dcc16a41df22c697794a713245adb435b98b6a12126b3741f37b2b6d0
+DELIVERY_FILES=737
+ARCHIVE_SHA256=aca70d90e65b361fe556cee5dcd2d93b893be0f7f70236192c5c9943a2f079d3
+```
+
+Archives:
+
+- `/tmp/sow-v58-offline-cleanup-final-a-20260720/sow-delivery-2d20981dcc16a41d.tgz`
+- `/tmp/sow-v58-offline-cleanup-final-b-20260720/sow-delivery-2d20981dcc16a41d.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This validation ledger remains outside both manifests,
+so recording V-58 does not perturb the identity it records. No Cloudflare,
+CO/COS, EdgeOne or production repository was read or written. V-58 closes the
+local V-57 delivery gate only; the long-term Goal remains active.

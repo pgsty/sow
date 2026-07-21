@@ -181,6 +181,113 @@ func TestOfflineArchiveIntentDirectorySyncFailureKeepsRecoverableStage(t *testin
 	}
 }
 
+func TestOfflineArchiveIntentWriteFailureReportsStageCleanupDrift(t *testing.T) {
+	root, configPath := newOfflineArchiveTaintFixture(t)
+	input := filepath.Join(t.TempDir(), "payload.bin")
+	if err := os.WriteFile(input, []byte("intent cleanup drift\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runArchiveTaintOK(t, "add", input, "--config", configPath, "--repo", "public-assets", "--dest", "payload.bin")
+	runArchiveTaintOK(t, "promote", "beta", "latest", "--config", configPath, "--repo", "public-assets")
+	destination := filepath.Join(root, "offline", "intent-cleanup.tgz")
+	stateRoot := filepath.Join(root, ".sow")
+	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+
+	previous := offlineArchiveProjectionIntentWrite
+	offlineArchiveProjectionIntentWrite = func(string, string, []byte) error {
+		if err := os.Chmod(stageDirectory, 0o777); err != nil {
+			return err
+		}
+		return errors.New("injected offline archive intent write failure")
+	}
+	t.Cleanup(func() {
+		offlineArchiveProjectionIntentWrite = previous
+		_ = os.Chmod(stageDirectory, 0o700)
+	})
+	code, stdout, stderr := runArchiveTaintCLI(t,
+		"materialize", "latest", "--config", configPath, "--repo", "public-assets", "--tgz", destination,
+		"--workers", "1", "--chunk-entries", "1",
+	)
+	offlineArchiveProjectionIntentWrite = previous
+	if code != ExitVerification || !strings.Contains(stderr, "injected offline archive intent write failure") ||
+		!strings.Contains(stderr, "offline archive projection stage cleanup failed") || !strings.Contains(stderr, "--recover") {
+		t.Fatalf("intent cleanup drift code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if _, exists, err := readOfflineArchiveProjectionIntent(stateRoot); err != nil || exists {
+		t.Fatalf("failed intent write installed an intent exists=%t err=%v", exists, err)
+	}
+	if err := os.Chmod(stageDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(stageDirectory)
+	if err != nil || len(entries) != 1 || !offlineArchiveProjectionStagePattern.MatchString(entries[0].Name()) {
+		t.Fatalf("failed cleanup residue entries=%v err=%v", entries, err)
+	}
+	if _, err := os.Lstat(destination); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed pre-intent cleanup installed visible destination: %v", err)
+	}
+
+	code, stdout, stderr = runArchiveTaintCLI(t,
+		"materialize", "latest", "--config", configPath, "--repo", "public-assets", "--tgz", destination,
+		"--workers", "1", "--chunk-entries", "1", "--recover",
+	)
+	if code != ExitOK {
+		t.Fatalf("intent cleanup recovery code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if _, err := os.Stat(destination); err != nil {
+		t.Fatalf("intent cleanup recovery omitted archive: %v", err)
+	}
+	entries, err = os.ReadDir(stageDirectory)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("intent cleanup recovery retained stages=%v err=%v", entries, err)
+	}
+}
+
+func TestOfflineArchiveIntentWriteFailureRemovesUnownedStage(t *testing.T) {
+	root, configPath := newOfflineArchiveTaintFixture(t)
+	input := filepath.Join(t.TempDir(), "payload.bin")
+	if err := os.WriteFile(input, []byte("intent cleanup success\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runArchiveTaintOK(t, "add", input, "--config", configPath, "--repo", "public-assets", "--dest", "payload.bin")
+	runArchiveTaintOK(t, "promote", "beta", "latest", "--config", configPath, "--repo", "public-assets")
+	destination := filepath.Join(root, "offline", "intent-cleanup.tgz")
+	stateRoot := filepath.Join(root, ".sow")
+	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+
+	previous := offlineArchiveProjectionIntentWrite
+	offlineArchiveProjectionIntentWrite = func(string, string, []byte) error {
+		return errors.New("injected offline archive intent write failure")
+	}
+	t.Cleanup(func() { offlineArchiveProjectionIntentWrite = previous })
+	code, stdout, stderr := runArchiveTaintCLI(t,
+		"materialize", "latest", "--config", configPath, "--repo", "public-assets", "--tgz", destination,
+		"--workers", "1", "--chunk-entries", "1",
+	)
+	offlineArchiveProjectionIntentWrite = previous
+	if code != ExitVerification || !strings.Contains(stderr, "injected offline archive intent write failure") || strings.Contains(stderr, "stage cleanup failed") {
+		t.Fatalf("intent write failure code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if _, exists, err := readOfflineArchiveProjectionIntent(stateRoot); err != nil || exists {
+		t.Fatalf("failed intent write installed an intent exists=%t err=%v", exists, err)
+	}
+	entries, err := os.ReadDir(stageDirectory)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("successful cleanup retained stages=%v err=%v", entries, err)
+	}
+	if _, err := os.Lstat(destination); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed pre-intent write installed visible destination: %v", err)
+	}
+
+	code, stdout, stderr = runArchiveTaintCLI(t,
+		"materialize", "latest", "--config", configPath, "--repo", "public-assets", "--tgz", destination,
+		"--workers", "1", "--chunk-entries", "1",
+	)
+	if code != ExitOK {
+		t.Fatalf("intent write retry code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+}
+
 func TestOfflineArchiveRecoveryAcceptsSemanticallyEquivalentExistingReceipt(t *testing.T) {
 	root, configPath := newOfflineArchiveTaintFixture(t)
 	input := filepath.Join(t.TempDir(), "payload.bin")

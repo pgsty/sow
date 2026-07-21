@@ -319,7 +319,83 @@ func TestOfflineArchiveDurableStageSyncPrecedesReceipt(t *testing.T) {
 	if _, exists, err := readOfflineArchiveProjectionIntent(filepath.Join(root, ".sow")); err != nil || exists {
 		t.Fatalf("intent crossed failed durable stage boundary exists=%t err=%v", exists, err)
 	}
+	entries, err := os.ReadDir(filepath.Join(root, ".sow", offlineArchiveProjectionStageDir))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("durable stage sync failure retained unowned stage entries=%v err=%v", entries, err)
+	}
 	assertArchiveTaintPathAbsent(t, destination)
+}
+
+func TestOfflineArchiveStageSyncFailureReportsCleanupDrift(t *testing.T) {
+	root, configPath := newOfflineArchiveTaintFixture(t)
+	input := filepath.Join(t.TempDir(), "public.bin")
+	if err := os.WriteFile(input, []byte("durable-stage cleanup drift\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runArchiveTaintOK(t, "add", input, "--config", configPath, "--repo", "public-assets", "--dest", "payload.bin")
+	runArchiveTaintOK(t, "promote", "beta", "latest", "--config", configPath, "--repo", "public-assets")
+	destination := filepath.Join(root, "offline", "stage-sync-cleanup.tgz")
+	stateRoot := filepath.Join(root, ".sow")
+	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+	canonical := state.New(stateRoot)
+
+	var staged archiveResult
+	previousBefore := archiveBeforeTaintPrecommitHook
+	previousSync := offlineArchiveProjectionStageSync
+	archiveBeforeTaintPrecommitHook = func(result archiveResult) error {
+		staged = result
+		return nil
+	}
+	offlineArchiveProjectionStageSync = func(*os.Root) error {
+		if err := os.Chmod(stageDirectory, 0o000); err != nil {
+			return err
+		}
+		return errors.New("injected durable archive stage sync failure")
+	}
+	t.Cleanup(func() {
+		archiveBeforeTaintPrecommitHook = previousBefore
+		offlineArchiveProjectionStageSync = previousSync
+		_ = os.Chmod(stageDirectory, 0o700)
+	})
+	code, stdout, stderr := runArchiveTaintCLI(t,
+		"materialize", "latest", "--config", configPath, "--repo", "public-assets", "--tgz", destination,
+		"--workers", "1", "--chunk-entries", "1",
+	)
+	archiveBeforeTaintPrecommitHook = previousBefore
+	offlineArchiveProjectionStageSync = previousSync
+	if code != ExitVerification || !strings.Contains(stderr, "injected durable archive stage sync failure") ||
+		!strings.Contains(stderr, "offline archive projection stage cleanup failed") || !strings.Contains(stderr, "--recover") {
+		t.Fatalf("stage sync cleanup drift code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if err := os.Chmod(stageDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(stageDirectory)
+	if err != nil || len(entries) != 1 || !offlineArchiveProjectionStagePattern.MatchString(entries[0].Name()) {
+		t.Fatalf("failed stage cleanup residue entries=%v err=%v", entries, err)
+	}
+	if _, exists, err := readOfflineArchiveProjectionIntent(stateRoot); err != nil || exists {
+		t.Fatalf("stage sync failure installed intent exists=%t err=%v", exists, err)
+	}
+	if staged.SHA256 == "" {
+		t.Fatal("stage sync fault did not capture archive identity")
+	}
+	if _, exists, err := readOfflineArchiveTaintReceipt(canonical, staged.SHA256); err != nil || exists {
+		t.Fatalf("stage sync failure installed receipt exists=%t err=%v", exists, err)
+	}
+	assertArchiveTaintPathAbsent(t, destination)
+
+	code, stdout, stderr = runArchiveTaintCLI(t,
+		"materialize", "latest", "--config", configPath, "--repo", "public-assets", "--tgz", destination,
+		"--workers", "1", "--chunk-entries", "1", "--recover",
+	)
+	if code != ExitOK {
+		t.Fatalf("stage sync cleanup recovery code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	entries, err = os.ReadDir(stageDirectory)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("stage sync cleanup recovery retained stages=%v err=%v", entries, err)
+	}
 }
 
 func TestOfflineArchivePreReceiptProcessCrashLeavesOnlyPrivateBytes(t *testing.T) {

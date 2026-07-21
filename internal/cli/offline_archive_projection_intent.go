@@ -143,7 +143,7 @@ func readOfflineArchiveProjectionIntent(stateRoot string) (offlineArchiveProject
 	return intent, true, nil
 }
 
-func installOfflineArchiveProjectionStage(stateRoot string, result archiveResult, transactionID string) (string, error) {
+func installOfflineArchiveProjectionStage(stateRoot string, result archiveResult, transactionID string) (stageRelative string, resultErr error) {
 	stateAbs, err := archiveAbsolutePath(stateRoot)
 	if err != nil {
 		return "", err
@@ -188,8 +188,9 @@ func installOfflineArchiveProjectionStage(stateRoot string, result archiveResult
 	committed := false
 	defer func() {
 		if !committed {
-			_ = root.Remove(destinationRelative)
-			_ = syncBoundArchiveDirectory(root)
+			if cleanupErr := discardOfflineArchiveProjectionStage(stateAbs, destinationRelative); cleanupErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("offline archive projection stage cleanup failed; retry with --recover: %w", cleanupErr))
+			}
 		}
 	}()
 	expected := result
@@ -211,8 +212,7 @@ func installOfflineArchiveProjectionStage(stateRoot string, result archiveResult
 	return destinationRelative, nil
 }
 
-func prepareOfflineArchiveProjectionIntent(cfg *config.Config, source offlineArchiveSourceProof, result archiveResult, validationRoot string, adoption *offlineArchiveAdoptionContract) (offlineArchiveProjectionIntent, error) {
-	var intent offlineArchiveProjectionIntent
+func prepareOfflineArchiveProjectionIntent(cfg *config.Config, source offlineArchiveSourceProof, result archiveResult, validationRoot string, adoption *offlineArchiveAdoptionContract) (intent offlineArchiveProjectionIntent, resultErr error) {
 	if cfg == nil {
 		return intent, errors.New("offline archive projection configuration is unavailable")
 	}
@@ -230,7 +230,9 @@ func prepareOfflineArchiveProjectionIntent(cfg *config.Config, source offlineArc
 	keepStage := false
 	defer func() {
 		if !keepStage {
-			_ = discardOfflineArchiveProjectionStage(cfg.StatePath(), stageRelative)
+			if cleanupErr := discardOfflineArchiveProjectionStage(cfg.StatePath(), stageRelative); cleanupErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("offline archive projection stage cleanup failed; retry with --recover: %w", cleanupErr))
+			}
 		}
 	}()
 	configSHA, err := cfg.CanonicalSHA256()

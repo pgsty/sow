@@ -77,6 +77,10 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   expected-child 原子替换恢复精确父或首发前缺失；错误 URL 与“同字节、错 target-root”
   的合法 channel 均在修改前拒绝。受影响普通/race、迁移与双份 clean-delivery 全绿，
   仅临时本地 serving tree。
+- `2026-07-20-offline-archive-preintent-cleanup-failure.md`：离线 tgz 在 stage
+  fsync 或 intent write 失败时，清理错误不再被 defer 吞掉；绑定的 stage 目录负责
+  exact remove+fsync，失败明确要求 `--recover`。权限漂移、无漂移控制与真实恢复重放
+  普通/race 均通过，且失败前不生成 intent、receipt 或可见 destination。
 - `2026-07-20-retained-yum-authority-and-verifier-credential.md`：retained YUM
   closure 在 canonical authority 或 generation pins 缺失时不再复制当前 manifest
   伪装成功；L3/L4 缺凭据现在输出稳定、脱敏且可行动的 finding，并保持 network/auth
