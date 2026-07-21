@@ -55,6 +55,113 @@ func setupServingYUMView(t *testing.T) (root, configPath, rpmPath, keyPath strin
 	return root, configPath, rpmPath, keyPath, private
 }
 
+func TestRollbackLocalServingMirrorlistBindsExactParentAndPriorState(t *testing.T) {
+	manifestBody := "yum/test/el10/x86_64/Packages/p/pkg.rpm\t1\t" + strings.Repeat("a", 64) + "\n"
+	identity := serving.Identity{
+		View: "latest", Repo: "rpm-test", OS: "el10", Arch: "x86_64", LegacyRoot: "yum/test/el10/x86_64",
+		RefCommit: strings.Repeat("1", 40), ConfigSHA256: strings.Repeat("2", 64), RepositoryKeySHA256: strings.Repeat("3", 64),
+	}
+	parentGeneration, err := serving.DeriveGeneration(identity, strings.NewReader(manifestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := serving.NewTargetIdentity("latest", "public", "https://repo.example.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := serving.NewChannelForTarget(parentGeneration, target, nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongURLTarget, err := serving.NewTargetIdentity("latest", "public", "https://wrong.example.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongURLParent, err := serving.NewChannelForTarget(parentGeneration, wrongURLTarget, nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongRootTarget, err := serving.NewTargetIdentity("latest", "other-public", "https://repo.example.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongTargetParent, err := serving.NewChannelForTarget(parentGeneration, wrongRootTarget, nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity.RefCommit = strings.Repeat("4", 40)
+	childGeneration, err := serving.DeriveGeneration(identity, strings.NewReader(manifestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := serving.NewChannelForTarget(childGeneration, target, &parent, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installChild := func(t *testing.T, root string) {
+		t.Helper()
+		if _, err := serving.ReconcileMirrorlist(root, parent); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := serving.ReconcileMirrorlist(root, child); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, test := range []struct {
+		name   string
+		parent serving.Channel
+	}{
+		{name: "different URL", parent: wrongURLParent},
+		{name: "different target root", parent: wrongTargetParent},
+	} {
+		t.Run("reject another valid parent "+test.name+" before mutation", func(t *testing.T) {
+			root := t.TempDir()
+			installChild(t, root)
+			childBody, err := child.MirrorlistBody()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := rollbackLocalServingMirrorlist(root, &test.parent, child); err == nil || !strings.Contains(err.Error(), "parent") {
+				t.Fatalf("rollback accepted a valid but unsealed parent: %v", err)
+			}
+			observed, exists, err := serving.ReadMirrorlist(root, child.MirrorlistPath)
+			if err != nil || !exists || !bytes.Equal(observed, childBody) {
+				t.Fatalf("rejected rollback changed child pointer: body=%q exists=%t err=%v", observed, exists, err)
+			}
+		})
+	}
+
+	t.Run("restore exact parent", func(t *testing.T) {
+		root := t.TempDir()
+		installChild(t, root)
+		parentBody, err := parent.MirrorlistBody()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := rollbackLocalServingMirrorlist(root, &parent, child); err != nil {
+			t.Fatal(err)
+		}
+		observed, exists, err := serving.ReadMirrorlist(root, child.MirrorlistPath)
+		if err != nil || !exists || !bytes.Equal(observed, parentBody) {
+			t.Fatalf("exact rollback body=%q exists=%t err=%v", observed, exists, err)
+		}
+	})
+
+	t.Run("restore first-install absence", func(t *testing.T) {
+		root := t.TempDir()
+		if _, err := serving.ReconcileMirrorlist(root, parent); err != nil {
+			t.Fatal(err)
+		}
+		if err := rollbackLocalServingMirrorlist(root, nil, parent); err != nil {
+			t.Fatal(err)
+		}
+		if _, exists, err := serving.ReadMirrorlist(root, parent.MirrorlistPath); err != nil || exists {
+			t.Fatalf("first-install rollback exists=%t err=%v", exists, err)
+		}
+	})
+}
+
 func mirrorGenerationID(t *testing.T, root, relative string) string {
 	t.Helper()
 	body, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(relative)))

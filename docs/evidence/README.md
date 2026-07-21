@@ -72,6 +72,11 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   逐条绑定；四类错配在任何 CAS 计划前失败。真实 `gc --apply` 即使收到旧实现会接受的
   精确删除摘要也退出验证错误并保留全部对象。712 个 CLI ordinary/race、全包静态/
   迁移/性能与双份 clean-delivery 已通过。仅使用临时 Git/CAS，不触云或生产资源。
+- `2026-07-20-local-serving-atomic-parent-rollback.md`：本地 YUM post-flip trust
+  回滚现在先绑定 child 封存的 leaf/generation/mirrorlist digest/target 身份，再以单次
+  expected-child 原子替换恢复精确父或首发前缺失；错误 URL 与“同字节、错 target-root”
+  的合法 channel 均在修改前拒绝。受影响普通/race、迁移与双份 clean-delivery 全绿，
+  仅临时本地 serving tree。
 - `2026-07-20-yum-compatibility-bound-cutover-recovery.md`：实际 CLI 使用的锁与
   `os.Root` capability-bound YUM cutover recovery 现在覆盖 S2/S3 半写、孤儿、已提交及
   无 canonical authority 的拒绝路径；post-flip 故障恢复原链接或原缺失状态。709 个 CLI

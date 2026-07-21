@@ -2006,3 +2006,47 @@ CO/COS, EdgeOne or production repository was read or written. V-52 closes the
 local V-51 delivery gate only; the long-term Goal remains active. An earlier
 pre-commit candidate was invalidated rather than accepted after the staged
 whitespace gate removed two trailing blank lines from delivery-managed docs.
+
+## 2026-07-20 V-54 atomic sealed-parent serving rollback delivery
+
+V-54 supersedes V-52 after local YUM serving rollback was changed from a
+remove-then-create sequence to a single expected-child replacement, and the
+supplied parent was bound to the child's sealed generation, pointer digest,
+target identity, target root and mirrorlist path. The pre-fix red test proved
+that a syntactically valid parent with a different mirror URL was accepted;
+the fixed test also rejects a same-pointer parent from a different target
+without mutating the current child. Exact-parent restoration and first-install
+absence restoration both pass.
+
+Focused ordinary/race tests, the adjacent serving/trust/recovery group, final
+ordinary/race CLI shards G-M and R-V, compile/vet/Staticcheck, module integrity,
+the 44-family migration E2E suite, local adoption rollback and clean-delivery
+policy passed. External network and all real-cloud opt-ins remained disabled.
+
+After the spec, traceability row, dated evidence and delivery allowlist were
+frozen, two isolated clean deliveries used only the local read-only module
+download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v54-serving-rollback-final-a-20260720
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v54-serving-rollback-final-b-20260720
+
+PRODUCT_SOURCE_SHA256=a0583bbb322325caf884b358a73a83005d5e7a627b9f20c3c60a9e2443791670
+PRODUCT_SOURCE_FILES=547
+DELIVERY_CONTENT_SHA256=5fe75d4c3eb11b5fc8eabb636a87c56a5362c293da4c82ed2e1dde8663e6aead
+DELIVERY_FILES=733
+ARCHIVE_SHA256=3bb24d7ffda95ac25e4cb90e7ce6bd0609f988839026186632cd641ee1804c22
+```
+
+Archives:
+
+- `/tmp/sow-v54-serving-rollback-final-a-20260720/sow-delivery-5fe75d4c3eb11b5f.tgz`
+- `/tmp/sow-v54-serving-rollback-final-b-20260720/sow-delivery-5fe75d4c3eb11b5f.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This validation ledger remains outside both manifests,
+so recording V-54 does not perturb the identity it records. No Cloudflare,
+CO/COS, EdgeOne or production repository was read or written. V-54 closes the
+local V-53 delivery gate only; the long-term Goal remains active.

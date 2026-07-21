@@ -976,14 +976,26 @@ func restoreLocalServingMirrorlistGuarded(values commonFlags, cfg *config.Config
 }
 
 func rollbackLocalServingMirrorlist(targetRoot string, parent *serving.Channel, current serving.Channel) error {
-	if _, err := serving.RemoveMirrorlist(targetRoot, current); err != nil {
-		return err
-	}
 	if parent == nil {
-		return nil
+		return serving.RollbackMirrorlist(targetRoot, current, nil, false)
 	}
-	_, err := serving.RestoreMirrorlist(targetRoot, *parent)
-	return err
+	if err := parent.Validate(); err != nil {
+		return fmt.Errorf("validate local serving rollback parent: %w", err)
+	}
+	expectedTargetID := current.TargetID
+	if current.ParentTargetID != "" {
+		expectedTargetID = current.ParentTargetID
+	}
+	if parent.View != current.View || parent.Repo != current.Repo || parent.OS != current.OS || parent.Arch != current.Arch ||
+		parent.MirrorlistPath != current.MirrorlistPath || parent.Generation != current.ParentGeneration ||
+		parent.MirrorlistSHA256 != current.ParentMirrorlistSHA256 || parent.TargetID != expectedTargetID || parent.TargetRoot != current.TargetRoot {
+		return errors.New("local serving rollback parent differs from the sealed channel parent")
+	}
+	prior, err := parent.MirrorlistBody()
+	if err != nil {
+		return fmt.Errorf("render local serving rollback parent: %w", err)
+	}
+	return serving.RollbackMirrorlist(targetRoot, current, prior, true)
 }
 
 func localServingChannelMatches(current, wanted serving.Channel) bool {
