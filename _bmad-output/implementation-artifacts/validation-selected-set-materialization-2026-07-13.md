@@ -1891,3 +1891,40 @@ V-43 does not perturb the identity it records. No request was made to the
 authorized `pro` test bucket, any other bucket, CDN, Worker, Zone, CO/COS,
 EdgeOne or production repository. V-43 is the current V-14 delivery identity;
 the long-term Goal remains active.
+
+## 2026-07-20 V-48 bound YUM cutover recovery delivery identity
+
+V-48 supersedes V-43 after the production capability-bound YUM compatibility
+cutover recovery gained executable crash-state and post-flip rollback evidence.
+The code-bearing source passed all 709 CLI tests in six ordinary and six race
+shards, all non-CLI packages ordinary/race, nested RPM tests/provenance/vulnerability,
+compile/vet/Staticcheck, four static cross-builds, 47/47 edge contracts, seven
+hermetic migration suites and all 50k performance gates. Real cloud, upstream
+and Docker opt-ins were zero throughout.
+
+After the spec, traceability row and dated evidence were frozen, two isolated
+clean deliveries used only the local read-only module download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v48-final-a-20260720
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v48-final-b-20260720
+
+PRODUCT_SOURCE_SHA256=63b45a5ee5bafe9c61b63535288b88994b741a862c8bc48999baa3c14441b93a
+PRODUCT_SOURCE_FILES=547
+DELIVERY_CONTENT_SHA256=a08df1a72ef18d8735805d836668c238d5decd16d67a5ad577c19fd84b04968c
+DELIVERY_FILES=727
+ARCHIVE_SHA256=0a853f3ac1c0ad4cc7f9d821ea9146124add6c022b1349fc9a82eaab21807a1f
+```
+
+Archives:
+
+- `/tmp/sow-v48-final-a-20260720/sow-delivery-a08df1a72ef18d87.tgz`
+- `/tmp/sow-v48-final-b-20260720/sow-delivery-a08df1a72ef18d87.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This validation ledger remains outside both manifests,
+so recording V-48 does not perturb the identity it records. No Cloudflare,
+CO/COS, EdgeOne or production repository was read or written. V-48 closes the
+local V-47 delivery gate only; the long-term Goal remains active.

@@ -9,6 +9,7 @@ _bmad-output/implementation-artifacts/spec-real-r2-publication-storage-transacti
 _bmad-output/implementation-artifacts/spec-remote-fsck-storage-only-authority.md
 _bmad-output/implementation-artifacts/spec-route-wire-canonicalization.md
 _bmad-output/implementation-artifacts/spec-static-verifier-provider-attestation.md
+_bmad-output/implementation-artifacts/spec-yum-compatibility-bound-cutover-recovery.md
 _bmad-output/implementation-artifacts/spec-yum-consumer-preflight-lock-release.md
 _bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/addendum.md
 _bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/prd.md
@@ -141,6 +142,7 @@ docs/evidence/2026-07-20-dead-code-static-analysis-closure.md
 docs/evidence/2026-07-20-r2-publication-storage-transaction.md
 docs/evidence/2026-07-20-reachable-history-config-memory-bound.md
 docs/evidence/2026-07-20-static-provider-attestation.md
+docs/evidence/2026-07-20-yum-compatibility-bound-cutover-recovery.md
 docs/evidence/README.md
 docs/examples/sow-pgdg.yaml
 docs/migration/audit-legacy-targets.sh

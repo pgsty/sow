@@ -240,6 +240,7 @@ internal/cli/yum_compat_bootstrap_test.go
 internal/cli/yum_compat_bound_cas.go
 internal/cli/yum_compat_bound_journal.go
 internal/cli/yum_compat_bound_materialize.go
+internal/cli/yum_compat_bound_recovery_test.go
 internal/cli/yum_compat_bound_state.go
 internal/cli/yum_compat_candidate_hardlink_test.go
 internal/cli/yum_compat_contract.go

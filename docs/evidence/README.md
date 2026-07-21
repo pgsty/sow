@@ -62,6 +62,10 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
 
 其余证据报告与验收入口如下；每项是否实跑、源码日期及外部边界以自身正文为准：
 
+- `2026-07-20-yum-compatibility-bound-cutover-recovery.md`：实际 CLI 使用的锁与
+  `os.Root` capability-bound YUM cutover recovery 现在覆盖 S2/S3 半写、孤儿、已提交及
+  无 canonical authority 的拒绝路径；post-flip 故障恢复原链接或原缺失状态。709 个 CLI
+  ordinary/race、全包静态/迁移/性能与双份 clean-delivery 已通过；全程仅临时本地仓库。
 - `2026-07-20-dead-code-static-analysis-closure.md`：删除 42 个 `U1000` 不可达声明与
   768 行旧 wrapper/compatibility auditor，保留唯一 CLI 接线路径；默认 Staticcheck
   正确性检查、六片 ordinary/race、非 CLI ordinary/race、四平台静态构建、47 项边缘

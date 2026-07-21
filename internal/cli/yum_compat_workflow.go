@@ -197,9 +197,8 @@ type yumCompatibilityWorkflow struct {
 	// repository even if the public pathname is renamed concurrently.
 	readRoot *os.Root
 	// mutationHook is an unexported deterministic fault-injection seam. It is
-	// invoked only inside a bound mutation primitive, after ordinary admission
-	// checks and immediately before the primitive writes through an already-open
-	// directory capability. Production workflows always leave it nil.
+	// invoked only at named boundaries inside a bound mutation primitive after
+	// ordinary admission checks. Production workflows always leave it nil.
 	mutationHook func(string) error
 }
 
@@ -3347,18 +3346,19 @@ func reconcileYUMCompatibilityServingLink(cfg *config.Config, journal yumCompati
 }
 
 func reconcileYUMCompatibilityServingLinkWithHook(cfg *config.Config, journal yumCompatibilityCutoverJournal, afterParentOpen func() error) error {
-	return reconcileYUMCompatibilityServingLinkWithBinding(cfg, journal, nil, afterParentOpen, nil)
+	return reconcileYUMCompatibilityServingLinkWithBinding(cfg, journal, nil, afterParentOpen, nil, nil)
 }
 
 func reconcileYUMCompatibilityServingLinkBound(workflow yumCompatibilityWorkflow, journal yumCompatibilityCutoverJournal) error {
 	if err := requireYUMCompatibilityMutationBoundary(workflow, "open controlled compatibility serving link"); err != nil {
 		return err
 	}
-	var beforeCommit func() error
+	var beforeCommit, afterCommit func() error
 	if workflow.mutationHook != nil {
 		beforeCommit = func() error { return workflow.mutationHook("flip controlled compatibility serving link") }
+		afterCommit = func() error { return workflow.mutationHook("verify controlled compatibility serving link after flip") }
 	}
-	if err := reconcileYUMCompatibilityServingLinkWithBinding(workflow.cfg, journal, workflow.root, nil, beforeCommit); err != nil {
+	if err := reconcileYUMCompatibilityServingLinkWithBinding(workflow.cfg, journal, workflow.root, nil, beforeCommit, afterCommit); err != nil {
 		return err
 	}
 	return requireYUMCompatibilityMutationBoundary(workflow, "finish controlled compatibility serving-link flip")
@@ -3448,7 +3448,7 @@ func verifyRestoredYUMCompatibilityServingLink(parentRoot *os.Root, parentRelati
 	return nil
 }
 
-func reconcileYUMCompatibilityServingLinkWithBinding(cfg *config.Config, journal yumCompatibilityCutoverJournal, binding *yumCompatibilityRepositoryBinding, afterParentOpen, beforeCommit func() error) error {
+func reconcileYUMCompatibilityServingLinkWithBinding(cfg *config.Config, journal yumCompatibilityCutoverJournal, binding *yumCompatibilityRepositoryBinding, afterParentOpen, beforeCommit, afterCommit func() error) error {
 	if cfg == nil || cfg.Root == "" {
 		return errors.New("configuration root is unavailable")
 	}
@@ -3601,6 +3601,11 @@ func reconcileYUMCompatibilityServingLinkWithBinding(cfg *config.Config, journal
 			return err
 		}
 		changed = true
+		if afterCommit != nil {
+			if err := afterCommit(); err != nil {
+				return rollbackAfterMutation(err)
+			}
+		}
 		if err := syncYUMCompatibilityRootDirectory(parentRoot); err != nil {
 			return rollbackAfterMutation(err)
 		}
