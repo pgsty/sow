@@ -128,6 +128,23 @@ rclone lsf cf:pro
 普通测试套件始终运行离线负例 `TestRealCloudR2PublicationNetworkBoundary`；真实用例默认
 skip，只有上述完整门禁同时存在才可联网写入。
 
+## 2026-07-22 current-source revalidation
+
+Commit `9b481e994265d7b9e623c08a4014cadf8e233bb7` reran the hardened product
+transaction as `sow-r2-publication-20260722-020300`. The R2 credential existed
+only in the child environment reconstructed from the existing `rclone cf:`
+reference; a real Cloudflare API token was explicitly absent and the purge/CDN
+control path remained the local network-fenced adapter. The test passed in
+104.04s (package 104.734s):
+
+```text
+real R2 publication storage transaction PASS run=sow-r2-publication-20260722-020300 generation=1 puts=8 purge_adapter_calls=1 local_cdn_gets=2 drift_rejected=true cas_restore=true replay_unchanged=true remote_adoption=true full_fsck=true real_cf_control_plane=false real_custom_domain=false empty_before=true empty_after=true
+```
+
+The independent recursive `rclone lsf cf:pro` check returned zero objects. No
+other bucket, Cloudflare control-plane endpoint, CO/COS or production repository
+was contacted.
+
 ## 需求状态边界
 
 - FR-04：真实产品 publisher 已完成 R2 checkpoint create/CAS/final readback 和 generation 1

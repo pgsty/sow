@@ -73,6 +73,22 @@ rclone lsf cf:pro --recursive --max-depth -1
 
 退出码 `0`、stdout 为空。
 
+## 2026-07-22 current-source revalidation
+
+Commit `9b481e994265d7b9e623c08a4014cadf8e233bb7` reran the same storage-only
+authority gate as `sow-r2-fsck-20260722-020600`. The credential was reconstructed
+only inside the shell from the existing `rclone cf:` reference and the CDN
+credential remained explicitly empty. The test passed in 29.18s (package
+29.891s):
+
+```text
+real R2 fsck PASS run=sow-r2-fsck-20260722-020600 adoption=true replay=true drift_rejected=true cas_restore=true cdn_credentials=false control_plane=false custom_domain=false empty_before=true empty_after=true
+```
+
+The independent recursive `rclone lsf cf:pro` check returned zero objects. No
+other bucket, Cloudflare control plane, CO/COS or production repository was
+contacted.
+
 ## 本地/协议回归
 
 以下门禁覆盖 R2/COS capability separation：

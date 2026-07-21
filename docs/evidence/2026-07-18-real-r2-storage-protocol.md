@@ -121,6 +121,21 @@ ok github.com/pgsty/sow/test/compat 31.708s
 它不是 bucket 对象，也没有被伪报为已 purge。整个 follow-up 没有 control-plane token、Worker、
 purge API、其他 bucket、`cos:` 或生产资源访问。
 
+## 2026-07-22 current-source revalidation
+
+Commit `9b481e994265d7b9e623c08a4014cadf8e233bb7` used the exact pinned resource
+again with run `sow-r2-storage-20260722-020100`. The credential was reconstructed
+only inside the test shell from the existing `rclone cf:` reference; neither key
+was printed or written. The current test passed in 33.97s (package 34.901s):
+
+```text
+real R2 storage PASS run=sow-r2-storage-20260722-020100 operations=create-only+cas-race+head+stream-get+main-beta-custom-domain+copy-source-cas+delete-capability-probe+identity-bound-unconditional-cleanup+custom-domain-post-delete-observation conditional_delete=false custom_domain_present=main=CURRENT-MISS/FRA,beta=CURRENT-MISS/FRA custom_domain_after_delete=main=STALE-HIT/FRA/max-age=1800,beta=STALE-HIT/FRA/max-age=1800 empty_before=true empty_after=true
+```
+
+An independent recursive `rclone lsf cf:pro` immediately afterwards returned
+zero objects. No other bucket, Cloudflare control-plane API, CO/COS or production
+repository was contacted.
+
 ## 能力判定
 
 | 原语 | 真实结果 | 产品处理 |

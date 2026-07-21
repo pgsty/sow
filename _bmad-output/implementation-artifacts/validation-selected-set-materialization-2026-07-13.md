@@ -2176,3 +2176,49 @@ archive digest above. This validation ledger remains outside both manifests,
 so recording V-60 does not perturb the identity it records. No Cloudflare,
 CO/COS, EdgeOne or production repository was read or written. V-60 closes the
 local V-59 delivery gate only; the long-term Goal remains active.
+
+## 2026-07-22 V-62 current R2 revalidation delivery
+
+V-62 supersedes V-60 after the exhaustive A-F coverage fixture correction and
+three current-commit real R2 revalidations. Commit
+`9b481e994265d7b9e623c08a4014cadf8e233bb7` passed the corrected focused
+ordinary/race tests, all six CLI coverage shards, and all fourteen non-CLI
+package coverage runs. The owner-authorized, dashboard-confirmed empty `pro`
+bucket then passed the real storage protocol, product publication-storage
+transaction, and storage-only fsck gates as runs
+`sow-r2-storage-20260722-020100`, `sow-r2-publication-20260722-020300`, and
+`sow-r2-fsck-20260722-020600`. Independent recursive `rclone lsf cf:pro`
+checks observed zero objects after every run.
+
+The existing `cf:` credential was reconstructed only in each child shell's
+environment; no key was printed, logged, or written. No other bucket,
+Cloudflare control-plane endpoint, CO/COS, EdgeOne, or production repository
+was accessed.
+
+After the evidence and traceability updates were frozen, two isolated clean
+deliveries used only the local read-only module download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /private/tmp/sow-v62-r2-current-a-20260722
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /private/tmp/sow-v62-r2-current-b-20260722
+
+PRODUCT_SOURCE_SHA256=281ba4509ca6bf3a60b31ca35ed104b6bcbdc887e522bfcc33a2006cb8d051d5
+PRODUCT_SOURCE_FILES=547
+DELIVERY_CONTENT_SHA256=3cb5fe82b3e2a5d1f4a7a670490767836a09d2b587769729e01342306b842c7d
+DELIVERY_FILES=739
+ARCHIVE_SHA256=5197a7ed553e0ae1f650036ef2d14cf2555c3f612d5007bea714761eacabe955
+```
+
+Archives:
+
+- `/private/tmp/sow-v62-r2-current-a-20260722/sow-delivery-3cb5fe82b3e2a5d1.tgz`
+- `/private/tmp/sow-v62-r2-current-b-20260722/sow-delivery-3cb5fe82b3e2a5d1.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This validation ledger remains outside both manifests,
+so recording V-62 does not perturb the identity it records. The long-term Goal
+remains active because real Cloudflare Worker/purge/cache-log, COS/EdgeOne, and
+production migration evidence are still open; production resources remain
+forbidden test targets.
