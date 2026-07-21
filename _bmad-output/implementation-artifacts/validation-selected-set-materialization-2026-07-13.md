@@ -1983,24 +1983,26 @@ download cache:
 
 ```text
 SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
-  test/compat/test-clean-delivery.sh /tmp/sow-v52-fenced-delete-final-a-20260720
+  test/compat/test-clean-delivery.sh /tmp/sow-v52-fenced-delete-committed-a-20260720
 SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
-  test/compat/test-clean-delivery.sh /tmp/sow-v52-fenced-delete-final-b-20260720
+  test/compat/test-clean-delivery.sh /tmp/sow-v52-fenced-delete-committed-b-20260720
 
 PRODUCT_SOURCE_SHA256=d34bcf7829bba4e6034ad14db4609e002d0a9a230068c38163bebcc517cb393f
 PRODUCT_SOURCE_FILES=547
-DELIVERY_CONTENT_SHA256=a0d4dea88a7f22041bc5367143ccbdb502805989a273b3fe1c26d29cabaed11b
+DELIVERY_CONTENT_SHA256=e34a13df8f4a853c697c8c0618098370c7ddc7ebf0846a6b6c23bbc6e4cfa76b
 DELIVERY_FILES=731
-ARCHIVE_SHA256=01de6c60ecf732a3a87d0edc1ab8586aa58803e3f9009b3b0152e079666abb15
+ARCHIVE_SHA256=6dbdade5b2cee78ce1b0721697aa4191712dcd0afe14215300aef900f7260981
 ```
 
 Archives:
 
-- `/tmp/sow-v52-fenced-delete-final-a-20260720/sow-delivery-a0d4dea88a7f2204.tgz`
-- `/tmp/sow-v52-fenced-delete-final-b-20260720/sow-delivery-a0d4dea88a7f2204.tgz`
+- `/tmp/sow-v52-fenced-delete-committed-a-20260720/sow-delivery-e34a13df8f4a853c.tgz`
+- `/tmp/sow-v52-fenced-delete-committed-b-20260720/sow-delivery-e34a13df8f4a853c.tgz`
 
 Independent `cmp` returned 0 and both `shasum -a 256` values matched the
 archive digest above. This validation ledger remains outside both manifests,
 so recording V-52 does not perturb the identity it records. No Cloudflare,
 CO/COS, EdgeOne or production repository was read or written. V-52 closes the
-local V-51 delivery gate only; the long-term Goal remains active.
+local V-51 delivery gate only; the long-term Goal remains active. An earlier
+pre-commit candidate was invalidated rather than accepted after the staged
+whitespace gate removed two trailing blank lines from delivery-managed docs.
