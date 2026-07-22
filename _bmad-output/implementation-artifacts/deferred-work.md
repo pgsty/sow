@@ -41,3 +41,11 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md`
   summary: Derived-state admission should freeze directory ownership/writeability and reject foreign hardlink aliases when the threat model includes same-host hostile writers.
   evidence: Root and leaf identity checks reject coordinate replacement but do not reject group/other-writable directories or require link count one, so another principal with write access could retain an alias and mutate the installed inode after verification.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-projection-stage-install-rollback-identity.md`
+  summary: Canonical `Store.Apply` reopens staged pathnames after journaling, so a post-prepare replacement can commit bytes that are not bound to the durable projection intent.
+  evidence: The asset/package `after-fence-before-apply` boundary occurs after prepare returns its process-local stage identity ledger; `buildJournal` hashes the then-current replacement and `installPathChanges` reopens/copies it without comparing that inode and digest to the higher-level projection intent identity.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-projection-stage-install-rollback-identity.md`
+  summary: Preserved projection-orphan audit quarantines need explicit `fsck` inventory and capability-bound retirement.
+  evidence: ADR-0041 deliberately makes the first `--recover` rename an unowned final stage to `.preserved-<nonce>` and makes later recovery ignore that strict form; current `fsck`/GC does not enumerate or retire those audit copies.

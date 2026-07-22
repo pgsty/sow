@@ -153,6 +153,7 @@ internal/cli/projection_intent_audit.go
 internal/cli/projection_intent_audit_test.go
 internal/cli/projection_intent_removal_test.go
 internal/cli/projection_intent_remove.go
+internal/cli/projection_stage_install_test.go
 internal/cli/promote.go
 internal/cli/promote_test.go
 internal/cli/publish.go

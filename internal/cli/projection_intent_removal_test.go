@@ -254,7 +254,7 @@ func TestPackageProjectionRecoveryPreservesConcurrentResidueReplacement(t *testi
 	})
 }
 
-func TestProjectionRecoveryRemovesExactEmptyResidues(t *testing.T) {
+func TestProjectionRecoveryPreservesExactOrphanResidues(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		relative string
@@ -275,14 +275,156 @@ func TestProjectionRecoveryRemovesExactEmptyResidues(t *testing.T) {
 			if err := os.WriteFile(path, nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if err := tc.cleanup(stateRoot); err != nil {
-				t.Fatalf("remove exact empty projection residue: %v", err)
+			if err := tc.cleanup(stateRoot); err == nil || !strings.Contains(err.Error(), "preserved orphan") {
+				t.Fatalf("orphan projection residue was not preserved for audit: %v", err)
 			}
 			if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("exact empty projection residue remains: %v", err)
+				t.Fatalf("orphan projection residue remains in the live coordinate: %v", err)
+			}
+			entries, err := os.ReadDir(stateRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			preserved := ""
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), tc.relative+".preserved-") {
+					preserved = filepath.Join(stateRoot, entry.Name())
+				}
+			}
+			if preserved == "" {
+				t.Fatal("orphan projection residue has no preserved audit coordinate")
+			}
+			if body, err := os.ReadFile(preserved); err != nil || len(body) != 0 {
+				t.Fatalf("preserved empty projection residue changed body=%q err=%v", body, err)
+			}
+			if err := tc.cleanup(stateRoot); err != nil {
+				t.Fatalf("second recovery did not ignore preserved audit residue: %v", err)
 			}
 		})
 	}
+}
+
+func TestProjectionRecoveryRejectsUnknownStageSuffixes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		relative string
+		cleanup  func(string) error
+	}{
+		{
+			name: "asset", relative: assetProjectionStagePrefix + strings.Repeat("b", 32) + ".tsv.test-original",
+			cleanup: func(root string) error { return cleanupAssetProjectionIntentResidue(root, true) },
+		},
+		{
+			name: "package", relative: packageProjectionStagePrefix + strings.Repeat("c", 32) + "-000.tsv.test-original",
+			cleanup: func(root string) error { return cleanupPackageProjectionIntentResidue(root, true) },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stateRoot := t.TempDir()
+			path := filepath.Join(stateRoot, tc.relative)
+			body := []byte("unknown projection residue")
+			if err := os.WriteFile(path, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.cleanup(stateRoot); err == nil || !strings.Contains(err.Error(), "unsafe") {
+				t.Fatalf("unknown projection residue suffix was not rejected: %v", err)
+			}
+			if current, err := os.ReadFile(path); err != nil || !bytes.Equal(current, body) {
+				t.Fatalf("unknown projection residue changed body=%q err=%v", current, err)
+			}
+		})
+	}
+}
+
+func TestProjectionStageNameClassificationIsExact(t *testing.T) {
+	assetID := strings.Repeat("1", 32)
+	packageID := strings.Repeat("2", 32)
+	for _, tc := range []struct {
+		name  string
+		valid bool
+		check func(string) bool
+	}{
+		{name: assetProjectionStagePrefix + assetID + ".tsv", valid: true, check: isAssetProjectionStageFinalName},
+		{name: assetProjectionStagePrefix + assetID + "-config.yaml", valid: true, check: isAssetProjectionStageFinalName},
+		{name: assetProjectionStagePrefix + assetID + ".tsv.test-original", check: isAssetProjectionStageFinalName},
+		{name: packageProjectionStagePrefix + packageID + "-000.tsv", valid: true, check: isPackageProjectionStageFinalName},
+		{name: packageProjectionStagePrefix + packageID + "-1000.tsv", valid: true, check: isPackageProjectionStageFinalName},
+		{name: packageProjectionStagePrefix + packageID + "-0000.tsv", check: isPackageProjectionStageFinalName},
+		{name: packageProjectionStagePrefix + packageID + "-00x.tsv", check: isPackageProjectionStageFinalName},
+	} {
+		if actual := tc.check(tc.name); actual != tc.valid {
+			t.Errorf("projection stage classification name=%q actual=%t want=%t", tc.name, actual, tc.valid)
+		}
+	}
+	final := packageProjectionStagePrefix + packageID + "-000.tsv"
+	for _, tc := range []struct {
+		name      string
+		temporary bool
+		preserved bool
+	}{
+		{name: final + ".tmp-" + strings.Repeat("a", 32), temporary: true},
+		{name: final + ".tmp-install-" + strings.Repeat("b", 32) + ".tmp-remove-" + strings.Repeat("c", 32), temporary: true},
+		{name: final + ".preserved-" + strings.Repeat("d", 32), preserved: true},
+		{name: final + ".tmp", temporary: false},
+		{name: final + ".preserved-not-hex", preserved: false},
+	} {
+		if actual := isProjectionStageTemporaryName(tc.name, isPackageProjectionStageFinalName); actual != tc.temporary {
+			t.Errorf("temporary classification name=%q actual=%t want=%t", tc.name, actual, tc.temporary)
+		}
+		if actual := isProjectionStagePreservedName(tc.name, isPackageProjectionStageFinalName); actual != tc.preserved {
+			t.Errorf("preserved classification name=%q actual=%t want=%t", tc.name, actual, tc.preserved)
+		}
+	}
+}
+
+func TestExactPrivateStateRemovalRevalidatesLastUnlinkBoundary(t *testing.T) {
+	stateRoot := t.TempDir()
+	name := "owned.tmp-" + strings.Repeat("d", 32)
+	path := filepath.Join(stateRoot, name)
+	if err := os.WriteFile(path, []byte("owned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	file, identity, err := bindExactProjectionResidue(root, name, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	directory, err := root.Open(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+	canary := []byte("last-boundary replacement")
+	var quarantine string
+	previous := projectionStateBeforeUnlinkHook
+	projectionStateBeforeUnlinkHook = func(relative string) error {
+		quarantine = filepath.Join(stateRoot, relative)
+		if err := os.Rename(quarantine, quarantine+".test-original"); err != nil {
+			return err
+		}
+		return os.WriteFile(quarantine, canary, 0o600)
+	}
+	t.Cleanup(func() { projectionStateBeforeUnlinkHook = previous })
+	err = commitExactPrivateStateFileRemoval(root, directory, file, identity, name, func() error { return nil })
+	if err == nil {
+		t.Fatal("exact removal accepted a replacement at the last unlink boundary")
+	}
+	preserved := false
+	for _, candidate := range []string{path, quarantine} {
+		body, readErr := os.ReadFile(candidate)
+		if readErr == nil && bytes.Equal(body, canary) {
+			preserved = true
+		}
+	}
+	if !preserved {
+		t.Fatal("last-boundary replacement bytes did not survive")
+	}
+	projectionStateBeforeUnlinkHook = previous
 }
 
 func assertProjectionResidueReplacementPreserved(t *testing.T, stateRoot, name string, cleanup func() error) {

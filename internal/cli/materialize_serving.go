@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/pgsty/sow/internal/config"
@@ -1509,7 +1510,7 @@ func readBoundedExactRegularFile(directory, name string, limit int64) ([]byte, e
 		return nil, err
 	}
 	defer root.Close()
-	file, err := root.Open(name)
+	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1519,11 +1520,14 @@ func readBoundedExactRegularFile(directory, name string, limit int64) ([]byte, e
 	}
 	body, readErr := io.ReadAll(io.LimitReader(file, limit+1))
 	after, restatErr := file.Stat()
+	current, lstatErr := root.Lstat(name)
 	closeErr := file.Close()
-	if readErr != nil || restatErr != nil || closeErr != nil {
-		return nil, errors.Join(readErr, restatErr, closeErr)
+	if readErr != nil || restatErr != nil || lstatErr != nil || closeErr != nil {
+		return nil, errors.Join(readErr, restatErr, lstatErr, closeErr)
 	}
-	if len(body) > int(limit) || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+	if after == nil || current == nil || len(body) > int(limit) || !os.SameFile(before, after) || !os.SameFile(before, current) ||
+		before.Size() != after.Size() || before.Size() != current.Size() || before.Mode() != after.Mode() || before.Mode() != current.Mode() ||
+		!before.ModTime().Equal(after.ModTime()) || !before.ModTime().Equal(current.ModTime()) {
 		return nil, errors.New("local serving journal exceeded its limit or changed while reading")
 	}
 	return body, nil

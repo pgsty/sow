@@ -43,6 +43,7 @@ var packageProjectionMutationHook func(string) error
 var packageProjectionBeforeLockHook func() error
 var packageProjectionCleanupHook func(packageProjectionIntent)
 var packageProjectionNow = func() time.Time { return time.Now().UTC() }
+var packageProjectionIntentInstall = installProjectionIntentBytes
 
 type packageProjectionMutation struct {
 	leaf     viewLeaf
@@ -300,14 +301,30 @@ func (intent packageProjectionIntent) validate() error {
 }
 
 func writePackageProjectionIntent(stateRoot string, intent packageProjectionIntent) error {
-	if err := intent.validate(); err != nil {
+	body, err := marshalPackageProjectionIntent(intent)
+	if err != nil {
 		return err
+	}
+	return writeDerivedStateFile(stateRoot, packageProjectionIntentRelative, body)
+}
+
+func installPackageProjectionIntent(stateRoot string, intent packageProjectionIntent, boundRoot os.FileInfo) error {
+	body, err := marshalPackageProjectionIntent(intent)
+	if err != nil {
+		return err
+	}
+	return packageProjectionIntentInstall(stateRoot, packageProjectionIntentRelative, body, boundRoot)
+}
+
+func marshalPackageProjectionIntent(intent packageProjectionIntent) ([]byte, error) {
+	if err := intent.validate(); err != nil {
+		return nil, err
 	}
 	body, err := json.Marshal(intent)
 	if err != nil || len(body) > packageProjectionIntentMaxBytes {
-		return errors.Join(err, errors.New("pending package projection exceeds size limit"))
+		return nil, errors.Join(err, errors.New("pending package projection exceeds size limit"))
 	}
-	return writeDerivedStateFile(stateRoot, packageProjectionIntentRelative, body)
+	return body, nil
 }
 
 func readPackageProjectionIntent(stateRoot string) (packageProjectionIntent, bool, error) {
@@ -460,18 +477,39 @@ func cleanupPackageProjectionIntentResidue(stateRoot string, recover bool) error
 		}
 	}
 	removed := false
+	preserved := make([]string, 0)
 	for _, entry := range entries {
 		name := entry.Name()
-		isIntentTemporary := strings.HasPrefix(name, packageProjectionIntentRelative+".tmp-")
-		if !isIntentTemporary && !strings.HasPrefix(name, packageProjectionStagePrefix) {
+		isIntentTemporary := isDerivedStateTemporaryName(name, packageProjectionIntentRelative)
+		isStageTemporary := isProjectionStageTemporaryName(name, isPackageProjectionStageFinalName)
+		isPreserved := isProjectionStagePreservedName(name, isPackageProjectionStageFinalName)
+		isProjectionStage := isPackageProjectionStageFinalName(name)
+		if isPreserved {
 			continue
 		}
 		_, retained := wanted[name]
-		if retained && (strings.HasSuffix(name, ".tsv") || strings.HasSuffix(name, "-config.yaml")) {
+		if retained && isProjectionStage {
+			continue
+		}
+		isOrphanStage := isProjectionStage && !retained
+		if !isIntentTemporary && !isStageTemporary && !isOrphanStage {
+			if strings.HasPrefix(name, packageProjectionStagePrefix) || strings.HasPrefix(name, packageProjectionIntentRelative+".") {
+				return fmt.Errorf("unsafe pending package projection residue name %q", name)
+			}
 			continue
 		}
 		if !recover {
 			return errors.New("interrupted pending package projection residue requires --recover")
+		}
+		if isOrphanStage {
+			retainedName, moved, err := preserveExactProjectionResidue(stateRoot, name)
+			if err != nil {
+				return errors.Join(err, fmt.Errorf("unsafe pending package projection residue %s", name))
+			}
+			if moved {
+				preserved = append(preserved, retainedName)
+			}
+			continue
 		}
 		exact, err := removeExactProjectionResidue(stateRoot, name)
 		if err != nil {
@@ -480,13 +518,17 @@ func cleanupPackageProjectionIntentResidue(stateRoot string, recover bool) error
 		removed = removed || exact
 	}
 	if removed {
-		return syncLocalDirectory(stateRoot)
+		if err := syncLocalDirectory(stateRoot); err != nil {
+			return err
+		}
+	}
+	if len(preserved) != 0 {
+		return fmt.Errorf("preserved orphan package projection residue at %s; inspect it, then retry with --recover", strings.Join(preserved, ", "))
 	}
 	return nil
 }
 
-func preparePackageProjectionIntent(cfg *config.Config, canonical *state.Store, operation, family string, mutations []packageProjectionMutation, staged map[string]string, trust *materializationTrustSnapshot, privateKey, passphrase []byte) (packageProjectionIntent, map[string]string, error) {
-	var intent packageProjectionIntent
+func preparePackageProjectionIntent(cfg *config.Config, canonical *state.Store, operation, family string, mutations []packageProjectionMutation, staged map[string]string, trust *materializationTrustSnapshot, privateKey, passphrase []byte) (intent packageProjectionIntent, durable map[string]string, resultErr error) {
 	if len(mutations) == 0 || (family != "apt" && family != "yum" && family != "mixed") {
 		return intent, nil, errors.New("pending package projection mutation set is empty or invalid")
 	}
@@ -526,16 +568,15 @@ func preparePackageProjectionIntent(cfg *config.Config, canonical *state.Store, 
 	if err != nil {
 		return intent, nil, err
 	}
-	durable := make(map[string]string, len(staged))
+	durable = make(map[string]string, len(staged))
 	for path, source := range staged {
 		durable[path] = source
 	}
-	installed := make([]string, 0, len(mutations)+1)
+	installed := make([]projectionStageIdentity, 0, len(mutations)+1)
+	keepStages := false
 	defer func() {
-		if intent.ID == "" {
-			for _, name := range installed {
-				_ = os.Remove(filepath.Join(cfg.StatePath(), name))
-			}
+		if resultErr != nil && !keepStages {
+			resultErr = errors.Join(resultErr, rollbackInstalledProjectionStages(installed))
 		}
 	}()
 	intent = packageProjectionIntent{
@@ -543,10 +584,11 @@ func preparePackageProjectionIntent(cfg *config.Config, canonical *state.Store, 
 		ConfigSHA256: configSHA, ConfigSize: int64(len(canonicalConfig)), ConfigStage: packageProjectionStagePrefix + transactionID + "-config.yaml",
 		ExpectedHead: head.String(), TargetSHA256: targetSHA, RepositoryKeySHA256: trust.repositoryKeySHA256,
 	}
-	if err := writeDerivedStateFile(cfg.StatePath(), intent.ConfigStage, canonicalConfig); err != nil {
+	_, configIdentity, err := installProjectionStageBytes(cfg.StatePath(), intent.ConfigStage, canonicalConfig)
+	if err != nil {
 		return packageProjectionIntent{}, nil, err
 	}
-	installed = append(installed, intent.ConfigStage)
+	installed = append(installed, configIdentity)
 	durable["config/sow.yaml"] = filepath.Join(cfg.StatePath(), intent.ConfigStage)
 	repoIDs := make([]string, 0, len(trust.yum))
 	for repoID := range trust.yum {
@@ -566,11 +608,11 @@ func preparePackageProjectionIntent(cfg *config.Config, canonical *state.Store, 
 			return packageProjectionIntent{}, nil, fmt.Errorf("package projection stage %s is absent", mutation.viewPath)
 		}
 		stageRelative := fmt.Sprintf("%s%s-%03d.tsv", packageProjectionStagePrefix, transactionID, index)
-		object, err := installPendingAssetProjectionStage(cfg.StatePath(), stageRelative, source)
+		object, stageIdentity, err := installPendingProjectionStageBound(cfg.StatePath(), stageRelative, source, configIdentity.root)
 		if err != nil {
 			return packageProjectionIntent{}, nil, err
 		}
-		installed = append(installed, stageRelative)
+		installed = append(installed, stageIdentity)
 		durable[mutation.viewPath] = filepath.Join(cfg.StatePath(), stageRelative)
 		intent.Units = append(intent.Units, packageProjectionIntentUnit{
 			Repo: mutation.leaf.repo.ID, View: mutation.view, OS: mutation.leaf.os, Arch: mutation.leaf.arch,
@@ -586,9 +628,33 @@ func preparePackageProjectionIntent(cfg *config.Config, canonical *state.Store, 
 	if err != nil {
 		return packageProjectionIntent{}, nil, err
 	}
-	if err := writePackageProjectionIntent(cfg.StatePath(), intent); err != nil {
-		intent.ID = ""
+	if err := verifyInstalledProjectionStages(installed); err != nil {
 		return packageProjectionIntent{}, nil, err
+	}
+	if err := installPackageProjectionIntent(cfg.StatePath(), intent, configIdentity.root); err != nil {
+		if rootErr := verifyProjectionStageRootIdentity(cfg.StatePath(), configIdentity.root); rootErr != nil {
+			keepStages = true
+			return intent, nil, errors.Join(err, rootErr, errors.New("restore the exact projection state root, then retry with --recover"))
+		}
+		current, exists, readErr := readPackageProjectionIntent(cfg.StatePath())
+		rootErr := verifyProjectionStageRootIdentity(cfg.StatePath(), configIdentity.root)
+		if rootErr != nil {
+			keepStages = true
+			return intent, nil, errors.Join(err, readErr, rootErr, errors.New("restore the exact projection state root, then retry with --recover"))
+		}
+		if readErr != nil {
+			keepStages = true
+			return intent, nil, errors.Join(err, readErr, errors.New("pending package projection intent commit is ambiguous; retry with --recover"))
+		}
+		if exists && current.ID == intent.ID {
+			keepStages = true
+			return intent, nil, errors.Join(err, errors.New("pending package projection intent may require --recover after directory sync failure"))
+		}
+		return packageProjectionIntent{}, nil, err
+	}
+	keepStages = true
+	if err := verifyInstalledProjectionStages(installed); err != nil {
+		return intent, nil, errors.Join(err, errors.New("pending package projection intent committed with changed stages; retry with --recover"))
 	}
 	return intent, durable, nil
 }
@@ -912,9 +978,6 @@ func recoverPendingPackageProjection(ctx context.Context, cfg *config.Config, va
 		return true, err
 	}
 	defer propagateStateLockRelease(lock, &resultErr, stderr)
-	if err := requireNoForeignMaterializationIntent(cfg, operation, true); err != nil {
-		return true, err
-	}
 	// The pre-lock read is admission only. Another process may have recovered
 	// the exact bridge while this caller waited, or a new bridge may now occupy
 	// the pathname. Re-read under the global lock and treat only complete
@@ -950,6 +1013,9 @@ func recoverPendingPackageProjection(ctx context.Context, cfg *config.Config, va
 	}
 	if intent.Operation != operation {
 		return true, fmt.Errorf("pending package projection %s replaced matching %s recovery", intent.Operation, operation)
+	}
+	if err := requireNoForeignMaterializationIntent(cfg, operation, true); err != nil {
+		return true, err
 	}
 	canonical := state.New(cfg.StatePath())
 	if err := requireProjectionTransactionsCompatibleBeforeRecovery(cfg, canonical, operation); err != nil {

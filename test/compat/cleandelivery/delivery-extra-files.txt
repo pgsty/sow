@@ -10,6 +10,7 @@ _bmad-output/implementation-artifacts/spec-gc-provenance-canonical-identity.md
 _bmad-output/implementation-artifacts/spec-local-serving-atomic-parent-rollback.md
 _bmad-output/implementation-artifacts/spec-materialization-target-hostability-preflight.md
 _bmad-output/implementation-artifacts/spec-offline-archive-preintent-cleanup-failure.md
+_bmad-output/implementation-artifacts/spec-projection-stage-install-rollback-identity.md
 _bmad-output/implementation-artifacts/spec-reachable-history-config-memory-bound.md
 _bmad-output/implementation-artifacts/spec-real-r2-publication-storage-transaction.md
 _bmad-output/implementation-artifacts/spec-remote-fsck-storage-only-authority.md
@@ -60,6 +61,7 @@ docs/adr/0037-pre-upload-confidential-edge-denial-attestation.md
 docs/adr/0038-yum-consumer-preflight-receipt.md
 docs/adr/0039-caret-url-wire-canonicalization.md
 docs/adr/0040-bounded-configuration-topology.md
+docs/adr/0041-preserved-projection-orphan-quarantine.md
 docs/architecture.md
 docs/client-installation.md
 docs/evidence/2026-07-11-client-compat.md
@@ -160,6 +162,7 @@ docs/evidence/2026-07-22-materialization-target-hostability-preflight.md
 docs/evidence/2026-07-22-materialize-temporary-cleanup-identity.md
 docs/evidence/2026-07-22-projection-intent-removal-identity.md
 docs/evidence/2026-07-22-projection-stage-cleanup-identity.md
+docs/evidence/2026-07-22-projection-stage-install-rollback-identity.md
 docs/evidence/2026-07-22-reconcile-prune-identity.md
 docs/evidence/2026-07-22-upstream-proof-order-determinism.md
 docs/evidence/README.md

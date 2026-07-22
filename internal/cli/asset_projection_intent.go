@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -38,6 +40,15 @@ var assetProjectionMutationHook func(string) error
 var projectionIntentRemovalHook func(string) error
 var projectionStageCleanupHook func(string) error
 var projectionResidueCleanupHook func(string) error
+
+// projectionStageInstallHook brackets the source-admission and final-install
+// boundaries for deterministic filesystem-race tests. Production never sets
+// it.
+var projectionStageInstallHook func(phase, path string) error
+
+// The installer is replaceable only by focused durability tests that emulate
+// a successful atomic install followed by a reported durability error.
+var assetProjectionIntentInstall = installProjectionIntentBytes
 
 type assetProjectionIntent struct {
 	Schema          string                          `json:"schema"`
@@ -122,8 +133,7 @@ func (intent assetProjectionIntent) validate() error {
 	return nil
 }
 
-func prepareAssetProjectionIntent(cfg *config.Config, canonical *state.Store, operation, operationScope string, repo config.Repo, viewName, viewPath string, viewRef plumbing.ReferenceName, expected plumbing.Hash, staged string, archive *offlineArchiveAdoptionContract) (assetProjectionIntent, string, error) {
-	var intent assetProjectionIntent
+func prepareAssetProjectionIntent(cfg *config.Config, canonical *state.Store, operation, operationScope string, repo config.Repo, viewName, viewPath string, viewRef plumbing.ReferenceName, expected plumbing.Hash, staged string, archive *offlineArchiveAdoptionContract) (intent assetProjectionIntent, stageAbsolute string, resultErr error) {
 	if cfg == nil || canonical == nil {
 		return intent, "", errors.New("pending asset projection state is unavailable")
 	}
@@ -135,21 +145,20 @@ func prepareAssetProjectionIntent(cfg *config.Config, canonical *state.Store, op
 		return intent, "", err
 	}
 	stageRelative := assetProjectionStagePrefix + transactionID + ".tsv"
-	stageAbsolute := filepath.Join(cfg.StatePath(), stageRelative)
-	object, err := installPendingAssetProjectionStage(cfg.StatePath(), stageRelative, staged)
+	stageAbsolute = filepath.Join(cfg.StatePath(), stageRelative)
+	installed := make([]projectionStageIdentity, 0, 2)
+	keepStages := false
+	defer func() {
+		if resultErr != nil && !keepStages {
+			resultErr = errors.Join(resultErr, rollbackInstalledProjectionStages(installed))
+		}
+	}()
+	object, stageIdentity, err := installPendingProjectionStage(cfg.StatePath(), stageRelative, staged)
 	if err != nil {
 		return intent, "", err
 	}
-	committed := false
+	installed = append(installed, stageIdentity)
 	configStageRelative := assetProjectionStagePrefix + transactionID + "-config.yaml"
-	configStageAbsolute := filepath.Join(cfg.StatePath(), configStageRelative)
-	defer func() {
-		if !committed {
-			_ = os.Remove(stageAbsolute)
-			_ = os.Remove(configStageAbsolute)
-			_ = syncLocalDirectory(cfg.StatePath())
-		}
-	}()
 	head, err := canonical.HeadHash()
 	if err != nil {
 		return intent, "", err
@@ -160,9 +169,11 @@ func prepareAssetProjectionIntent(cfg *config.Config, canonical *state.Store, op
 	}
 	configDigest := sha256.Sum256(canonicalConfig)
 	configSHA := hex.EncodeToString(configDigest[:])
-	if err := writeDerivedStateFile(cfg.StatePath(), configStageRelative, canonicalConfig); err != nil {
+	_, configIdentity, err := installProjectionStageBytesBound(cfg.StatePath(), configStageRelative, canonicalConfig, stageIdentity.root)
+	if err != nil {
 		return intent, "", err
 	}
+	installed = append(installed, configIdentity)
 	targetSHA, err := materializationTargetSHA256(cfg.Root)
 	if err != nil {
 		return intent, "", err
@@ -176,80 +187,345 @@ func prepareAssetProjectionIntent(cfg *config.Config, canonical *state.Store, op
 		ManifestSize: object.Size, StageRelative: stageRelative, ArchiveAdoption: cloneOfflineArchiveAdoptionContract(archive),
 	}
 	intent.ID, _ = assetProjectionIntentID(intent)
-	if err := writeAssetProjectionIntent(cfg.StatePath(), intent); err != nil {
+	if err := verifyInstalledProjectionStages(installed); err != nil {
 		return assetProjectionIntent{}, "", err
 	}
-	committed = true
+	if err := installAssetProjectionIntent(cfg.StatePath(), intent, stageIdentity.root); err != nil {
+		if rootErr := verifyProjectionStageRootIdentity(cfg.StatePath(), stageIdentity.root); rootErr != nil {
+			keepStages = true
+			return intent, "", errors.Join(err, rootErr, errors.New("restore the exact projection state root, then retry with --recover"))
+		}
+		current, exists, readErr := readAssetProjectionIntent(cfg.StatePath())
+		rootErr := verifyProjectionStageRootIdentity(cfg.StatePath(), stageIdentity.root)
+		if rootErr != nil {
+			keepStages = true
+			return intent, "", errors.Join(err, readErr, rootErr, errors.New("restore the exact projection state root, then retry with --recover"))
+		}
+		if readErr != nil {
+			keepStages = true
+			return intent, "", errors.Join(err, readErr, errors.New("pending asset projection intent commit is ambiguous; retry with --recover"))
+		}
+		if exists && current.ID == intent.ID {
+			keepStages = true
+			return intent, "", errors.Join(err, errors.New("pending asset projection intent may require --recover after directory sync failure"))
+		}
+		return assetProjectionIntent{}, "", err
+	}
+	keepStages = true
+	if err := verifyInstalledProjectionStages(installed); err != nil {
+		return intent, "", errors.Join(err, errors.New("pending asset projection intent committed with changed stages; retry with --recover"))
+	}
 	return intent, stageAbsolute, nil
 }
 
 func installPendingAssetProjectionStage(stateRoot, relative, source string) (repository.Object, error) {
+	object, _, err := installPendingProjectionStage(stateRoot, relative, source)
+	return object, err
+}
+
+func installPendingProjectionStage(stateRoot, relative, source string) (repository.Object, projectionStageIdentity, error) {
+	return installPendingProjectionStageBound(stateRoot, relative, source, nil)
+}
+
+func installPendingProjectionStageBound(stateRoot, relative, source string, boundRoot os.FileInfo) (repository.Object, projectionStageIdentity, error) {
 	var result repository.Object
-	inspected, err := inspectOfflineArchiveInput(source)
+	var installed projectionStageIdentity
+	input, before, err := openExactOfflineArchiveInput(source)
 	if err != nil {
-		return result, err
+		return result, installed, err
+	}
+	inspected, err := inspectOfflineArchiveOpenFile(context.Background(), source, input, before, defaultOfflineArchiveInspectionLimits)
+	if err != nil {
+		return result, installed, errors.Join(err, input.Close())
+	}
+	if projectionStageInstallHook != nil {
+		if err := projectionStageInstallHook("after-source-inspection", source); err != nil {
+			return result, installed, errors.Join(err, input.Close())
+		}
+	}
+	afterHook, err := os.Lstat(source)
+	if err != nil || afterHook == nil || !os.SameFile(before, afterHook) || afterHook.Mode() != before.Mode() ||
+		afterHook.Size() != before.Size() || !afterHook.ModTime().Equal(before.ModTime()) {
+		return result, installed, errors.Join(err, input.Close(), errors.New("pending projection stage source coordinate changed before copy"))
+	}
+	if _, err := input.Seek(0, io.SeekStart); err != nil {
+		return result, installed, errors.Join(err, input.Close())
+	}
+	verifySource := func() error {
+		openedAfter, statErr := input.Stat()
+		currentAfter, lstatErr := os.Lstat(source)
+		if statErr != nil || lstatErr != nil || openedAfter == nil || currentAfter == nil ||
+			!os.SameFile(before, openedAfter) || !os.SameFile(before, currentAfter) ||
+			openedAfter.Mode() != before.Mode() || currentAfter.Mode() != before.Mode() ||
+			openedAfter.Size() != before.Size() || currentAfter.Size() != before.Size() ||
+			!openedAfter.ModTime().Equal(before.ModTime()) || !currentAfter.ModTime().Equal(before.ModTime()) {
+			return errors.Join(statErr, lstatErr, errors.New("pending projection stage source changed while copying"))
+		}
+		return nil
+	}
+	result, installed, installErr := installProjectionStageReader(stateRoot, relative, inspected.Object, input, verifySource, boundRoot)
+	closeErr := input.Close()
+	if installErr != nil || closeErr != nil {
+		if installErr == nil && installed.valid() {
+			_, cleanupErr := removeInstalledProjectionStage(installed)
+			if cleanupErr != nil {
+				cleanupErr = fmt.Errorf("pending projection stage cleanup failed; retry with --recover: %w", cleanupErr)
+			}
+			return repository.Object{}, projectionStageIdentity{}, errors.Join(closeErr, cleanupErr)
+		}
+		return repository.Object{}, projectionStageIdentity{}, errors.Join(installErr, closeErr)
+	}
+	return result, installed, nil
+}
+
+func installProjectionStageBytes(stateRoot, relative string, body []byte) (repository.Object, projectionStageIdentity, error) {
+	return installProjectionStageBytesBound(stateRoot, relative, body, nil)
+}
+
+func installProjectionStageBytesBound(stateRoot, relative string, body []byte, boundRoot os.FileInfo) (repository.Object, projectionStageIdentity, error) {
+	digest := sha256.Sum256(body)
+	parsed, err := repository.ParseDigest(hex.EncodeToString(digest[:]))
+	if err != nil {
+		return repository.Object{}, projectionStageIdentity{}, err
+	}
+	expected := repository.Object{SHA256: parsed, Size: int64(len(body))}
+	return installProjectionStageReader(stateRoot, relative, expected, bytes.NewReader(body), nil, boundRoot)
+}
+
+func installProjectionStageReader(stateRoot, relative string, expected repository.Object, input io.Reader, verifySource func() error, boundRoot os.FileInfo) (result repository.Object, installed projectionStageIdentity, resultErr error) {
+	if filepath.Base(relative) != relative || relative == "" || relative == "." || input == nil ||
+		expected.Size < 0 || expected.Size == math.MaxInt64 || !validMaterializationTrustSHA256(expected.HashString()) {
+		return result, installed, errors.New("pending projection stage install capability is invalid")
+	}
+	stateRoot, err := filepath.Abs(stateRoot)
+	if err != nil {
+		return result, installed, err
+	}
+	rootBefore, err := os.Lstat(stateRoot)
+	if err != nil || rootBefore == nil || rootBefore.Mode()&os.ModeSymlink != 0 || !rootBefore.IsDir() {
+		return result, installed, errors.Join(err, errors.New("pending projection stage root is not a real directory"))
 	}
 	root, err := os.OpenRoot(stateRoot)
 	if err != nil {
-		return result, err
+		return result, installed, err
 	}
 	defer root.Close()
+	rootIdentity, err := root.Stat(".")
+	if err != nil || rootIdentity == nil || !os.SameFile(rootBefore, rootIdentity) {
+		return result, installed, errors.Join(err, errors.New("pending projection stage root changed while binding"))
+	}
+	if boundRoot != nil && (!os.SameFile(boundRoot, rootIdentity) || boundRoot.Mode() != rootIdentity.Mode()) {
+		return result, installed, errors.New("pending projection stage root differs from the prepared transaction root")
+	}
+	if err := verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity); err != nil {
+		return result, installed, err
+	}
 	if _, err := root.Lstat(relative); err == nil {
-		return result, errors.New("pending asset projection stage already exists")
+		return result, installed, errors.New("pending projection stage already exists")
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return result, err
+		return result, installed, err
 	}
-	temporary := relative + ".tmp"
-	_ = root.Remove(temporary)
-	input, err := os.Open(source)
-	if err != nil {
-		return result, err
-	}
-	output, err := root.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		input.Close()
-		return result, err
-	}
-	installed := false
-	defer func() {
-		input.Close()
-		output.Close()
-		if !installed {
-			_ = root.Remove(temporary)
-		}
-	}()
-	hasher := sha256.New()
-	written, copyErr := io.CopyBuffer(io.MultiWriter(output, hasher), input, make([]byte, 256*1024))
-	closeErr := errors.Join(input.Close(), output.Sync(), output.Close())
-	if copyErr != nil || closeErr != nil || written != inspected.Object.Size || hex.EncodeToString(hasher.Sum(nil)) != inspected.Object.HashString() {
-		return result, errors.Join(copyErr, closeErr, errors.New("pending asset projection stage differs from admitted manifest"))
-	}
-	if err := root.Rename(temporary, relative); err != nil {
-		return result, err
-	}
-	installed = true
 	directory, err := root.Open(".")
 	if err != nil {
-		return result, err
+		return result, installed, err
 	}
-	if err := errors.Join(directory.Sync(), directory.Close()); err != nil {
-		return result, err
+	defer directory.Close()
+	nonce, err := state.NewTransactionID()
+	if err != nil {
+		return result, installed, err
 	}
-	return inspected.Object, nil
+	temporary := relative + ".tmp-" + nonce
+	file, err := root.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if err != nil {
+		return result, installed, err
+	}
+	closed := false
+	committed := false
+	identity, err := file.Stat()
+	if err != nil || identity == nil {
+		closeErr := file.Close()
+		return result, installed, errors.Join(err, closeErr, fmt.Errorf("pending projection stage temporary %s could not be bound; retry with --recover", temporary))
+	}
+	createdIdentity := identity
+	currentName := temporary
+	installed = projectionStageIdentity{stateRoot: stateRoot, root: rootIdentity, relative: temporary, inode: identity, size: expected.Size, sha256: expected.HashString()}
+	defer func() {
+		if !closed {
+			closeErr := file.Close()
+			closed = true
+			if closeErr != nil {
+				resultErr = errors.Join(resultErr, closeErr)
+			}
+		}
+		if resultErr != nil && !committed {
+			cleanupErr := removeExactDerivedStateTemporary(root, currentName, createdIdentity)
+			if cleanupErr != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("pending projection stage cleanup failed; retry with --recover: %w", cleanupErr))
+			}
+			installed = projectionStageIdentity{}
+			result = repository.Object{}
+		}
+	}()
+	if err := file.Chmod(0o600); err != nil {
+		return result, installed, err
+	}
+	identity, err = file.Stat()
+	current, lstatErr := root.Lstat(temporary)
+	if err != nil || lstatErr != nil || identity == nil || current == nil ||
+		!os.SameFile(createdIdentity, identity) || !os.SameFile(createdIdentity, current) ||
+		!privateExactProjectionStage(identity, 0) || !privateExactProjectionStage(current, 0) ||
+		identity.Mode().Perm() != 0o600 || current.Mode().Perm() != 0o600 {
+		return result, installed, errors.Join(err, lstatErr, errors.New("pending projection stage temporary is not an exact mode-0600 regular file"))
+	}
+	createdIdentity = identity
+	installed.inode = identity
+	hasher := sha256.New()
+	written, copyErr := io.CopyBuffer(io.MultiWriter(file, hasher), io.LimitReader(input, expected.Size+1), make([]byte, 256*1024))
+	if copyErr != nil || written != expected.Size || hex.EncodeToString(hasher.Sum(nil)) != expected.HashString() {
+		return result, installed, errors.Join(copyErr, errors.New("pending projection stage differs from admitted bytes"))
+	}
+	if verifySource != nil {
+		if err := verifySource(); err != nil {
+			return result, installed, err
+		}
+	}
+	if err := file.Sync(); err != nil {
+		return result, installed, err
+	}
+	after, statErr := file.Stat()
+	current, lstatErr = root.Lstat(temporary)
+	if statErr != nil || lstatErr != nil || after == nil || current == nil ||
+		!os.SameFile(identity, after) || !os.SameFile(identity, current) || !privateExactProjectionStage(after, expected.Size) ||
+		!privateExactProjectionStage(current, expected.Size) {
+		return result, installed, errors.Join(statErr, lstatErr, errors.New("pending projection stage temporary changed while writing"))
+	}
+	identity = after
+	installed.inode = identity
+	var expectedDigest [sha256.Size]byte
+	copy(expectedDigest[:], expected.SHA256[:])
+	if err := verifyExactDerivedStateBytes(file, identity, expectedDigest); err != nil {
+		return result, installed, err
+	}
+	if err := verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity); err != nil {
+		return result, installed, err
+	}
+	isolationNonce, err := state.NewTransactionID()
+	if err != nil {
+		return result, installed, err
+	}
+	isolation := relative + ".tmp-install-" + isolationNonce
+	if err := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), temporary, isolation); err != nil {
+		return result, installed, err
+	}
+	currentName = isolation
+	installed.relative = isolation
+	if err := directory.Sync(); err != nil {
+		return result, installed, err
+	}
+	if projectionStageInstallHook != nil {
+		if err := projectionStageInstallHook("before-install", filepath.Join(stateRoot, isolation)); err != nil {
+			return result, installed, err
+		}
+	}
+	if verifySource != nil {
+		if err := verifySource(); err != nil {
+			return result, installed, err
+		}
+	}
+	if err := verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity); err != nil {
+		return result, installed, err
+	}
+	isolated, lstatErr := root.Lstat(isolation)
+	opened, statErr := file.Stat()
+	if lstatErr != nil || statErr != nil || isolated == nil || opened == nil ||
+		!os.SameFile(identity, isolated) || !os.SameFile(identity, opened) ||
+		!privateExactProjectionStage(isolated, expected.Size) || !privateExactProjectionStage(opened, expected.Size) {
+		return result, installed, errors.Join(lstatErr, statErr, errors.New("pending projection stage candidate changed before installation"))
+	}
+	if err := verifyExactDerivedStateBytes(file, identity, expectedDigest); err != nil {
+		return result, installed, err
+	}
+	if err := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), isolation, relative); err != nil {
+		return result, installed, err
+	}
+	currentName = relative
+	installed.relative = relative
+	if err := directory.Sync(); err != nil {
+		return result, installed, err
+	}
+	destination, lstatErr := root.Lstat(relative)
+	opened, statErr = file.Stat()
+	if lstatErr != nil || statErr != nil || destination == nil || opened == nil ||
+		!os.SameFile(identity, destination) || !os.SameFile(identity, opened) ||
+		!privateExactProjectionStage(destination, expected.Size) || !privateExactProjectionStage(opened, expected.Size) {
+		return result, installed, errors.Join(lstatErr, statErr, errors.New("pending projection stage destination changed during installation"))
+	}
+	if err := verifyExactDerivedStateBytes(file, identity, expectedDigest); err != nil {
+		return result, installed, err
+	}
+	if projectionStageInstallHook != nil {
+		if err := projectionStageInstallHook("after-destination-verify", filepath.Join(stateRoot, relative)); err != nil {
+			return result, installed, err
+		}
+		if err := verifyExactDerivedStateBytes(file, identity, expectedDigest); err != nil {
+			return result, installed, err
+		}
+	}
+	destination, lstatErr = root.Lstat(relative)
+	opened, statErr = file.Stat()
+	if lstatErr != nil || statErr != nil || destination == nil || opened == nil ||
+		!os.SameFile(identity, destination) || !os.SameFile(identity, opened) ||
+		!privateExactProjectionStage(destination, expected.Size) || !privateExactProjectionStage(opened, expected.Size) ||
+		destination.Mode() != identity.Mode() || opened.Mode() != identity.Mode() ||
+		!destination.ModTime().Equal(identity.ModTime()) || !opened.ModTime().Equal(identity.ModTime()) {
+		return result, installed, errors.Join(lstatErr, statErr, errors.New("pending projection stage destination changed after verification"))
+	}
+	if err := verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity); err != nil {
+		return result, installed, err
+	}
+	if err := file.Close(); err != nil {
+		closed = true
+		return result, installed, err
+	}
+	closed = true
+	committed = true
+	result = expected
+	return result, installed, nil
 }
 
 func writeAssetProjectionIntent(stateRoot string, intent assetProjectionIntent) error {
-	if err := intent.validate(); err != nil {
-		return err
-	}
-	body, err := json.Marshal(intent)
+	body, err := marshalAssetProjectionIntent(intent)
 	if err != nil {
 		return err
 	}
-	if len(body) > assetProjectionIntentMaxBytes {
-		return errors.New("pending asset projection intent exceeds size limit")
-	}
 	return writeDerivedStateFile(stateRoot, assetProjectionIntentRelative, body)
+}
+
+func installAssetProjectionIntent(stateRoot string, intent assetProjectionIntent, boundRoot os.FileInfo) error {
+	body, err := marshalAssetProjectionIntent(intent)
+	if err != nil {
+		return err
+	}
+	return assetProjectionIntentInstall(stateRoot, assetProjectionIntentRelative, body, boundRoot)
+}
+
+func marshalAssetProjectionIntent(intent assetProjectionIntent) ([]byte, error) {
+	if err := intent.validate(); err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(intent)
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > assetProjectionIntentMaxBytes {
+		return nil, errors.New("pending asset projection intent exceeds size limit")
+	}
+	return body, nil
+}
+
+func installProjectionIntentBytes(stateRoot, relative string, body []byte, boundRoot os.FileInfo) error {
+	_, _, err := installProjectionStageBytesBound(stateRoot, relative, body, boundRoot)
+	return err
 }
 
 func readAssetProjectionIntent(stateRoot string) (assetProjectionIntent, bool, error) {
@@ -312,18 +588,36 @@ func cleanupAssetProjectionIntentResidue(stateRoot string, recover bool) error {
 		return readErr
 	}
 	removed := false
+	preserved := make([]string, 0)
 	for _, entry := range entries {
 		name := entry.Name()
-		isTemporary := strings.HasPrefix(name, assetProjectionIntentRelative+".tmp-") ||
-			strings.HasPrefix(name, assetProjectionStagePrefix) && (strings.HasSuffix(name, ".tmp") || strings.Contains(name, ".tmp-"))
-		isProjectionStage := strings.HasPrefix(name, assetProjectionStagePrefix) && (strings.HasSuffix(name, ".tsv") || strings.HasSuffix(name, "-config.yaml"))
+		isIntentTemporary := isDerivedStateTemporaryName(name, assetProjectionIntentRelative)
+		isStageTemporary := isProjectionStageTemporaryName(name, isAssetProjectionStageFinalName)
+		isPreserved := isProjectionStagePreservedName(name, isAssetProjectionStageFinalName)
+		isProjectionStage := isAssetProjectionStageFinalName(name)
 		isWantedStage := exists && (name == intent.StageRelative || name == intent.ConfigStage)
 		isOrphanStage := isProjectionStage && !isWantedStage
-		if !isTemporary && !isOrphanStage {
+		if isPreserved || isWantedStage {
+			continue
+		}
+		if !isIntentTemporary && !isStageTemporary && !isOrphanStage {
+			if strings.HasPrefix(name, assetProjectionStagePrefix) || strings.HasPrefix(name, assetProjectionIntentRelative+".") {
+				return fmt.Errorf("unsafe pending asset projection residue name %q", name)
+			}
 			continue
 		}
 		if !recover {
 			return errors.New("interrupted pending asset projection residue requires --recover")
+		}
+		if isOrphanStage {
+			retained, moved, err := preserveExactProjectionResidue(stateRoot, name)
+			if err != nil {
+				return errors.Join(err, fmt.Errorf("unsafe pending asset projection residue %s", name))
+			}
+			if moved {
+				preserved = append(preserved, retained)
+			}
+			continue
 		}
 		exact, err := removeExactProjectionResidue(stateRoot, name)
 		if err != nil {
@@ -332,7 +626,12 @@ func cleanupAssetProjectionIntentResidue(stateRoot string, recover bool) error {
 		removed = removed || exact
 	}
 	if removed {
-		return syncLocalDirectory(stateRoot)
+		if err := syncLocalDirectory(stateRoot); err != nil {
+			return err
+		}
+	}
+	if len(preserved) != 0 {
+		return fmt.Errorf("preserved orphan asset projection residue at %s; inspect it, then retry with --recover", strings.Join(preserved, ", "))
 	}
 	return nil
 }

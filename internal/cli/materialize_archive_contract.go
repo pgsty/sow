@@ -14,10 +14,12 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -156,8 +158,9 @@ type inspectedOfflineArchiveInput struct {
 	Marker *offlineArchiveMarker
 }
 
-// These hooks bracket the single-pass marker decision for deterministic
-// in-place mutation tests. Production never sets them.
+// These hooks bracket exact opening and the single-pass marker decision for
+// deterministic filesystem-race tests. Production never sets them.
+var offlineArchiveInputBeforeOpenHook func(string) error
 var offlineArchiveInputAfterHeaderPeekHook func(*os.File) error
 var offlineArchiveInputAfterMarkerHook func(*os.File) error
 
@@ -246,6 +249,44 @@ func inspectOfflineArchiveInputContext(ctx context.Context, filename string) (in
 
 func inspectOfflineArchiveInputWithLimits(ctx context.Context, filename string, limits offlineArchiveInspectionLimits) (inspectedOfflineArchiveInput, error) {
 	var inspected inspectedOfflineArchiveInput
+	file, identity, err := openExactOfflineArchiveInput(filename)
+	if err != nil {
+		return inspected, err
+	}
+	inspected, inspectErr := inspectOfflineArchiveOpenFile(ctx, filename, file, identity, limits)
+	closeErr := file.Close()
+	return inspected, errors.Join(inspectErr, closeErr)
+}
+
+func openExactOfflineArchiveInput(filename string) (*os.File, os.FileInfo, error) {
+	info, err := os.Lstat(filename)
+	if err != nil || info == nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() == math.MaxInt64 {
+		return nil, nil, errors.Join(err, errors.New("offline archive input is not an exact regular file"))
+	}
+	if offlineArchiveInputBeforeOpenHook != nil {
+		if err := offlineArchiveInputBeforeOpenHook(filename); err != nil {
+			return nil, nil, err
+		}
+	}
+	file, err := os.OpenFile(filename, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	opened, statErr := file.Stat()
+	current, lstatErr := os.Lstat(filename)
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		!os.SameFile(info, opened) || !os.SameFile(info, current) ||
+		opened.Mode() != info.Mode() || current.Mode() != info.Mode() ||
+		opened.Size() != info.Size() || current.Size() != info.Size() ||
+		!opened.ModTime().Equal(info.ModTime()) || !current.ModTime().Equal(info.ModTime()) {
+		closeErr := file.Close()
+		return nil, nil, errors.Join(statErr, lstatErr, closeErr, errors.New("offline archive input changed while opening"))
+	}
+	return file, opened, nil
+}
+
+func inspectOfflineArchiveOpenFile(ctx context.Context, filename string, file *os.File, info os.FileInfo, limits offlineArchiveInspectionLimits) (inspectedOfflineArchiveInput, error) {
+	var inspected inspectedOfflineArchiveInput
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -255,18 +296,21 @@ func inspectOfflineArchiveInputWithLimits(ctx context.Context, filename string, 
 	if limits.MaxExpandedBytes <= 0 || limits.MaxMembers <= 0 || limits.MaxExpansionRatio <= 0 || limits.ExpansionSlack < 0 {
 		return inspected, errors.New("invalid offline archive inspection limits")
 	}
-	info, err := os.Lstat(filename)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return inspected, errors.Join(err, errors.New("offline archive input is not a regular file"))
+	if filename == "" || file == nil || info == nil || info.Size() < 0 || info.Size() == math.MaxInt64 ||
+		info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return inspected, errors.New("offline archive open-file inspection binding is invalid")
 	}
-	file, err := os.Open(filename)
-	if err != nil {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return inspected, err
 	}
-	opened, err := file.Stat()
-	if err != nil || !os.SameFile(info, opened) {
-		file.Close()
-		return inspected, errors.Join(err, errors.New("offline archive input changed while opening"))
+	opened, statErr := file.Stat()
+	current, lstatErr := os.Lstat(filename)
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		!os.SameFile(info, opened) || !os.SameFile(info, current) ||
+		opened.Mode() != info.Mode() || current.Mode() != info.Mode() ||
+		opened.Size() != info.Size() || current.Size() != info.Size() ||
+		!opened.ModTime().Equal(info.ModTime()) || !current.ModTime().Equal(info.ModTime()) {
+		return inspected, errors.Join(statErr, lstatErr, errors.New("offline archive input changed before inspection"))
 	}
 	// Hash the exact byte stream consumed by marker inspection. The former
 	// hash-then-seek design let an in-place writer present different bytes to
@@ -275,53 +319,45 @@ func inspectOfflineArchiveInputWithLimits(ctx context.Context, filename string, 
 	// that same digest to the marker decision as well.
 	hasher := sha256.New()
 	counter := &offlineArchiveByteCounter{}
-	hashedInput := io.TeeReader(file, io.MultiWriter(hasher, counter))
+	hashedInput := io.TeeReader(io.LimitReader(file, info.Size()+1), io.MultiWriter(hasher, counter))
 	input := bufio.NewReaderSize(hashedInput, 64*1024)
 	header, peekErr := input.Peek(64 * 1024)
 	if peekErr != nil && !errors.Is(peekErr, io.EOF) && !errors.Is(peekErr, bufio.ErrBufferFull) {
-		file.Close()
 		return inspected, peekErr
 	}
 	headerMarker, headerComplete, err := parseOfflineArchiveMarkerHeaderStatus(header)
 	if err != nil {
-		file.Close()
 		return inspected, err
 	}
 	if offlineArchiveInputAfterHeaderPeekHook != nil {
 		if err := offlineArchiveInputAfterHeaderPeekHook(file); err != nil {
-			file.Close()
 			return inspected, err
 		}
 	}
 	meter := &offlineArchiveInspectionMeter{limits: limits}
 	payloadMarker, err := inspectOfflineArchivePayloadMarker(ctx, input, headerMarker, headerComplete, len(header) >= 2 && header[0] == 0x1f && header[1] == 0x8b, meter)
 	if err != nil {
-		file.Close()
 		return inspected, err
 	}
 	if offlineArchiveInputAfterMarkerHook != nil {
 		if err := offlineArchiveInputAfterMarkerHook(file); err != nil {
-			file.Close()
 			return inspected, err
 		}
 	}
 	marker, err := reconcileOfflineArchiveMarkers(headerMarker, payloadMarker)
 	if err != nil {
-		file.Close()
 		return inspected, err
 	}
 	if _, err := io.Copy(io.Discard, input); err != nil {
-		file.Close()
 		return inspected, err
 	}
 	written := counter.Written
 	openedAfter, openedErr := file.Stat()
-	closeErr := file.Close()
 	after, afterErr := os.Lstat(filename)
-	if openedErr != nil || closeErr != nil || afterErr != nil || written != info.Size() || openedAfter.Size() != info.Size() ||
+	if openedErr != nil || afterErr != nil || openedAfter == nil || after == nil || written != info.Size() || openedAfter.Size() != info.Size() ||
 		after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() || after.Size() != info.Size() ||
 		!openedAfter.ModTime().Equal(info.ModTime()) || !after.ModTime().Equal(info.ModTime()) || !os.SameFile(info, openedAfter) || !os.SameFile(info, after) {
-		return inspected, errors.Join(openedErr, closeErr, afterErr, errors.New("offline archive input changed during inspection"))
+		return inspected, errors.Join(openedErr, afterErr, errors.New("offline archive input changed during inspection"))
 	}
 	digest, err := repository.ParseDigest(hex.EncodeToString(hasher.Sum(nil)))
 	if err != nil {

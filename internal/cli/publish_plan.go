@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
@@ -2223,7 +2224,7 @@ func removeExactDerivedStateTemporary(parent *os.Root, name string, expected os.
 		current.Mode().Perm()&0o077 != 0 || !os.SameFile(expected, current) {
 		return errors.Join(err, errors.New("derived state temporary was replaced; refuse cleanup"))
 	}
-	file, err := parent.Open(name)
+	file, err := parent.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}

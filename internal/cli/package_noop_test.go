@@ -1005,11 +1005,14 @@ func TestPackageProjectionCompletionIgnoresOrphanStageCleanupFailure(t *testing.
 	if err := os.Rename(backup, stage); err != nil {
 		t.Fatal(err)
 	}
-	if err := cleanupPackageProjectionIntentResidue(stateRoot, true); err != nil {
-		t.Fatalf("later orphan cleanup did not converge: %v", err)
+	if err := cleanupPackageProjectionIntentResidue(stateRoot, true); err == nil || !strings.Contains(err.Error(), "preserved orphan") {
+		t.Fatalf("later orphan cleanup did not quarantine for audit: %v", err)
 	}
 	if _, err := os.Stat(stage); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("orphan package stage remains after retry: %v", err)
+		t.Fatalf("orphan package stage remains in the live coordinate: %v", err)
+	}
+	if err := cleanupPackageProjectionIntentResidue(stateRoot, true); err != nil {
+		t.Fatalf("second orphan cleanup did not converge: %v", err)
 	}
 }
 
