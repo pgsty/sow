@@ -194,30 +194,29 @@ func TestOfflineArchiveIntentWriteFailureReportsStageCleanupDrift(t *testing.T) 
 	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
 
 	previous := offlineArchiveProjectionIntentWrite
+	previousDiscard := offlineArchiveProjectionStageDiscard
 	offlineArchiveProjectionIntentWrite = func(string, string, []byte) error {
-		if err := os.Chmod(stageDirectory, 0o777); err != nil {
-			return err
-		}
 		return errors.New("injected offline archive intent write failure")
+	}
+	offlineArchiveProjectionStageDiscard = func(string, string) error {
+		return errors.New("injected offline archive projection stage cleanup failure")
 	}
 	t.Cleanup(func() {
 		offlineArchiveProjectionIntentWrite = previous
-		_ = os.Chmod(stageDirectory, 0o700)
+		offlineArchiveProjectionStageDiscard = previousDiscard
 	})
 	code, stdout, stderr := runArchiveTaintCLI(t,
 		"materialize", "latest", "--config", configPath, "--repo", "public-assets", "--tgz", destination,
 		"--workers", "1", "--chunk-entries", "1",
 	)
 	offlineArchiveProjectionIntentWrite = previous
+	offlineArchiveProjectionStageDiscard = previousDiscard
 	if code != ExitVerification || !strings.Contains(stderr, "injected offline archive intent write failure") ||
 		!strings.Contains(stderr, "offline archive projection stage cleanup failed") || !strings.Contains(stderr, "--recover") {
 		t.Fatalf("intent cleanup drift code=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}
 	if _, exists, err := readOfflineArchiveProjectionIntent(stateRoot); err != nil || exists {
 		t.Fatalf("failed intent write installed an intent exists=%t err=%v", exists, err)
-	}
-	if err := os.Chmod(stageDirectory, 0o700); err != nil {
-		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(stageDirectory)
 	if err != nil || len(entries) != 1 || !offlineArchiveProjectionStagePattern.MatchString(entries[0].Name()) {

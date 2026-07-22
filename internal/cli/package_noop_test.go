@@ -790,6 +790,48 @@ func TestPackageProjectionReturnedAfterIntentErrorRemainsInputlessRecoverable(t 
 	}
 }
 
+func TestPackageProjectionApplyRejectsDurableStageDriftBeforeStateBinding(t *testing.T) {
+	root, configPath, packagePath, keyPath := preparePackageNoopDEB(t)
+	canonical := state.New(filepath.Join(root, ".sow"))
+	baseline, err := canonical.HeadHash()
+	if err != nil || baseline.IsZero() {
+		t.Fatalf("baseline HEAD=%s err=%v", baseline, err)
+	}
+	previous := packageProjectionMutationHook
+	packageProjectionMutationHook = func(phase string) error {
+		if phase != "after-fence-before-apply" {
+			return nil
+		}
+		intent, exists, err := readPackageProjectionIntent(filepath.Join(root, ".sow"))
+		if err != nil || !exists || len(intent.Units) == 0 {
+			return errors.Join(err, errors.New("test package projection intent is unavailable"))
+		}
+		return os.WriteFile(filepath.Join(root, ".sow", intent.Units[0].StageRelative), []byte("unapproved package projection manifest\n"), 0o600)
+	}
+	t.Cleanup(func() { packageProjectionMutationHook = previous })
+	var stdout, stderr bytes.Buffer
+	addErr := runAdd(t.Context(), []string{
+		packagePath, "--config", configPath, "--repo", "deb-test", "--gpg-private-key-file", keyPath, "--workers", "1", "--chunk-entries", "1",
+	}, &stdout, &stderr)
+	if addErr == nil || !strings.Contains(addErr.Error(), "expected identity") {
+		t.Fatalf("package stage drift err=%v stdout=%s stderr=%s", addErr, stdout.String(), stderr.String())
+	}
+	if head, err := canonical.HeadHash(); err != nil || head != baseline {
+		t.Fatalf("package stage drift changed HEAD head=%s want=%s err=%v", head, baseline, err)
+	}
+	intent, exists, err := readPackageProjectionIntent(filepath.Join(root, ".sow"))
+	if err != nil || !exists {
+		t.Fatalf("failed package mutation did not retain recovery intent exists=%t err=%v", exists, err)
+	}
+	if _, transactionExists, err := canonical.Transaction(intent.TransactionID); err != nil || transactionExists {
+		t.Fatalf("package stage drift crossed journal boundary exists=%t err=%v", transactionExists, err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, ".sow", intent.Units[0].StageRelative))
+	if err != nil || string(body) != "unapproved package projection manifest\n" {
+		t.Fatalf("package stage drift replacement body=%q err=%v", body, err)
+	}
+}
+
 func TestPackageProjectionAbortedCanonicalInstallRepairsAndRecoversInputless(t *testing.T) {
 	root, configPath, packagePath, keyPath := preparePackageNoopDEB(t)
 	var faultPath, backupPath string

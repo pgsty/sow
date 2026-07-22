@@ -45,6 +45,8 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-projection-stage-install-rollback-identity.md`
   summary: Canonical `Store.Apply` reopens staged pathnames after journaling, so a post-prepare replacement can commit bytes that are not bound to the durable projection intent.
   evidence: The asset/package `after-fence-before-apply` boundary occurs after prepare returns its process-local stage identity ledger; `buildJournal` hashes the then-current replacement and `installPathChanges` reopens/copies it without comparing that inode and digest to the higher-level projection intent identity.
+  status: resolved
+  resolution: V-78 makes projection inject the complete canonical path-to-size/SHA-256 vector, binds every stage once with a no-follow/nonblocking retained descriptor before journaling, and consumes that descriptor through Apply/Recover/RecoverAborted. Exact raw HEAD/ref/index/tree/worktree CAS and native lock retention close the adjacent Git commit window. See `_bmad-output/implementation-artifacts/spec-canonical-apply-stage-identity.md` and `docs/evidence/2026-07-22-canonical-apply-stage-identity.md`.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-projection-stage-install-rollback-identity.md`
   summary: Preserved projection-orphan audit quarantines need explicit `fsck` inventory and capability-bound retirement.

@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	git "github.com/go-git/go-git/v5"
@@ -33,6 +35,183 @@ var (
 type FileIdentity struct {
 	Size   int64
 	SHA256 string
+}
+
+// boundStagedFile retains the exact descriptor whose bytes were admitted into
+// a transaction. The pathname remains only a revocation coordinate: replacing
+// it never changes the descriptor being installed and is rejected before the
+// canonical Git commit.
+type boundStagedFile struct {
+	canonical      string
+	path           string
+	stagedRelative string
+	file           *os.File
+	info           os.FileInfo
+	identity       FileIdentity
+}
+
+type boundStageSet struct {
+	files map[string]*boundStagedFile
+}
+
+func (set *boundStageSet) close() error {
+	if set == nil {
+		return nil
+	}
+	var result error
+	paths := make([]string, 0, len(set.files))
+	for canonical := range set.files {
+		paths = append(paths, canonical)
+	}
+	sort.Strings(paths)
+	for _, canonical := range paths {
+		bound := set.files[canonical]
+		if bound == nil || bound.file == nil {
+			continue
+		}
+		if err := bound.file.Close(); err != nil {
+			result = errors.Join(result, fmt.Errorf("close staged file %s: %w", bound.canonical, err))
+		}
+		bound.file = nil
+	}
+	return result
+}
+
+func validFileIdentity(identity FileIdentity) bool {
+	return identity.Size >= 0 && identity.Size < math.MaxInt64 && len(identity.SHA256) == sha256.Size*2 && isLowerHex(identity.SHA256)
+}
+
+func hashBoundDescriptor(file *os.File, size int64) (FileIdentity, error) {
+	if file == nil || size < 0 || size == math.MaxInt64 {
+		return FileIdentity{}, errors.New("staged file has an invalid bounded size")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return FileIdentity{}, err
+	}
+	hasher := sha256.New()
+	read, err := io.CopyBuffer(hasher, io.LimitReader(file, size+1), make([]byte, 256*1024))
+	if err != nil {
+		return FileIdentity{}, err
+	}
+	if read != size {
+		return FileIdentity{}, fmt.Errorf("staged file changed while reading: read %d bytes, expected %d", read, size)
+	}
+	return FileIdentity{Size: read, SHA256: hex.EncodeToString(hasher.Sum(nil))}, nil
+}
+
+func (s *Store) bindStagedFiles(staged map[string]string, expected map[string]FileIdentity, journalPaths bool) (*boundStageSet, error) {
+	if expected != nil {
+		if len(expected) != len(staged) {
+			return nil, fmt.Errorf("%w: expected staged identity set does not exactly match staged canonical paths", ErrFileConflict)
+		}
+		for canonical, identity := range expected {
+			if _, exists := staged[canonical]; !exists {
+				return nil, fmt.Errorf("%w: expected staged identity has no staged canonical path %s", ErrFileConflict, canonical)
+			}
+			if err := validateStatePath(canonical); err != nil || !validFileIdentity(identity) {
+				return nil, errors.Join(err, fmt.Errorf("invalid expected staged identity for canonical file %s", canonical))
+			}
+		}
+	}
+	paths := make([]string, 0, len(staged))
+	for canonical := range staged {
+		if err := validateStatePath(canonical); err != nil {
+			return nil, fmt.Errorf("invalid canonical state path %q: %w", canonical, err)
+		}
+		paths = append(paths, canonical)
+	}
+	sort.Strings(paths)
+	set := &boundStageSet{files: make(map[string]*boundStagedFile, len(paths))}
+	fail := func(err error) (*boundStageSet, error) {
+		return nil, errors.Join(err, set.close())
+	}
+	for _, canonical := range paths {
+		filename := staged[canonical]
+		stagedRelative := ""
+		if journalPaths {
+			var err error
+			stagedRelative, err = s.journalStagedPath(filename)
+			if err != nil {
+				return fail(fmt.Errorf("stage %s: %w", canonical, err))
+			}
+		}
+		before, err := os.Lstat(filename)
+		if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+			return fail(errors.Join(err, fmt.Errorf("staged file %q is not a regular non-symlink", filename)))
+		}
+		file, err := os.OpenFile(filename, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return fail(fmt.Errorf("open staged file %s: %w", canonical, err))
+		}
+		opened, err := file.Stat()
+		if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+			_ = file.Close()
+			return fail(errors.Join(err, fmt.Errorf("staged file %s changed while opening", canonical)))
+		}
+		bound := &boundStagedFile{canonical: canonical, path: filename, stagedRelative: stagedRelative, file: file, info: opened}
+		set.files[canonical] = bound
+		identity, err := hashBoundDescriptor(file, opened.Size())
+		if err != nil {
+			return fail(fmt.Errorf("hash staged file %s: %w", canonical, err))
+		}
+		bound.identity = identity
+		if expected != nil && identity != expected[canonical] {
+			return fail(fmt.Errorf("%w: staged file %s does not match its expected identity", ErrFileConflict, canonical))
+		}
+		if err := s.verifyBoundStageCoordinate(bound); err != nil {
+			return fail(err)
+		}
+	}
+	return set, nil
+}
+
+func (s *Store) verifyBoundStageCoordinate(bound *boundStagedFile) error {
+	if bound == nil || bound.file == nil {
+		return errors.New("staged file descriptor is unavailable")
+	}
+	opened, openErr := bound.file.Stat()
+	current, pathErr := os.Lstat(bound.path)
+	if openErr != nil || pathErr != nil || !opened.Mode().IsRegular() || current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
+		!os.SameFile(bound.info, opened) || !os.SameFile(bound.info, current) || opened.Size() != bound.info.Size() ||
+		opened.Mode() != bound.info.Mode() || !opened.ModTime().Equal(bound.info.ModTime()) || current.Size() != bound.info.Size() ||
+		current.Mode() != bound.info.Mode() || !current.ModTime().Equal(bound.info.ModTime()) {
+		return errors.Join(openErr, pathErr, fmt.Errorf("%w: staged file %s changed after it was bound", ErrFileConflict, bound.canonical))
+	}
+	if bound.stagedRelative != "" {
+		relative, err := s.journalStagedPath(bound.path)
+		if err != nil || relative != bound.stagedRelative {
+			return errors.Join(err, fmt.Errorf("%w: staged file %s changed its transaction path", ErrFileConflict, bound.canonical))
+		}
+	}
+	return nil
+}
+
+func (s *Store) verifyBoundStage(bound *boundStagedFile) error {
+	if err := s.verifyBoundStageCoordinate(bound); err != nil {
+		return err
+	}
+	identity, err := hashBoundDescriptor(bound.file, bound.identity.Size)
+	if err != nil || identity != bound.identity {
+		return errors.Join(err, fmt.Errorf("%w: staged file %s changed after it was bound", ErrFileConflict, bound.canonical))
+	}
+	return s.verifyBoundStageCoordinate(bound)
+}
+
+func (s *Store) boundStageGitHash(bound *boundStagedFile) (plumbing.Hash, error) {
+	if err := s.verifyBoundStageCoordinate(bound); err != nil {
+		return plumbing.ZeroHash, err
+	}
+	if _, err := bound.file.Seek(0, io.SeekStart); err != nil {
+		return plumbing.ZeroHash, err
+	}
+	gitHasher := plumbing.NewHasher(plumbing.BlobObject, bound.identity.Size)
+	shaHasher := sha256.New()
+	read, copyErr := io.CopyBuffer(io.MultiWriter(gitHasher, shaHasher), io.LimitReader(bound.file, bound.identity.Size+1), make([]byte, 256*1024))
+	coordinateErr := s.verifyBoundStageCoordinate(bound)
+	if copyErr != nil || coordinateErr != nil || read != bound.identity.Size || hex.EncodeToString(shaHasher.Sum(nil)) != bound.identity.SHA256 {
+		return plumbing.ZeroHash, errors.Join(copyErr, coordinateErr, fmt.Errorf("%w: staged file %s changed while computing its Git identity", ErrFileConflict, bound.canonical))
+	}
+	return gitHasher.Sum(), nil
 }
 
 // FileIdentityAtHead returns the exact byte identity recorded for one file by
@@ -158,6 +337,11 @@ type ApplyOptions struct {
 	// empty value preserves the default cryptographically random allocation.
 	TransactionID string
 	ExpectedFiles map[string]FileExpectation
+	// ExpectedStages binds the complete canonical path -> byte identity vector
+	// approved by a higher-level durable workflow. A non-nil map must have the
+	// exact same key set as staged; nil preserves the compatibility API while
+	// still retaining descriptor-bound source identities inside Store.Apply.
+	ExpectedStages map[string]FileIdentity
 	// DeletePaths removes exact canonical worktree files in the same recoverable
 	// Git commit as Staged. The intent journal binds the bytes being removed so a
 	// retry cannot silently delete a different local-state object.
@@ -168,14 +352,15 @@ type ApplyOptions struct {
 // Staged paths and file identities remain internal to the state layer; callers
 // bind the public operation/message fields to their own progress identity.
 type TransactionRecord struct {
-	ID           string
-	Operation    string
-	Message      string
-	Phase        string
-	ExpectedHead plumbing.Hash
-	Commit       plumbing.Hash
-	Files        []TransactionFileRecord
-	Refs         []TransactionRefRecord
+	ID              string
+	Operation       string
+	Message         string
+	Phase           string
+	ExpectedHead    plumbing.Hash
+	ExpectedHeadRaw string
+	Commit          plumbing.Hash
+	Files           []TransactionFileRecord
+	Refs            []TransactionRefRecord
 }
 
 type TransactionFileRecord struct {
@@ -213,18 +398,87 @@ type journalRef struct {
 }
 
 type transactionJournal struct {
-	Schema       string        `json:"schema"`
-	ID           string        `json:"id"`
-	Operation    string        `json:"operation"`
-	Phase        string        `json:"phase"`
-	Message      string        `json:"message"`
-	ExpectedHead string        `json:"expected_head"`
-	Commit       string        `json:"commit,omitempty"`
-	Files        []journalFile `json:"files"`
-	Refs         []journalRef  `json:"refs"`
-	CreatedAt    string        `json:"created_at"`
-	UpdatedAt    string        `json:"updated_at"`
-	Failure      string        `json:"failure,omitempty"`
+	Schema          string        `json:"schema"`
+	ID              string        `json:"id"`
+	Operation       string        `json:"operation"`
+	Phase           string        `json:"phase"`
+	Message         string        `json:"message"`
+	ExpectedHead    string        `json:"expected_head"`
+	ExpectedHeadRaw string        `json:"expected_head_raw,omitempty"`
+	Commit          string        `json:"commit,omitempty"`
+	Files           []journalFile `json:"files"`
+	Refs            []journalRef  `json:"refs"`
+	CreatedAt       string        `json:"created_at"`
+	UpdatedAt       string        `json:"updated_at"`
+	Failure         string        `json:"failure,omitempty"`
+}
+
+// journalExpectedHeadSnapshot reconstructs the exact raw HEAD coordinate
+// frozen before an intent became durable. ExpectedHeadRaw is optional only so
+// already-written v1 journals remain recoverable; every newly written journal
+// records it and therefore rejects a same-hash branch or detached-HEAD switch.
+func journalExpectedHeadSnapshot(journal *transactionJournal) (repositoryHeadSnapshot, bool, error) {
+	expected := plumbing.NewHash(journal.ExpectedHead)
+	if journal.ExpectedHeadRaw == "" {
+		return repositoryHeadSnapshot{hash: expected}, false, nil
+	}
+	body := journal.ExpectedHeadRaw
+	var raw *plumbing.Reference
+	switch {
+	case strings.HasPrefix(body, "ref: "):
+		if !strings.HasSuffix(body, "\n") || strings.Count(body, "\n") != 1 {
+			return repositoryHeadSnapshot{}, false, errors.New("transaction journal has invalid symbolic raw HEAD")
+		}
+		target := plumbing.ReferenceName(strings.TrimSuffix(strings.TrimPrefix(body, "ref: "), "\n"))
+		if target == plumbing.HEAD || !strings.HasPrefix(target.String(), "refs/") {
+			return repositoryHeadSnapshot{}, false, errors.New("transaction journal has invalid symbolic raw HEAD target")
+		}
+		if err := target.Validate(); err != nil {
+			return repositoryHeadSnapshot{}, false, err
+		}
+		raw = plumbing.NewSymbolicReference(plumbing.HEAD, target)
+		snapshot := repositoryHeadSnapshot{raw: raw, name: target, hash: expected}
+		if !expected.IsZero() {
+			snapshot.target = plumbing.NewHashReference(target, expected)
+		}
+		return snapshot, true, nil
+	default:
+		if len(body) != 41 || body[40] != '\n' || !isLowerHex(body[:40]) {
+			return repositoryHeadSnapshot{}, false, errors.New("transaction journal has invalid detached raw HEAD")
+		}
+		hash := plumbing.NewHash(body[:40])
+		if hash.IsZero() || hash != expected {
+			return repositoryHeadSnapshot{}, false, errors.New("transaction journal detached raw HEAD differs from expected HEAD")
+		}
+		raw = plumbing.NewHashReference(plumbing.HEAD, hash)
+		return repositoryHeadSnapshot{raw: raw, target: raw, name: plumbing.HEAD, hash: hash}, true, nil
+	}
+}
+
+func requireJournalHeadCoordinate(repository *git.Repository, journal *transactionJournal) (repositoryHeadSnapshot, error) {
+	frozen, exact, err := journalExpectedHeadSnapshot(journal)
+	if err != nil {
+		return repositoryHeadSnapshot{}, err
+	}
+	current, err := snapshotRepositoryHead(repository)
+	if err != nil {
+		return repositoryHeadSnapshot{}, err
+	}
+	if !exact {
+		return current, nil
+	}
+	var matches bool
+	if frozen.raw.Type() == plumbing.SymbolicReference {
+		matches = current.raw.Type() == plumbing.SymbolicReference && current.raw.Target() == frozen.raw.Target()
+	} else {
+		// A detached transaction stays detached. Its raw hash may legitimately
+		// advance to the transaction commit before the intent phase is persisted.
+		matches = current.raw.Type() == plumbing.HashReference
+	}
+	if !matches {
+		return repositoryHeadSnapshot{}, fmt.Errorf("%w: canonical raw HEAD coordinate changed after transaction intent", ErrRefConflict)
+	}
+	return current, nil
 }
 
 type RecoveryResult struct {
@@ -297,8 +551,12 @@ func (s *Store) RecoverAborted(ctx context.Context, expected TransactionRecord) 
 	if journal == nil || journal.Phase != "aborted" || journal.Commit != "" || journal.Failure != "aborted before canonical commit" {
 		return RecoveryResult{}, errors.New("aborted transaction journal has an invalid retry boundary")
 	}
-	head, err := s.HeadHash()
-	if err != nil || head != current.ExpectedHead {
+	repository, err := s.ensureRepository()
+	if err != nil {
+		return RecoveryResult{}, err
+	}
+	headSnapshot, err := requireJournalHeadCoordinate(repository, journal)
+	if err != nil || headSnapshot.hash != current.ExpectedHead {
 		return RecoveryResult{}, errors.Join(err, errors.New("aborted transaction canonical HEAD changed before retry"))
 	}
 	for _, update := range current.Refs {
@@ -307,10 +565,12 @@ func (s *Store) RecoverAborted(ctx context.Context, expected TransactionRecord) 
 			return RecoveryResult{}, errors.Join(err, fmt.Errorf("aborted transaction ref %s changed before retry", update.Name))
 		}
 	}
-	if _, err := s.verifyJournalFiles(journal); err != nil {
+	bound, err := s.bindJournalFiles(journal)
+	if err != nil {
 		return RecoveryResult{}, fmt.Errorf("verify aborted transaction stages: %w", err)
 	}
-	if err := s.resetCanonicalWorktree(current.ExpectedHead, journal); err != nil {
+	defer func() { _ = bound.close() }()
+	if err := s.resetCanonicalWorktree(current.ExpectedHead, journal, bound); err != nil {
 		return RecoveryResult{}, fmt.Errorf("reset aborted transaction worktree: %w", err)
 	}
 	if _, err := s.verifyJournalDeletes(journal); err != nil {
@@ -321,9 +581,9 @@ func (s *Store) RecoverAborted(ctx context.Context, expected TransactionRecord) 
 	if err := s.writeJournal(journal); err != nil {
 		return RecoveryResult{}, fmt.Errorf("persist aborted transaction retry intent: %w", err)
 	}
-	results, err := s.Recover(ctx)
+	results, err := s.recover(ctx, current.ID, bound)
 	if err != nil {
-		return RecoveryResult{}, err
+		return RecoveryResult{}, errors.Join(err, s.restoreAbortedRetryBoundary(current.ID, current.ExpectedHead))
 	}
 	for _, result := range results {
 		if result.ID == current.ID {
@@ -333,9 +593,36 @@ func (s *Store) RecoverAborted(ctx context.Context, expected TransactionRecord) 
 	return RecoveryResult{}, errors.New("aborted transaction retry produced no recovery result")
 }
 
+func (s *Store) restoreAbortedRetryBoundary(id string, expectedHead plumbing.Hash) error {
+	journals, err := s.readJournals()
+	if err != nil {
+		return err
+	}
+	for _, journal := range journals {
+		if journal.ID != id {
+			continue
+		}
+		if journal.Phase != "intent" || journal.Commit != "" {
+			return nil
+		}
+		repository, openErr := s.ensureRepository()
+		if openErr != nil {
+			return openErr
+		}
+		head, headErr := requireJournalHeadCoordinate(repository, journal)
+		if headErr != nil || head.hash != expectedHead {
+			return errors.Join(headErr, errors.New("aborted transaction canonical HEAD changed while restoring retry boundary"))
+		}
+		journal.Phase = "aborted"
+		journal.Failure = "aborted before canonical commit"
+		return s.writeJournal(journal)
+	}
+	return fmt.Errorf("aborted transaction %s disappeared while restoring retry boundary", id)
+}
+
 func transactionRecordsEqual(left, right TransactionRecord) bool {
 	if left.ID != right.ID || left.Operation != right.Operation || left.Message != right.Message || left.Phase != right.Phase ||
-		left.ExpectedHead != right.ExpectedHead || left.Commit != right.Commit || len(left.Files) != len(right.Files) || len(left.Refs) != len(right.Refs) {
+		left.ExpectedHead != right.ExpectedHead || left.ExpectedHeadRaw != right.ExpectedHeadRaw || left.Commit != right.Commit || len(left.Files) != len(right.Files) || len(left.Refs) != len(right.Refs) {
 		return false
 	}
 	for index := range left.Files {
@@ -381,21 +668,39 @@ func (s *Store) Apply(ctx context.Context, operation, message string, staged map
 	if len(incomplete) != 0 {
 		return plumbing.ZeroHash, false, fmt.Errorf("%w: %s", ErrRecoveryRequired, strings.Join(incomplete, ","))
 	}
-	expectedHead, err := s.HeadHash()
+	repository, err := s.ensureRepository()
 	if err != nil {
 		return plumbing.ZeroHash, false, err
 	}
+	expectedHeadSnapshot, err := snapshotRepositoryHead(repository)
+	if err != nil {
+		return plumbing.ZeroHash, false, err
+	}
+	expectedHeadRaw, err := referenceBody(expectedHeadSnapshot.raw)
+	if err != nil {
+		return plumbing.ZeroHash, false, err
+	}
+	expectedHead := expectedHeadSnapshot.hash
 	if err := s.verifyExpectedFilesAt(expectedHead, options.ExpectedFiles); err != nil {
 		return plumbing.ZeroHash, false, err
 	}
-	journal, err := s.buildJournalWithDeletes(operation, message, expectedHead, staged, options.DeletePaths, refs)
+	bound, err := s.bindStagedFiles(staged, options.ExpectedStages, true)
+	if err != nil {
+		return plumbing.ZeroHash, false, err
+	}
+	defer func() { _ = bound.close() }()
+	journal, err := s.buildJournalWithDeletesBound(operation, message, expectedHead, bound, options.DeletePaths, refs)
 	if err != nil {
 		return plumbing.ZeroHash, false, err
 	}
 	if options.TransactionID != "" {
 		journal.ID = options.TransactionID
 	}
+	journal.ExpectedHeadRaw = expectedHeadRaw
 	if err := s.requireCanonicalWorktreeMatchesHead(); err != nil {
+		return plumbing.ZeroHash, false, err
+	}
+	if err := requireRepositoryHead(repository, expectedHeadSnapshot); err != nil {
 		return plumbing.ZeroHash, false, err
 	}
 	if err := s.writeJournal(journal); err != nil {
@@ -406,8 +711,14 @@ func (s *Store) Apply(ctx context.Context, operation, message string, staged map
 			return plumbing.ZeroHash, false, err
 		}
 	}
-	commit, changed, err := s.installPathChanges(staged, options.DeletePaths, message)
+	commit, changed, err := s.installPathChangesBoundAt(bound, options.DeletePaths, message, &expectedHeadSnapshot)
 	if err != nil {
+		if !commit.IsZero() {
+			journal.Commit = commit.String()
+			resolveJournalRefTargets(journal, commit)
+			journal.Phase = "committed"
+			return commit, changed, errors.Join(err, s.writeJournal(journal))
+		}
 		journal.Phase = "aborted"
 		journal.Failure = "aborted before canonical commit"
 		_ = s.writeJournal(journal)
@@ -524,8 +835,9 @@ func (s *Store) Transaction(id string) (TransactionRecord, bool, error) {
 		}
 		record := TransactionRecord{
 			ID: journal.ID, Operation: journal.Operation, Message: journal.Message, Phase: journal.Phase,
-			ExpectedHead: plumbing.NewHash(journal.ExpectedHead), Files: make([]TransactionFileRecord, 0, len(journal.Files)),
-			Refs: make([]TransactionRefRecord, 0, len(journal.Refs)),
+			ExpectedHead: plumbing.NewHash(journal.ExpectedHead), ExpectedHeadRaw: journal.ExpectedHeadRaw,
+			Files: make([]TransactionFileRecord, 0, len(journal.Files)),
+			Refs:  make([]TransactionRefRecord, 0, len(journal.Refs)),
 		}
 		if journal.Commit != "" {
 			record.Commit = plumbing.NewHash(journal.Commit)
@@ -612,7 +924,20 @@ func (s *Store) buildJournal(operation, message string, expected plumbing.Hash, 
 }
 
 func (s *Store) buildJournalWithDeletes(operation, message string, expected plumbing.Hash, staged map[string]string, deleted []string, refs []RefUpdate) (*transactionJournal, error) {
-	if len(staged) == 0 && len(deleted) == 0 {
+	bound, err := s.bindStagedFiles(staged, nil, true)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = bound.close() }()
+	return s.buildJournalWithDeletesBound(operation, message, expected, bound, deleted, refs)
+}
+
+func (s *Store) buildJournalWithDeletesBound(operation, message string, expected plumbing.Hash, bound *boundStageSet, deleted []string, refs []RefUpdate) (*transactionJournal, error) {
+	if bound == nil {
+		return nil, errors.New("transaction stage bindings are unavailable")
+	}
+	stagedCount := len(bound.files)
+	if stagedCount == 0 && len(deleted) == 0 {
 		return nil, errors.New("transaction has no canonical files")
 	}
 	id, err := transactionID()
@@ -624,8 +949,8 @@ func (s *Store) buildJournalWithDeletes(operation, message string, expected plum
 		Schema: transactionSchema, ID: id, Operation: operation, Phase: "intent", Message: message,
 		ExpectedHead: expected.String(), CreatedAt: now, UpdatedAt: now,
 	}
-	paths := make([]string, 0, len(staged))
-	for canonical := range staged {
+	paths := make([]string, 0, stagedCount)
+	for canonical := range bound.files {
 		paths = append(paths, canonical)
 	}
 	sort.Strings(paths)
@@ -633,15 +958,11 @@ func (s *Store) buildJournalWithDeletes(operation, message string, expected plum
 		if err := validateStatePath(canonical); err != nil {
 			return nil, err
 		}
-		stagedRelative, err := s.journalStagedPath(staged[canonical])
-		if err != nil {
-			return nil, fmt.Errorf("stage %s: %w", canonical, err)
-		}
-		digest, size, err := hashRegularFile(staged[canonical])
-		if err != nil {
+		stage := bound.files[canonical]
+		if err := s.verifyBoundStage(stage); err != nil {
 			return nil, err
 		}
-		journal.Files = append(journal.Files, journalFile{Canonical: canonical, Staged: stagedRelative, Size: size, SHA256: digest})
+		journal.Files = append(journal.Files, journalFile{Canonical: canonical, Staged: stage.stagedRelative, Size: stage.identity.Size, SHA256: stage.identity.SHA256})
 	}
 	deletePaths := append([]string(nil), deleted...)
 	sort.Strings(deletePaths)
@@ -649,7 +970,7 @@ func (s *Store) buildJournalWithDeletes(operation, message string, expected plum
 		if err := validateStatePath(canonical); err != nil {
 			return nil, err
 		}
-		if _, replaced := staged[canonical]; replaced {
+		if _, replaced := bound.files[canonical]; replaced {
 			return nil, fmt.Errorf("canonical state path %s cannot be installed and deleted together", canonical)
 		}
 		if index != 0 && deletePaths[index-1] == canonical {
@@ -823,9 +1144,14 @@ func (s *Store) RequireNoIncompleteTransactions() error {
 // Recover safely replays every incomplete local transaction in journal order.
 // The caller must hold the SOW mutation lock.
 func (s *Store) Recover(ctx context.Context) ([]RecoveryResult, error) {
+	return s.recover(ctx, "", nil)
+}
+
+func (s *Store) recover(ctx context.Context, retainedID string, retained *boundStageSet) ([]RecoveryResult, error) {
 	if err := s.requireWritable(); err != nil {
 		return nil, err
 	}
+	defer func() { _ = retained.close() }()
 	journals, err := s.readJournals()
 	if err != nil {
 		return nil, err
@@ -843,31 +1169,40 @@ func (s *Store) Recover(ctx context.Context) ([]RecoveryResult, error) {
 		}
 		var commit plumbing.Hash
 		if journal.Phase == "intent" {
-			head, err := s.HeadHash()
-			if err != nil {
-				return results, err
+			repository, openErr := s.ensureRepository()
+			if openErr != nil {
+				return results, openErr
 			}
+			headSnapshot, headErr := requireJournalHeadCoordinate(repository, journal)
+			if headErr != nil {
+				return results, fmt.Errorf("recover %s HEAD coordinate: %w", journal.ID, headErr)
+			}
+			head := headSnapshot.hash
 			expected := plumbing.NewHash(journal.ExpectedHead)
 			switch {
 			case head == expected:
 				// No commit exists yet, so replay still depends on the exact
 				// staged sources recorded by the intent journal.
-				staged, verifyErr := s.verifyJournalFiles(journal)
-				if verifyErr != nil {
-					return results, fmt.Errorf("recover %s: %w", journal.ID, verifyErr)
+				bound := retained
+				if bound == nil || journal.ID != retainedID {
+					var verifyErr error
+					bound, verifyErr = s.bindJournalFiles(journal)
+					if verifyErr != nil {
+						return results, fmt.Errorf("recover %s: %w", journal.ID, verifyErr)
+					}
 				}
 				// An intent can stop after any staged file was copied and added to
 				// the index but before Commit. Reset every replay, not only delete
 				// transactions, or equal source/destination bytes can make the
 				// installer return the old HEAD and resolve refs to the wrong commit.
-				if resetErr := s.resetCanonicalWorktree(expected, journal); resetErr != nil {
-					return results, fmt.Errorf("recover %s partial canonical mutation: %w", journal.ID, resetErr)
+				if resetErr := s.resetCanonicalWorktree(expected, journal, bound); resetErr != nil {
+					return results, errors.Join(fmt.Errorf("recover %s partial canonical mutation: %w", journal.ID, resetErr), bound.close())
 				}
 				deleted, verifyErr := s.verifyJournalDeletes(journal)
 				if verifyErr != nil {
-					return results, fmt.Errorf("recover %s: %w", journal.ID, verifyErr)
+					return results, errors.Join(fmt.Errorf("recover %s: %w", journal.ID, verifyErr), bound.close())
 				}
-				commit, _, err = s.installPathChanges(staged, deleted, journal.Message)
+				commit, _, err = s.installPathChangesBoundAt(bound, deleted, journal.Message, &headSnapshot)
 				if err != nil {
 					return results, fmt.Errorf("recover %s commit: %w", journal.ID, err)
 				}
@@ -876,10 +1211,6 @@ func (s *Store) Recover(ctx context.Context) ([]RecoveryResult, error) {
 				// durably advance intent -> committed. Callers are allowed to
 				// remove transaction staging on return, so prove the committed
 				// tree directly before consulting any staged pathname.
-				repository, openErr := s.ensureRepository()
-				if openErr != nil {
-					return results, openErr
-				}
 				matches, matchErr := s.commitExactlyAppliesJournal(repository, head, expected, journal)
 				if matchErr != nil {
 					return results, matchErr
@@ -905,13 +1236,14 @@ func (s *Store) Recover(ctx context.Context) ([]RecoveryResult, error) {
 			if commit.IsZero() {
 				return results, fmt.Errorf("recover %s: committed journal has no commit", journal.ID)
 			}
-			currentHead, headErr := s.HeadHash()
-			if headErr != nil || currentHead.IsZero() {
-				return results, errors.Join(headErr, fmt.Errorf("recover %s: canonical HEAD disappeared after transaction commit", journal.ID))
-			}
 			repository, openErr := s.ensureRepository()
 			if openErr != nil {
 				return results, openErr
+			}
+			currentSnapshot, headErr := requireJournalHeadCoordinate(repository, journal)
+			currentHead := currentSnapshot.hash
+			if headErr != nil || currentHead.IsZero() {
+				return results, errors.Join(headErr, fmt.Errorf("recover %s: canonical HEAD disappeared after transaction commit", journal.ID))
 			}
 			journalCommit, commitErr := repository.CommitObject(commit)
 			currentCommit, currentErr := repository.CommitObject(currentHead)
@@ -1056,23 +1388,21 @@ func (s *Store) readJournals() ([]*transactionJournal, error) {
 	return journals, nil
 }
 
-func (s *Store) verifyJournalFiles(journal *transactionJournal) (map[string]string, error) {
+func (s *Store) bindJournalFiles(journal *transactionJournal) (*boundStageSet, error) {
 	staged := make(map[string]string, len(journal.Files))
+	expected := make(map[string]FileIdentity, len(journal.Files))
 	for _, file := range journal.Files {
 		if file.Delete {
 			continue
 		}
-		path := filepath.Join(s.stateDir, filepath.FromSlash(file.Staged))
-		digest, size, err := hashRegularFile(path)
-		if err != nil {
-			return nil, err
-		}
-		if digest != file.SHA256 || size != file.Size {
-			return nil, fmt.Errorf("staged file %s changed after intent was recorded", file.Canonical)
-		}
-		staged[file.Canonical] = path
+		staged[file.Canonical] = filepath.Join(s.stateDir, filepath.FromSlash(file.Staged))
+		expected[file.Canonical] = FileIdentity{Size: file.Size, SHA256: file.SHA256}
 	}
-	return staged, nil
+	bound, err := s.bindStagedFiles(staged, expected, true)
+	if err != nil {
+		return nil, fmt.Errorf("staged transaction file changed after intent was recorded: %w", err)
+	}
+	return bound, nil
 }
 
 func (s *Store) verifyJournalDeletes(journal *transactionJournal) ([]string, error) {
@@ -1099,7 +1429,10 @@ func (s *Store) verifyJournalDeletes(journal *transactionJournal) ([]string, err
 // appeared after intent was recorded and is preserved by failing recovery.
 // Staged transaction sources live outside the embedded worktree, so the exact
 // intent can then be replayed from a clean index and tracked-file baseline.
-func (s *Store) resetCanonicalWorktree(expected plumbing.Hash, journal *transactionJournal) error {
+func (s *Store) resetCanonicalWorktree(expected plumbing.Hash, journal *transactionJournal, bound *boundStageSet) error {
+	if bound == nil {
+		return errors.New("journal stage bindings are unavailable for canonical reset")
+	}
 	repository, err := s.ensureRepository()
 	if err != nil {
 		return err
@@ -1108,7 +1441,7 @@ func (s *Store) resetCanonicalWorktree(expected plumbing.Hash, journal *transact
 	if err != nil {
 		return err
 	}
-	paths, err := s.validatePartialCanonicalMutation(repository, worktree, expected, journal)
+	paths, err := s.validatePartialCanonicalMutation(repository, worktree, expected, journal, bound)
 	if err != nil {
 		return err
 	}
@@ -1185,7 +1518,7 @@ func (s *Store) resetCanonicalWorktree(expected plumbing.Hash, journal *transact
 	return nil
 }
 
-func (s *Store) validatePartialCanonicalMutation(repository *git.Repository, worktree *git.Worktree, expected plumbing.Hash, journal *transactionJournal) ([]string, error) {
+func (s *Store) validatePartialCanonicalMutation(repository *git.Repository, worktree *git.Worktree, expected plumbing.Hash, journal *transactionJournal, bound *boundStageSet) ([]string, error) {
 	allowed := make(map[string]journalFile, len(journal.Files))
 	paths := make([]string, 0, len(journal.Files))
 	for _, file := range journal.Files {
@@ -1227,7 +1560,11 @@ func (s *Store) validatePartialCanonicalMutation(repository *git.Repository, wor
 		indexAllowed := !indexExists && (!baselineExists || file.Delete) ||
 			indexExists && baselineExists && entry.Hash == baselineEntry.Hash && entry.Mode == baselineEntry.Mode
 		if !file.Delete && indexExists {
-			desiredHash, err := journalGitBlobHash(filepath.Join(s.stateDir, filepath.FromSlash(file.Staged)), file.Size, file.SHA256)
+			stage, exists := bound.files[file.Canonical]
+			if !exists || stage.identity != (FileIdentity{Size: file.Size, SHA256: file.SHA256}) {
+				return nil, fmt.Errorf("journal stage binding for %s is unavailable or changed", file.Canonical)
+			}
+			desiredHash, err := s.boundStageGitHash(stage)
 			if err != nil {
 				return nil, err
 			}
@@ -1280,34 +1617,6 @@ func treeBlobEntry(tree *object.Tree, canonical string) (*object.TreeEntry, bool
 		return nil, false, fmt.Errorf("canonical baseline path %s is not a regular file", canonical)
 	}
 	return entry, true, nil
-}
-
-func journalGitBlobHash(filename string, size int64, digest string) (plumbing.Hash, error) {
-	before, err := os.Lstat(filename)
-	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || before.Size() != size {
-		return plumbing.ZeroHash, errors.Join(err, errors.New("staged transaction file changed after intent"))
-	}
-	file, err := os.Open(filename)
-	if err != nil {
-		return plumbing.ZeroHash, err
-	}
-	opened, err := file.Stat()
-	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
-		_ = file.Close()
-		return plumbing.ZeroHash, errors.Join(err, errors.New("staged transaction file changed while opening"))
-	}
-	gitHasher := plumbing.NewHasher(plumbing.BlobObject, size)
-	shaHasher := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(gitHasher, shaHasher), file)
-	closeErr := file.Close()
-	if copyErr != nil || closeErr != nil {
-		return plumbing.ZeroHash, errors.Join(copyErr, closeErr)
-	}
-	after, err := os.Lstat(filename)
-	if err != nil || after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() || !os.SameFile(opened, after) || before.Mode() != after.Mode() || written != size || hex.EncodeToString(shaHasher.Sum(nil)) != digest {
-		return plumbing.ZeroHash, errors.Join(err, errors.New("staged transaction file changed after intent"))
-	}
-	return gitHasher.Sum(), nil
 }
 
 func (s *Store) validatePartialCanonicalFile(expected plumbing.Hash, file journalFile, baselineEntry *object.TreeEntry, baselineExists bool) error {
@@ -1563,6 +1872,9 @@ func validateJournal(journal *transactionJournal) error {
 	if len(journal.ExpectedHead) != 40 || !isLowerHex(journal.ExpectedHead) {
 		return errors.New("transaction journal has invalid expected HEAD")
 	}
+	if _, _, err := journalExpectedHeadSnapshot(journal); err != nil {
+		return err
+	}
 	if journal.Phase == "committed" || journal.Phase == "complete" {
 		if len(journal.Commit) != 40 || !isLowerHex(journal.Commit) || journal.Commit == plumbing.ZeroHash.String() {
 			return errors.New("transaction journal has invalid commit")
@@ -1641,33 +1953,27 @@ func hashRegularFile(path string) (string, int64, error) {
 	if beforePath.Mode()&os.ModeSymlink != 0 || !beforePath.Mode().IsRegular() {
 		return "", 0, fmt.Errorf("staged file %q is not a regular non-symlink", path)
 	}
-	file, err := os.Open(path)
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return "", 0, err
 	}
 	info, err := file.Stat()
 	if err != nil {
-		file.Close()
-		return "", 0, err
+		return "", 0, errors.Join(err, file.Close())
 	}
-	if !info.Mode().IsRegular() || !os.SameFile(beforePath, info) {
-		file.Close()
-		return "", 0, fmt.Errorf("staged file %q is not regular", path)
+	if !info.Mode().IsRegular() || !os.SameFile(beforePath, info) || beforePath.Size() != info.Size() || beforePath.Mode() != info.Mode() || !beforePath.ModTime().Equal(info.ModTime()) {
+		return "", 0, errors.Join(fmt.Errorf("staged file %q changed while opening", path), file.Close())
 	}
-	hasher := sha256.New()
-	size, copyErr := io.Copy(hasher, file)
+	identity, hashErr := hashBoundDescriptor(file, info.Size())
 	closeErr := file.Close()
-	if copyErr != nil || closeErr != nil {
-		return "", 0, errors.Join(copyErr, closeErr)
-	}
-	if size != info.Size() {
-		return "", 0, fmt.Errorf("staged file %q changed while hashing", path)
+	if hashErr != nil || closeErr != nil {
+		return "", 0, errors.Join(hashErr, closeErr)
 	}
 	after, err := os.Lstat(path)
-	if err != nil || after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() || !os.SameFile(info, after) || info.Size() != after.Size() || !info.ModTime().Equal(after.ModTime()) {
+	if err != nil || after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() || !os.SameFile(info, after) || info.Size() != after.Size() || info.Mode() != after.Mode() || !info.ModTime().Equal(after.ModTime()) {
 		return "", 0, fmt.Errorf("staged file %q changed while hashing", path)
 	}
-	return hex.EncodeToString(hasher.Sum(nil)), size, nil
+	return identity.SHA256, identity.Size, nil
 }
 
 func isLowerHex(value string) bool {

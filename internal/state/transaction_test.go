@@ -5,14 +5,20 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
+	indexformat "github.com/go-git/go-git/v5/plumbing/format/index"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
@@ -38,6 +44,1450 @@ func TestApplyRefUpdateTargetsExistingCommit(t *testing.T) {
 	}
 	if journals[0].Phase != "complete" || journals[0].Refs[0].Target != target.String() {
 		t.Fatalf("journal did not preserve explicit target: %+v", journals[0])
+	}
+}
+
+func TestApplyExpectedStagesRejectsMutationAfterIntent(t *testing.T) {
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	for _, test := range []struct {
+		name    string
+		mutate  func(string) error
+		staged  string
+		present string
+	}{
+		{
+			name:    "same bytes replacement inode",
+			staged:  "approved\n",
+			present: "approved\n",
+			mutate: func(path string) error {
+				if err := os.Rename(path, path+".approved"); err != nil {
+					return err
+				}
+				return os.WriteFile(path, []byte("approved\n"), 0o600)
+			},
+		},
+		{
+			name:    "different bytes replacement inode",
+			staged:  "approved\n",
+			present: "unapproved\n",
+			mutate: func(path string) error {
+				if err := os.Rename(path, path+".approved"); err != nil {
+					return err
+				}
+				return os.WriteFile(path, []byte("unapproved\n"), 0o600)
+			},
+		},
+		{
+			name:    "approved inode changed in place",
+			staged:  "approved\n",
+			present: "unapproved and larger\n",
+			mutate: func(path string) error {
+				return os.WriteFile(path, []byte("unapproved and larger\n"), 0o600)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), ".sow")
+			store := New(stateDir)
+			baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+			stage := transactionTestStage(t, stateDir, "approved.tsv", test.staged)
+			digest := sha256.Sum256([]byte(test.staged))
+			transactionID, err := NewTransactionID()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			_, _, err = store.Apply(t.Context(), "add", "bind approved stage", map[string]string{
+				canonicalPath: stage,
+			}, nil, ApplyOptions{
+				TransactionID: transactionID,
+				ExpectedStages: map[string]FileIdentity{
+					canonicalPath: {
+						Size:   int64(len(test.staged)),
+						SHA256: hex.EncodeToString(digest[:]),
+					},
+				},
+				AfterIntent: func() error { return test.mutate(stage) },
+			})
+			if err == nil {
+				t.Fatal("Apply accepted a staged file changed after durable intent")
+			}
+			if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+				t.Fatalf("rejected Apply changed HEAD head=%s want=%s err=%v apply_err=%v", head, baseline, headErr, err)
+			}
+			record, exists, recordErr := store.Transaction(transactionID)
+			if recordErr != nil || !exists || record.Phase != "aborted" || !record.Commit.IsZero() {
+				t.Fatalf("record exists=%t record=%+v err=%v apply_err=%v", exists, record, recordErr, err)
+			}
+			body, readErr := os.ReadFile(stage)
+			if readErr != nil || string(body) != test.present {
+				t.Fatalf("replacement body=%q want=%q err=%v", body, test.present, readErr)
+			}
+		})
+	}
+}
+
+func TestApplyExpectedStagesRequiresExactCanonicalVector(t *testing.T) {
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	for _, test := range []struct {
+		name     string
+		expected func(FileIdentity) map[string]FileIdentity
+	}{
+		{
+			name: "missing canonical identity",
+			expected: func(FileIdentity) map[string]FileIdentity {
+				return map[string]FileIdentity{}
+			},
+		},
+		{
+			name: "extra canonical identity",
+			expected: func(identity FileIdentity) map[string]FileIdentity {
+				return map[string]FileIdentity{canonicalPath: identity, "config/sow.yaml": identity}
+			},
+		},
+		{
+			name: "wrong byte identity",
+			expected: func(identity FileIdentity) map[string]FileIdentity {
+				identity.Size++
+				return map[string]FileIdentity{canonicalPath: identity}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), ".sow")
+			store := New(stateDir)
+			baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+			const body = "approved\n"
+			stage := transactionTestStage(t, stateDir, "approved.tsv", body)
+			digest := sha256.Sum256([]byte(body))
+			identity := FileIdentity{Size: int64(len(body)), SHA256: hex.EncodeToString(digest[:])}
+			_, _, err := store.Apply(t.Context(), "add", "reject partial stage vector", map[string]string{canonicalPath: stage}, nil, ApplyOptions{
+				ExpectedStages: test.expected(identity),
+			})
+			if err == nil {
+				t.Fatal("Apply accepted a partial or mismatched expected stage vector")
+			}
+			if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+				t.Fatalf("rejected stage vector changed HEAD head=%s want=%s err=%v", head, baseline, headErr)
+			}
+			journals, journalErr := store.readJournals()
+			if journalErr != nil || len(journals) != 0 {
+				t.Fatalf("rejected stage vector wrote journals=%+v err=%v", journals, journalErr)
+			}
+		})
+	}
+}
+
+func TestRecoverRetainsJournalStageDescriptorThroughInstall(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	journal, err := store.buildJournal("add", "recover bound stage", baseline, map[string]string{canonicalPath: stage}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.writeJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	original := stage + ".approved"
+	store.beforeBoundStageInstall = func() error {
+		store.beforeBoundStageInstall = nil
+		if err := os.Rename(stage, original); err != nil {
+			return err
+		}
+		return os.WriteFile(stage, []byte("approved\n"), 0o600)
+	}
+	if _, err := store.Recover(t.Context()); err == nil {
+		t.Fatal("recovery accepted a same-byte staged-path replacement after binding")
+	}
+	if head, err := store.HeadHash(); err != nil || head != baseline {
+		t.Fatalf("rejected recovery changed HEAD head=%s want=%s err=%v", head, baseline, err)
+	}
+	record, exists, err := store.Transaction(journal.ID)
+	if err != nil || !exists || record.Phase != "intent" || !record.Commit.IsZero() {
+		t.Fatalf("rejected recovery record exists=%t record=%+v err=%v", exists, record, err)
+	}
+	body, err := os.ReadFile(stage)
+	if err != nil || string(body) != "approved\n" {
+		t.Fatalf("recovery did not preserve replacement body=%q err=%v", body, err)
+	}
+	if err := os.Remove(stage); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(original, stage); err != nil {
+		t.Fatal(err)
+	}
+	results, err := store.Recover(t.Context())
+	if err != nil || len(results) != 1 || !results[0].Recovered || results[0].Commit.IsZero() {
+		t.Fatalf("repaired exact stage did not recover results=%+v err=%v", results, err)
+	}
+	reader, err := store.OpenPath(canonicalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, readErr := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if readErr != nil || closeErr != nil || string(committed) != "approved\n" {
+		t.Fatalf("recovered canonical body=%q read_err=%v close_err=%v", committed, readErr, closeErr)
+	}
+}
+
+func TestRecoverAbortedRetainsOneStageBindingAndRestoresRetryBoundary(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	digest := sha256.Sum256([]byte("approved\n"))
+	transactionID, err := NewTransactionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.beforeBoundStageInstall = func() error {
+		store.beforeBoundStageInstall = nil
+		return errors.New("injected initial install failure")
+	}
+	_, _, err = store.Apply(t.Context(), "add", "retry one retained binding", map[string]string{canonicalPath: stage}, nil, ApplyOptions{
+		TransactionID: transactionID,
+		ExpectedStages: map[string]FileIdentity{
+			canonicalPath: {Size: int64(len("approved\n")), SHA256: hex.EncodeToString(digest[:])},
+		},
+	})
+	if err == nil {
+		t.Fatal("initial Apply did not create an aborted retry boundary")
+	}
+	record, exists, err := store.Transaction(transactionID)
+	if err != nil || !exists || record.Phase != "aborted" {
+		t.Fatalf("initial aborted record exists=%t record=%+v err=%v", exists, record, err)
+	}
+	original := stage + ".approved"
+	store.beforeBoundStageInstall = func() error {
+		store.beforeBoundStageInstall = nil
+		if err := os.Rename(stage, original); err != nil {
+			return err
+		}
+		return os.WriteFile(stage, []byte("approved\n"), 0o600)
+	}
+	if _, err := store.RecoverAborted(t.Context(), record); !errors.Is(err, ErrFileConflict) {
+		t.Fatalf("aborted retry replacement err=%v want ErrFileConflict", err)
+	}
+	restored, exists, err := store.Transaction(transactionID)
+	if err != nil || !exists || restored.Phase != "aborted" || !restored.Commit.IsZero() {
+		t.Fatalf("failed retry did not restore aborted boundary exists=%t record=%+v err=%v", exists, restored, err)
+	}
+	if head, err := store.HeadHash(); err != nil || head != baseline {
+		t.Fatalf("failed aborted retry changed HEAD head=%s want=%s err=%v", head, baseline, err)
+	}
+	if err := os.Remove(stage); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(original, stage); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := store.RecoverAborted(t.Context(), record)
+	if err != nil || !recovered.Recovered || recovered.Commit.IsZero() {
+		t.Fatalf("repaired aborted retry result=%+v err=%v", recovered, err)
+	}
+}
+
+func TestApplyRejectsFIFOReplacementAfterIntentWithoutBlocking(t *testing.T) {
+	if os.Getenv("SOW_TEST_APPLY_FIFO_STAGE") == "1" {
+		stateDir := filepath.Join(t.TempDir(), ".sow")
+		store := New(stateDir)
+		const canonicalPath = "views/beta/assets/all/all.tsv"
+		baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+		stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+		digest := sha256.Sum256([]byte("approved\n"))
+		transactionID, err := NewTransactionID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref, err := ViewRef("beta", "assets", "all", "all")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _, err = store.Apply(t.Context(), "add", "reject FIFO stage replacement", map[string]string{canonicalPath: stage}, []RefUpdate{{Name: ref}}, ApplyOptions{
+			TransactionID:  transactionID,
+			ExpectedStages: map[string]FileIdentity{canonicalPath: {Size: int64(len("approved\n")), SHA256: hex.EncodeToString(digest[:])}},
+			AfterIntent: func() error {
+				if err := os.Rename(stage, stage+".approved"); err != nil {
+					return err
+				}
+				return syscall.Mkfifo(stage, 0o600)
+			},
+		})
+		if !errors.Is(err, ErrFileConflict) {
+			t.Fatalf("Apply FIFO replacement err=%v want ErrFileConflict", err)
+		}
+		if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+			t.Fatalf("FIFO rejection changed HEAD head=%s want=%s err=%v", head, baseline, headErr)
+		}
+		if _, exists, refErr := store.Ref(ref); refErr != nil || exists {
+			t.Fatalf("FIFO rejection advanced ref exists=%t err=%v", exists, refErr)
+		}
+		record, exists, recordErr := store.Transaction(transactionID)
+		if recordErr != nil || !exists || record.Phase != "aborted" || !record.Commit.IsZero() {
+			t.Fatalf("FIFO rejection record exists=%t record=%+v err=%v", exists, record, recordErr)
+		}
+		if info, statErr := os.Lstat(stage); statErr != nil || info.Mode()&os.ModeNamedPipe == 0 {
+			t.Fatalf("FIFO replacement was not preserved info=%v err=%v", info, statErr)
+		}
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestApplyRejectsFIFOReplacementAfterIntentWithoutBlocking$")
+	command.Env = append(os.Environ(), "SOW_TEST_APPLY_FIFO_STAGE=1")
+	output, err := command.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("Apply blocked while rejecting FIFO stage replacement: %v output=%s", ctx.Err(), output)
+	}
+	if err != nil {
+		t.Fatalf("FIFO stage rejection helper failed: %v output=%s", err, output)
+	}
+}
+
+func TestApplyBoundedCopyRejectsInPlaceStageMutation(t *testing.T) {
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	for _, replacement := range []string{"x\n", "unapproved and larger\n", "altered!\n"} {
+		name := "same-size"
+		switch {
+		case len(replacement) < len("approved\n"):
+			name = "truncate"
+		case len(replacement) > len("approved\n"):
+			name = "grow"
+		}
+		t.Run(name, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), ".sow")
+			store := New(stateDir)
+			baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+			stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+			stageInfo, err := os.Stat(stage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := sha256.Sum256([]byte("approved\n"))
+			store.beforeBoundStageCopy = func() error {
+				store.beforeBoundStageCopy = nil
+				if err := os.WriteFile(stage, []byte(replacement), 0o600); err != nil {
+					return err
+				}
+				return os.Chtimes(stage, stageInfo.ModTime(), stageInfo.ModTime())
+			}
+			transactionID, err := NewTransactionID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, err = store.Apply(t.Context(), "add", "reject in-place stage mutation", map[string]string{canonicalPath: stage}, nil, ApplyOptions{
+				TransactionID: transactionID,
+				ExpectedStages: map[string]FileIdentity{
+					canonicalPath: {Size: int64(len("approved\n")), SHA256: hex.EncodeToString(digest[:])},
+				},
+			})
+			if !errors.Is(err, ErrFileConflict) {
+				t.Fatalf("in-place mutation err=%v want ErrFileConflict", err)
+			}
+			if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+				t.Fatalf("bounded-copy rejection changed HEAD head=%s want=%s err=%v", head, baseline, headErr)
+			}
+			record, exists, recordErr := store.Transaction(transactionID)
+			if recordErr != nil || !exists || record.Phase != "aborted" || !record.Commit.IsZero() {
+				t.Fatalf("bounded-copy record exists=%t record=%+v err=%v apply_err=%v", exists, record, recordErr, err)
+			}
+			body, readErr := os.ReadFile(stage)
+			if readErr != nil || string(body) != replacement {
+				t.Fatalf("bounded-copy mutation body=%q want=%q err=%v", body, replacement, readErr)
+			}
+		})
+	}
+}
+
+func TestApplyRevalidatesWholeStageVectorBeforeCommit(t *testing.T) {
+	const (
+		firstPath  = "views/beta/assets/all/a.tsv"
+		secondPath = "views/beta/assets/all/b.tsv"
+		firstBody  = "approved first\n"
+		secondBody = "approved second\n"
+	)
+	for _, test := range []struct {
+		name   string
+		mutate func(string, string, string) error
+	}{
+		{
+			name: "earlier source path replaced during later copy",
+			mutate: func(stateDir, firstStage, _ string) error {
+				if err := os.Rename(firstStage, firstStage+".approved"); err != nil {
+					return err
+				}
+				return os.WriteFile(firstStage, []byte(firstBody), 0o600)
+			},
+		},
+		{
+			name: "earlier canonical destination overwritten during later copy",
+			mutate: func(stateDir, _, firstCanonical string) error {
+				return os.WriteFile(firstCanonical, []byte("unapproved canonical bytes\n"), 0o644)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), ".sow")
+			store := New(stateDir)
+			_ = installTransactionTestCommit(t, store, firstPath, "baseline first\n")
+			baseline := installTransactionTestCommit(t, store, secondPath, "baseline second\n")
+			firstStage := transactionTestStage(t, stateDir, "first.tsv", firstBody)
+			secondStage := transactionTestStage(t, stateDir, "second.tsv", secondBody)
+			firstDigest := sha256.Sum256([]byte(firstBody))
+			secondDigest := sha256.Sum256([]byte(secondBody))
+			transactionID, err := NewTransactionID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			copyCalls := 0
+			store.beforeBoundStageCopy = func() error {
+				copyCalls++
+				if copyCalls != 2 {
+					return nil
+				}
+				store.beforeBoundStageCopy = nil
+				return test.mutate(stateDir, firstStage, filepath.Join(stateDir, "state", filepath.FromSlash(firstPath)))
+			}
+			_, _, err = store.Apply(t.Context(), "add", "revalidate full stage vector", map[string]string{
+				firstPath: firstStage, secondPath: secondStage,
+			}, nil, ApplyOptions{
+				TransactionID: transactionID,
+				ExpectedStages: map[string]FileIdentity{
+					firstPath:  {Size: int64(len(firstBody)), SHA256: hex.EncodeToString(firstDigest[:])},
+					secondPath: {Size: int64(len(secondBody)), SHA256: hex.EncodeToString(secondDigest[:])},
+				},
+			})
+			if !errors.Is(err, ErrFileConflict) {
+				t.Fatalf("multi-stage mutation err=%v want ErrFileConflict", err)
+			}
+			if copyCalls != 2 {
+				t.Fatalf("multi-stage mutation copy calls=%d want=2", copyCalls)
+			}
+			if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+				t.Fatalf("multi-stage rejection changed HEAD head=%s want=%s err=%v", head, baseline, headErr)
+			}
+			record, exists, recordErr := store.Transaction(transactionID)
+			if recordErr != nil || !exists || record.Phase != "aborted" || !record.Commit.IsZero() {
+				t.Fatalf("multi-stage record exists=%t record=%+v err=%v apply_err=%v", exists, record, recordErr, err)
+			}
+			for canonical, want := range map[string]string{firstPath: "baseline first\n", secondPath: "baseline second\n"} {
+				body, readErr := os.ReadFile(filepath.Join(stateDir, "state", filepath.FromSlash(canonical)))
+				if readErr != nil || string(body) != want {
+					t.Fatalf("rolled back canonical %s body=%q want=%q err=%v", canonical, body, want, readErr)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyRejectsStageHardLinkedToCanonicalDestination(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	const body = "approved\n"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, body)
+	stageDirectory := filepath.Join(stateDir, "transactions", "hardlink")
+	if err := os.MkdirAll(stageDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stage := filepath.Join(stageDirectory, "approved.tsv")
+	if err := os.Link(filepath.Join(stateDir, "state", filepath.FromSlash(canonicalPath)), stage); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(body))
+	transactionID, err := NewTransactionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.Apply(t.Context(), "add", "reject canonical hardlink source", map[string]string{canonicalPath: stage}, nil, ApplyOptions{
+		TransactionID: transactionID,
+		ExpectedStages: map[string]FileIdentity{
+			canonicalPath: {Size: int64(len(body)), SHA256: hex.EncodeToString(digest[:])},
+		},
+	})
+	if !errors.Is(err, ErrFileConflict) || !strings.Contains(err.Error(), "hard-linked") {
+		t.Fatalf("canonical hardlink stage err=%v", err)
+	}
+	if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+		t.Fatalf("hardlink rejection changed HEAD head=%s want=%s err=%v", head, baseline, headErr)
+	}
+	if stageInfo, stageErr := os.Stat(stage); stageErr != nil || !stageInfo.Mode().IsRegular() {
+		t.Fatalf("hardlink stage was not preserved info=%v err=%v", stageInfo, stageErr)
+	}
+}
+
+func TestApplyRejectsHeadMoveBeforeCanonicalMutation(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	prior := installTransactionTestCommit(t, store, canonicalPath, "prior\n")
+	baseline := installTransactionTestCommit(t, store, "config/sow.yaml", "baseline config\n")
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	store.beforeBoundStageInstall = func() error {
+		store.beforeBoundStageInstall = nil
+		repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+		if err != nil {
+			return err
+		}
+		head, err := repository.Head()
+		if err != nil {
+			return err
+		}
+		return repository.Storer.SetReference(plumbing.NewHashReference(head.Name(), prior))
+	}
+	_, _, err := store.Apply(t.Context(), "add", "reject moved HEAD", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+	if !errors.Is(err, ErrRefConflict) {
+		t.Fatalf("moved HEAD err=%v want ErrRefConflict", err)
+	}
+	if head, headErr := store.HeadHash(); headErr != nil || head != prior || head == baseline {
+		t.Fatalf("Apply overwrote external HEAD move head=%s prior=%s baseline=%s err=%v", head, prior, baseline, headErr)
+	}
+}
+
+func TestApplyRejectsRawHeadBranchSwitchAtSameCommit(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	const alternate = plumbing.ReferenceName("refs/heads/external-same-hash")
+	store.beforeBoundStageInstall = func() error {
+		store.beforeBoundStageInstall = nil
+		repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+		if err != nil {
+			return err
+		}
+		if err := repository.Storer.SetReference(plumbing.NewHashReference(alternate, baseline)); err != nil {
+			return err
+		}
+		return repository.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, alternate))
+	}
+	_, _, err := store.Apply(t.Context(), "add", "reject raw HEAD branch switch", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+	if !errors.Is(err, ErrRefConflict) {
+		t.Fatalf("same-hash raw HEAD switch err=%v want ErrRefConflict", err)
+	}
+	repository, openErr := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	raw, rawErr := repository.Storer.Reference(plumbing.HEAD)
+	if rawErr != nil || raw.Type() != plumbing.SymbolicReference || raw.Target() != alternate {
+		t.Fatalf("Apply overwrote raw HEAD switch raw=%v err=%v", raw, rawErr)
+	}
+}
+
+func TestApplyRejectsRawHeadBranchSwitchAfterIntent(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	const alternate = plumbing.ReferenceName("refs/heads/external-after-intent")
+	transactionID, err := NewTransactionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.Apply(t.Context(), "add", "reject raw HEAD switch after intent", map[string]string{canonicalPath: stage}, nil, ApplyOptions{
+		TransactionID: transactionID,
+		AfterIntent: func() error {
+			repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+			if err != nil {
+				return err
+			}
+			if err := repository.Storer.SetReference(plumbing.NewHashReference(alternate, baseline)); err != nil {
+				return err
+			}
+			return repository.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, alternate))
+		},
+	})
+	if !errors.Is(err, ErrRefConflict) {
+		t.Fatalf("after-intent same-hash raw HEAD switch err=%v want ErrRefConflict", err)
+	}
+	repository, openErr := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	raw, rawErr := repository.Storer.Reference(plumbing.HEAD)
+	if rawErr != nil || raw.Type() != plumbing.SymbolicReference || raw.Target() != alternate {
+		t.Fatalf("rejected Apply overwrote after-intent raw HEAD raw=%v err=%v", raw, rawErr)
+	}
+	record, exists, recordErr := store.Transaction(transactionID)
+	if recordErr != nil || !exists || record.Phase != "aborted" || !record.Commit.IsZero() {
+		t.Fatalf("after-intent conflict record exists=%t record=%+v err=%v", exists, record, recordErr)
+	}
+}
+
+func TestRecoverRejectsRawHeadBranchSwitchAtSameExpectedCommit(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	stage := transactionTestStage(t, stateDir, "approved-recovery.tsv", "approved\n")
+	const alternate = plumbing.ReferenceName("refs/heads/external-recovery-same-hash")
+	injected := errors.New("stop after durable intent")
+	transactionID, err := NewTransactionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = store.Apply(t.Context(), "add", "reject recovery raw HEAD switch", map[string]string{canonicalPath: stage}, nil, ApplyOptions{
+		TransactionID: transactionID,
+		AfterIntent: func() error {
+			repository, openErr := git.PlainOpen(filepath.Join(stateDir, "state"))
+			if openErr != nil {
+				return openErr
+			}
+			if refErr := repository.Storer.SetReference(plumbing.NewHashReference(alternate, baseline)); refErr != nil {
+				return refErr
+			}
+			if refErr := repository.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, alternate)); refErr != nil {
+				return refErr
+			}
+			return injected
+		},
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("Apply stop err=%v want injected", err)
+	}
+	if _, err := store.Recover(t.Context()); !errors.Is(err, ErrRefConflict) {
+		t.Fatalf("same-hash raw HEAD recovery err=%v want ErrRefConflict", err)
+	}
+	repository, openErr := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	raw, rawErr := repository.Storer.Reference(plumbing.HEAD)
+	if rawErr != nil || raw.Type() != plumbing.SymbolicReference || raw.Target() != alternate {
+		t.Fatalf("recovery overwrote external raw HEAD raw=%v err=%v", raw, rawErr)
+	}
+	if got, readErr := os.ReadFile(filepath.Join(stateDir, "state", filepath.FromSlash(canonicalPath))); readErr != nil || string(got) != "baseline\n" {
+		t.Fatalf("rejected recovery changed canonical bytes=%q err=%v", got, readErr)
+	}
+	record, exists, recordErr := store.Transaction(transactionID)
+	if recordErr != nil || !exists || record.Phase != "intent" || record.ExpectedHeadRaw == "" {
+		t.Fatalf("rejected recovery record exists=%t record=%+v err=%v", exists, record, recordErr)
+	}
+}
+
+func TestApplySupportsDetachedHeadWithExactCAS(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Storer.SetReference(plumbing.NewHashReference(plumbing.HEAD, baseline)); err != nil {
+		t.Fatal(err)
+	}
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	commit, changed, err := store.Apply(t.Context(), "add", "detached exact CAS", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+	if err != nil || !changed || commit.IsZero() || commit == baseline {
+		t.Fatalf("detached Apply commit=%s changed=%t err=%v", commit, changed, err)
+	}
+	raw, err := repository.Storer.Reference(plumbing.HEAD)
+	if err != nil || raw.Type() != plumbing.HashReference || raw.Hash() != commit {
+		t.Fatalf("detached Apply raw HEAD=%v commit=%s err=%v", raw, commit, err)
+	}
+	created, err := repository.CommitObject(commit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(created.ParentHashes) != 1 || created.ParentHashes[0] != baseline {
+		t.Fatalf("detached commit parents=%v baseline=%s", created.ParentHashes, baseline)
+	}
+}
+
+func TestRecoverReplaysFrozenDetachedHeadCoordinate(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Storer.SetReference(plumbing.NewHashReference(plumbing.HEAD, baseline)); err != nil {
+		t.Fatal(err)
+	}
+	stage := transactionTestStage(t, stateDir, "detached-recovery.tsv", "approved\n")
+	injected := errors.New("stop detached transaction after intent")
+	_, _, err = store.Apply(t.Context(), "add", "recover detached exact CAS", map[string]string{canonicalPath: stage}, nil, ApplyOptions{
+		AfterIntent: func() error { return injected },
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("detached Apply stop err=%v want injected", err)
+	}
+	results, err := store.Recover(t.Context())
+	if err != nil || len(results) != 1 || results[0].Commit.IsZero() || results[0].Commit == baseline {
+		t.Fatalf("detached recovery results=%#v err=%v", results, err)
+	}
+	raw, err := repository.Storer.Reference(plumbing.HEAD)
+	if err != nil || raw.Type() != plumbing.HashReference || raw.Hash() != results[0].Commit {
+		t.Fatalf("detached recovery raw HEAD=%v commit=%s err=%v", raw, results[0].Commit, err)
+	}
+}
+
+func TestApplySupportsPackedOnlyHeadTarget(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := snapshotRepositoryHead(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.Storer.PackRefs(); err != nil {
+		t.Fatal(err)
+	}
+	loose, err := canonicalLooseReferencePath(filepath.Join(stateDir, "state"), head.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(loose); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("PackRefs retained loose HEAD target %s: %v", loose, err)
+	}
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	commit, changed, err := store.Apply(t.Context(), "add", "packed HEAD exact CAS", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+	if err != nil || !changed || commit.IsZero() || commit == baseline {
+		t.Fatalf("packed HEAD Apply commit=%s changed=%t baseline=%s err=%v", commit, changed, baseline, err)
+	}
+	updated, err := repository.Storer.Reference(head.name)
+	if err != nil || updated.Hash() != commit {
+		t.Fatalf("packed HEAD target ref=%v commit=%s err=%v", updated, commit, err)
+	}
+}
+
+func TestApplyUnbornHeadCreateIsExclusive(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	external := plumbing.NewHash(strings.Repeat("a", 40))
+	store.beforeUnbornHeadCreate = func() error {
+		store.beforeUnbornHeadCreate = nil
+		repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+		if err != nil {
+			return err
+		}
+		raw, err := repository.Storer.Reference(plumbing.HEAD)
+		if err != nil {
+			return err
+		}
+		return repository.Storer.SetReference(plumbing.NewHashReference(raw.Target(), external))
+	}
+	_, _, err := store.Apply(t.Context(), "add", "exclusive unborn HEAD", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+	if !errors.Is(err, ErrRefConflict) {
+		t.Fatalf("unborn ref race err=%v want ErrRefConflict", err)
+	}
+	repository, openErr := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	head, headErr := repository.Head()
+	if headErr != nil || head.Hash() != external {
+		t.Fatalf("exclusive create overwrote external root head=%v external=%s err=%v", head, external, headErr)
+	}
+	if _, statErr := os.Lstat(filepath.Join(stateDir, "state", filepath.FromSlash(canonicalPath))); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("unborn race retained canonical mutation err=%v", statErr)
+	}
+}
+
+func TestApplyReferencePublishFsyncFailureCompensates(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		baseline bool
+	}{
+		{name: "existing HEAD", baseline: true},
+		{name: "unborn HEAD", baseline: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), ".sow")
+			store := New(stateDir)
+			const canonicalPath = "views/beta/assets/all/all.tsv"
+			baseline := plumbing.ZeroHash
+			if test.baseline {
+				baseline = installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+			}
+			stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+			injected := errors.New("injected reference parent fsync failure")
+			store.syncReferenceDirectory = func(string) error {
+				store.syncReferenceDirectory = nil
+				return injected
+			}
+			_, _, err := store.Apply(t.Context(), "add", "compensate ref fsync failure", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+			if !errors.Is(err, injected) {
+				t.Fatalf("reference fsync failure err=%v want injected", err)
+			}
+			head, headErr := store.HeadHash()
+			if headErr != nil || head != baseline {
+				t.Fatalf("reference fsync compensation head=%s want=%s err=%v", head, baseline, headErr)
+			}
+			canonical := filepath.Join(stateDir, "state", filepath.FromSlash(canonicalPath))
+			body, readErr := os.ReadFile(canonical)
+			if test.baseline {
+				if readErr != nil || string(body) != "baseline\n" {
+					t.Fatalf("existing ref compensation body=%q err=%v", body, readErr)
+				}
+			} else if !errors.Is(readErr, os.ErrNotExist) {
+				t.Fatalf("unborn ref compensation retained canonical body=%q err=%v", body, readErr)
+			}
+		})
+	}
+}
+
+func TestApplyLateReferenceReleaseFailurePersistsCommittedRecoveryBoundary(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	stage := transactionTestStage(t, stateDir, "late-release.tsv", "approved\n")
+	transactionID, err := NewTransactionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected held reference release failure")
+	store.beforeReferenceRelease = func() error {
+		store.beforeReferenceRelease = nil
+		return injected
+	}
+	commit, changed, err := store.Apply(t.Context(), "add", "late reference release", map[string]string{canonicalPath: stage}, nil, ApplyOptions{TransactionID: transactionID})
+	if !errors.Is(err, injected) || !changed || commit.IsZero() || commit == baseline {
+		t.Fatalf("late release commit=%s changed=%t baseline=%s err=%v", commit, changed, baseline, err)
+	}
+	record, exists, recordErr := store.Transaction(transactionID)
+	if recordErr != nil || !exists || record.Phase != "committed" || record.Commit != commit {
+		t.Fatalf("late release boundary exists=%t record=%+v err=%v", exists, record, recordErr)
+	}
+	results, recoverErr := store.Recover(t.Context())
+	if recoverErr != nil || len(results) != 1 || results[0].Commit != commit {
+		t.Fatalf("late release recovery results=%#v err=%v", results, recoverErr)
+	}
+	completed, exists, recordErr := store.Transaction(transactionID)
+	if recordErr != nil || !exists || completed.Phase != "complete" || completed.Commit != commit {
+		t.Fatalf("late release completion exists=%t record=%+v err=%v", exists, completed, recordErr)
+	}
+}
+
+func TestApplyRecoversOnlyProvenStaleSOWReferenceLock(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := snapshotRepositoryHead(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	referencePath, err := canonicalLooseReferencePath(filepath.Join(stateDir, "state"), head.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := readProcessIdentity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := referenceLockMarker{
+		pid: 1 << 30, identity: identity,
+		tempName: ".sow-ref-stale-fixture", markerName: ".sow-lock-stale-fixture",
+	}
+	lockPath := referencePath + ".lock"
+	markerStage := filepath.Join(filepath.Dir(referencePath), marker.markerName)
+	if err := os.WriteFile(markerStage, []byte(marker.encode()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(markerStage, lockPath); err != nil {
+		t.Fatal(err)
+	}
+	temporary := filepath.Join(filepath.Dir(referencePath), marker.tempName)
+	if err := os.WriteFile(temporary, []byte("stale temporary\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	commit, changed, err := store.Apply(t.Context(), "add", "recover stale SOW ref lock", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+	if err != nil || !changed || commit.IsZero() {
+		t.Fatalf("stale SOW lock recovery commit=%s changed=%t err=%v", commit, changed, err)
+	}
+	for _, filename := range []string{lockPath, temporary, markerStage} {
+		if _, err := os.Lstat(filename); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stale SOW ref debris survived at %s: %v", filename, err)
+		}
+	}
+}
+
+func TestApplyDoesNotRemoveForeignReferenceLock(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := snapshotRepositoryHead(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	referencePath, err := canonicalLooseReferencePath(filepath.Join(stateDir, "state"), head.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := referencePath + ".lock"
+	foreign := []byte(strings.Repeat("b", 40) + "\n")
+	if err := os.WriteFile(lockPath, foreign, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	_, _, err = store.Apply(t.Context(), "add", "preserve foreign ref lock", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+	if !errors.Is(err, ErrRefConflict) {
+		t.Fatalf("foreign reference lock err=%v want ErrRefConflict", err)
+	}
+	body, readErr := os.ReadFile(lockPath)
+	if readErr != nil || string(body) != string(foreign) {
+		t.Fatalf("foreign reference lock changed body=%q err=%v", body, readErr)
+	}
+}
+
+func TestApplyRetainsCompleteNativeReferenceLockThroughPostCommitValidation(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := snapshotRepositoryHead(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	referencePath, err := canonicalLooseReferencePath(filepath.Join(stateDir, "state"), head.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := referencePath + ".lock"
+	rawLockPath := filepath.Join(stateDir, "state", ".git", "HEAD.lock")
+	observed := false
+	store.afterBoundCommit = func(plumbing.Hash) error {
+		for _, candidate := range []string{lockPath, rawLockPath} {
+			file, createErr := os.OpenFile(candidate, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+			if createErr == nil {
+				_ = file.Close()
+				_ = os.Remove(candidate)
+				return fmt.Errorf("native Git lock %s was released before post-commit validation", candidate)
+			}
+			if !errors.Is(createErr, os.ErrExist) {
+				return createErr
+			}
+			body, readErr := os.ReadFile(candidate)
+			if readErr != nil {
+				return readErr
+			}
+			if _, parseErr := parseReferenceLockMarker(string(body)); parseErr != nil {
+				return fmt.Errorf("published native Git lock marker %s is incomplete: %w", candidate, parseErr)
+			}
+		}
+		for _, directory := range []string{filepath.Dir(referencePath), filepath.Join(stateDir, "state", ".git")} {
+			markerDebris, globErr := filepath.Glob(filepath.Join(directory, ".sow-lock-*"))
+			if globErr != nil || len(markerDebris) != 0 {
+				return errors.Join(globErr, fmt.Errorf("hidden lock marker debris remained after atomic publication: %v", markerDebris))
+			}
+		}
+		observed = true
+		return nil
+	}
+	stage := transactionTestStage(t, stateDir, "native-lock-held.tsv", "approved\n")
+	commit, changed, err := store.Apply(t.Context(), "add", "retain native lock", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+	if err != nil || !changed || commit.IsZero() || !observed {
+		t.Fatalf("held native lock commit=%s changed=%t observed=%t err=%v", commit, changed, observed, err)
+	}
+	for _, candidate := range []string{lockPath, rawLockPath} {
+		if _, err := os.Lstat(candidate); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("native Git lock %s survived completed transaction: %v", candidate, err)
+		}
+	}
+}
+
+func TestApplyRollbackFailureStillReleasesNativeReferenceLocks(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, err := snapshotRepositoryHead(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	referencePath, err := canonicalLooseReferencePath(filepath.Join(stateDir, "state"), head.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locks := []string{referencePath + ".lock", filepath.Join(stateDir, "state", ".git", "HEAD.lock")}
+	destination := filepath.Join(stateDir, "state", filepath.FromSlash(canonicalPath))
+	injected := errors.New("inject post-commit rollback")
+	store.afterBoundCommit = func(plumbing.Hash) error {
+		if err := os.Remove(destination); err != nil {
+			return err
+		}
+		if err := os.Mkdir(destination, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(destination, "foreign"), []byte("preserve\n"), 0o644); err != nil {
+			return err
+		}
+		return injected
+	}
+	stage := transactionTestStage(t, stateDir, "rollback-lock-release.tsv", "approved\n")
+	_, _, err = store.Apply(t.Context(), "add", "release locks after rollback failure", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+	if !errors.Is(err, injected) || !strings.Contains(err.Error(), "backup retained") {
+		t.Fatalf("rollback failure err=%v want injected and retained backup", err)
+	}
+	if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+		t.Fatalf("rollback failure HEAD=%s baseline=%s err=%v", head, baseline, headErr)
+	}
+	for _, lock := range locks {
+		if _, statErr := os.Lstat(lock); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("native Git lock %s survived rollback failure: %v", lock, statErr)
+		}
+	}
+}
+
+func TestApplyRejectsNoncanonicalIndexFlags(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*git.Repository) error
+	}{
+		{name: "merge stage", mutate: func(repository *git.Repository) error {
+			index, err := repository.Storer.Index()
+			if err != nil {
+				return err
+			}
+			index.Entries[0].Stage = 2
+			return repository.Storer.SetIndex(index)
+		}},
+		{name: "skip worktree", mutate: func(repository *git.Repository) error {
+			index, err := repository.Storer.Index()
+			if err != nil {
+				return err
+			}
+			index.Entries[0].SkipWorktree = true
+			return repository.Storer.SetIndex(index)
+		}},
+		{name: "intent to add", mutate: func(repository *git.Repository) error {
+			index, err := repository.Storer.Index()
+			if err != nil {
+				return err
+			}
+			index.Entries[0].IntentToAdd = true
+			return repository.Storer.SetIndex(index)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), ".sow")
+			store := New(stateDir)
+			const canonicalPath = "views/beta/assets/all/all.tsv"
+			baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+			stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+			store.beforeBoundStageInstall = func() error {
+				store.beforeBoundStageInstall = nil
+				repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+				if err != nil {
+					return err
+				}
+				return test.mutate(repository)
+			}
+			_, _, err := store.Apply(t.Context(), "add", "reject noncanonical index flags", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+			if !errors.Is(err, ErrRefConflict) {
+				t.Fatalf("noncanonical index err=%v want ErrRefConflict", err)
+			}
+			if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+				t.Fatalf("index flag rejection changed HEAD head=%s want=%s err=%v", head, baseline, headErr)
+			}
+		})
+	}
+}
+
+func TestApplyRejectsForeignIndexEntryBeforeCanonicalMutation(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	foreign := filepath.Join(stateDir, "state", "foreign.txt")
+	store.beforeBoundStageInstall = func() error {
+		store.beforeBoundStageInstall = nil
+		if err := os.WriteFile(foreign, []byte("external index entry\n"), 0o644); err != nil {
+			return err
+		}
+		repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+		if err != nil {
+			return err
+		}
+		worktree, err := repository.Worktree()
+		if err != nil {
+			return err
+		}
+		_, err = worktree.Add("foreign.txt")
+		return err
+	}
+	_, _, err := store.Apply(t.Context(), "add", "reject foreign index entry", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+	if !errors.Is(err, ErrRefConflict) {
+		t.Fatalf("foreign index err=%v want ErrRefConflict", err)
+	}
+	if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+		t.Fatalf("foreign index rejection changed HEAD head=%s want=%s err=%v", head, baseline, headErr)
+	}
+	body, readErr := os.ReadFile(foreign)
+	if readErr != nil || string(body) != "external index entry\n" {
+		t.Fatalf("foreign index writer was not preserved body=%q err=%v", body, readErr)
+	}
+}
+
+func TestApplyRollsBackCommitWithFinalForeignIndexEntry(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	foreign := filepath.Join(stateDir, "state", "final-foreign.txt")
+	transactionID, err := NewTransactionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.afterBoundCommit = func(plumbing.Hash) error {
+		store.afterBoundCommit = nil
+		if err := os.WriteFile(foreign, []byte("final foreign index entry\n"), 0o644); err != nil {
+			return err
+		}
+		repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+		if err != nil {
+			return err
+		}
+		worktree, err := repository.Worktree()
+		if err != nil {
+			return err
+		}
+		_, err = worktree.Add("final-foreign.txt")
+		return err
+	}
+	_, _, err = store.Apply(t.Context(), "add", "reject final foreign index", map[string]string{canonicalPath: stage}, nil, ApplyOptions{TransactionID: transactionID})
+	if !errors.Is(err, ErrRefConflict) {
+		t.Fatalf("final foreign index err=%v want ErrRefConflict", err)
+	}
+	if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+		t.Fatalf("invalid commit was not rolled back head=%s want=%s err=%v", head, baseline, headErr)
+	}
+	record, exists, recordErr := store.Transaction(transactionID)
+	if recordErr != nil || !exists || record.Phase != "aborted" || !record.Commit.IsZero() {
+		t.Fatalf("invalid commit record exists=%t record=%+v err=%v", exists, record, recordErr)
+	}
+	body, readErr := os.ReadFile(filepath.Join(stateDir, "state", filepath.FromSlash(canonicalPath)))
+	if readErr != nil || string(body) != "baseline\n" {
+		t.Fatalf("invalid commit rollback canonical body=%q err=%v", body, readErr)
+	}
+	foreignBody, readErr := os.ReadFile(foreign)
+	if readErr != nil || string(foreignBody) != "final foreign index entry\n" {
+		t.Fatalf("invalid commit rollback erased external file body=%q err=%v", foreignBody, readErr)
+	}
+	repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := repository.Storer.Index()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range index.Entries {
+		if entry.Name == "final-foreign.txt" {
+			t.Fatal("invalid commit rollback retained foreign index entry")
+		}
+	}
+}
+
+func TestApplyRejectsFinalCanonicalWorktreeDrift(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		hook func(*Store, func() error)
+	}{
+		{name: "before commit", hook: func(store *Store, mutate func() error) {
+			store.beforeBoundCommit = func() error {
+				store.beforeBoundCommit = nil
+				return mutate()
+			}
+		}},
+		{name: "after commit", hook: func(store *Store, mutate func() error) {
+			store.afterBoundCommit = func(plumbing.Hash) error {
+				store.afterBoundCommit = nil
+				return mutate()
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), ".sow")
+			store := New(stateDir)
+			const canonicalPath = "views/beta/assets/all/all.tsv"
+			baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+			stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+			canonical := filepath.Join(stateDir, "state", filepath.FromSlash(canonicalPath))
+			test.hook(store, func() error { return os.WriteFile(canonical, []byte("tampered\n"), 0o644) })
+			_, _, err := store.Apply(t.Context(), "add", "reject final worktree drift", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+			if err == nil {
+				t.Fatal("Apply accepted final canonical worktree drift")
+			}
+			if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+				t.Fatalf("worktree drift rollback head=%s want=%s err=%v", head, baseline, headErr)
+			}
+			body, readErr := os.ReadFile(canonical)
+			if readErr != nil || string(body) != "baseline\n" {
+				t.Fatalf("worktree drift rollback body=%q err=%v", body, readErr)
+			}
+		})
+	}
+}
+
+func TestApplyNoOpRejectsUnrelatedCanonicalDrift(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(string) error
+	}{
+		{name: "tracked", mutate: func(workDir string) error {
+			return os.WriteFile(filepath.Join(workDir, "config", "sow.yaml"), []byte("tampered config\n"), 0o644)
+		}},
+		{name: "untracked", mutate: func(workDir string) error {
+			return os.WriteFile(filepath.Join(workDir, "untracked.txt"), []byte("foreign\n"), 0o644)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := filepath.Join(t.TempDir(), ".sow")
+			store := New(stateDir)
+			const canonicalPath = "views/beta/assets/all/all.tsv"
+			installTransactionTestCommit(t, store, canonicalPath, "same\n")
+			baseline := installTransactionTestCommit(t, store, "config/sow.yaml", "baseline config\n")
+			stage := transactionTestStage(t, stateDir, "same.tsv", "same\n")
+			store.beforeBoundStageInstall = func() error {
+				store.beforeBoundStageInstall = nil
+				return test.mutate(filepath.Join(stateDir, "state"))
+			}
+			_, _, err := store.Apply(t.Context(), "add", "reject no-op unrelated drift", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+			if err == nil {
+				t.Fatal("no-op Apply accepted unrelated canonical drift")
+			}
+			if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+				t.Fatalf("no-op drift changed HEAD head=%s want=%s err=%v", head, baseline, headErr)
+			}
+		})
+	}
+}
+
+func TestApplyRestoresRawHeadAfterCommitAndPreservesExternalBranch(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	const alternate = plumbing.ReferenceName("refs/heads/external-after-commit")
+	repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalHead, err := snapshotRepositoryHead(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transactionID, err := NewTransactionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var created plumbing.Hash
+	store.afterBoundCommit = func(hash plumbing.Hash) error {
+		store.afterBoundCommit = nil
+		created = hash
+		repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+		if err != nil {
+			return err
+		}
+		if err := repository.Storer.SetReference(plumbing.NewHashReference(alternate, hash)); err != nil {
+			return err
+		}
+		return repository.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, alternate))
+	}
+	_, _, err = store.Apply(t.Context(), "add", "reject post-commit raw HEAD switch", map[string]string{canonicalPath: stage}, nil, ApplyOptions{TransactionID: transactionID})
+	if !errors.Is(err, ErrRefConflict) || created.IsZero() {
+		t.Fatalf("post-commit raw HEAD switch created=%s err=%v", created, err)
+	}
+	raw, rawErr := repository.Storer.Reference(plumbing.HEAD)
+	if rawErr != nil || !referencesEqual(raw, originalHead.raw) {
+		t.Fatalf("rollback did not restore raw HEAD raw=%v want=%v err=%v", raw, originalHead.raw, rawErr)
+	}
+	alternateRef, refErr := repository.Storer.Reference(alternate)
+	if refErr != nil || alternateRef.Hash() != created {
+		t.Fatalf("rollback erased external branch ref=%v created=%s err=%v", alternateRef, created, refErr)
+	}
+	originalBranch, refErr := repository.Storer.Reference(originalHead.name)
+	if refErr != nil || originalBranch.Hash() != baseline {
+		t.Fatalf("rollback did not compare-and-set original branch ref=%v baseline=%s err=%v", originalBranch, baseline, refErr)
+	}
+	body, readErr := os.ReadFile(filepath.Join(stateDir, "state", filepath.FromSlash(canonicalPath)))
+	if readErr != nil || string(body) != "baseline\n" {
+		t.Fatalf("raw HEAD rollback left checkout inconsistent body=%q err=%v", body, readErr)
+	}
+	record, exists, recordErr := store.Transaction(transactionID)
+	if recordErr != nil || !exists || record.Phase != "aborted" {
+		t.Fatalf("post-commit drift journal exists=%t record=%+v err=%v", exists, record, recordErr)
+	}
+	result, recoverErr := store.RecoverAborted(t.Context(), record)
+	if recoverErr != nil || !result.Recovered || result.Commit.IsZero() {
+		t.Fatalf("restored rollback boundary was not retryable result=%+v err=%v", result, recoverErr)
+	}
+	completed, exists, recordErr := store.Transaction(transactionID)
+	if recordErr != nil || !exists || completed.Phase != "complete" {
+		t.Fatalf("retried transaction did not complete exists=%t record=%+v err=%v", exists, completed, recordErr)
+	}
+}
+
+func TestApplyRawHeadRestoreUsesExactSymbolicCAS(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	const alternate = plumbing.ReferenceName("refs/heads/external-alternate")
+	const third = plumbing.ReferenceName("refs/heads/external-third")
+	var created plumbing.Hash
+	store.afterBoundCommit = func(hash plumbing.Hash) error {
+		store.afterBoundCommit = nil
+		created = hash
+		repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+		if err != nil {
+			return err
+		}
+		if err := repository.Storer.SetReference(plumbing.NewHashReference(alternate, hash)); err != nil {
+			return err
+		}
+		return repository.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, alternate))
+	}
+	store.beforeRawHeadRestore = func() error {
+		store.beforeRawHeadRestore = nil
+		repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+		if err != nil {
+			return err
+		}
+		if err := repository.Storer.SetReference(plumbing.NewHashReference(third, baseline)); err != nil {
+			return err
+		}
+		return repository.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, third))
+	}
+	_, _, err := store.Apply(t.Context(), "add", "exact symbolic HEAD rollback", map[string]string{canonicalPath: stage}, nil, ApplyOptions{})
+	if !errors.Is(err, ErrRefConflict) || created.IsZero() {
+		t.Fatalf("symbolic CAS race created=%s err=%v", created, err)
+	}
+	repository, openErr := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	raw, rawErr := repository.Storer.Reference(plumbing.HEAD)
+	if rawErr != nil || raw.Type() != plumbing.SymbolicReference || raw.Target() != third {
+		t.Fatalf("exact symbolic CAS overwrote third branch raw=%v err=%v", raw, rawErr)
+	}
+	head, headErr := repository.Head()
+	if headErr != nil || head.Hash() != baseline {
+		t.Fatalf("third branch does not preserve consistent baseline head=%v err=%v", head, headErr)
+	}
+	alternateRef, refErr := repository.Storer.Reference(alternate)
+	if refErr != nil || alternateRef.Hash() != created {
+		t.Fatalf("symbolic CAS erased alternate branch ref=%v created=%s err=%v", alternateRef, created, refErr)
+	}
+}
+
+func TestApplyCommitObjectReadFailureRestoresNonInitialHead(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	stage := transactionTestStage(t, stateDir, "approved.tsv", "approved\n")
+	transactionID, err := NewTransactionID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.afterBoundCommit = func(hash plumbing.Hash) error {
+		store.afterBoundCommit = nil
+		value := hash.String()
+		return os.Remove(filepath.Join(stateDir, "state", ".git", "objects", value[:2], value[2:]))
+	}
+	_, _, err = store.Apply(t.Context(), "add", "rollback unreadable created commit", map[string]string{canonicalPath: stage}, nil, ApplyOptions{TransactionID: transactionID})
+	if err == nil {
+		t.Fatal("Apply accepted an unreadable created commit object")
+	}
+	if head, headErr := store.HeadHash(); headErr != nil || head != baseline {
+		t.Fatalf("unreadable commit rollback head=%s want=%s err=%v", head, baseline, headErr)
+	}
+	body, readErr := os.ReadFile(filepath.Join(stateDir, "state", filepath.FromSlash(canonicalPath)))
+	if readErr != nil || string(body) != "baseline\n" {
+		t.Fatalf("unreadable commit rollback body=%q err=%v", body, readErr)
+	}
+	record, exists, recordErr := store.Transaction(transactionID)
+	if recordErr != nil || !exists || record.Phase != "aborted" {
+		t.Fatalf("unreadable commit journal exists=%t record=%+v err=%v", exists, record, recordErr)
+	}
+	result, recoverErr := store.RecoverAborted(t.Context(), record)
+	if recoverErr != nil || !result.Recovered || result.Commit.IsZero() {
+		t.Fatalf("unreadable commit rollback was not retryable result=%+v err=%v", result, recoverErr)
+	}
+}
+
+func TestCommitVectorRejectsForeignGitlink(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	store := New(stateDir)
+	const canonicalPath = "views/beta/assets/all/all.tsv"
+	baseline := installTransactionTestCommit(t, store, canonicalPath, "baseline\n")
+	repository, err := git.PlainOpen(filepath.Join(stateDir, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	index, err := repository.Storer.Index()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := make(map[string]canonicalWorktreeEntry, len(index.Entries))
+	for _, entry := range index.Entries {
+		expected[entry.Name] = canonicalWorktreeEntry{hash: entry.Hash, mode: entry.Mode}
+	}
+	index.Entries = append(index.Entries, &indexformat.Entry{
+		Name: "foreign-submodule", Hash: baseline, Mode: filemode.Submodule,
+	})
+	if err := repository.Storer.SetIndex(index); err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := repository.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	commit, err := worktree.Commit("foreign gitlink fixture", &git.CommitOptions{
+		Author:  &object.Signature{Name: "test", Email: "test@localhost", When: now},
+		Parents: []plumbing.Hash{baseline},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := requireCommitMatchesIndexVector(repository, commit, baseline, expected); !errors.Is(err, ErrRefConflict) {
+		t.Fatalf("foreign gitlink verification err=%v want ErrRefConflict", err)
 	}
 }
 

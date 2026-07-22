@@ -90,6 +90,15 @@ type packageProjectionIntent struct {
 	Attestation             string                        `json:"attestation"`
 }
 
+func packageProjectionExpectedStages(intent packageProjectionIntent) map[string]state.FileIdentity {
+	expected := make(map[string]state.FileIdentity, len(intent.Units)+1)
+	for _, unit := range intent.Units {
+		expected[unit.ViewPath] = state.FileIdentity{Size: unit.ManifestSize, SHA256: unit.ManifestSHA256}
+	}
+	expected["config/sow.yaml"] = state.FileIdentity{Size: intent.ConfigSize, SHA256: intent.ConfigSHA256}
+	return expected
+}
+
 type packageProjectionCompletionReceipt struct {
 	Schema        string `json:"schema"`
 	ID            string `json:"id"`
@@ -917,7 +926,10 @@ func ensurePackageProjectionCanonical(ctx context.Context, cfg *config.Config, c
 			updates = append(updates, state.RefUpdate{Name: plumbing.ReferenceName(unit.ViewRef), Expected: expected})
 		}
 		staged["config/sow.yaml"] = filepath.Join(cfg.StatePath(), intent.ConfigStage)
-		if _, _, err := applyCanonicalConfig(ctx, cfg, canonical, intent.Operation, intent.Message, staged, updates, state.ApplyOptions{TransactionID: intent.TransactionID}); err != nil {
+		if _, _, err := applyCanonicalConfig(ctx, cfg, canonical, intent.Operation, intent.Message, staged, updates, state.ApplyOptions{
+			TransactionID:  intent.TransactionID,
+			ExpectedStages: packageProjectionExpectedStages(intent),
+		}); err != nil {
 			return state.TransactionRecord{}, err
 		}
 		record, transactionExists, err = canonical.Transaction(intent.TransactionID)

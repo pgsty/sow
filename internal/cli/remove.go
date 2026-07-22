@@ -310,6 +310,7 @@ func runRemove(ctx context.Context, args []string, stdout, stderr io.Writer) (re
 			staged["config/sow.yaml"] = filepath.Join(cfg.StatePath(), intent.ConfigStage)
 			message = intent.Message
 			applyOptions.TransactionID = intent.TransactionID
+			applyOptions.ExpectedStages = assetProjectionExpectedStages(intent)
 			if assetProjectionMutationHook != nil {
 				if hookErr := assetProjectionMutationHook("after-fence-before-apply"); hookErr != nil {
 					return withExitCode(ExitConflict, "pending asset removal projection fault: %v", hookErr)
@@ -335,6 +336,7 @@ func runRemove(ctx context.Context, args []string, stdout, stderr io.Writer) (re
 			staged = durable
 			message = intent.Message
 			applyOptions.TransactionID = intent.TransactionID
+			applyOptions.ExpectedStages = packageProjectionExpectedStages(intent)
 			if packageProjectionMutationHook != nil {
 				if hookErr := packageProjectionMutationHook("after-fence-before-apply"); hookErr != nil {
 					return withExitCode(ExitConflict, "pending package removal projection fault: %v", hookErr)

@@ -32,6 +32,10 @@ var offlineArchiveProjectionStagePattern = regexp.MustCompile(`^offline-archive-
 // tests. Production binds it to an fsync of the private stage directory.
 var offlineArchiveProjectionStageSync = syncBoundArchiveDirectory
 
+// offlineArchiveProjectionStageDiscard is replaceable only by focused
+// rollback tests. Production binds it to exact private-stage cleanup.
+var offlineArchiveProjectionStageDiscard = discardOfflineArchiveProjectionStage
+
 // offlineArchiveProjectionIntentWrite is replaceable only by focused
 // durability tests that emulate rename success followed by directory-fsync
 // failure.
@@ -188,7 +192,7 @@ func installOfflineArchiveProjectionStage(stateRoot string, result archiveResult
 	committed := false
 	defer func() {
 		if !committed {
-			if cleanupErr := discardOfflineArchiveProjectionStage(stateAbs, destinationRelative); cleanupErr != nil {
+			if cleanupErr := offlineArchiveProjectionStageDiscard(stateAbs, destinationRelative); cleanupErr != nil {
 				resultErr = errors.Join(resultErr, fmt.Errorf("offline archive projection stage cleanup failed; retry with --recover: %w", cleanupErr))
 			}
 		}
@@ -230,7 +234,7 @@ func prepareOfflineArchiveProjectionIntent(cfg *config.Config, source offlineArc
 	keepStage := false
 	defer func() {
 		if !keepStage {
-			if cleanupErr := discardOfflineArchiveProjectionStage(cfg.StatePath(), stageRelative); cleanupErr != nil {
+			if cleanupErr := offlineArchiveProjectionStageDiscard(cfg.StatePath(), stageRelative); cleanupErr != nil {
 				resultErr = errors.Join(resultErr, fmt.Errorf("offline archive projection stage cleanup failed; retry with --recover: %w", cleanupErr))
 			}
 		}

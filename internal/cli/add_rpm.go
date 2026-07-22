@@ -374,6 +374,7 @@ func runAddRPMExpected(ctx context.Context, cfg *config.Config, selected []confi
 			staged = durable
 			message = intent.Message
 			applyOptions.TransactionID = intent.TransactionID
+			applyOptions.ExpectedStages = packageProjectionExpectedStages(intent)
 			if packageProjectionMutationHook != nil {
 				if hookErr := packageProjectionMutationHook("after-fence-before-apply"); hookErr != nil {
 					return withExitCode(ExitConflict, "pending RPM projection fault: %v", hookErr)

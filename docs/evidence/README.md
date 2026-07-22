@@ -62,6 +62,11 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
 
 其余证据报告与验收入口如下；每项是否实跑、源码日期及外部边界以自身正文为准：
 
+- `2026-07-22-canonical-apply-stage-identity.md`：canonical Apply/Recover 从
+  projection intent 接收完整 path→size/SHA-256 向量，并从 journal 前绑定的
+  no-follow/nonblocking descriptor 流式安装；raw HEAD、target ref、index、tree 与
+  worktree 在 native lock 下闭合。全仓、focused ordinary/race、四平台静态构建及
+  root Linux arm64 只读/断网容器通过；仅本地临时目录，不触云或生产资源。
 - `2026-07-20-full-provider-checkpoint-fenced-delete.md`：完整
   `R2CloudflareHTTP`/`COSEdgeOneHTTP` 现由真实 TLS 回环直接证明 checkpoint-fenced
   DELETE 的精确 key、无伪条件头、两家临时凭据 SigV4、错误分类和非法 key 零请求；三层

@@ -73,6 +73,19 @@ type assetProjectionIntent struct {
 	ArchiveAdoption *offlineArchiveAdoptionContract `json:"archive_adoption,omitempty"`
 }
 
+func assetProjectionExpectedStages(intent assetProjectionIntent) map[string]state.FileIdentity {
+	return map[string]state.FileIdentity{
+		intent.ViewPath: {
+			Size:   intent.ManifestSize,
+			SHA256: intent.ManifestSHA256,
+		},
+		"config/sow.yaml": {
+			Size:   intent.ConfigSize,
+			SHA256: intent.ConfigSHA256,
+		},
+	}
+}
+
 func assetProjectionIntentMessage(operation, operationScope, repo, transactionID string, archive *offlineArchiveAdoptionContract) string {
 	scope := operationScope
 	if scope == "" {
@@ -842,7 +855,10 @@ func recoverPendingAssetProjectionLocked(ctx context.Context, cfg *config.Config
 		defer os.RemoveAll(txDir)
 		_, _, err = applyCanonicalConfig(ctx, cfg, canonical, intent.Operation, intent.Message,
 			map[string]string{intent.ViewPath: stage, "config/sow.yaml": filepath.Join(cfg.StatePath(), intent.ConfigStage)},
-			[]state.RefUpdate{{Name: viewRef, Expected: expected}}, state.ApplyOptions{TransactionID: intent.TransactionID})
+			[]state.RefUpdate{{Name: viewRef, Expected: expected}}, state.ApplyOptions{
+				TransactionID:  intent.TransactionID,
+				ExpectedStages: assetProjectionExpectedStages(intent),
+			})
 		if err != nil {
 			return true, err
 		}

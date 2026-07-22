@@ -509,7 +509,10 @@ func addAssetFiles(ctx context.Context, cfg *config.Config, selected []config.Re
 		staged := map[string]string{viewPath: durableStage}
 		configHash := intent.ConfigSHA256
 		staged["config/sow.yaml"] = filepath.Join(cfg.StatePath(), intent.ConfigStage)
-		applyOptions := state.ApplyOptions{TransactionID: intent.TransactionID}
+		applyOptions := state.ApplyOptions{
+			TransactionID:  intent.TransactionID,
+			ExpectedStages: assetProjectionExpectedStages(intent),
+		}
 		if assetProjectionMutationHook != nil {
 			applyOptions.AfterIntent = func() error { return assetProjectionMutationHook("after-transaction-intent-before-commit") }
 			applyOptions.AfterCommit = func() error { return assetProjectionMutationHook("after-canonical-commit-before-ref") }

@@ -1,7 +1,9 @@
 .gitattributes
 .github/workflows/ci.yml
 .gitignore
+_bmad-output/implementation-artifacts/spec-canonical-apply-stage-identity.md
 cmd/sow/main.go
+docs/evidence/2026-07-22-canonical-apply-stage-identity.md
 edge/README.md
 edge/basic/nginx.conf.example
 edge/build.mjs
@@ -149,6 +151,7 @@ internal/cli/package_projection_intent.go
 internal/cli/package_repository_contract.go
 internal/cli/package_repository_contract_test.go
 internal/cli/physical_migration_fixture_test.go
+internal/cli/projection_expected_stages_test.go
 internal/cli/projection_intent_audit.go
 internal/cli/projection_intent_audit_test.go
 internal/cli/projection_intent_removal_test.go

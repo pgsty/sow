@@ -1039,6 +1039,52 @@ func TestAssetProjectionIntentRecoversEveryCanonicalToJournalProcessStop(t *test
 	}
 }
 
+func TestAssetProjectionApplyRejectsDurableStageDriftBeforeStateBinding(t *testing.T) {
+	root, configPath := newAssetMaterializeHardeningFixture(t)
+	input := filepath.Join(t.TempDir(), "stage-drift.bin")
+	if err := os.WriteFile(input, []byte("approved asset payload\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	canonical := state.New(filepath.Join(root, ".sow"))
+	baseline, err := canonical.HeadHash()
+	if err != nil || baseline.IsZero() {
+		t.Fatalf("baseline HEAD=%s err=%v", baseline, err)
+	}
+	previous := assetProjectionMutationHook
+	assetProjectionMutationHook = func(phase string) error {
+		if phase != "after-fence-before-apply" {
+			return nil
+		}
+		intent, exists, err := readAssetProjectionIntent(filepath.Join(root, ".sow"))
+		if err != nil || !exists {
+			return errors.Join(err, errors.New("test projection intent is unavailable"))
+		}
+		return os.WriteFile(filepath.Join(root, ".sow", intent.StageRelative), []byte("unapproved projection manifest\n"), 0o600)
+	}
+	t.Cleanup(func() { assetProjectionMutationHook = previous })
+
+	code, stdout, stderr := runAssetMaterializeHardeningCLI(t,
+		"add", input, "--config", configPath, "--repo", "asset", "--dest", "stage-drift.bin", "--workers", "1", "--chunk-entries", "1",
+	)
+	if code != ExitConflict || !strings.Contains(stderr, "expected identity") {
+		t.Fatalf("stage drift code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if head, err := canonical.HeadHash(); err != nil || head != baseline {
+		t.Fatalf("stage drift changed HEAD head=%s want=%s err=%v", head, baseline, err)
+	}
+	intent, exists, err := readAssetProjectionIntent(filepath.Join(root, ".sow"))
+	if err != nil || !exists {
+		t.Fatalf("failed mutation did not retain recovery intent exists=%t err=%v", exists, err)
+	}
+	if _, transactionExists, err := canonical.Transaction(intent.TransactionID); err != nil || transactionExists {
+		t.Fatalf("stage drift crossed journal boundary exists=%t err=%v", transactionExists, err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, ".sow", intent.StageRelative))
+	if err != nil || string(body) != "unapproved projection manifest\n" {
+		t.Fatalf("stage drift replacement body=%q err=%v", body, err)
+	}
+}
+
 func TestAssetProjectionReturnedAfterIntentErrorRemainsInputlessRecoverable(t *testing.T) {
 	root, configPath := newAssetMaterializeHardeningFixture(t)
 	input := filepath.Join(t.TempDir(), "returned-error.bin")

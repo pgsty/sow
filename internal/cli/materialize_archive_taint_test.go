@@ -342,20 +342,21 @@ func TestOfflineArchiveStageSyncFailureReportsCleanupDrift(t *testing.T) {
 	var staged archiveResult
 	previousBefore := archiveBeforeTaintPrecommitHook
 	previousSync := offlineArchiveProjectionStageSync
+	previousDiscard := offlineArchiveProjectionStageDiscard
 	archiveBeforeTaintPrecommitHook = func(result archiveResult) error {
 		staged = result
 		return nil
 	}
 	offlineArchiveProjectionStageSync = func(*os.Root) error {
-		if err := os.Chmod(stageDirectory, 0o000); err != nil {
-			return err
-		}
 		return errors.New("injected durable archive stage sync failure")
+	}
+	offlineArchiveProjectionStageDiscard = func(string, string) error {
+		return errors.New("injected offline archive projection stage cleanup failure")
 	}
 	t.Cleanup(func() {
 		archiveBeforeTaintPrecommitHook = previousBefore
 		offlineArchiveProjectionStageSync = previousSync
-		_ = os.Chmod(stageDirectory, 0o700)
+		offlineArchiveProjectionStageDiscard = previousDiscard
 	})
 	code, stdout, stderr := runArchiveTaintCLI(t,
 		"materialize", "latest", "--config", configPath, "--repo", "public-assets", "--tgz", destination,
@@ -363,12 +364,10 @@ func TestOfflineArchiveStageSyncFailureReportsCleanupDrift(t *testing.T) {
 	)
 	archiveBeforeTaintPrecommitHook = previousBefore
 	offlineArchiveProjectionStageSync = previousSync
+	offlineArchiveProjectionStageDiscard = previousDiscard
 	if code != ExitVerification || !strings.Contains(stderr, "injected durable archive stage sync failure") ||
 		!strings.Contains(stderr, "offline archive projection stage cleanup failed") || !strings.Contains(stderr, "--recover") {
 		t.Fatalf("stage sync cleanup drift code=%d stdout=%s stderr=%s", code, stdout, stderr)
-	}
-	if err := os.Chmod(stageDirectory, 0o700); err != nil {
-		t.Fatal(err)
 	}
 	entries, err := os.ReadDir(stageDirectory)
 	if err != nil || len(entries) != 1 || !offlineArchiveProjectionStagePattern.MatchString(entries[0].Name()) {

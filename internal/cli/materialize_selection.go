@@ -467,7 +467,7 @@ func newMaterializationSelectionJournal(operation, configSHA256, parentConfigSHA
 		return materializationSelectionJournal{}, errors.New("materialization trust snapshot is unavailable")
 	}
 	journal := materializationSelectionJournal{
-		Schema: materializationSelectionJournalSchema, Operation: operation, OperationScope: snapshot.operationScope, Phase: materializationSelectionPrepared,
+		Schema: materializationSelectionJournalSchema, Operation: operation, OperationScope: snapshot.materializationOperationScope(), Phase: materializationSelectionPrepared,
 		ConfigSHA256: configSHA256, ParentConfigSHA256: parentConfigSHA256, ExpectedHead: expectedHead, RepositoryKeySHA256: snapshot.repositoryKeySHA256,
 		ArchiveAdoption: cloneOfflineArchiveAdoptionContract(snapshot.archiveAdoption), Units: append([]materializationSelectedUnit(nil), units...),
 	}
@@ -601,7 +601,7 @@ func currentMaterializationCanonicalIdentity(cfg *config.Config, canonical *stat
 }
 
 func materializationSnapshotMatchesJournal(snapshot *materializationTrustSnapshot, journal materializationSelectionJournal) bool {
-	if snapshot == nil || snapshot.operationScope != journal.OperationScope || snapshot.repositoryKeySHA256 != journal.RepositoryKeySHA256 || len(snapshot.yum) != len(journal.YUMKeyrings) ||
+	if snapshot == nil || snapshot.materializationOperationScope() != journal.OperationScope || snapshot.repositoryKeySHA256 != journal.RepositoryKeySHA256 || len(snapshot.yum) != len(journal.YUMKeyrings) ||
 		!offlineArchiveAdoptionContractEqual(snapshot.archiveAdoption, journal.ArchiveAdoption) {
 		return false
 	}
@@ -612,6 +612,15 @@ func materializationSnapshotMatchesJournal(snapshot *materializationTrustSnapsho
 		}
 	}
 	return true
+}
+
+func (snapshot *materializationTrustSnapshot) materializationOperationScope() string {
+	if snapshot == nil {
+		return ""
+	}
+	snapshot.selectionMu.Lock()
+	defer snapshot.selectionMu.Unlock()
+	return snapshot.operationScope
 }
 
 func requireMaterializationUnitSubset(requested []materializationSelectedUnit, durable map[string]materializationSelectedUnit, exact bool) error {
