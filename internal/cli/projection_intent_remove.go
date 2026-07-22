@@ -478,14 +478,22 @@ func removeExactProjectionResidueBounded(stateRoot, relative string, maximum int
 }
 
 func commitExactPrivateStateFileRemoval(root *os.Root, directory, file *os.File, identity os.FileInfo, relative string, verify func() error) error {
+	return commitExactPrivateStateFileRemovalAt(root, directory, file, identity, relative, relative, verify)
+}
+
+func commitExactPrivateStateFileRemovalAt(root *os.Root, directory, file *os.File, identity os.FileInfo, relative, quarantineBase string, verify func() error) error {
 	if root == nil || directory == nil || file == nil || identity == nil || verify == nil {
 		return errors.New("projection state removal binding is incomplete")
+	}
+	if filepath.Base(relative) != relative || relative == "" || relative == "." ||
+		filepath.Base(quarantineBase) != quarantineBase || quarantineBase == "" || quarantineBase == "." {
+		return errors.New("projection state removal coordinate is invalid")
 	}
 	nonce, err := state.NewTransactionID()
 	if err != nil {
 		return err
 	}
-	quarantine := relative + ".tmp-remove-" + nonce
+	quarantine := quarantineBase + ".tmp-remove-" + nonce
 	if err := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), relative, quarantine); err != nil {
 		return err
 	}
@@ -497,6 +505,19 @@ func commitExactPrivateStateFileRemoval(root *os.Root, directory, file *os.File,
 		}
 		return errors.Join(cause, syncErr)
 	}
+	verifyCoordinateAbsent := func() error {
+		_, coordinateErr := root.Lstat(relative)
+		if errors.Is(coordinateErr, os.ErrNotExist) {
+			return nil
+		}
+		if coordinateErr != nil {
+			return coordinateErr
+		}
+		return fmt.Errorf("projection state removal coordinate %s was reoccupied", relative)
+	}
+	if err := verifyCoordinateAbsent(); err != nil {
+		return restore(err)
+	}
 	quarantined, lstatErr := root.Lstat(quarantine)
 	opened, statErr := file.Stat()
 	if lstatErr != nil || statErr != nil || quarantined == nil || opened == nil ||
@@ -505,6 +526,9 @@ func commitExactPrivateStateFileRemoval(root *os.Root, directory, file *os.File,
 		return restore(errors.Join(lstatErr, statErr, errors.New("projection state file changed before removal commit")))
 	}
 	if err := verify(); err != nil {
+		return restore(err)
+	}
+	if err := verifyCoordinateAbsent(); err != nil {
 		return restore(err)
 	}
 	quarantined, lstatErr = root.Lstat(quarantine)
@@ -522,6 +546,9 @@ func commitExactPrivateStateFileRemoval(root *os.Root, directory, file *os.File,
 			return restore(err)
 		}
 	}
+	if err := verifyCoordinateAbsent(); err != nil {
+		return restore(err)
+	}
 	quarantined, lstatErr = root.Lstat(quarantine)
 	opened, statErr = file.Stat()
 	if lstatErr != nil || statErr != nil || quarantined == nil || opened == nil ||
@@ -529,6 +556,9 @@ func commitExactPrivateStateFileRemoval(root *os.Root, directory, file *os.File,
 		return restore(errors.Join(lstatErr, statErr, errors.New("projection state quarantine changed before unlink")))
 	}
 	if err := verify(); err != nil {
+		return restore(err)
+	}
+	if err := verifyCoordinateAbsent(); err != nil {
 		return restore(err)
 	}
 	quarantined, lstatErr = root.Lstat(quarantine)

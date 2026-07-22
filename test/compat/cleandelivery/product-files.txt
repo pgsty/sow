@@ -2,8 +2,10 @@
 .github/workflows/ci.yml
 .gitignore
 _bmad-output/implementation-artifacts/spec-canonical-apply-stage-identity.md
+_bmad-output/implementation-artifacts/spec-offline-archive-residue-removal-identity.md
 cmd/sow/main.go
 docs/evidence/2026-07-22-canonical-apply-stage-identity.md
+docs/evidence/2026-07-22-offline-archive-residue-removal-identity.md
 edge/README.md
 edge/basic/nginx.conf.example
 edge/build.mjs
@@ -229,6 +231,7 @@ internal/cli/sync_replay.go
 internal/cli/sync_test.go
 internal/cli/sync_transaction_cleanup.go
 internal/cli/testdata/pgdg-redhat-nonfree-repo.rpm.b64
+internal/cli/umask_unix.go
 internal/cli/verify.go
 internal/cli/verify_affinity_test.go
 internal/cli/verify_cache_test.go

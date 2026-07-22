@@ -2044,6 +2044,17 @@ func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr e
 			}
 		}
 	}()
+	if err := file.Chmod(0o600); err != nil {
+		return err
+	}
+	hardened, statErr := file.Stat()
+	current, lstatErr := parent.Lstat(temporary)
+	if statErr != nil || lstatErr != nil || hardened == nil || current == nil ||
+		!os.SameFile(identity, hardened) || !os.SameFile(identity, current) ||
+		hardened.Mode() != 0o600 || current.Mode() != 0o600 {
+		return errors.Join(statErr, lstatErr, errors.New("derived state temporary did not acquire its exact private mode"))
+	}
+	identity = hardened
 	if derivedStateWriteHook != nil {
 		if err := derivedStateWriteHook(filepath.Join(directory, temporary)); err != nil {
 			return err
@@ -2057,9 +2068,10 @@ func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr e
 		return err
 	}
 	after, statErr := file.Stat()
-	current, lstatErr := parent.Lstat(temporary)
+	current, lstatErr = parent.Lstat(temporary)
 	if statErr != nil || lstatErr != nil || after == nil || current == nil ||
-		!os.SameFile(identity, after) || !os.SameFile(identity, current) || after.Size() != int64(expectedSize) {
+		!os.SameFile(identity, after) || !os.SameFile(identity, current) || after.Size() != int64(expectedSize) ||
+		after.Mode() != 0o600 || current.Mode() != 0o600 {
 		return errors.Join(statErr, lstatErr, errors.New("derived state temporary changed while writing"))
 	}
 	identity = after

@@ -7,8 +7,10 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -126,6 +128,695 @@ func TestOfflineArchiveResidueCleanupDoesNotFollowStageDirectorySymlink(t *testi
 	}
 	if body, err := os.ReadFile(victim); err != nil || string(body) != "must survive\n" {
 		t.Fatalf("cleanup changed external victim body=%q err=%v", body, err)
+	}
+}
+
+func TestOfflineArchiveIntentTempCleanupPreservesConcurrentReplacement(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := offlineArchiveProjectionIntentRelative + ".tmp-" + strings.Repeat("a", 32)
+	path := filepath.Join(stateRoot, name)
+	displaced := filepath.Join(t.TempDir(), "admitted-intent-temp")
+	if err := os.WriteFile(path, []byte("admitted temp\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := projectionResidueCleanupHook
+	projectionResidueCleanupHook = func(relative string) error {
+		if relative != name {
+			return errors.New("unexpected residue cleanup coordinate")
+		}
+		if err := os.Rename(path, displaced); err != nil {
+			return err
+		}
+		return os.WriteFile(path, []byte("replacement temp\n"), 0o600)
+	}
+	t.Cleanup(func() { projectionResidueCleanupHook = previous })
+	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+	projectionResidueCleanupHook = previous
+	if err == nil {
+		t.Fatal("intent temporary replacement was accepted as exact cleanup")
+	}
+	if body, readErr := os.ReadFile(path); readErr != nil || string(body) != "replacement temp\n" {
+		t.Fatalf("intent temporary replacement body=%q err=%v cleanupErr=%v", body, readErr, err)
+	}
+	if body, readErr := os.ReadFile(displaced); readErr != nil || string(body) != "admitted temp\n" {
+		t.Fatalf("admitted intent temporary body=%q err=%v", body, readErr)
+	}
+}
+
+func TestOfflineArchiveStageResidueCleanupPreservesConcurrentReplacement(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+	if err := os.MkdirAll(stageDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := offlineArchiveProjectionStagePrefix + strings.Repeat("b", 32) + ".tgz"
+	path := filepath.Join(stageDirectory, name)
+	displaced := filepath.Join(t.TempDir(), "admitted-stage.tgz")
+	if err := os.WriteFile(path, []byte("admitted archive stage\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	previous := projectionResidueCleanupHook
+	projectionResidueCleanupHook = func(relative string) error {
+		if relative != name {
+			return errors.New("unexpected stage cleanup coordinate")
+		}
+		if err := os.Rename(path, displaced); err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, []byte("replacement archive stage\n"), 0o600); err != nil {
+			return err
+		}
+		return os.Chmod(path, 0o444)
+	}
+	t.Cleanup(func() { projectionResidueCleanupHook = previous })
+	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+	projectionResidueCleanupHook = previous
+	if err == nil {
+		t.Fatal("archive stage replacement was accepted as exact cleanup")
+	}
+	if body, readErr := os.ReadFile(path); readErr != nil || string(body) != "replacement archive stage\n" {
+		t.Fatalf("archive stage replacement body=%q err=%v cleanupErr=%v", body, readErr, err)
+	}
+	if body, readErr := os.ReadFile(displaced); readErr != nil || string(body) != "admitted archive stage\n" {
+		t.Fatalf("admitted archive stage body=%q err=%v", body, readErr)
+	}
+}
+
+func TestOfflineArchiveResidueCleanupRejectsMalformedNames(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stage bool
+	}{
+		{name: offlineArchiveProjectionIntentRelative + ".tmp"},
+		{name: offlineArchiveProjectionIntentRelative + ".tmp-not-hex"},
+		{name: offlineArchiveProjectionStagePrefix + strings.Repeat("c", 32) + ".tgz.tmp-remove-not-hex", stage: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stateRoot := filepath.Join(t.TempDir(), ".sow")
+			directory := stateRoot
+			mode := os.FileMode(0o600)
+			if tc.stage {
+				directory = filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+				mode = 0o444
+			}
+			if err := os.MkdirAll(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(directory, tc.name)
+			if err := os.WriteFile(path, []byte("malformed residue\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, mode); err != nil {
+				t.Fatal(err)
+			}
+			err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+			if err == nil || !strings.Contains(err.Error(), "unsafe offline archive projection") {
+				t.Fatalf("malformed residue error=%v", err)
+			}
+			if body, readErr := os.ReadFile(path); readErr != nil || string(body) != "malformed residue\n" {
+				t.Fatalf("malformed residue body=%q err=%v", body, readErr)
+			}
+		})
+	}
+}
+
+func TestOfflineArchiveResidueCleanupIsExactAndIdempotent(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+	if err := os.MkdirAll(stageDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	temporaries := []string{
+		filepath.Join(stateRoot, offlineArchiveProjectionIntentRelative+".tmp-"+strings.Repeat("d", 32)),
+		filepath.Join(stateRoot, offlineArchiveProjectionIntentRelative+".tmp-remove-"+strings.Repeat("6", 32)),
+		filepath.Join(stateRoot, offlineArchiveProjectionIntentRelative+".tmp-"+strings.Repeat("7", 32)+".tmp-remove-"+strings.Repeat("8", 32)+".tmp-remove-"+strings.Repeat("9", 32)),
+	}
+	stageBase := offlineArchiveProjectionStagePrefix + strings.Repeat("e", 32) + ".tgz"
+	stages := []string{
+		filepath.Join(stageDirectory, stageBase),
+		filepath.Join(stageDirectory, stageBase+".tmp-remove-"+strings.Repeat("f", 32)),
+		filepath.Join(stageDirectory, stageBase+".tmp-install-"+strings.Repeat("a", 32)+".tmp-remove-"+strings.Repeat("b", 32)+".tmp-remove-"+strings.Repeat("c", 32)),
+	}
+	for _, temporary := range temporaries {
+		if err := os.WriteFile(temporary, []byte("intent temporary\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, stage := range stages {
+		if err := os.WriteFile(stage, []byte("archive stage\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(stage, 0o444); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cleanupOfflineArchiveProjectionResidue(stateRoot, false); err == nil || !strings.Contains(err.Error(), "requires --recover") {
+		t.Fatalf("non-recovery residue error=%v", err)
+	}
+	for _, path := range append(append([]string(nil), temporaries...), stages...) {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("non-recovery changed %s: %v", path, err)
+		}
+	}
+	if err := cleanupOfflineArchiveProjectionResidue(stateRoot, true); err != nil {
+		t.Fatalf("recover exact residues: %v", err)
+	}
+	for _, path := range append(append([]string(nil), temporaries...), stages...) {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("recovery retained %s: %v", path, err)
+		}
+	}
+	if err := cleanupOfflineArchiveProjectionResidue(stateRoot, true); err != nil {
+		t.Fatalf("idempotent residue recovery: %v", err)
+	}
+}
+
+func TestOfflineArchiveResidueCleanupRequarantinesWithoutNesting(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := offlineArchiveProjectionIntentRelative + ".tmp-remove-" + strings.Repeat("d", 32)
+	path := filepath.Join(stateRoot, name)
+	if err := os.WriteFile(path, []byte("interrupted quarantine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("stop after stable requarantine")
+	observed := ""
+	previous := projectionStateBeforeUnlinkHook
+	projectionStateBeforeUnlinkHook = func(quarantine string) error {
+		observed = quarantine
+		return injected
+	}
+	t.Cleanup(func() { projectionStateBeforeUnlinkHook = previous })
+	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+	projectionStateBeforeUnlinkHook = previous
+	if !errors.Is(err, injected) {
+		t.Fatalf("stable requarantine error=%v", err)
+	}
+	if strings.Count(observed, ".tmp-remove-") != 1 || !strings.HasPrefix(observed, offlineArchiveProjectionIntentRelative+".tmp-remove-") {
+		t.Fatalf("requarantine nested its removal suffix: %q", observed)
+	}
+	if body, readErr := os.ReadFile(path); readErr != nil || string(body) != "interrupted quarantine\n" {
+		t.Fatalf("failed requarantine did not restore original coordinate body=%q err=%v", body, readErr)
+	}
+	if err := cleanupOfflineArchiveProjectionResidue(stateRoot, true); err != nil {
+		t.Fatalf("replay stable requarantine: %v", err)
+	}
+}
+
+func TestOfflineArchiveIntentTempCleanupRejectsSpecialFilesWithoutBlocking(t *testing.T) {
+	for _, kind := range []string{"fifo", "symlink"} {
+		t.Run(kind, func(t *testing.T) {
+			stateRoot := filepath.Join(t.TempDir(), ".sow")
+			if err := os.Mkdir(stateRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			name := offlineArchiveProjectionIntentRelative + ".tmp-" + strings.Repeat("1", 32)
+			path := filepath.Join(stateRoot, name)
+			switch kind {
+			case "fifo":
+				if err := syscall.Mkfifo(path, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				victim := filepath.Join(t.TempDir(), "victim")
+				if err := os.WriteFile(victim, []byte("victim\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(victim, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			done := make(chan error, 1)
+			go func() { done <- cleanupOfflineArchiveProjectionResidue(stateRoot, true) }()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatalf("%s residue was accepted", kind)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatalf("%s residue cleanup blocked", kind)
+			}
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("%s residue was removed: %v", kind, err)
+			}
+		})
+	}
+}
+
+func TestOfflineArchiveResidueCleanupRequiresExactModes(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		mode  os.FileMode
+		stage bool
+	}{
+		{name: "intent-read-only", mode: 0o400},
+		{name: "intent-owner-executable", mode: 0o700},
+		{name: "stage-owner-writable", mode: 0o644, stage: true},
+		{name: "stage-owner-only", mode: 0o400, stage: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stateRoot := filepath.Join(t.TempDir(), ".sow")
+			directory := stateRoot
+			name := offlineArchiveProjectionIntentRelative + ".tmp-" + strings.Repeat("e", 32)
+			if tc.stage {
+				directory = filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+				name = offlineArchiveProjectionStagePrefix + strings.Repeat("e", 32) + ".tgz"
+			}
+			if err := os.MkdirAll(directory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(directory, name)
+			if err := os.WriteFile(path, []byte("wrong mode\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, tc.mode); err != nil {
+				t.Fatal(err)
+			}
+			err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+			if err == nil || !strings.Contains(err.Error(), "not an exact regular file") {
+				t.Fatalf("wrong mode %04o error=%v", tc.mode, err)
+			}
+			if _, statErr := os.Lstat(path); statErr != nil {
+				t.Fatalf("wrong-mode residue was removed: %v", statErr)
+			}
+		})
+	}
+
+	stateRoot := t.TempDir()
+	path := filepath.Join(stateRoot, "mode-source")
+	if err := os.WriteFile(path, []byte("mode source\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exactOfflineArchiveIntentTemporary(offlineArchiveModeInfo{FileInfo: info, mode: 0o600 | os.ModeSetuid}) ||
+		exactOfflineArchiveStageResidue(offlineArchiveModeInfo{FileInfo: info, mode: 0o444 | os.ModeSticky}) {
+		t.Fatal("special mode bits were admitted by exact residue policies")
+	}
+}
+
+func TestDerivedStateWriterRepairsRestrictiveUmaskToExactPrivateMode(t *testing.T) {
+	stateRoot := t.TempDir()
+	previousUmask := syscall.Umask(0o400)
+	err := writeDerivedStateFile(stateRoot, "exact-private.json", []byte("{}\n"))
+	syscall.Umask(previousUmask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(filepath.Join(stateRoot, "exact-private.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode() != 0o600 {
+		t.Fatalf("derived state mode=%v want=0600", info.Mode())
+	}
+}
+
+func TestSOWProcessInitNormalizesRestrictiveOwnerUmask(t *testing.T) {
+	if output := os.Getenv("SOW_UMASK_HELPER_OUTPUT"); output != "" {
+		if err := os.Mkdir(output, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		file, err := os.OpenFile(filepath.Join(output, "state"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	output := filepath.Join(t.TempDir(), "init-mode-directory")
+	previousUmask := syscall.Umask(0o500)
+	command := exec.Command(os.Args[0], "-test.run=^TestSOWProcessInitNormalizesRestrictiveOwnerUmask$")
+	command.Env = append(os.Environ(), "SOW_UMASK_HELPER_OUTPUT="+output)
+	runErr := command.Run()
+	syscall.Umask(previousUmask)
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	info, err := os.Lstat(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode() != os.ModeDir|0o700 {
+		t.Fatalf("process-init directory mode=%v want=0700", info.Mode())
+	}
+	info, err = os.Lstat(filepath.Join(output, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode() != 0o600 {
+		t.Fatalf("process-init state mode=%v want=0600", info.Mode())
+	}
+}
+
+func TestDerivedStateWriterRejectsSameInodeModeMutation(t *testing.T) {
+	stateRoot := t.TempDir()
+	previous := derivedStateWriteHook
+	derivedStateWriteHook = func(relative string) error {
+		return os.Chmod(filepath.Join(stateRoot, filepath.Base(relative)), 0o400)
+	}
+	t.Cleanup(func() { derivedStateWriteHook = previous })
+	err := writeDerivedStateFile(stateRoot, "mode-mutated.json", []byte("{}\n"))
+	derivedStateWriteHook = previous
+	if err == nil || !strings.Contains(err.Error(), "temporary changed while writing") {
+		t.Fatalf("same-inode mode mutation error=%v", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(stateRoot, "mode-mutated.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("mode-mutated state was published: %v", statErr)
+	}
+	entries, readErr := os.ReadDir(stateRoot)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("mode-mutated temporary was not cleaned entries=%v err=%v", entries, readErr)
+	}
+}
+
+func TestOfflineArchiveIntentTempBindRejectsFIFOReplacementWithoutBlocking(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := offlineArchiveProjectionIntentRelative + ".tmp-" + strings.Repeat("4", 32)
+	path := filepath.Join(stateRoot, name)
+	displaced := filepath.Join(t.TempDir(), "admitted-bind-temp")
+	if err := os.WriteFile(path, []byte("admitted bind temp\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := projectionStateBeforeBindOpenHook
+	projectionStateBeforeBindOpenHook = func(relative string) error {
+		if relative != name {
+			return errors.New("unexpected bind coordinate")
+		}
+		if err := os.Rename(path, displaced); err != nil {
+			return err
+		}
+		return syscall.Mkfifo(path, 0o600)
+	}
+	t.Cleanup(func() { projectionStateBeforeBindOpenHook = previous })
+	done := make(chan error, 1)
+	go func() { done <- cleanupOfflineArchiveProjectionResidue(stateRoot, true) }()
+	select {
+	case err := <-done:
+		projectionStateBeforeBindOpenHook = previous
+		if err == nil || !strings.Contains(err.Error(), "changed while binding") {
+			t.Fatalf("FIFO bind replacement error=%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("FIFO replacement blocked residue binding")
+	}
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("FIFO replacement info=%+v err=%v", info, err)
+	}
+	if body, err := os.ReadFile(displaced); err != nil || string(body) != "admitted bind temp\n" {
+		t.Fatalf("admitted bind temp body=%q err=%v", body, err)
+	}
+}
+
+func TestOfflineArchiveIntentTempCleanupRevalidatesFinalUnlinkBoundary(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := offlineArchiveProjectionIntentRelative + ".tmp-" + strings.Repeat("5", 32)
+	path := filepath.Join(stateRoot, name)
+	displaced := filepath.Join(t.TempDir(), "admitted-quarantine-temp")
+	if err := os.WriteFile(path, []byte("admitted quarantine temp\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := projectionStateBeforeUnlinkHook
+	projectionStateBeforeUnlinkHook = func(quarantine string) error {
+		quarantinePath := filepath.Join(stateRoot, quarantine)
+		if err := os.Rename(quarantinePath, displaced); err != nil {
+			return err
+		}
+		return os.WriteFile(quarantinePath, []byte("final unlink replacement\n"), 0o600)
+	}
+	t.Cleanup(func() { projectionStateBeforeUnlinkHook = previous })
+	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+	projectionStateBeforeUnlinkHook = previous
+	if err == nil || !strings.Contains(err.Error(), "quarantine changed before unlink") {
+		t.Fatalf("final unlink replacement error=%v", err)
+	}
+	if body, readErr := os.ReadFile(path); readErr != nil || string(body) != "final unlink replacement\n" {
+		t.Fatalf("final unlink replacement body=%q err=%v", body, readErr)
+	}
+	if body, readErr := os.ReadFile(displaced); readErr != nil || string(body) != "admitted quarantine temp\n" {
+		t.Fatalf("admitted quarantine body=%q err=%v", body, readErr)
+	}
+}
+
+func TestOfflineArchiveIntentTempCleanupRejectsReoccupiedCoordinate(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := offlineArchiveProjectionIntentRelative + ".tmp-" + strings.Repeat("a", 32)
+	path := filepath.Join(stateRoot, name)
+	if err := os.WriteFile(path, []byte("admitted coordinate\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := projectionStateBeforeUnlinkHook
+	projectionStateBeforeUnlinkHook = func(string) error {
+		return os.WriteFile(path, []byte("reoccupied coordinate\n"), 0o600)
+	}
+	t.Cleanup(func() { projectionStateBeforeUnlinkHook = previous })
+	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+	projectionStateBeforeUnlinkHook = previous
+	if err == nil || !strings.Contains(err.Error(), "was reoccupied") {
+		t.Fatalf("reoccupied coordinate error=%v", err)
+	}
+	if body, readErr := os.ReadFile(path); readErr != nil || string(body) != "reoccupied coordinate\n" {
+		t.Fatalf("replacement coordinate body=%q err=%v", body, readErr)
+	}
+	entries, readErr := os.ReadDir(stateRoot)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	preserved := false
+	for _, entry := range entries {
+		if entry.Name() == name || !strings.HasPrefix(entry.Name(), name+".tmp-remove-") {
+			continue
+		}
+		body, readErr := os.ReadFile(filepath.Join(stateRoot, entry.Name()))
+		if readErr == nil && string(body) == "admitted coordinate\n" {
+			preserved = true
+		}
+	}
+	if !preserved {
+		t.Fatal("admitted inode was not retained at its exact quarantine")
+	}
+}
+
+func TestOfflineArchiveIntentTempCleanupRejectsStateRootReplacement(t *testing.T) {
+	parent := t.TempDir()
+	stateRoot := filepath.Join(parent, ".sow")
+	displacedRoot := filepath.Join(parent, "admitted-state-root")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := offlineArchiveProjectionIntentRelative + ".tmp-" + strings.Repeat("2", 32)
+	if err := os.WriteFile(filepath.Join(stateRoot, name), []byte("admitted root\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previous := projectionResidueCleanupHook
+	projectionResidueCleanupHook = func(string) error {
+		if err := os.Rename(stateRoot, displacedRoot); err != nil {
+			return err
+		}
+		if err := os.Mkdir(stateRoot, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(stateRoot, name), []byte("replacement root\n"), 0o600)
+	}
+	t.Cleanup(func() { projectionResidueCleanupHook = previous })
+	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+	projectionResidueCleanupHook = previous
+	if err == nil || !strings.Contains(err.Error(), "root coordinate changed") {
+		t.Fatalf("state-root replacement error=%v", err)
+	}
+	if body, readErr := os.ReadFile(filepath.Join(displacedRoot, name)); readErr != nil || string(body) != "admitted root\n" {
+		t.Fatalf("admitted root residue body=%q err=%v", body, readErr)
+	}
+	if body, readErr := os.ReadFile(filepath.Join(stateRoot, name)); readErr != nil || string(body) != "replacement root\n" {
+		t.Fatalf("replacement root residue body=%q err=%v", body, readErr)
+	}
+}
+
+func TestOfflineArchiveStageCleanupRejectsNewOwningIntent(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+	if err := os.MkdirAll(stageDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	transactionID := strings.Repeat("c", 32)
+	name := offlineArchiveProjectionStagePrefix + transactionID + ".tgz"
+	path := filepath.Join(stageDirectory, name)
+	if err := os.WriteFile(path, []byte("newly owned stage\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	intent := testOfflineArchiveProjectionIntent(t, transactionID)
+	previous := projectionResidueCleanupHook
+	wroteIntent := false
+	projectionResidueCleanupHook = func(relative string) error {
+		if relative != name || wroteIntent {
+			return nil
+		}
+		wroteIntent = true
+		return writeOfflineArchiveProjectionIntent(stateRoot, intent)
+	}
+	t.Cleanup(func() { projectionResidueCleanupHook = previous })
+	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+	projectionResidueCleanupHook = previous
+	if err == nil || !strings.Contains(err.Error(), "intent changed during residue cleanup") {
+		t.Fatalf("new owning intent error=%v", err)
+	}
+	if !wroteIntent {
+		t.Fatal("ownership change seam did not run")
+	}
+	if body, readErr := os.ReadFile(path); readErr != nil || string(body) != "newly owned stage\n" {
+		t.Fatalf("newly owned stage body=%q err=%v", body, readErr)
+	}
+	if current, exists, readErr := readOfflineArchiveProjectionIntent(stateRoot); readErr != nil || !exists || current.ID != intent.ID {
+		t.Fatalf("new owner intent exists=%t current=%+v err=%v", exists, current, readErr)
+	}
+}
+
+func TestOfflineArchiveResidueNoDeleteBranchRevalidatesStateRoot(t *testing.T) {
+	parent := t.TempDir()
+	stateRoot := filepath.Join(parent, ".sow")
+	displaced := filepath.Join(parent, "admitted-state-root")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	previous := offlineArchiveProjectionResidueBeforeReturnHook
+	offlineArchiveProjectionResidueBeforeReturnHook = func() error {
+		if err := os.Rename(stateRoot, displaced); err != nil {
+			return err
+		}
+		return os.Mkdir(stateRoot, 0o700)
+	}
+	t.Cleanup(func() { offlineArchiveProjectionResidueBeforeReturnHook = previous })
+	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+	offlineArchiveProjectionResidueBeforeReturnHook = previous
+	if err == nil || !strings.Contains(err.Error(), "root coordinate changed") {
+		t.Fatalf("no-delete state-root replacement error=%v", err)
+	}
+	if info, statErr := os.Stat(displaced); statErr != nil || !info.IsDir() {
+		t.Fatalf("bound state root was not preserved info=%+v err=%v", info, statErr)
+	}
+}
+
+func TestOfflineArchiveResidueNoStageBranchRejectsAppearingStageCoordinate(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	previous := offlineArchiveProjectionResidueBeforeReturnHook
+	offlineArchiveProjectionResidueBeforeReturnHook = func() error {
+		return os.Mkdir(stageDirectory, 0o700)
+	}
+	t.Cleanup(func() { offlineArchiveProjectionResidueBeforeReturnHook = previous })
+	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+	offlineArchiveProjectionResidueBeforeReturnHook = previous
+	if err == nil || !strings.Contains(err.Error(), "stage coordinate appeared") {
+		t.Fatalf("appearing stage coordinate error=%v", err)
+	}
+	if info, statErr := os.Stat(stageDirectory); statErr != nil || !info.IsDir() {
+		t.Fatalf("appearing stage coordinate info=%+v err=%v", info, statErr)
+	}
+}
+
+func TestOfflineArchiveOwnedStageBranchRevalidatesStageRoot(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+	displaced := filepath.Join(stateRoot, "admitted-stage-root")
+	if err := os.MkdirAll(stageDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	transactionID := strings.Repeat("d", 32)
+	name := offlineArchiveProjectionStagePrefix + transactionID + ".tgz"
+	path := filepath.Join(stageDirectory, name)
+	if err := os.WriteFile(path, []byte("owned final stage\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeOfflineArchiveProjectionIntent(stateRoot, testOfflineArchiveProjectionIntent(t, transactionID)); err != nil {
+		t.Fatal(err)
+	}
+	previous := offlineArchiveProjectionResidueBeforeReturnHook
+	offlineArchiveProjectionResidueBeforeReturnHook = func() error {
+		if err := os.Rename(stageDirectory, displaced); err != nil {
+			return err
+		}
+		return os.Mkdir(stageDirectory, 0o700)
+	}
+	t.Cleanup(func() { offlineArchiveProjectionResidueBeforeReturnHook = previous })
+	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+	offlineArchiveProjectionResidueBeforeReturnHook = previous
+	if err == nil || !strings.Contains(err.Error(), "root coordinate changed") {
+		t.Fatalf("owned-stage root replacement error=%v", err)
+	}
+	if body, readErr := os.ReadFile(filepath.Join(displaced, name)); readErr != nil || string(body) != "owned final stage\n" {
+		t.Fatalf("owned final stage body=%q err=%v", body, readErr)
+	}
+}
+
+func TestOfflineArchiveStageCleanupRejectsDirectoryReplacement(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+	displaced := filepath.Join(stateRoot, "admitted-stage-directory")
+	if err := os.MkdirAll(stageDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := offlineArchiveProjectionStagePrefix + strings.Repeat("3", 32) + ".tgz"
+	writeStage := func(directory, body string) error {
+		path := filepath.Join(directory, name)
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			return err
+		}
+		return os.Chmod(path, 0o444)
+	}
+	if err := writeStage(stageDirectory, "admitted stage root\n"); err != nil {
+		t.Fatal(err)
+	}
+	previous := projectionResidueCleanupHook
+	projectionResidueCleanupHook = func(string) error {
+		if err := os.Rename(stageDirectory, displaced); err != nil {
+			return err
+		}
+		if err := os.Mkdir(stageDirectory, 0o700); err != nil {
+			return err
+		}
+		return writeStage(stageDirectory, "replacement stage root\n")
+	}
+	t.Cleanup(func() { projectionResidueCleanupHook = previous })
+	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
+	projectionResidueCleanupHook = previous
+	if err == nil || !strings.Contains(err.Error(), "root coordinate changed") {
+		t.Fatalf("stage-directory replacement error=%v", err)
+	}
+	if body, readErr := os.ReadFile(filepath.Join(displaced, name)); readErr != nil || string(body) != "admitted stage root\n" {
+		t.Fatalf("admitted stage-root residue body=%q err=%v", body, readErr)
+	}
+	if body, readErr := os.ReadFile(filepath.Join(stageDirectory, name)); readErr != nil || string(body) != "replacement stage root\n" {
+		t.Fatalf("replacement stage-root residue body=%q err=%v", body, readErr)
 	}
 }
 
@@ -402,3 +1093,40 @@ func writeScannerGzip(t *testing.T, filename string, header gzip.Header, payload
 		t.Fatal(errors.Join(writeErr, closeErr))
 	}
 }
+
+func testOfflineArchiveProjectionIntent(t *testing.T, transactionID string) offlineArchiveProjectionIntent {
+	t.Helper()
+	intent := offlineArchiveProjectionIntent{
+		Schema:        offlineArchiveProjectionIntentSchema,
+		TransactionID: transactionID,
+		ConfigSHA256:  strings.Repeat("1", 64),
+		Source: offlineArchiveSourceProof{
+			ID:              "test-offline-archive-source",
+			Access:          "public",
+			Refs:            []offlineArchiveSourceRef{{Name: "refs/sow/views/latest/public-assets/all/all", Commit: strings.Repeat("2", 40), Path: "views/latest/public-assets/all/all.json", Repo: "public-assets", OS: "all", Arch: "all"}},
+			EntriesSHA256:   strings.Repeat("3", 64),
+			Confidentiality: "public",
+		},
+		ArchiveSHA256:  strings.Repeat("4", 64),
+		ArchiveSize:    1,
+		StageRelative:  filepath.Join(offlineArchiveProjectionStageDir, offlineArchiveProjectionStagePrefix+transactionID+".tgz"),
+		Destination:    filepath.Join(t.TempDir(), "destination.tgz"),
+		ValidationRoot: t.TempDir(),
+	}
+	var err error
+	intent.ID, err = offlineArchiveProjectionIntentID(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := intent.validate(); err != nil {
+		t.Fatalf("invalid ownership fixture: %v", err)
+	}
+	return intent
+}
+
+type offlineArchiveModeInfo struct {
+	os.FileInfo
+	mode os.FileMode
+}
+
+func (info offlineArchiveModeInfo) Mode() os.FileMode { return info.mode }

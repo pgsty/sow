@@ -29,6 +29,8 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md`
   summary: Offline-archive projection temporary cleanup still needs exact-inode deletion instead of a pathname check followed by pathname removal.
   evidence: `cleanupOfflineArchiveProjectionIntentTemps` in `internal/cli/offline_archive_projection_intent.go` retains the pre-existing `Lstat(path) -> os.Remove(path)` race and can delete a replacement after validation.
+  status: resolved
+  resolution: V-79 replaces pathname deletion for intent temporaries and 0444 stage residues with strict offline-only grammar, retained no-follow/nonblocking descriptors, stable no-replace quarantine, original-coordinate absence checks, exact mode/size/root/intent ownership fences and parent fsync. Repeated-crash, replacement, ownership, umask and no-delete branches are covered by ordinary/race/fault-injection tests. See `_bmad-output/implementation-artifacts/spec-offline-archive-residue-removal-identity.md` and `docs/evidence/2026-07-22-offline-archive-residue-removal-identity.md`.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md`
   summary: Shared derived-state directory creation needs a recursively durable mkdir protocol.
