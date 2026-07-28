@@ -31,6 +31,9 @@ CGO_ENABLED=0 go build -trimpath -o sow ./cmd/sow
 ./sow fsck --config sow.yaml
 ./sow fsck --config sow.yaml --target cf --adopt-remote-inventory
 ./sow fsck --config sow.yaml --target cf --repair-purge-ledger
+# fsck 报告 preserved projection audit 后，一次只退休一个当前 inode
+./sow fsck --config sow.yaml --retire-preserved-projection <exact-name> \
+  --confirm <retire-token>
 ./sow materialize stable --config sow.yaml --target export/stable \
   --serving-base-url https://repo.example/pro/v1/basic --tgz export/stable.tgz
 ./sow gc --config sow.yaml                 # dry-run
@@ -279,6 +282,13 @@ Git 中每一代首次原子发布的 commit 恢复字节完全相同的 purge r
 `sow-checkpoint/v1` 非空 purge plan 写入可复算的 plan-binding attestation；随后重建
 绑定 canonical HEAD 的 SQLite cache 并重审整条历史。partial/完整删除/同代改写的
 control triplet、缺少原子 receipt 或孤儿证据仍会失败关闭，不能被 repair 掩盖。
+
+中断恢复若发现没有 durable owner 的最终 projection stage，会先把它改名为严格的
+`.preserved-<nonce>` 审计副本而不删除。L1 与本地 fsck 流式列出其 name/kind/size/SHA256
+和绑定当前 POSIX inode 的 `retire_token`；普通 `--recover` 与 GC 永不隐式删除。
+检查完成后只能用 `fsck --retire-preserved-projection <exact-name> --confirm
+<retire-token>` 一次退休一个。对象被替换、加硬链接或改变元数据后旧 token 失效；命令
+响应丢失后的缺失坐标重放无副作用并报告 `already_absent=true`。
 
 `sow verify --layer L3` 从 canonical
 `remotes/<target>/intents/views/<view>/plan.json`（快照使用

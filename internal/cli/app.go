@@ -508,15 +508,27 @@ func runFSCK(ctx context.Context, args []string, stdout, stderr io.Writer) (resu
 	fs.Var(&targetFlags, "target", "remote target to audit with full ListObjectsV2 (cf or cos; repeatable; omitted for local-only fsck)")
 	adoptRemoteFlag := fs.Bool("adopt-remote-inventory", false, "explicitly adopt one stable remote bucket inventory after double-list and byte verification")
 	repairPurgeLedgerFlag := fs.Bool("repair-purge-ledger", false, "local-only: restore canonical purge receipts from immutable Git anchors and attest legacy v1 plan bindings")
+	retireProjectionFlag := fs.String("retire-preserved-projection", "", "remove exactly one inspected preserved projection audit quarantine")
+	confirmFlag := fs.String("confirm", "", "capability-bound retirement token printed by fsck")
 	limit := fs.Int("limit", 100, "maximum drift entries printed per repo (0 prints none)")
 	fs.Usage = func() {
-		printSubcommandUsage(fs, "sow fsck [--config sow.yaml] [--root DIR] [--target cf|cos] [--adopt-remote-inventory | --repair-purge-ledger] [--repo NAME] [--os OS] [--arch ARCH] [--limit N] [--recover]")
+		printSubcommandUsage(fs, "sow fsck [--config sow.yaml] [--root DIR] [--target cf|cos] [--adopt-remote-inventory | --repair-purge-ledger | --retire-preserved-projection NAME --confirm TOKEN] [--repo NAME] [--os OS] [--arch ARCH] [--limit N] [--recover]")
 	}
 	if help, err := parseFlagSet(fs, args); err != nil || help {
 		return err
 	}
 	if fs.NArg() != 0 || *limit < 0 {
 		return withExitCode(ExitUsage, "fsck accepts no positional arguments and --limit cannot be negative")
+	}
+	if (*retireProjectionFlag == "") != (*confirmFlag == "") {
+		return withExitCode(ExitUsage, "--retire-preserved-projection and --confirm are required together")
+	}
+	if *retireProjectionFlag != "" {
+		if *adoptRemoteFlag || *repairPurgeLedgerFlag || values.recover ||
+			len(targetFlags.values()) != 0 || len(values.repos.values()) != 0 ||
+			len(values.oses.values()) != 0 || len(values.arches.values()) != 0 {
+			return withExitCode(ExitUsage, "--retire-preserved-projection is local-only and does not accept recovery, remote, repair, or repository selectors")
+		}
 	}
 	if *adoptRemoteFlag {
 		targets := uniqueSorted(targetFlags.values())
@@ -562,7 +574,42 @@ func runFSCK(ctx context.Context, args []string, stdout, stderr io.Writer) (resu
 		return withExitCode(ExitConflict, "%v", err)
 	}
 	defer propagateStateLockRelease(lock, &resultErr, stderr)
+	preservedAudit, preservedErr := inspectPreservedProjectionAudits(cfg.StatePath())
+	if preservedErr != nil {
+		preservedAudit = invalidPreservedProjectionAudit(preservedErr)
+		preservedAudit.writeFSCKDrift(stdout)
+		return withExitCode(ExitVerification, "fsck could not safely inventory preserved projection audit quarantines")
+	}
 	projectionAudit := inspectProjectionIntentsForAudit(cfg.StatePath())
+	if *retireProjectionFlag != "" {
+		if projectionAudit.pending() {
+			projectionAudit.writeFSCKDrift(stdout)
+			return withExitCode(ExitConflict, "pending or invalid projection recovery intent blocks preserved projection retirement")
+		}
+		if err := requirePreservedProjectionRetirementQuiescent(cfg); err != nil {
+			return withExitCode(ExitConflict, "preserved projection retirement requires quiescent local state: %v", err)
+		}
+		record, retired, absent, err := preservedAudit.retire(*retireProjectionFlag, *confirmFlag)
+		if err != nil {
+			return withExitCode(ExitConflict, "%v", err)
+		}
+		sha256Value := record.SHA256
+		if sha256Value == "" {
+			sha256Value = "-"
+		}
+		fmt.Fprintf(
+			stdout,
+			"fsck-retire-preserved-projection name=%s kind=%s retired=%t already_absent=%t size=%d sha256=%s\n",
+			record.Name,
+			record.Kind,
+			retired,
+			absent,
+			record.Size,
+			sha256Value,
+		)
+		return nil
+	}
+	preservedAudit.writeFSCKDrift(stdout)
 	if projectionAudit.pending() {
 		projectionAudit.writeFSCKDrift(stdout)
 		return withExitCode(ExitVerification, "fsck found %d pending or invalid projection recovery intent(s); run the matching add, rm, or materialize command with --recover", len(projectionAudit.findings))
@@ -689,7 +736,7 @@ func runFSCK(ctx context.Context, args []string, stdout, stderr io.Writer) (resu
 			target, result.Generations, result.Receipts, result.Attestations, result.Commit, result.Changed)
 		return nil
 	}
-	dirty := false
+	dirty := preservedAudit.pending()
 	materializedRouteStage := materializedRouteAuditStagePath(transactionDir)
 	if err := os.MkdirAll(materializedRouteStage, 0o700); err != nil {
 		return withExitCode(ExitInternal, "prepare canonical materialized-route audit: %v", err)

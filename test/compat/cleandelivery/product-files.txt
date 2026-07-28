@@ -6,13 +6,16 @@ _bmad-output/implementation-artifacts/spec-derived-state-hostile-writer-admissio
 _bmad-output/implementation-artifacts/spec-derived-state-recursive-directory-durability.md
 _bmad-output/implementation-artifacts/spec-derived-state-replacement-outcome.md
 _bmad-output/implementation-artifacts/spec-offline-archive-residue-removal-identity.md
+_bmad-output/implementation-artifacts/spec-preserved-projection-audit-retirement.md
 cmd/sow/main.go
 docs/adr/0043-derived-state-hostile-writer-admission.md
+docs/adr/0044-preserved-projection-audit-retirement.md
 docs/evidence/2026-07-22-canonical-apply-stage-identity.md
 docs/evidence/2026-07-22-offline-archive-residue-removal-identity.md
 docs/evidence/2026-07-26-derived-state-recursive-directory-durability.md
 docs/evidence/2026-07-28-derived-state-hostile-writer-admission.md
 docs/evidence/2026-07-28-derived-state-replacement-outcome.md
+docs/evidence/2026-07-28-preserved-projection-audit-retirement.md
 edge/README.md
 edge/basic/nginx.conf.example
 edge/build.mjs
@@ -172,6 +175,8 @@ internal/cli/package_projection_intent.go
 internal/cli/package_repository_contract.go
 internal/cli/package_repository_contract_test.go
 internal/cli/physical_migration_fixture_test.go
+internal/cli/projection_audit_quarantine.go
+internal/cli/projection_audit_quarantine_test.go
 internal/cli/projection_expected_stages_test.go
 internal/cli/projection_intent_audit.go
 internal/cli/projection_intent_audit_test.go

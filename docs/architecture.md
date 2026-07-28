@@ -322,6 +322,14 @@ Every mutation follows: persist intent journal and expected HEAD; stage immutabl
   same-digest move between components cannot suppress the new placement.
 - **rm** removes a mutable-view reference, not bytes. It fails if the result removes an object reachable from stable, any snapshot/history ref, a target remote ref or a live journal.
 - GC is a separate, explicit reachability operation so ordinary mutations stay incremental. Roots include every repo/view/snapshot/remote ref, retained commit, materialized generation, provenance evidence and incomplete journal. `sow gc` automatically computes and verifies the complete orphan set; deletion additionally requires that exact set digest via `--apply --confirm`, and a changed/missing/corrupt set fails closed. Only unreachable objects may be deleted; [ADR-0008](adr/0008-gc-reachability-and-confirmation.md) freezes this interpretation of automatic reclamation.
+- A restart-visible unowned final projection stage is not CAS garbage and is
+  never deleted by recovery or GC. It is preserved under the strict
+  `.preserved-<nonce>` grammar, reported by L1/fsck with a token bound to its
+  exact bytes and POSIX inode identity, and retired only one-at-a-time with
+  `sow fsck --retire-preserved-projection NAME --confirm TOKEN`. The retirement
+  descriptor remains held through quarantine, unlink and directory fsync; a
+  replacement or alias fails closed. See [ADR-0041](adr/0041-preserved-projection-orphan-quarantine.md)
+  and [ADR-0044](adr/0044-preserved-projection-audit-retirement.md).
 - Frozen EL8 beginning with Pigsty v5.0.0 permits verify, materialize, publish and byte-identical repair. Add, sync, promotion of new content, and non-gzip index regeneration fail.
 - RPM provenance records upstream URL, index SHA-256/size and original RPM CAS
   object. New v3 receipts retain bounded packet evidence and additionally bind

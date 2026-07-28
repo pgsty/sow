@@ -110,9 +110,23 @@ func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer) (re
 	}
 	defer propagateStateLockRelease(lock, &resultErr, stderr)
 	projectionAudit := inspectProjectionIntentsForAudit(cfg.StatePath())
-	if verifyLayerSelected(layers, verify.LayerL1) && projectionAudit.pending() {
+	var preservedAudit preservedProjectionAudit
+	if verifyLayerSelected(layers, verify.LayerL1) {
+		preservedAudit, err = inspectPreservedProjectionAudits(cfg.StatePath())
+		if err != nil {
+			preservedAudit = invalidPreservedProjectionAudit(err)
+		}
+	}
+	if verifyLayerSelected(layers, verify.LayerL1) && (projectionAudit.pending() || preservedAudit.pending()) {
+		checks := make([]verify.Check, 0, 2)
+		if projectionAudit.pending() {
+			checks = append(checks, projectionAudit.verifyCheck())
+		}
+		if preservedAudit.pending() {
+			checks = append(checks, preservedAudit.verifyCheck())
+		}
 		report := verify.Run(ctx, verify.Request{
-			Layers: []verify.Layer{verify.LayerL1}, Checks: []verify.Check{projectionAudit.verifyCheck()},
+			Layers: []verify.Layer{verify.LayerL1}, Checks: checks,
 			Workers: values.workers, MaxFindings: *maxFindings,
 		})
 		return emitVerifyReport(stdout, *jsonOutput, report, false)
