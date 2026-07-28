@@ -266,23 +266,12 @@ func requirePreservedProjectionRetirementQuiescent(cfg *config.Config) error {
 }
 
 func requireNoDerivedStateReplacementTransactionsReadOnly(stateRoot string) error {
-	stateRoot, root, rootIdentity, err := bindAdmittedDerivedStateDirectory(stateRoot, "derived state replacement inventory root")
+	audit, err := inspectDerivedStateResidues(stateRoot)
 	if err != nil {
 		return err
 	}
-	defer root.Close()
-	directory, err := root.Open(".")
-	if err != nil {
-		return err
-	}
-	sets, listErr := listDerivedStateReplacementCarrierSets(directory)
-	closeErr := directory.Close()
-	rootErr := verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity)
-	if listErr != nil || closeErr != nil || rootErr != nil {
-		return errors.Join(listErr, closeErr, rootErr)
-	}
-	if len(sets) != 0 {
-		return errors.New("interrupted derived state replacement blocks preserved projection retirement")
+	if audit.pending() {
+		return errors.New("interrupted derived state replacement or temporary residue blocks preserved projection retirement")
 	}
 	return nil
 }

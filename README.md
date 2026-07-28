@@ -29,6 +29,7 @@ CGO_ENABLED=0 go build -trimpath -o sow ./cmd/sow
 ./sow verify --config sow.yaml --layer L1,L2
 ./sow verify --config sow.yaml --layer L3,L4 --view stable --target cf --pro-token-file ./pro-token
 ./sow fsck --config sow.yaml
+./sow fsck --config sow.yaml --recover        # 仅恢复严格的本地事务/随机残留
 ./sow fsck --config sow.yaml --target cf --adopt-remote-inventory
 ./sow fsck --config sow.yaml --target cf --repair-purge-ledger
 # fsck 报告 preserved projection audit 后，一次只退休一个当前 inode
@@ -282,6 +283,13 @@ Git 中每一代首次原子发布的 commit 恢复字节完全相同的 purge r
 `sow-checkpoint/v1` 非空 purge plan 写入可复算的 plan-binding attestation；随后重建
 绑定 canonical HEAD 的 SQLite cache 并重审整条历史。partial/完整删除/同代改写的
 control triplet、缺少原子 receipt 或孤儿证据仍会失败关闭，不能被 repair 掩盖。
+
+L1 与本地 fsck 还会盘点 `.sow` 根控制文件、`generated/**` 和三个 writer journal
+目录中的未完成 derived-state。普通检查只报告；`fsck --recover` 依次收敛严格的空目录
+stage、durable replacement carrier 和带 128-bit 随机能力的 write/install/removal
+临时文件，并在每类变更后重新盘点。旧 16-hex 可预测临时名和
+`.tmp-derived-directory-*.preserved-*` 外来替换证据绝不自动删除，必须由操作者检查。
+扫描不会进入 canonical Git、cache、CAS、sync/stage/tmp、materialized/origin 或制品树。
 
 中断恢复若发现没有 durable owner 的最终 projection stage，会先把它改名为严格的
 `.preserved-<nonce>` 审计副本而不删除。L1 与本地 fsck 流式列出其 name/kind/size/SHA256

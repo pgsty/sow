@@ -574,6 +574,29 @@ func runFSCK(ctx context.Context, args []string, stdout, stderr io.Writer) (resu
 		return withExitCode(ExitConflict, "%v", err)
 	}
 	defer propagateStateLockRelease(lock, &resultErr, stderr)
+	derivedResidueAudit, derivedResidueErr := inspectDerivedStateResidues(cfg.StatePath())
+	if derivedResidueErr != nil {
+		derivedResidueAudit = invalidDerivedStateResidueAudit(derivedResidueErr)
+		derivedResidueAudit.writeFSCKDrift(stdout)
+		return withExitCode(ExitVerification, "fsck could not safely inventory derived state recovery residue")
+	}
+	if derivedResidueAudit.pending() {
+		derivedResidueAudit.writeFSCKDrift(stdout)
+		if !values.recover {
+			return withExitCode(ExitVerification, "fsck found pending derived state residue; retry with --recover")
+		}
+		stats, err := recoverDerivedStateResidues(cfg.StatePath(), derivedResidueAudit)
+		if err != nil {
+			return withExitCode(ExitConflict, "recover derived state residue: %v", err)
+		}
+		fmt.Fprintf(
+			stdout,
+			"fsck-recover-derived-state directory_stages=%d transactions=%d temporaries=%d clean=true\n",
+			stats.DirectoryStages,
+			stats.Transactions,
+			stats.Temporaries,
+		)
+	}
 	preservedAudit, preservedErr := inspectPreservedProjectionAudits(cfg.StatePath())
 	if preservedErr != nil {
 		preservedAudit = invalidPreservedProjectionAudit(preservedErr)
@@ -980,6 +1003,25 @@ func prepareCanonicalStateCoreForYUMCompatibilityRecovery(ctx context.Context, s
 }
 
 func prepareCanonicalStateCoreUnchecked(ctx context.Context, store *state.Store, recover bool, stdout io.Writer) error {
+	if recover {
+		audit, err := inspectDerivedStateResidues(store.StateDir())
+		if err != nil {
+			return withExitCode(ExitConflict, "inspect derived state recovery residue: %v", err)
+		}
+		if audit.pending() {
+			stats, err := recoverDerivedStateResidues(store.StateDir(), audit)
+			if err != nil {
+				return withExitCode(ExitConflict, "recover derived state residue: %v", err)
+			}
+			fmt.Fprintf(
+				stdout,
+				"recovered derived_state_directory_stages=%d derived_state_transactions=%d temporary_residues=%d\n",
+				stats.DirectoryStages,
+				stats.Transactions,
+				stats.Temporaries,
+			)
+		}
+	}
 	var recovered int
 	if recover {
 		results, err := store.Recover(ctx)

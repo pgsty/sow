@@ -110,20 +110,29 @@ func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer) (re
 	}
 	defer propagateStateLockRelease(lock, &resultErr, stderr)
 	projectionAudit := inspectProjectionIntentsForAudit(cfg.StatePath())
+	var derivedResidueAudit derivedStateResidueAudit
 	var preservedAudit preservedProjectionAudit
 	if verifyLayerSelected(layers, verify.LayerL1) {
+		derivedResidueAudit, err = inspectDerivedStateResidues(cfg.StatePath())
+		if err != nil {
+			derivedResidueAudit = invalidDerivedStateResidueAudit(err)
+		}
 		preservedAudit, err = inspectPreservedProjectionAudits(cfg.StatePath())
 		if err != nil {
 			preservedAudit = invalidPreservedProjectionAudit(err)
 		}
 	}
-	if verifyLayerSelected(layers, verify.LayerL1) && (projectionAudit.pending() || preservedAudit.pending()) {
-		checks := make([]verify.Check, 0, 2)
+	if verifyLayerSelected(layers, verify.LayerL1) &&
+		(projectionAudit.pending() || preservedAudit.pending() || derivedResidueAudit.pending()) {
+		checks := make([]verify.Check, 0, 3)
 		if projectionAudit.pending() {
 			checks = append(checks, projectionAudit.verifyCheck())
 		}
 		if preservedAudit.pending() {
 			checks = append(checks, preservedAudit.verifyCheck())
+		}
+		if derivedResidueAudit.pending() {
+			checks = append(checks, derivedResidueAudit.verifyCheck())
 		}
 		report := verify.Run(ctx, verify.Request{
 			Layers: []verify.Layer{verify.LayerL1}, Checks: checks,

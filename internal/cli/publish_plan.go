@@ -2231,6 +2231,9 @@ func writeDerivedStateFileTransaction(stateRoot, relative string, body []byte, r
 	if relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return errors.New("unsafe derived state path")
 	}
+	if _, _, _, related := classifyStrictDerivedStateTemporaryName(filepath.Base(relative)); related {
+		return errors.New("derived state destination uses the reserved temporary-name grammar")
+	}
 	expectedDigest := sha256.Sum256(body)
 	expectedSize := len(body)
 	stateRoot, err := filepath.Abs(stateRoot)
@@ -2292,6 +2295,9 @@ func writeDerivedStateFileTransaction(stateRoot, relative string, body []byte, r
 		if err := recoverBoundDerivedStateReplacementTransactions(parent, directoryHandle, mutationGuard, recoverUnexpectedDirectoryMutation); err != nil {
 			return err
 		}
+	}
+	if err := requireNoUnjournaledDerivedStateTemporaries(directoryHandle); err != nil {
+		return errors.Join(err, errDerivedStateReplacementRecoveryRequired)
 	}
 	result.Outcome = derivedStateReplacementNotCommitted
 	nonce, err := state.NewTransactionID()

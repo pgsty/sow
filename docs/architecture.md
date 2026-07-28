@@ -330,6 +330,15 @@ Every mutation follows: persist intent journal and expected HEAD; stage immutabl
   descriptor remains held through quarantine, unlink and directory fsync; a
   replacement or alias fails closed. See [ADR-0041](adr/0041-preserved-projection-orphan-quarantine.md)
   and [ADR-0044](adr/0044-preserved-projection-audit-retirement.md).
+- L1 and local fsck stream a bounded, descriptor-bound inventory over only the
+  `.sow` root control files, `generated/**`, and the materialization/serving
+  writer journal directories. Explicit recovery converges V-80 empty directory
+  stages, durable replacement carriers, then 128-bit random
+  write/install/removal temporaries, with a fresh inventory between classes.
+  Bare predictable 16-hex legacy names and V-80 `.preserved-*` replacement
+  evidence are reported but never auto-deleted. Canonical Git, cache, CAS,
+  sync/stage/tmp, materialized/origin and payload trees are outside this
+  deletion authority. See [ADR-0045](adr/0045-generic-derived-state-residue-recovery.md).
 - Frozen EL8 beginning with Pigsty v5.0.0 permits verify, materialize, publish and byte-identical repair. Add, sync, promotion of new content, and non-gzip index regeneration fail.
 - RPM provenance records upstream URL, index SHA-256/size and original RPM CAS
   object. New v3 receipts retain bounded packet evidence and additionally bind
