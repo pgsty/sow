@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -196,28 +197,47 @@ func installOfflineArchiveProjectionStage(stateRoot string, result archiveResult
 	}
 	destinationName := offlineArchiveProjectionStagePrefix + transactionID + ".tgz"
 	destinationRelative := filepath.Join(offlineArchiveProjectionStageDir, destinationName)
-	root, err := os.OpenRoot(stateAbs)
+	if _, _, err := ensureDerivedStateControlDirectory(
+		stateAbs,
+		offlineArchiveProjectionStageDir,
+		"offline archive projection stage directory",
+		true,
+	); err != nil {
+		return "", err
+	}
+	root, stageRoot, err := bindOfflineArchiveProjectionRoots(stateAbs, true)
 	if err != nil {
 		return "", err
 	}
 	defer root.Close()
-	stageDirectoryCreated := false
-	if info, err := root.Lstat(offlineArchiveProjectionStageDir); errors.Is(err, os.ErrNotExist) {
-		if err := root.Mkdir(offlineArchiveProjectionStageDir, 0o700); err != nil {
-			return "", err
-		}
-		stageDirectoryCreated = true
-	} else if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
-		return "", errors.Join(err, errors.New("offline archive projection stage directory is not private"))
+	defer stageRoot.Close()
+	rootIdentity, err := root.Stat(".")
+	if err != nil || rootIdentity == nil {
+		return "", errors.Join(err, errors.New("offline archive projection state-root identity is unavailable"))
 	}
-	if stageDirectoryCreated {
-		if err := syncBoundArchiveDirectory(root); err != nil {
-			return "", err
-		}
+	stageIdentity, err := stageRoot.Stat(".")
+	if err != nil || stageIdentity == nil {
+		return "", errors.Join(err, errors.New("offline archive projection stage-root identity is unavailable"))
 	}
-	if _, err := root.Lstat(destinationRelative); err == nil {
+	verifyRoots := func() error {
+		return errors.Join(
+			verifyBoundDerivedStateRoot(root, stateAbs, rootIdentity),
+			verifyBoundDerivedStateRoot(
+				stageRoot,
+				filepath.Join(stateAbs, offlineArchiveProjectionStageDir),
+				stageIdentity,
+			),
+		)
+	}
+	if err := verifyRoots(); err != nil {
+		return "", err
+	}
+	if _, err := stageRoot.Lstat(destinationName); err == nil {
 		return "", errors.New("offline archive projection stage already exists")
 	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err := verifyRoots(); err != nil {
 		return "", err
 	}
 	if err := root.Link(sourceRelative, destinationRelative); err != nil {
@@ -233,17 +253,18 @@ func installOfflineArchiveProjectionStage(stateRoot string, result archiveResult
 	}()
 	expected := result
 	expected.Stage = filepath.Join(stateAbs, destinationRelative)
-	if err := requireBoundArchiveFile(root, destinationRelative, expected); err != nil {
+	if err := requireBoundArchiveFile(stageRoot, destinationName, expected); err != nil {
+		return "", err
+	}
+	if err := verifyRoots(); err != nil {
 		return "", err
 	}
 	// This fsync is the durable private-stage boundary. It precedes both the
 	// operation intent and canonical taint receipt.
-	stageRoot, err := root.OpenRoot(offlineArchiveProjectionStageDir)
-	if err != nil {
+	if err := offlineArchiveProjectionStageSync(stageRoot); err != nil {
 		return "", err
 	}
-	defer stageRoot.Close()
-	if err := offlineArchiveProjectionStageSync(stageRoot); err != nil {
+	if err := verifyRoots(); err != nil {
 		return "", err
 	}
 	committed = true
@@ -313,6 +334,64 @@ func prepareOfflineArchiveProjectionIntent(cfg *config.Config, source offlineArc
 	return intent, nil
 }
 
+func removeExactOfflineArchiveStagePayload(stageRoot *os.Root, stageName string, expectedSize int64, expectedSHA256 string) error {
+	if stageRoot == nil || !offlineArchiveProjectionStagePattern.MatchString(stageName) ||
+		(expectedSize >= 0 && !validMaterializationTrustSHA256(expectedSHA256)) {
+		return errors.New("offline archive projection stage cleanup binding is invalid")
+	}
+	before, err := stageRoot.Lstat(stageName)
+	if errors.Is(err, os.ErrNotExist) {
+		return syncBoundArchiveDirectory(stageRoot)
+	}
+	if err != nil || before == nil || before.Mode()&os.ModeSymlink != 0 ||
+		!before.Mode().IsRegular() || before.Mode().Perm() != 0o444 ||
+		(expectedSize >= 0 && before.Size() != expectedSize) {
+		return errors.Join(err, errors.New("offline archive projection stage is not an exact read-only payload"))
+	}
+	file, err := stageRoot.OpenFile(stageName, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	opened, statErr := file.Stat()
+	current, lstatErr := stageRoot.Lstat(stageName)
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		!os.SameFile(before, opened) || !os.SameFile(before, current) ||
+		opened.Mode() != before.Mode() || current.Mode() != before.Mode() ||
+		opened.Size() != before.Size() || current.Size() != before.Size() ||
+		!opened.ModTime().Equal(before.ModTime()) ||
+		!current.ModTime().Equal(before.ModTime()) {
+		return errors.Join(statErr, lstatErr, errors.New("offline archive projection stage changed while binding cleanup"))
+	}
+	if expectedSize >= 0 {
+		if _, err := hashExactOpenProjectionStage(file, before, expectedSize, expectedSHA256); err != nil {
+			return err
+		}
+	}
+	directory, err := stageRoot.Open(".")
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return commitExactPrivateStateFileRemovalAt(
+		stageRoot,
+		directory,
+		file,
+		before,
+		stageName,
+		stageName,
+		func() error {
+			after, statErr := file.Stat()
+			if statErr != nil || after == nil || !os.SameFile(before, after) ||
+				after.Mode() != before.Mode() || after.Size() != before.Size() ||
+				!after.ModTime().Equal(before.ModTime()) {
+				return errors.Join(statErr, errors.New("offline archive projection stage changed during cleanup"))
+			}
+			return nil
+		},
+	)
+}
+
 func discardOfflineArchiveProjectionStage(stateRoot, stageRelative string) error {
 	root, stageRoot, err := bindOfflineArchiveProjectionRoots(stateRoot, false)
 	if err != nil {
@@ -327,43 +406,100 @@ func discardOfflineArchiveProjectionStage(stateRoot, stageRelative string) error
 	if !offlineArchiveProjectionStagePattern.MatchString(stageName) || filepath.Join(offlineArchiveProjectionStageDir, stageName) != stageRelative {
 		return errors.New("invalid offline archive projection stage cleanup path")
 	}
-	if err := stageRoot.Remove(stageName); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return syncBoundArchiveDirectory(stageRoot)
+	return removeExactOfflineArchiveStagePayload(stageRoot, stageName, -1, "")
 }
 
 func removeOfflineArchiveProjectionIntent(stateRoot string, intent offlineArchiveProjectionIntent) error {
-	current, exists, err := readOfflineArchiveProjectionIntent(stateRoot)
-	if err != nil || !exists || current.ID != intent.ID {
-		return errors.Join(err, errors.New("pending offline archive projection intent changed before completion"))
+	if err := intent.validate(); err != nil {
+		return err
 	}
 	root, stageRoot, err := bindOfflineArchiveProjectionRoots(stateRoot, false)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
+	stateAbs, err := archiveAbsolutePath(stateRoot)
+	if err != nil {
+		return err
+	}
+	rootIdentity, err := root.Stat(".")
+	if err != nil || rootIdentity == nil {
+		return errors.Join(err, errors.New("offline archive projection state-root identity is unavailable"))
+	}
+	if err := verifyBoundDerivedStateRoot(root, stateAbs, rootIdentity); err != nil {
+		return err
+	}
+	intentFile, intentIdentity, intentBody, err := bindExactProjectionIntent(
+		root,
+		offlineArchiveProjectionIntentRelative,
+		offlineArchiveProjectionIntentMaxBytes,
+	)
+	if err != nil {
+		return err
+	}
+	defer intentFile.Close()
+	current, err := decodeOfflineArchiveProjectionIntent(intentBody)
+	if err != nil || current.ID != intent.ID {
+		return errors.Join(err, errors.New("pending offline archive projection intent changed before completion"))
+	}
+	verifyIntentDescriptor := func() error {
+		body, readErr := readExactOpenProjectionIntent(intentFile, intentIdentity, offlineArchiveProjectionIntentMaxBytes)
+		opened, statErr := intentFile.Stat()
+		if readErr != nil || statErr != nil || opened == nil ||
+			!os.SameFile(intentIdentity, opened) ||
+			!sameDerivedStateControlFileSecurity(intentIdentity, opened) ||
+			!bytes.Equal(intentBody, body) {
+			return errors.Join(readErr, statErr, errors.New("pending offline archive projection intent changed during completion"))
+		}
+		decoded, decodeErr := decodeOfflineArchiveProjectionIntent(body)
+		if decodeErr != nil || decoded.ID != intent.ID {
+			return errors.Join(decodeErr, errors.New("pending offline archive projection intent identity changed during completion"))
+		}
+		return verifyBoundDerivedStateRoot(root, stateAbs, rootIdentity)
+	}
+	verifyIntent := func() error {
+		if err := verifyIntentDescriptor(); err != nil {
+			return err
+		}
+		currentInfo, lstatErr := root.Lstat(offlineArchiveProjectionIntentRelative)
+		if lstatErr != nil || currentInfo == nil ||
+			!os.SameFile(intentIdentity, currentInfo) ||
+			!sameDerivedStateControlFileSecurity(intentIdentity, currentInfo) {
+			return errors.Join(lstatErr, errors.New("pending offline archive projection intent coordinate changed during completion"))
+		}
+		return nil
+	}
+	if err := verifyIntent(); err != nil {
+		return err
+	}
 	if stageRoot != nil {
 		defer stageRoot.Close()
 		stageName := filepath.Base(intent.StageRelative)
-		if info, statErr := stageRoot.Lstat(stageName); statErr == nil {
-			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-				return errors.New("offline archive projection stage changed before completion")
-			}
-			if err := stageRoot.Remove(stageName); err != nil {
-				return err
-			}
-			if err := syncBoundArchiveDirectory(stageRoot); err != nil {
-				return err
-			}
-		} else if !errors.Is(statErr, os.ErrNotExist) {
-			return statErr
+		if err := removeExactOfflineArchiveStagePayload(
+			stageRoot,
+			stageName,
+			intent.ArchiveSize,
+			intent.ArchiveSHA256,
+		); err != nil {
+			return err
 		}
 	}
-	if err := root.Remove(offlineArchiveProjectionIntentRelative); err != nil {
+	if err := verifyIntent(); err != nil {
 		return err
 	}
-	return syncBoundArchiveDirectory(root)
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return commitExactPrivateStateFileRemoval(
+		root,
+		directory,
+		intentFile,
+		intentIdentity,
+		offlineArchiveProjectionIntentRelative,
+		verifyIntentDescriptor,
+	)
 }
 
 func cleanupOfflineArchiveProjectionResidue(stateRoot string, recover bool) error {
@@ -517,7 +653,8 @@ func cleanupOfflineArchiveProjectionResidue(stateRoot string, recover bool) erro
 }
 
 func exactOfflineArchiveIntentTemporary(info os.FileInfo) bool {
-	return info != nil && info.Mode() == 0o600 && info.Size() <= offlineArchiveProjectionIntentMaxBytes
+	_, admissionErr := admitDerivedStateControlFile(info, "offline archive projection intent temporary")
+	return admissionErr == nil && info.Mode() == 0o600 && info.Size() <= offlineArchiveProjectionIntentMaxBytes
 }
 
 func exactOfflineArchiveStageResidue(info os.FileInfo) bool {
@@ -665,7 +802,10 @@ func bindOfflineArchiveProjectionRoots(stateRoot string, requireStage bool) (*os
 	if err != nil {
 		return nil, nil, err
 	}
-	root, _, err := walkAbsoluteArchiveDirectory(stateAbs, false)
+	_, root, rootIdentity, err := bindAdmittedDerivedStateDirectory(
+		stateAbs,
+		"offline archive projection state root",
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -677,18 +817,31 @@ func bindOfflineArchiveProjectionRoots(stateRoot string, requireStage bool) (*os
 		root.Close()
 		return nil, nil, errors.Join(err, errors.New("offline archive projection stage directory is not private"))
 	}
-	stageRoot, err := root.OpenRoot(offlineArchiveProjectionStageDir)
+	if _, err := admitDerivedStateDirectory(before, "offline archive projection stage directory"); err != nil {
+		root.Close()
+		return nil, nil, err
+	}
+	stageAbs := filepath.Join(stateAbs, offlineArchiveProjectionStageDir)
+	_, stageRoot, stageIdentity, err := bindAdmittedDerivedStateDirectory(
+		stageAbs,
+		"offline archive projection stage directory",
+	)
 	if err != nil {
 		root.Close()
 		return nil, nil, err
 	}
 	after, afterErr := root.Lstat(offlineArchiveProjectionStageDir)
 	opened, openedErr := stageRoot.Stat(".")
+	rootVerifyErr := verifyBoundDerivedStateRoot(root, stateAbs, rootIdentity)
 	if afterErr != nil || openedErr != nil || after.Mode()&os.ModeSymlink != 0 || !after.IsDir() ||
-		!os.SameFile(before, after) || !os.SameFile(before, opened) {
+		!os.SameFile(before, after) || !os.SameFile(before, opened) ||
+		!os.SameFile(stageIdentity, after) || !os.SameFile(stageIdentity, opened) ||
+		!sameDerivedStateDirectorySecurity(before, after) ||
+		!sameDerivedStateDirectorySecurity(before, opened) ||
+		rootVerifyErr != nil {
 		stageRoot.Close()
 		root.Close()
-		return nil, nil, errors.Join(afterErr, openedErr, errors.New("offline archive projection stage directory changed while binding"))
+		return nil, nil, errors.Join(afterErr, openedErr, rootVerifyErr, errors.New("offline archive projection stage directory changed while binding"))
 	}
 	return root, stageRoot, nil
 }

@@ -691,34 +691,12 @@ func (journal localServingRemovalJournal) validate() error {
 }
 
 func localServingRemovalDirectory(stateRoot string, create bool) (string, bool, error) {
-	stateAbs, err := filepath.Abs(stateRoot)
-	if err != nil {
-		return "", false, err
-	}
-	info, err := os.Lstat(stateAbs)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return "", false, errors.Join(err, errors.New("state root is not a real directory"))
-	}
-	root, err := os.OpenRoot(stateAbs)
-	if err != nil {
-		return "", false, err
-	}
-	defer root.Close()
-	const relative = "serving-removal-journal"
-	info, err = root.Lstat(relative)
-	if errors.Is(err, os.ErrNotExist) && !create {
-		return filepath.Join(stateAbs, relative), false, nil
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		if err := root.Mkdir(relative, 0o700); err != nil {
-			return "", false, err
-		}
-		info, err = root.Lstat(relative)
-	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return "", false, errors.Join(err, errors.New("serving removal journal directory is unsafe"))
-	}
-	return filepath.Join(stateAbs, relative), true, nil
+	return ensureDerivedStateControlDirectory(
+		stateRoot,
+		"serving-removal-journal",
+		"local serving removal journal directory",
+		create,
+	)
 }
 
 func createLocalServingRemovalJournal(stateRoot string, journal localServingRemovalJournal) error {
@@ -791,13 +769,24 @@ func removeLocalServingRemovalJournal(stateRoot, id string) error {
 	if err != nil || !exists {
 		return errors.Join(err, errors.New("local serving removal journal directory is missing"))
 	}
-	filename := filepath.Join(directory, id+".json")
-	info, err := os.Lstat(filename)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.Join(err, errors.New("local serving removal journal is unsafe"))
-	}
-	if err := os.Remove(filename); err != nil {
-		return err
-	}
-	return syncLocalDirectory(directory)
+	name := id + ".json"
+	return removeExactProjectionIntent(directory, name, localServingRemovalLimit, func(body []byte) error {
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		var journal localServingRemovalJournal
+		if err := decoder.Decode(&journal); err != nil {
+			return err
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+			return errors.New("local serving removal journal has trailing JSON")
+		}
+		if err := journal.validate(); err != nil {
+			return err
+		}
+		if journal.ID != id {
+			return errors.New("local serving removal journal ID changed before removal")
+		}
+		return nil
+	})
 }

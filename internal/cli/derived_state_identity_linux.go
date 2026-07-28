@@ -18,9 +18,11 @@ func derivedStateDirectoryIdentityToken(info os.FileInfo) (string, bool) {
 		return "", false
 	}
 	return fmt.Sprintf(
-		"%d:%d:%d:%d:%d:%d:%d:%d:%d",
+		"%d:%d:%d:%d:%d:%d:%d:%d:%d:%d:%d",
 		stat.Dev,
 		stat.Ino,
+		stat.Uid,
+		stat.Gid,
 		stat.Ctim.Sec,
 		stat.Ctim.Nsec,
 		stat.Mtim.Sec,

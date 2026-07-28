@@ -225,7 +225,7 @@ while IFS="$(printf '\t')" read -r relative expected; do
 	}
 done < "$TMP/source.tsv"
 
-echo 'pigsty_yum_consumer_audit=pass mapped_definitions=28'
+echo 'pigsty_yum_consumer_audit=pass mapped_definitions=22'
 echo 'pigsty_yum_consumer_stage=pass source_unchanged=true'
 echo 'pigsty_yum_consumer_apply=pass replay_idempotent=true mixed_state_recovered=true'
 echo 'pigsty_yum_consumer_preflight_gate=pass rejected_before_mutation=true revalidated_before_write=true receipt_bound=true unsafe_manifest_rejected=true disjoint_plan_enforced=true stale_symlink_not_followed=true'

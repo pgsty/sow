@@ -54,8 +54,12 @@ func verifyProjectionStageRootIdentity(stateRoot string, expected os.FileInfo) e
 	}
 	current, err := os.Lstat(absolute)
 	if err != nil || current == nil || current.Mode()&os.ModeSymlink != 0 || !current.IsDir() ||
-		!os.SameFile(expected, current) || current.Mode() != expected.Mode() {
+		!os.SameFile(expected, current) ||
+		!sameDerivedStateDirectorySecurity(expected, current) {
 		return errors.Join(err, errors.New("prepared projection state-root coordinate changed"))
+	}
+	if _, err := admitDerivedStateDirectory(current, "prepared projection state root"); err != nil {
+		return err
 	}
 	root, err := os.OpenRoot(absolute)
 	if err != nil {
@@ -315,7 +319,7 @@ func removeExactProjectionIntent(stateRoot, relative string, maximum int64, vali
 	if filepath.Base(relative) != relative || relative == "." || relative == "" || maximum <= 0 || validate == nil {
 		return errors.New("projection intent removal capability is invalid")
 	}
-	root, err := os.OpenRoot(stateRoot)
+	stateRoot, root, rootIdentity, err := bindAdmittedDerivedStateDirectory(stateRoot, "projection intent state root")
 	if err != nil {
 		return err
 	}
@@ -343,7 +347,7 @@ func removeExactProjectionIntent(stateRoot, relative string, maximum int64, vali
 		if readErr != nil || !bytes.Equal(body, lastBody) {
 			return errors.Join(readErr, errors.New("projection intent bytes changed before completion commit"))
 		}
-		return nil
+		return verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity)
 	})
 }
 
@@ -352,7 +356,7 @@ func removeExactProjectionStage(stateRoot, relative string, expectedSize int64, 
 		expectedSize < 0 || expectedSize == math.MaxInt64 || !validMaterializationTrustSHA256(expectedSHA256) {
 		return false, errors.New("projection stage cleanup capability is invalid")
 	}
-	root, err := os.OpenRoot(stateRoot)
+	stateRoot, root, rootIdentity, err := bindAdmittedDerivedStateDirectory(stateRoot, "projection stage state root")
 	if err != nil {
 		return false, err
 	}
@@ -390,7 +394,7 @@ func removeExactProjectionStage(stateRoot, relative string, expectedSize int64, 
 		if verifyErr != nil || firstDigest != lastDigest {
 			return errors.Join(verifyErr, errors.New("projection stage bytes changed before cleanup commit"))
 		}
-		return nil
+		return verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity)
 	})
 	if err != nil {
 		return false, err
@@ -478,16 +482,43 @@ func removeExactProjectionResidueBounded(stateRoot, relative string, maximum int
 }
 
 func commitExactPrivateStateFileRemoval(root *os.Root, directory, file *os.File, identity os.FileInfo, relative string, verify func() error) error {
-	return commitExactPrivateStateFileRemovalAt(root, directory, file, identity, relative, relative, verify)
+	return commitExactPrivateStateFileRemovalAtPolicy(root, directory, file, identity, relative, relative, true, verify)
 }
 
 func commitExactPrivateStateFileRemovalAt(root *os.Root, directory, file *os.File, identity os.FileInfo, relative, quarantineBase string, verify func() error) error {
+	return commitExactPrivateStateFileRemovalAtPolicy(root, directory, file, identity, relative, quarantineBase, false, verify)
+}
+
+func commitExactPrivateStateFileRemovalAtPolicy(root *os.Root, directory, file *os.File, identity os.FileInfo, relative, quarantineBase string, strictControl bool, verify func() error) error {
 	if root == nil || directory == nil || file == nil || identity == nil || verify == nil {
 		return errors.New("projection state removal binding is incomplete")
 	}
 	if filepath.Base(relative) != relative || relative == "" || relative == "." ||
 		filepath.Base(quarantineBase) != quarantineBase || quarantineBase == "" || quarantineBase == "." {
 		return errors.New("projection state removal coordinate is invalid")
+	}
+	if strictControl {
+		if _, err := admitDerivedStateControlFile(identity, "projection state removal control file"); err != nil {
+			return err
+		}
+	}
+	verifyRemovalIdentity := func(quarantined, opened os.FileInfo, phase string) error {
+		if quarantined == nil || opened == nil ||
+			quarantined.Mode()&os.ModeSymlink != 0 || !quarantined.Mode().IsRegular() ||
+			!os.SameFile(identity, quarantined) || !os.SameFile(identity, opened) {
+			return fmt.Errorf("projection state file changed %s", phase)
+		}
+		if !strictControl {
+			return nil
+		}
+		_, quarantinedErr := admitDerivedStateControlFile(quarantined, "quarantined projection state control file")
+		_, openedErr := admitDerivedStateControlFile(opened, "opened projection state control file")
+		if quarantinedErr != nil || openedErr != nil ||
+			!sameDerivedStateControlFileSecurity(identity, quarantined) ||
+			!sameDerivedStateControlFileSecurity(identity, opened) {
+			return errors.Join(quarantinedErr, openedErr, fmt.Errorf("projection state control-file security changed %s", phase))
+		}
+		return nil
 	}
 	nonce, err := state.NewTransactionID()
 	if err != nil {
@@ -520,10 +551,8 @@ func commitExactPrivateStateFileRemovalAt(root *os.Root, directory, file *os.Fil
 	}
 	quarantined, lstatErr := root.Lstat(quarantine)
 	opened, statErr := file.Stat()
-	if lstatErr != nil || statErr != nil || quarantined == nil || opened == nil ||
-		quarantined.Mode()&os.ModeSymlink != 0 || !quarantined.Mode().IsRegular() ||
-		!os.SameFile(identity, quarantined) || !os.SameFile(identity, opened) {
-		return restore(errors.Join(lstatErr, statErr, errors.New("projection state file changed before removal commit")))
+	if identityErr := verifyRemovalIdentity(quarantined, opened, "before removal commit"); lstatErr != nil || statErr != nil || identityErr != nil {
+		return restore(errors.Join(lstatErr, statErr, identityErr))
 	}
 	if err := verify(); err != nil {
 		return restore(err)
@@ -533,10 +562,8 @@ func commitExactPrivateStateFileRemovalAt(root *os.Root, directory, file *os.Fil
 	}
 	quarantined, lstatErr = root.Lstat(quarantine)
 	opened, statErr = file.Stat()
-	if lstatErr != nil || statErr != nil || quarantined == nil || opened == nil ||
-		quarantined.Mode()&os.ModeSymlink != 0 || !quarantined.Mode().IsRegular() ||
-		!os.SameFile(identity, quarantined) || !os.SameFile(identity, opened) {
-		return restore(errors.Join(lstatErr, statErr, errors.New("projection state quarantine changed before removal")))
+	if identityErr := verifyRemovalIdentity(quarantined, opened, "before removal"); lstatErr != nil || statErr != nil || identityErr != nil {
+		return restore(errors.Join(lstatErr, statErr, identityErr))
 	}
 	if err := directory.Sync(); err != nil {
 		return restore(fmt.Errorf("sync projection state removal commit: %w", err))
@@ -551,9 +578,8 @@ func commitExactPrivateStateFileRemovalAt(root *os.Root, directory, file *os.Fil
 	}
 	quarantined, lstatErr = root.Lstat(quarantine)
 	opened, statErr = file.Stat()
-	if lstatErr != nil || statErr != nil || quarantined == nil || opened == nil ||
-		!os.SameFile(identity, quarantined) || !os.SameFile(identity, opened) {
-		return restore(errors.Join(lstatErr, statErr, errors.New("projection state quarantine changed before unlink")))
+	if identityErr := verifyRemovalIdentity(quarantined, opened, "before unlink"); lstatErr != nil || statErr != nil || identityErr != nil {
+		return restore(errors.Join(lstatErr, statErr, identityErr))
 	}
 	if err := verify(); err != nil {
 		return restore(err)
@@ -563,10 +589,8 @@ func commitExactPrivateStateFileRemovalAt(root *os.Root, directory, file *os.Fil
 	}
 	quarantined, lstatErr = root.Lstat(quarantine)
 	opened, statErr = file.Stat()
-	if lstatErr != nil || statErr != nil || quarantined == nil || opened == nil ||
-		quarantined.Mode()&os.ModeSymlink != 0 || !quarantined.Mode().IsRegular() ||
-		!os.SameFile(identity, quarantined) || !os.SameFile(identity, opened) {
-		return restore(errors.Join(lstatErr, statErr, errors.New("projection state quarantine changed at unlink boundary")))
+	if identityErr := verifyRemovalIdentity(quarantined, opened, "at unlink boundary"); lstatErr != nil || statErr != nil || identityErr != nil {
+		return restore(errors.Join(lstatErr, statErr, identityErr))
 	}
 	if err := root.Remove(quarantine); err != nil {
 		return restore(fmt.Errorf("remove exact projection state quarantine: %w", err))
@@ -698,16 +722,19 @@ func readExactOpenProjectionIntent(file *os.File, identity os.FileInfo, maximum 
 }
 
 func privateExactProjectionIntent(info os.FileInfo, maximum int64) bool {
-	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() &&
+	_, admissionErr := admitDerivedStateControlFile(info, "projection intent")
+	return admissionErr == nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() &&
 		info.Mode().Perm()&0o077 == 0 && info.Size() > 0 && info.Size() <= maximum
 }
 
 func privateExactProjectionStage(info os.FileInfo, expectedSize int64) bool {
-	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() &&
+	_, admissionErr := admitDerivedStateControlFile(info, "projection stage")
+	return admissionErr == nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() &&
 		info.Mode().Perm()&0o077 == 0 && info.Size() == expectedSize
 }
 
 func privateExactProjectionResidue(info os.FileInfo, maximum int64) bool {
-	return info != nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() && info.Mode().Perm()&0o077 == 0 &&
+	_, admissionErr := admitDerivedStateControlFile(info, "projection residue")
+	return admissionErr == nil && info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() && info.Mode().Perm()&0o077 == 0 &&
 		(maximum < 0 || info.Size() <= maximum)
 }

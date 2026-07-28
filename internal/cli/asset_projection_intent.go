@@ -379,6 +379,20 @@ func installProjectionStageReader(stateRoot, relative string, expected repositor
 			result = repository.Object{}
 		}
 	}()
+	if projectionStageInstallHook != nil {
+		if err := projectionStageInstallHook("before-chmod", filepath.Join(stateRoot, temporary)); err != nil {
+			return result, installed, err
+		}
+	}
+	if _, err := verifyBoundDerivedStateControlFile(
+		root,
+		temporary,
+		file,
+		createdIdentity,
+		"pending projection stage temporary before chmod",
+	); err != nil {
+		return result, installed, err
+	}
 	if err := file.Chmod(0o600); err != nil {
 		return result, installed, err
 	}
@@ -392,6 +406,20 @@ func installProjectionStageReader(stateRoot, relative string, expected repositor
 	}
 	createdIdentity = identity
 	installed.inode = identity
+	if projectionStageInstallHook != nil {
+		if err := projectionStageInstallHook("before-write", filepath.Join(stateRoot, temporary)); err != nil {
+			return result, installed, err
+		}
+	}
+	if _, err := verifyBoundDerivedStateControlFile(
+		root,
+		temporary,
+		file,
+		createdIdentity,
+		"pending projection stage temporary before write",
+	); err != nil {
+		return result, installed, err
+	}
 	hasher := sha256.New()
 	written, copyErr := io.CopyBuffer(io.MultiWriter(file, hasher), io.LimitReader(input, expected.Size+1), make([]byte, 256*1024))
 	if copyErr != nil || written != expected.Size || hex.EncodeToString(hasher.Sum(nil)) != expected.HashString() {

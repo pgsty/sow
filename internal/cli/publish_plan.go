@@ -2012,6 +2012,9 @@ func cacheDerivedStateDirectoryIdentity(info os.FileInfo) (derivedStateDirectory
 	if info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return derivedStateDirectoryCachedIdentity{}, false
 	}
+	if _, err := admitDerivedStateDirectory(info, "derived state recovery-cache directory"); err != nil {
+		return derivedStateDirectoryCachedIdentity{}, false
+	}
 	token, ok := derivedStateDirectoryIdentityToken(info)
 	if !ok {
 		return derivedStateDirectoryCachedIdentity{}, false
@@ -2023,7 +2026,7 @@ func sameCachedDerivedStateDirectoryIdentity(cached derivedStateDirectoryCachedI
 	token, ok := derivedStateDirectoryIdentityToken(current)
 	return ok && cached.info != nil && !cached.validUntil.IsZero() && time.Now().Before(cached.validUntil) &&
 		os.SameFile(cached.info, current) &&
-		cached.info.Mode() == current.Mode() && cached.token == token
+		sameDerivedStateDirectorySecurity(cached.info, current) && cached.token == token
 }
 
 type derivedStateDirectoryMutationGuard struct {
@@ -2061,8 +2064,15 @@ func (g *derivedStateDirectoryMutationGuard) current() (os.FileInfo, error) {
 	current, lstatErr := g.root.Lstat(g.relative)
 	if statErr != nil || lstatErr != nil || fresh == nil || current == nil ||
 		!os.SameFile(g.expected, fresh) || !os.SameFile(g.expected, current) ||
-		fresh.Mode() != g.expected.Mode() || current.Mode() != g.expected.Mode() {
+		!sameDerivedStateDirectorySecurity(g.expected, fresh) ||
+		!sameDerivedStateDirectorySecurity(g.expected, current) {
 		return nil, errors.Join(statErr, lstatErr, errors.New("derived state directory changed across mutation guard"))
+	}
+	if _, err := admitDerivedStateDirectory(fresh, "bound derived state mutation directory"); err != nil {
+		return nil, err
+	}
+	if _, err := admitDerivedStateDirectory(current, "current derived state mutation directory"); err != nil {
+		return nil, err
 	}
 	return fresh, nil
 }
@@ -2231,6 +2241,12 @@ func writeDerivedStateFileTransaction(stateRoot, relative string, body []byte, r
 	if err != nil || rootBefore.Mode()&os.ModeSymlink != 0 || !rootBefore.IsDir() {
 		return errors.Join(err, errors.New("derived state root is not a real directory"))
 	}
+	if err := verifyDerivedStateImmediateParent(stateRoot); err != nil {
+		return err
+	}
+	if _, err := admitDerivedStateDirectory(rootBefore, "derived state root"); err != nil {
+		return err
+	}
 	root, err := os.OpenRoot(stateRoot)
 	if err != nil {
 		return err
@@ -2320,6 +2336,15 @@ func writeDerivedStateFileTransaction(stateRoot, relative string, body []byte, r
 	if err := mutationGuard.admitKnownMutation(); err != nil {
 		return err
 	}
+	if _, err := verifyBoundDerivedStateControlFile(
+		parent,
+		temporary,
+		file,
+		identity,
+		"derived state temporary before chmod",
+	); err != nil {
+		return err
+	}
 	if err := file.Chmod(0o600); err != nil {
 		return err
 	}
@@ -2327,7 +2352,9 @@ func writeDerivedStateFileTransaction(stateRoot, relative string, body []byte, r
 	current, lstatErr := parent.Lstat(temporary)
 	if statErr != nil || lstatErr != nil || hardened == nil || current == nil ||
 		!os.SameFile(identity, hardened) || !os.SameFile(identity, current) ||
-		hardened.Mode() != 0o600 || current.Mode() != 0o600 {
+		hardened.Mode() != 0o600 || current.Mode() != 0o600 ||
+		!sameDerivedStateControlFileAuthority(identity, hardened) ||
+		!sameDerivedStateControlFileAuthority(identity, current) {
 		return errors.Join(statErr, lstatErr, errors.New("derived state temporary did not acquire its exact private mode"))
 	}
 	identity = hardened
@@ -2335,6 +2362,15 @@ func writeDerivedStateFileTransaction(stateRoot, relative string, body []byte, r
 		if err := derivedStateWriteHook(filepath.Join(directory, temporary)); err != nil {
 			return err
 		}
+	}
+	if _, err := verifyBoundDerivedStateControlFile(
+		parent,
+		temporary,
+		file,
+		identity,
+		"derived state temporary before write",
+	); err != nil {
+		return err
 	}
 	written, err := file.Write(body)
 	if err != nil || written != expectedSize {
@@ -2347,7 +2383,9 @@ func writeDerivedStateFileTransaction(stateRoot, relative string, body []byte, r
 	current, lstatErr = parent.Lstat(temporary)
 	if statErr != nil || lstatErr != nil || after == nil || current == nil ||
 		!os.SameFile(identity, after) || !os.SameFile(identity, current) || after.Size() != int64(expectedSize) ||
-		after.Mode() != 0o600 || current.Mode() != 0o600 {
+		after.Mode() != 0o600 || current.Mode() != 0o600 ||
+		!sameDerivedStateControlFileSecurity(identity, after) ||
+		!sameDerivedStateControlFileSecurity(identity, current) {
 		return errors.Join(statErr, lstatErr, errors.New("derived state temporary changed while writing"))
 	}
 	identity = after
@@ -2452,7 +2490,8 @@ func markDerivedStateDirectoryRecoveryClean(
 	current, lstatErr := root.Lstat(relative)
 	if statErr != nil || lstatErr != nil || fresh == nil || current == nil ||
 		!os.SameFile(expected, fresh) || !os.SameFile(expected, current) ||
-		fresh.Mode() != expected.Mode() || current.Mode() != expected.Mode() {
+		!sameDerivedStateDirectorySecurity(expected, fresh) ||
+		!sameDerivedStateDirectorySecurity(expected, current) {
 		return errors.Join(statErr, lstatErr, errors.New("derived state directory changed before final recovery cache admission"))
 	}
 	freshToken, tokenOK := derivedStateDirectoryIdentityToken(fresh)
@@ -2488,7 +2527,8 @@ func markDerivedStateDirectoryRecoveryClean(
 	finalPathIdentity, finalPathErr := root.Lstat(relative)
 	if finalStatErr != nil || finalPathErr != nil || finalIdentity == nil || finalPathIdentity == nil ||
 		!os.SameFile(expected, finalIdentity) || !os.SameFile(expected, finalPathIdentity) ||
-		finalIdentity.Mode() != expected.Mode() || finalPathIdentity.Mode() != expected.Mode() {
+		!sameDerivedStateDirectorySecurity(expected, finalIdentity) ||
+		!sameDerivedStateDirectorySecurity(expected, finalPathIdentity) {
 		return errors.Join(finalStatErr, finalPathErr, errors.New("derived state directory changed at final recovery cache admission"))
 	}
 	finalToken, finalTokenOK := derivedStateDirectoryIdentityToken(finalIdentity)
@@ -2538,7 +2578,8 @@ func bindOrCreateDurableDerivedStateDirectory(root *os.Root, stateRoot string, r
 		return nil, nil, nil, err
 	}
 	currentIdentity, err := current.Stat(".")
-	if err != nil || currentIdentity == nil || !os.SameFile(rootIdentity, currentIdentity) || currentIdentity.Mode() != rootIdentity.Mode() {
+	if err != nil || currentIdentity == nil || !os.SameFile(rootIdentity, currentIdentity) ||
+		!sameDerivedStateDirectorySecurity(rootIdentity, currentIdentity) {
 		_ = current.Close()
 		return nil, nil, nil, errors.Join(err, errors.New("derived state root changed while starting directory traversal"))
 	}
@@ -2818,7 +2859,10 @@ func createBoundDerivedStateDirectoryStage(root, parent *os.Root, stateRoot, par
 		pathCurrent, pathErr := parent.Lstat(name)
 		if hardenedErr != nil || stageErr != nil || pathErr != nil || hardened == nil || stageCurrent == nil || pathCurrent == nil ||
 			hardened.Mode() != os.ModeDir|0o700 || stageCurrent.Mode() != os.ModeDir|0o700 || pathCurrent.Mode() != os.ModeDir|0o700 ||
-			!os.SameFile(before, hardened) || !os.SameFile(before, stageCurrent) || !os.SameFile(before, pathCurrent) {
+			!os.SameFile(before, hardened) || !os.SameFile(before, stageCurrent) || !os.SameFile(before, pathCurrent) ||
+			!sameDerivedStateDirectoryAuthority(before, hardened) ||
+			!sameDerivedStateDirectoryAuthority(before, stageCurrent) ||
+			!sameDerivedStateDirectoryAuthority(before, pathCurrent) {
 			_ = handle.Close()
 			_ = stage.Close()
 			return name, stageKey, nil, nil, nil, errors.Join(hardenedErr, stageErr, pathErr, fmt.Errorf("derived state directory stage %s requires replay recovery after failing exact private mode", stageRelative))
@@ -2955,7 +2999,10 @@ func recoverDerivedStateDirectoryStages(root, parent *os.Root, parentHandle *os.
 				pathCurrent, pathErr := parent.Lstat(name)
 				if hardenedErr != nil || stageErr != nil || pathErr != nil || hardened == nil || stageCurrent == nil || pathCurrent == nil ||
 					hardened.Mode() != os.ModeDir|0o700 || stageCurrent.Mode() != os.ModeDir|0o700 || pathCurrent.Mode() != os.ModeDir|0o700 ||
-					!os.SameFile(before, hardened) || !os.SameFile(before, stageCurrent) || !os.SameFile(before, pathCurrent) {
+					!os.SameFile(before, hardened) || !os.SameFile(before, stageCurrent) || !os.SameFile(before, pathCurrent) ||
+					!sameDerivedStateDirectoryAuthority(before, hardened) ||
+					!sameDerivedStateDirectoryAuthority(before, stageCurrent) ||
+					!sameDerivedStateDirectoryAuthority(before, pathCurrent) {
 					_ = handle.Close()
 					_ = stage.Close()
 					cause := errors.Join(hardenedErr, stageErr, pathErr, fmt.Errorf("crash residue %s changed while repairing private mode", stageRelative))
@@ -3005,7 +3052,8 @@ func recoverDerivedStateDirectoryStages(root, parent *os.Root, parentHandle *os.
 	finalPathIdentity, finalPathErr := root.Lstat(parentRelative)
 	if finalStatErr != nil || finalPathErr != nil || finalIdentity == nil || finalPathIdentity == nil ||
 		!os.SameFile(parentIdentity, finalIdentity) || !os.SameFile(parentIdentity, finalPathIdentity) ||
-		finalIdentity.Mode() != parentIdentity.Mode() || finalPathIdentity.Mode() != parentIdentity.Mode() {
+		!sameDerivedStateDirectorySecurity(parentIdentity, finalIdentity) ||
+		!sameDerivedStateDirectorySecurity(parentIdentity, finalPathIdentity) {
 		return errors.Join(finalStatErr, finalPathErr, errors.New("derived state directory changed after recovery scan"))
 	}
 	for dirty := range derivedStateDirectoryStageState.dirty {
@@ -3310,8 +3358,18 @@ func verifyBoundDerivedStateRoot(root *os.Root, path string, expected os.FileInf
 		opened.Mode()&os.ModeSymlink != 0 || current.Mode()&os.ModeSymlink != 0 ||
 		!opened.IsDir() || !current.IsDir() ||
 		!os.SameFile(expected, opened) || !os.SameFile(expected, current) ||
-		opened.Mode() != expected.Mode() || current.Mode() != expected.Mode() {
+		!sameDerivedStateDirectorySecurity(expected, opened) ||
+		!sameDerivedStateDirectorySecurity(expected, current) {
 		return errors.Join(statErr, lstatErr, errors.New("derived state root coordinate changed"))
+	}
+	if err := verifyDerivedStateImmediateParent(path); err != nil {
+		return err
+	}
+	if _, err := admitDerivedStateDirectory(opened, "bound derived state root"); err != nil {
+		return err
+	}
+	if _, err := admitDerivedStateDirectory(current, "current derived state root"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -3341,8 +3399,15 @@ func verifyBoundDerivedStateDirectory(root *os.Root, directory *os.File, relativ
 		opened.Mode()&os.ModeSymlink != 0 || current.Mode()&os.ModeSymlink != 0 ||
 		!opened.IsDir() || !current.IsDir() ||
 		!os.SameFile(expected, opened) || !os.SameFile(expected, current) ||
-		opened.Mode() != expected.Mode() || current.Mode() != expected.Mode() {
+		!sameDerivedStateDirectorySecurity(expected, opened) ||
+		!sameDerivedStateDirectorySecurity(expected, current) {
 		return errors.Join(statErr, lstatErr, errors.New("derived state directory coordinate changed"))
+	}
+	if _, err := admitDerivedStateDirectory(opened, "bound derived state control directory"); err != nil {
+		return err
+	}
+	if _, err := admitDerivedStateDirectory(current, "current derived state control directory"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -3361,7 +3426,8 @@ func verifyExactDerivedStateBytes(file *os.File, expected os.FileInfo, expectedD
 	copy(actual[:], hasher.Sum(nil))
 	if readErr != nil || statErr != nil || after == nil || written != expected.Size() || actual != expectedDigest ||
 		!os.SameFile(expected, after) || after.Size() != expected.Size() ||
-		after.Mode() != expected.Mode() || !after.ModTime().Equal(expected.ModTime()) {
+		after.Mode() != expected.Mode() || !after.ModTime().Equal(expected.ModTime()) ||
+		!sameDerivedStateControlFileSecurity(expected, after) {
 		return errors.Join(readErr, statErr, errors.New("derived state install candidate bytes changed before publication"))
 	}
 	return nil
@@ -3379,6 +3445,9 @@ func removeExactDerivedStateTemporary(parent *os.Root, name string, expected os.
 		current.Mode().Perm()&0o077 != 0 || !os.SameFile(expected, current) {
 		return errors.Join(err, errors.New("derived state temporary was replaced; refuse cleanup"))
 	}
+	if _, err := admitDerivedStateControlFile(current, fmt.Sprintf("derived state temporary %s", name)); err != nil {
+		return err
+	}
 	file, err := parent.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
@@ -3387,7 +3456,9 @@ func removeExactDerivedStateTemporary(parent *os.Root, name string, expected os.
 	opened, statErr := file.Stat()
 	current, lstatErr := parent.Lstat(name)
 	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
-		!os.SameFile(expected, opened) || !os.SameFile(expected, current) {
+		!os.SameFile(expected, opened) || !os.SameFile(expected, current) ||
+		!sameDerivedStateControlFileSecurity(expected, opened) ||
+		!sameDerivedStateControlFileSecurity(expected, current) {
 		return errors.Join(statErr, lstatErr, errors.New("derived state temporary changed before cleanup"))
 	}
 	directory, err := parent.Open(".")
@@ -3398,7 +3469,8 @@ func removeExactDerivedStateTemporary(parent *os.Root, name string, expected os.
 	return commitExactPrivateStateFileRemoval(parent, directory, file, expected, name, func() error {
 		after, err := file.Stat()
 		if err != nil || after == nil || !os.SameFile(expected, after) ||
-			after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() || after.Mode().Perm()&0o077 != 0 {
+			after.Mode()&os.ModeSymlink != 0 || !after.Mode().IsRegular() || after.Mode().Perm()&0o077 != 0 ||
+			!sameDerivedStateControlFileSecurity(expected, after) {
 			return errors.Join(err, errors.New("derived state temporary changed during cleanup"))
 		}
 		return nil

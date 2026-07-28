@@ -1156,15 +1156,19 @@ func removeMaterializationSelectionJournal(stateRoot string) error {
 	if err != nil || !exists {
 		return errors.Join(err, errors.New("materialization journal directory is missing"))
 	}
-	filename := filepath.Join(directory, "active.json")
-	info, err := os.Lstat(filename)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
-		return errors.Join(err, errors.New("materialization journal is not an exact regular file"))
-	}
-	if err := os.Remove(filename); err != nil {
-		return err
-	}
-	return syncLocalDirectory(directory)
+	return removeExactProjectionIntent(directory, "active.json", materializationSelectionJournalMaxBytes, func(body []byte) error {
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		var journal materializationSelectionJournal
+		if err := decoder.Decode(&journal); err != nil {
+			return err
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+			return errors.New("materialization selection journal has trailing JSON")
+		}
+		return journal.validate()
+	})
 }
 
 func cleanupMaterializationSelectionJournalTemps(stateRoot string) error {
@@ -1197,49 +1201,10 @@ func cleanupMaterializationSelectionJournalTemps(stateRoot string) error {
 }
 
 func materializationSelectionJournalDirectory(stateRoot string, create bool) (string, bool, error) {
-	stateAbs, err := filepath.Abs(stateRoot)
-	if err != nil {
-		return "", false, err
-	}
-	stateInfo, err := os.Lstat(stateAbs)
-	if errors.Is(err, os.ErrNotExist) && !create {
-		return filepath.Join(stateAbs, "materialization-journal"), false, nil
-	}
-	if err != nil || !stateInfo.IsDir() || stateInfo.Mode()&os.ModeSymlink != 0 {
-		return "", false, errors.Join(err, errors.New("state root is not a real directory"))
-	}
-	root, err := os.OpenRoot(stateAbs)
-	if err != nil {
-		return "", false, err
-	}
-	defer root.Close()
-	const relative = "materialization-journal"
-	info, err := root.Lstat(relative)
-	created := false
-	if errors.Is(err, os.ErrNotExist) && !create {
-		return filepath.Join(stateAbs, relative), false, nil
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		if err := root.Mkdir(relative, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-			return "", false, err
-		}
-		created = true
-		info, err = root.Lstat(relative)
-	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
-		return "", false, errors.Join(err, errors.New("materialization journal parent is not a real directory"))
-	}
-	if created {
-		// Persist the directory entry itself before a fence can be relied on.
-		// writeDerivedStateFile subsequently fsyncs the leaf directory after
-		// installing active.json; both levels are required for crash durability.
-		stateDirectory, syncErr := os.Open(stateAbs)
-		if syncErr != nil {
-			return "", false, syncErr
-		}
-		if syncErr = errors.Join(stateDirectory.Sync(), stateDirectory.Close()); syncErr != nil {
-			return "", false, syncErr
-		}
-	}
-	return filepath.Join(stateAbs, relative), true, nil
+	return ensureDerivedStateControlDirectory(
+		stateRoot,
+		"materialization-journal",
+		"materialization selection journal directory",
+		create,
+	)
 }

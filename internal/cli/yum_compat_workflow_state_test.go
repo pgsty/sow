@@ -356,6 +356,227 @@ func TestYUMCompatibilityCandidateBindingRejectsParentReplacementWithoutRedirect
 	}
 }
 
+func TestYUMCompatibilityCandidateBindingRejectsWritableParentWithoutChmod(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(parent, "candidate")
+	if _, err := openYUMCompatibilityCandidateBinding(&config.Config{Root: t.TempDir()}, output); err == nil ||
+		!strings.Contains(err.Error(), "group/other writable") {
+		t.Fatalf("writable candidate parent was admitted: %v", err)
+	}
+	info, err := os.Lstat(parent)
+	if err != nil || info.Mode().Perm() != 0o777 {
+		t.Fatalf("unsafe candidate parent was mutated: mode=%v err=%v", info.Mode().Perm(), err)
+	}
+}
+
+func TestYUMCompatibilityCandidateJournalRejectsHardlinkAlias(t *testing.T) {
+	parent := t.TempDir()
+	output := filepath.Join(parent, "candidate")
+	id := "infra-legacy-x86-64"
+	binding := testYUMCompatibilityCandidateBinding(t, output)
+	if _, err := createYUMCompatibilityCandidateJournal(id, binding); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := yumCompatibilityCandidateJournalPath(output)
+	alias := filepath.Join(t.TempDir(), "candidate-journal-alias")
+	if err := os.Link(journalPath, alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readYUMCompatibilityCandidateJournal(binding, id); err == nil ||
+		!strings.Contains(err.Error(), "link count") {
+		t.Fatalf("hardlink-aliased candidate journal was read: %v", err)
+	}
+	if err := removeYUMCompatibilityCandidateJournal(binding); err == nil ||
+		!strings.Contains(err.Error(), "link count") {
+		t.Fatalf("hardlink-aliased candidate journal was removed: %v", err)
+	}
+	left, leftErr := os.Lstat(journalPath)
+	right, rightErr := os.Lstat(alias)
+	if leftErr != nil || rightErr != nil || !os.SameFile(left, right) {
+		t.Fatalf("candidate journal alias evidence was not preserved: left=%v right=%v", leftErr, rightErr)
+	}
+}
+
+func TestYUMCompatibilityCandidatePhaseExchangeRejectsDestinationAlias(t *testing.T) {
+	parent := t.TempDir()
+	output := filepath.Join(parent, "candidate")
+	id := "infra-legacy-x86-64"
+	binding := testYUMCompatibilityCandidateBinding(t, output)
+	journal, err := createYUMCompatibilityCandidateJournal(id, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := yumCompatibilityCandidateJournalPath(binding.output)
+	before, err := os.ReadFile(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "candidate-phase-alias")
+	previous := derivedStateControlBeforeExchangeHook
+	fired := false
+	derivedStateControlBeforeExchangeHook = func(_, destination string) error {
+		if fired || destination != filepath.Base(base) {
+			return nil
+		}
+		fired = true
+		return os.Link(base, alias)
+	}
+	t.Cleanup(func() { derivedStateControlBeforeExchangeHook = previous })
+	journal.Phase = yumCompatibilityCandidatePrepared
+	if err := writeYUMCompatibilityCandidateJournal(binding, journal, false); err == nil ||
+		!strings.Contains(err.Error(), "link count") {
+		t.Fatalf("hardlink-aliased candidate phase destination was overwritten: %v", err)
+	}
+	derivedStateControlBeforeExchangeHook = previous
+	if !fired {
+		t.Fatal("candidate destination race was not injected")
+	}
+	assertUnchangedHardlinkEvidence(t, base, alias, before)
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeYUMCompatibilityCandidateJournal(binding, journal, false); err != nil {
+		t.Fatalf("candidate phase retry after removing alias: %v", err)
+	}
+	observed, exists, err := readYUMCompatibilityCandidateJournal(binding, id)
+	if err != nil || !exists || observed.Phase != yumCompatibilityCandidatePrepared {
+		t.Fatalf("candidate phase retry observed=%+v exists=%t err=%v", observed, exists, err)
+	}
+}
+
+func TestYUMCompatibilityBoundCutoverJournalRejectsHardlinkAlias(t *testing.T) {
+	statePath := t.TempDir()
+	root, err := os.OpenRoot(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	id := "infra-legacy-x86-64"
+	name, err := yumCompatibilityCutoverJournalName(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := yumCompatibilityCutoverJournal{
+		Schema: yumCompatibilityCutoverJournalSchema, ID: id, Action: "cutover",
+		Phase: yumCompatibilityCutoverPrepared, EventSHA256: strings.Repeat("a", 64),
+		ServingLink: "/tmp/serving", FromTarget: "/tmp/raw", ToTarget: "/tmp/candidate",
+	}
+	body, err := json.Marshal(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(statePath, name), append(body, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "cutover-journal-alias")
+	if err := os.Link(filepath.Join(statePath, name), alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := readYUMCompatibilityCutoverJournalBoundAt(root, name, id); err == nil ||
+		!strings.Contains(err.Error(), "link count") {
+		t.Fatalf("hardlink-aliased cutover journal was read: %v", err)
+	}
+	info, err := root.Lstat(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := removeExactYUMCompatibilityBoundControlFile(root, name, info); err == nil ||
+		!strings.Contains(err.Error(), "link count") {
+		t.Fatalf("hardlink-aliased cutover journal was removed: %v", err)
+	}
+	left, leftErr := os.Lstat(filepath.Join(statePath, name))
+	right, rightErr := os.Lstat(alias)
+	if leftErr != nil || rightErr != nil || !os.SameFile(left, right) {
+		t.Fatalf("cutover journal alias evidence was not preserved: left=%v right=%v", leftErr, rightErr)
+	}
+}
+
+func TestYUMCompatibilityControlWritersRejectHardlinkBeforeWrite(t *testing.T) {
+	t.Run("candidate", func(t *testing.T) {
+		parent := t.TempDir()
+		output := filepath.Join(parent, "candidate")
+		binding := testYUMCompatibilityCandidateBinding(t, output)
+		control := yumCompatibilityCandidateJournalPath(binding.output)
+		alias := filepath.Join(t.TempDir(), "candidate-control-alias")
+		previous := derivedStateControlBeforeWriteHook
+		fired := false
+		derivedStateControlBeforeWriteHook = func(kind, name string) error {
+			if fired || kind != "yum-candidate" || name != control {
+				return nil
+			}
+			fired = true
+			return os.Link(control, alias)
+		}
+		t.Cleanup(func() { derivedStateControlBeforeWriteHook = previous })
+
+		if _, err := binding.writeExclusiveControl(control, []byte("must not reach alias\n")); err == nil ||
+			!strings.Contains(err.Error(), "link count") {
+			t.Fatalf("hardlink-aliased candidate control was written: %v", err)
+		}
+		derivedStateControlBeforeWriteHook = previous
+		if !fired {
+			t.Fatal("candidate hardlink race was not injected")
+		}
+		assertEmptyHardlinkEvidence(t, control, alias)
+	})
+
+	t.Run("bound", func(t *testing.T) {
+		statePath := t.TempDir()
+		root, err := os.OpenRoot(statePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer root.Close()
+		name := "bound-control.next"
+		control := filepath.Join(statePath, name)
+		alias := filepath.Join(t.TempDir(), "bound-control-alias")
+		previous := derivedStateControlBeforeWriteHook
+		fired := false
+		derivedStateControlBeforeWriteHook = func(kind, observed string) error {
+			if fired || kind != "yum-bound" || observed != name {
+				return nil
+			}
+			fired = true
+			return os.Link(control, alias)
+		}
+		t.Cleanup(func() { derivedStateControlBeforeWriteHook = previous })
+
+		if _, err := writeYUMCompatibilityBoundControlFile(root, name, []byte("must not reach alias\n")); err == nil ||
+			!strings.Contains(err.Error(), "link count") {
+			t.Fatalf("hardlink-aliased bound control was written: %v", err)
+		}
+		derivedStateControlBeforeWriteHook = previous
+		if !fired {
+			t.Fatal("bound hardlink race was not injected")
+		}
+		assertEmptyHardlinkEvidence(t, control, alias)
+	})
+}
+
+func assertEmptyHardlinkEvidence(t *testing.T, control, alias string) {
+	t.Helper()
+	left, leftErr := os.Lstat(control)
+	right, rightErr := os.Lstat(alias)
+	if leftErr != nil || rightErr != nil || left == nil || right == nil ||
+		!os.SameFile(left, right) || left.Size() != 0 || right.Size() != 0 {
+		t.Fatalf("hardlink evidence changed: left=%v right=%v errors=%v/%v", left, right, leftErr, rightErr)
+	}
+}
+
+func assertUnchangedHardlinkEvidence(t *testing.T, control, alias string, before []byte) {
+	t.Helper()
+	left, leftErr := os.Lstat(control)
+	right, rightErr := os.Lstat(alias)
+	after, readErr := os.ReadFile(control)
+	if leftErr != nil || rightErr != nil || readErr != nil || left == nil || right == nil ||
+		!os.SameFile(left, right) || !bytes.Equal(after, before) {
+		t.Fatalf("hardlink destination evidence changed: before=%q after=%q left=%v right=%v errors=%v/%v/%v", before, after, left, right, leftErr, rightErr, readErr)
+	}
+}
+
 func TestYUMCompatibilityCandidateRecoveryRejectsCrossProcessParentClone(t *testing.T) {
 	parent := t.TempDir()
 	output := filepath.Join(parent, "candidate")
@@ -573,8 +794,8 @@ func TestYUMCompatibilityMutationBoundaryRejectsRepositoryRootSwap(t *testing.T)
 	if err := workflow.closeMutationRoots(); err != nil {
 		t.Fatal(err)
 	}
-	if err := first.Release(); err != nil {
-		t.Fatal(err)
+	if err := first.Release(); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("first holder released through a replaced repository coordinate: %v", err)
 	}
 	if current, err := os.Lstat(replacementLock); err != nil || !os.SameFile(replacementLockInfo, current) {
 		t.Fatalf("first holder removed replacement lock: %v", err)
@@ -590,6 +811,15 @@ func TestYUMCompatibilityMutationBoundaryRejectsRepositoryRootSwap(t *testing.T)
 	}
 	if err := second.Release(); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.RemoveAll(repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(displaced, repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("first holder could not release after restoring its exact coordinate: %v", err)
 	}
 }
 
@@ -669,14 +899,23 @@ func TestYUMCompatibilityCanonicalCommitAfterAdmissionCannotWriteReplacementRoot
 	if err := workflow.closeMutationRoots(); err != nil {
 		t.Fatal(err)
 	}
-	if err := first.Release(); err != nil {
-		t.Fatal(err)
+	if err := first.Release(); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("first holder released through a replaced repository coordinate: %v", err)
 	}
 	if second == nil {
 		t.Fatal("replacement lock was not acquired")
 	}
 	if err := second.Release(); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.RemoveAll(repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(displaced, repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("first holder could not release after restoring its exact coordinate: %v", err)
 	}
 }
 
@@ -735,14 +974,23 @@ func TestYUMCompatibilityCutoverJournalAfterAdmissionCannotWriteReplacementRoot(
 	if err := workflow.closeMutationRoots(); err != nil {
 		t.Fatal(err)
 	}
-	if err := first.Release(); err != nil {
-		t.Fatal(err)
+	if err := first.Release(); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("first holder released through a replaced repository coordinate: %v", err)
 	}
 	if second == nil {
 		t.Fatal("replacement lock was not acquired")
 	}
 	if err := second.Release(); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.RemoveAll(repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(displaced, repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("first holder could not release after restoring its exact coordinate: %v", err)
 	}
 }
 
@@ -813,14 +1061,23 @@ func TestYUMCompatibilityCASCommitAfterAdmissionCannotWriteReplacementRoot(t *te
 	if err := workflow.closeMutationRoots(); err != nil {
 		t.Fatal(err)
 	}
-	if err := first.Release(); err != nil {
-		t.Fatal(err)
+	if err := first.Release(); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("first holder released through a replaced repository coordinate: %v", err)
 	}
 	if second == nil {
 		t.Fatal("replacement lock was not acquired")
 	}
 	if err := second.Release(); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.RemoveAll(repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(displaced, repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("first holder could not release after restoring its exact coordinate: %v", err)
 	}
 }
 
@@ -1037,14 +1294,23 @@ func TestYUMCompatibilityMaterializeAfterAdmissionCannotWriteReplacementRoot(t *
 	if err := workflow.closeMutationRoots(); err != nil {
 		t.Fatal(err)
 	}
-	if err := first.Release(); err != nil {
-		t.Fatal(err)
+	if err := first.Release(); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("first holder released through a replaced repository coordinate: %v", err)
 	}
 	if second == nil {
 		t.Fatal("replacement lock was not acquired")
 	}
 	if err := second.Release(); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.RemoveAll(repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(displaced, repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("first holder could not release after restoring its exact coordinate: %v", err)
 	}
 }
 
@@ -1484,11 +1750,16 @@ func TestYUMCompatibilityCutoverJournalDualFileRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	pair, err = readYUMCompatibilityCutoverJournalPair(cfg, candidate.ID, true)
-	if err != nil || !pair.MainExists || pair.NextExists {
-		t.Fatalf("same-inode atomic first-install pair did not converge: %+v err=%v", pair, err)
+	if err == nil || !strings.Contains(err.Error(), "link count") {
+		t.Fatalf("hardlink-aliased first-install pair was accepted: %+v err=%v", pair, err)
 	}
-	if _, err := os.Lstat(base + ".next"); !os.IsNotExist(err) {
-		t.Fatalf("same-inode pending link remains: %v", err)
+	baseInfo, baseErr := os.Lstat(base)
+	nextInfo, nextErr := os.Lstat(base + ".next")
+	if baseErr != nil || nextErr != nil || !os.SameFile(baseInfo, nextInfo) {
+		t.Fatalf("hardlink-aliased pair evidence was not preserved: base=%v next=%v", baseErr, nextErr)
+	}
+	if err := os.Remove(base + ".next"); err != nil {
+		t.Fatal(err)
 	}
 
 	if err := os.Remove(base); err != nil {

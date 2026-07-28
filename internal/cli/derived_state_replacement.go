@@ -177,6 +177,9 @@ func replacementIdentityFromFile(file *os.File, info os.FileInfo, knownDigest *[
 	if file == nil || info == nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return derivedStateReplacementIdentity{}, errors.New("derived state replacement identity binding is invalid")
 	}
+	if _, err := admitDerivedStateControlFile(info, "derived state replacement object"); err != nil {
+		return derivedStateReplacementIdentity{}, err
+	}
 	digest := [sha256.Size]byte{}
 	if knownDigest != nil {
 		digest = *knownDigest
@@ -189,7 +192,8 @@ func replacementIdentityFromFile(file *os.File, info os.FileInfo, knownDigest *[
 		after, statErr := file.Stat()
 		if readErr != nil || statErr != nil || after == nil || written != info.Size() ||
 			!os.SameFile(info, after) || after.Size() != info.Size() || after.Mode() != info.Mode() ||
-			!after.ModTime().Equal(info.ModTime()) {
+			!after.ModTime().Equal(info.ModTime()) ||
+			!sameDerivedStateControlFileSecurity(info, after) {
 			return derivedStateReplacementIdentity{}, errors.Join(readErr, statErr, errors.New("derived state replacement object changed while hashing"))
 		}
 		copy(digest[:], hasher.Sum(nil))
@@ -197,7 +201,8 @@ func replacementIdentityFromFile(file *os.File, info os.FileInfo, knownDigest *[
 	after, statErr := file.Stat()
 	if statErr != nil || after == nil || !os.SameFile(info, after) ||
 		after.Size() != info.Size() || after.Mode() != info.Mode() ||
-		!after.ModTime().Equal(info.ModTime()) {
+		!after.ModTime().Equal(info.ModTime()) ||
+		!sameDerivedStateControlFileSecurity(info, after) {
 		return derivedStateReplacementIdentity{}, errors.Join(statErr, errors.New("derived state replacement object changed before identity capture"))
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
@@ -226,6 +231,9 @@ func bindDerivedStateReplacementObject(parent *os.Root, name string) (*os.File, 
 	if err != nil || before == nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
 		return nil, before, derivedStateReplacementIdentity{}, errors.Join(err, errors.New("derived state replacement object is not a regular file"))
 	}
+	if _, err := admitDerivedStateControlFile(before, fmt.Sprintf("derived state replacement object %s", name)); err != nil {
+		return nil, before, derivedStateReplacementIdentity{}, err
+	}
 	file, err := parent.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, before, derivedStateReplacementIdentity{}, err
@@ -234,7 +242,8 @@ func bindDerivedStateReplacementObject(parent *os.Root, name string) (*os.File, 
 	current, lstatErr := parent.Lstat(name)
 	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
 		!os.SameFile(before, opened) || !os.SameFile(before, current) ||
-		opened.Mode() != before.Mode() || current.Mode() != before.Mode() {
+		!sameDerivedStateControlFileSecurity(before, opened) ||
+		!sameDerivedStateControlFileSecurity(before, current) {
 		file.Close()
 		return nil, opened, derivedStateReplacementIdentity{}, errors.Join(statErr, lstatErr, errors.New("derived state replacement object changed while binding"))
 	}
@@ -253,7 +262,8 @@ func verifyHeldDerivedStateReplacementObject(file *os.File, expected os.FileInfo
 	current, err := file.Stat()
 	if err != nil || current == nil || !os.SameFile(expected, current) ||
 		current.Size() != identity.Size || uint32(current.Mode()) != identity.Mode ||
-		current.ModTime().UnixNano() != identity.ModTimeNS {
+		current.ModTime().UnixNano() != identity.ModTimeNS ||
+		!sameDerivedStateControlFileSecurity(expected, current) {
 		return errors.Join(err, errors.New("derived state replacement held object changed"))
 	}
 	actual, err := replacementIdentityFromFile(file, current, nil)
@@ -344,6 +354,16 @@ func createDerivedStateReplacementCarrier(
 		file.Close()
 		return identity, err
 	}
+	if _, err := verifyBoundDerivedStateControlFile(
+		parent,
+		name,
+		file,
+		identity,
+		"derived state replacement carrier before chmod",
+	); err != nil {
+		file.Close()
+		return identity, err
+	}
 	if err := file.Chmod(0o600); err != nil {
 		file.Close()
 		return identity, err
@@ -351,9 +371,20 @@ func createDerivedStateReplacementCarrier(
 	identity, statErr = file.Stat()
 	currentAfterMode, currentModeErr := parent.Lstat(name)
 	if statErr != nil || currentModeErr != nil || identity == nil || currentAfterMode == nil ||
-		!os.SameFile(identity, currentAfterMode) || identity.Mode() != 0o600 || currentAfterMode.Mode() != 0o600 {
+		!os.SameFile(identity, currentAfterMode) || identity.Mode() != 0o600 || currentAfterMode.Mode() != 0o600 ||
+		!sameDerivedStateControlFileSecurity(identity, currentAfterMode) {
 		file.Close()
 		return identity, errors.Join(statErr, currentModeErr, errors.New("derived state replacement carrier did not acquire exact private mode"))
+	}
+	if _, err := verifyBoundDerivedStateControlFile(
+		parent,
+		name,
+		file,
+		identity,
+		"derived state replacement carrier before write",
+	); err != nil {
+		file.Close()
+		return identity, err
 	}
 	written, writeErr := file.Write(body)
 	syncErr := file.Sync()
@@ -363,7 +394,9 @@ func createDerivedStateReplacementCarrier(
 	if writeErr != nil || syncErr != nil || afterErr != nil || currentErr != nil || closeErr != nil ||
 		written != len(body) || after == nil || current == nil ||
 		!os.SameFile(identity, after) || !os.SameFile(identity, current) ||
-		after.Size() != int64(len(body)) || after.Mode() != 0o600 || current.Mode() != 0o600 {
+		after.Size() != int64(len(body)) || after.Mode() != 0o600 || current.Mode() != 0o600 ||
+		!sameDerivedStateControlFileSecurity(identity, after) ||
+		!sameDerivedStateControlFileSecurity(identity, current) {
 		return identity, errors.Join(writeErr, syncErr, afterErr, currentErr, closeErr, errors.New("derived state replacement carrier write was not exact"))
 	}
 	if err := syncDerivedStateReplacementParent(directory, mutationGuard, recoverUnexpectedMutation, phase); err != nil {
@@ -398,6 +431,7 @@ func publishPreparedDerivedStateReplacementIntent(
 	current, statErr := parent.Lstat(main)
 	stagedCurrent, stagedErr := parent.Lstat(staged)
 	if statErr != nil || current == nil || !os.SameFile(identity, current) ||
+		!sameDerivedStateControlFileSecurity(identity, current) ||
 		!errors.Is(stagedErr, os.ErrNotExist) || stagedCurrent != nil {
 		return errors.Join(statErr, stagedErr, errors.New("derived state prepared intent changed while publishing"))
 	}
@@ -447,6 +481,9 @@ func readDerivedStateReplacementCarrier(parent *os.Root, name string) (derivedSt
 		before.Mode() != 0o600 || before.Size() <= 0 || before.Size() > derivedStateReplacementIntentMaxBytes {
 		return intent, before, nil, errors.Join(err, errors.New("derived state replacement carrier is not an exact private file"))
 	}
+	if _, err := admitDerivedStateControlFile(before, fmt.Sprintf("derived state replacement carrier %s", name)); err != nil {
+		return intent, before, nil, err
+	}
 	file, err := parent.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return intent, before, nil, err
@@ -463,7 +500,9 @@ func readDerivedStateReplacementCarrier(parent *os.Root, name string) (derivedSt
 		len(body) == 0 || len(body) > derivedStateReplacementIntentMaxBytes ||
 		!os.SameFile(before, opened) || !os.SameFile(before, current) ||
 		opened.Size() != int64(len(body)) || opened.Mode() != 0o600 || current.Mode() != 0o600 ||
-		!opened.ModTime().Equal(before.ModTime()) || !current.ModTime().Equal(before.ModTime()) {
+		!opened.ModTime().Equal(before.ModTime()) || !current.ModTime().Equal(before.ModTime()) ||
+		!sameDerivedStateControlFileSecurity(before, opened) ||
+		!sameDerivedStateControlFileSecurity(before, current) {
 		return intent, opened, body, errors.Join(readErr, hookErr, statErr, lstatErr, errors.New("derived state replacement carrier changed while reading"))
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
@@ -732,7 +771,9 @@ func replacementIdentityFromFileMustDigest(parent *os.Root, name string, expecte
 	current, statErr := file.Stat()
 	pathCurrent, lstatErr := parent.Lstat(name)
 	if statErr != nil || lstatErr != nil || current == nil || pathCurrent == nil ||
-		!os.SameFile(expected, current) || !os.SameFile(expected, pathCurrent) {
+		!os.SameFile(expected, current) || !os.SameFile(expected, pathCurrent) ||
+		!sameDerivedStateControlFileSecurity(expected, current) ||
+		!sameDerivedStateControlFileSecurity(expected, pathCurrent) {
 		return derivedStateReplacementIdentity{}, errors.Join(statErr, lstatErr, errors.New("derived state replacement carrier changed before cleanup"))
 	}
 	return replacementIdentityFromFile(file, current, &digest)
@@ -1351,7 +1392,7 @@ func recoverDerivedStateReplacementTransactions(stateRoot, directoryRelative str
 		directoryRelative = "."
 	}
 	if filepath.IsAbs(directoryRelative) || filepath.Clean(directoryRelative) != directoryRelative ||
-		strings.HasPrefix(directoryRelative, ".."+string(filepath.Separator)) {
+		directoryRelative == ".." || strings.HasPrefix(directoryRelative, ".."+string(filepath.Separator)) {
 		return errors.New("unsafe derived state replacement recovery directory")
 	}
 	absoluteRoot, err := filepath.Abs(stateRoot)
@@ -1362,14 +1403,21 @@ func recoverDerivedStateReplacementTransactions(stateRoot, directoryRelative str
 	if err != nil || rootBefore == nil || rootBefore.Mode()&os.ModeSymlink != 0 || !rootBefore.IsDir() {
 		return errors.Join(err, errors.New("derived state root is not a real directory"))
 	}
+	if _, err := admitDerivedStateDirectory(rootBefore, "derived state replacement recovery root"); err != nil {
+		return err
+	}
 	root, err := os.OpenRoot(absoluteRoot)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
 	rootIdentity, err := root.Stat(".")
-	if err != nil || rootIdentity == nil || !os.SameFile(rootBefore, rootIdentity) {
+	if err != nil || rootIdentity == nil || !os.SameFile(rootBefore, rootIdentity) ||
+		!sameDerivedStateDirectorySecurity(rootBefore, rootIdentity) {
 		return errors.Join(err, errors.New("derived state root changed while binding replacement recovery"))
+	}
+	if err := verifyBoundDerivedStateRoot(root, absoluteRoot, rootIdentity); err != nil {
+		return err
 	}
 	directoryBefore, err := root.Lstat(directoryRelative)
 	if errors.Is(err, os.ErrNotExist) {
@@ -1378,7 +1426,11 @@ func recoverDerivedStateReplacementTransactions(stateRoot, directoryRelative str
 	if err != nil || directoryBefore == nil || directoryBefore.Mode()&os.ModeSymlink != 0 || !directoryBefore.IsDir() {
 		return errors.Join(err, errors.New("derived state replacement recovery directory is not real"))
 	}
-	unlock := lockDerivedStateDirectoryWriter(filepath.Join(absoluteRoot, directoryRelative))
+	if _, err := admitDerivedStateDirectory(directoryBefore, "derived state replacement recovery directory"); err != nil {
+		return err
+	}
+	directoryPath := filepath.Clean(filepath.Join(absoluteRoot, directoryRelative))
+	unlock := lockDerivedStateDirectoryWriter(directoryPath)
 	defer unlock()
 	parent, err := root.OpenRoot(directoryRelative)
 	if err != nil {
@@ -1394,8 +1446,15 @@ func recoverDerivedStateReplacementTransactions(stateRoot, directoryRelative str
 	directoryCurrent, currentErr := root.Lstat(directoryRelative)
 	if statErr != nil || currentErr != nil || directoryIdentity == nil || directoryCurrent == nil ||
 		!os.SameFile(directoryBefore, directoryIdentity) || !os.SameFile(directoryBefore, directoryCurrent) ||
-		directoryIdentity.Mode() != directoryBefore.Mode() || directoryCurrent.Mode() != directoryBefore.Mode() {
+		!sameDerivedStateDirectorySecurity(directoryBefore, directoryIdentity) ||
+		!sameDerivedStateDirectorySecurity(directoryBefore, directoryCurrent) {
 		return errors.Join(statErr, currentErr, errors.New("derived state replacement recovery directory changed while binding"))
+	}
+	if _, err := admitDerivedStateDirectory(directoryIdentity, "bound derived state replacement recovery directory"); err != nil {
+		return err
+	}
+	if err := verifyBoundDerivedStateRoot(parent, directoryPath, directoryIdentity); err != nil {
+		return err
 	}
 	mutationGuard, err := newDerivedStateDirectoryMutationGuard(root, directory, absoluteRoot, directoryRelative, directoryIdentity)
 	if err != nil {

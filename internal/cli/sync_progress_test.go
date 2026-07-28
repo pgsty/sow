@@ -87,6 +87,61 @@ func TestSyncProgressIsAtomicPrivateSecretFreeAndSymlinkSafe(t *testing.T) {
 	}
 }
 
+func TestSyncProgressExchangeRejectsDestinationAliasWithoutOverwrite(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	if err := os.Mkdir(stateDir, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := acquireSyncOperation(context.Background(), stateDir, "pgdg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer operation.Close()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	progress := &syncProgress{
+		Schema: syncProgressSchema, Upstream: "pgdg", Repository: "apt-test", Format: "apt",
+		ConfigSHA256: strings.Repeat("a", 64), SelectionSHA256: strings.Repeat("b", 64),
+		ReplaySHA256: emptySyncReplaySHA256, ReplayCount: 0,
+		ProvenanceInputSHA256: strings.Repeat("d", 64),
+		Phase:                 syncPhasePrepared, CompletedUnits: []string{}, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := operation.Write(progress); err != nil {
+		t.Fatal(err)
+	}
+	progressPath := filepath.Join(operation.dir, syncProgressFilename)
+	original, err := os.ReadFile(progressPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "progress-alias")
+	previous := derivedStateControlBeforeExchangeHook
+	derivedStateControlBeforeExchangeHook = func(source, destination string) error {
+		if destination != syncProgressFilename || !strings.HasPrefix(source, ".progress-") {
+			return errors.New("unexpected sync progress exchange coordinates")
+		}
+		return os.Link(progressPath, alias)
+	}
+	t.Cleanup(func() { derivedStateControlBeforeExchangeHook = previous })
+	updated := *progress
+	updated.UpdatedAt = time.Now().Add(time.Second).UTC().Format(time.RFC3339Nano)
+	if err := operation.Write(&updated); err == nil || !strings.Contains(err.Error(), "link count") {
+		t.Fatalf("aliased progress destination was overwritten: %v", err)
+	}
+	derivedStateControlBeforeExchangeHook = previous
+	current, currentErr := os.ReadFile(progressPath)
+	aliased, aliasErr := os.ReadFile(alias)
+	if currentErr != nil || aliasErr != nil ||
+		!reflect.DeepEqual(current, original) || !reflect.DeepEqual(aliased, original) {
+		t.Fatalf("failed progress exchange changed evidence current=%q alias=%q currentErr=%v aliasErr=%v", current, aliased, currentErr, aliasErr)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := operation.Write(&updated); err != nil {
+		t.Fatalf("progress did not converge after external alias removal: %v", err)
+	}
+}
+
 func TestSyncOperationLockFailsClosedAndReleasesWithDescriptor(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), ".sow")
 	if err := os.Mkdir(stateDir, 0o711); err != nil {
@@ -123,6 +178,149 @@ func TestSyncOperationLockFailsClosedAndReleasesWithDescriptor(t *testing.T) {
 	}
 	if _, err := acquireSyncOperation(context.Background(), stateDir, "unsafe"); err == nil || !strings.Contains(err.Error(), "private regular") {
 		t.Fatalf("unsafe operation lock err=%v", err)
+	}
+}
+
+func TestSyncControlDirectoriesAndLockRejectHostileWriterAdmission(t *testing.T) {
+	t.Run("writable directory is never chmodded", func(t *testing.T) {
+		stateDir := filepath.Join(t.TempDir(), ".sow")
+		if err := os.Mkdir(stateDir, 0o711); err != nil {
+			t.Fatal(err)
+		}
+		syncDir := filepath.Join(stateDir, "sync")
+		if err := os.Mkdir(syncDir, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(syncDir, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := acquireSyncOperation(context.Background(), stateDir, "pgdg"); err == nil ||
+			!strings.Contains(err.Error(), "group/other writable") {
+			t.Fatalf("writable sync directory was admitted: %v", err)
+		}
+		info, err := os.Lstat(syncDir)
+		if err != nil || info.Mode().Perm() != 0o777 {
+			t.Fatalf("unsafe pre-existing directory was mutated: mode=%v err=%v", info.Mode().Perm(), err)
+		}
+	})
+
+	t.Run("persistent lock hardlink is preserved", func(t *testing.T) {
+		stateDir := filepath.Join(t.TempDir(), ".sow")
+		if err := os.Mkdir(stateDir, 0o711); err != nil {
+			t.Fatal(err)
+		}
+		operation, err := acquireSyncOperation(context.Background(), stateDir, "pgdg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		lockPath := filepath.Join(operation.dir, ".operation.lock")
+		if err := operation.Close(); err != nil {
+			t.Fatal(err)
+		}
+		alias := filepath.Join(t.TempDir(), "operation-lock-alias")
+		if err := os.Link(lockPath, alias); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := acquireSyncOperation(context.Background(), stateDir, "pgdg"); err == nil ||
+			!strings.Contains(err.Error(), "private regular") {
+			t.Fatalf("hardlink-aliased operation lock was admitted: %v", err)
+		}
+		left, leftErr := os.Lstat(lockPath)
+		right, rightErr := os.Lstat(alias)
+		if leftErr != nil || rightErr != nil || !os.SameFile(left, right) {
+			t.Fatalf("operation-lock alias evidence was not preserved: left=%v right=%v", leftErr, rightErr)
+		}
+	})
+}
+
+func TestSyncProgressAndReplayRejectHardlinkAliases(t *testing.T) {
+	t.Run("progress", func(t *testing.T) {
+		stateDir := filepath.Join(t.TempDir(), ".sow")
+		if err := os.Mkdir(stateDir, 0o711); err != nil {
+			t.Fatal(err)
+		}
+		operation, err := acquireSyncOperation(context.Background(), stateDir, "pgdg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer operation.Close()
+		progress := validSyncProgressFixture()
+		if err := operation.Write(&progress); err != nil {
+			t.Fatal(err)
+		}
+		progressPath := filepath.Join(operation.dir, syncProgressFilename)
+		alias := filepath.Join(t.TempDir(), "progress-alias")
+		if err := os.Link(progressPath, alias); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := operation.Load(); err == nil || !strings.Contains(err.Error(), "single-link") {
+			t.Fatalf("hardlink-aliased progress was read: %v", err)
+		}
+		if err := operation.RemoveProgress(); err == nil || !strings.Contains(err.Error(), "unsafe") {
+			t.Fatalf("hardlink-aliased progress was removed: %v", err)
+		}
+		left, leftErr := os.Lstat(progressPath)
+		right, rightErr := os.Lstat(alias)
+		if leftErr != nil || rightErr != nil || !os.SameFile(left, right) {
+			t.Fatalf("progress alias evidence was not preserved: left=%v right=%v", leftErr, rightErr)
+		}
+	})
+
+	t.Run("replay callback interval", func(t *testing.T) {
+		stateDir := filepath.Join(t.TempDir(), ".sow")
+		if err := os.Mkdir(stateDir, 0o711); err != nil {
+			t.Fatal(err)
+		}
+		operation, err := acquireSyncOperation(context.Background(), stateDir, "pgdg")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer operation.Close()
+		records := []syncReplayRecord{
+			{Format: "deb", SHA256: strings.Repeat("1", 64), Size: 1, Name: "one", Version: "1", Arch: "amd64", Basename: "one.deb", Component: "main"},
+			{Format: "deb", SHA256: strings.Repeat("2", 64), Size: 1, Name: "two", Version: "1", Arch: "amd64", Basename: "two.deb", Component: "main"},
+		}
+		sha, count, err := operation.WriteReplay(records, "", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		progress := &syncProgress{ReplaySHA256: sha, ReplayCount: count}
+		replayPath := filepath.Join(operation.dir, syncReplayFilename)
+		alias := filepath.Join(t.TempDir(), "replay-alias")
+		callbacks := 0
+		err = operation.ForEachReplay(progress, func(syncReplayRecord) error {
+			callbacks++
+			if callbacks == 1 {
+				return os.Link(replayPath, alias)
+			}
+			return nil
+		})
+		if err == nil || !strings.Contains(err.Error(), "link count") {
+			t.Fatalf("replay callback interval accepted a new hardlink alias: callbacks=%d err=%v", callbacks, err)
+		}
+		if callbacks != 1 {
+			t.Fatalf("replay continued callbacks after authority drift: %d", callbacks)
+		}
+		if err := operation.RemoveReplay(); err == nil || !strings.Contains(err.Error(), "unsafe") {
+			t.Fatalf("hardlink-aliased replay was removed: %v", err)
+		}
+		left, leftErr := os.Lstat(replayPath)
+		right, rightErr := os.Lstat(alias)
+		if leftErr != nil || rightErr != nil || !os.SameFile(left, right) {
+			t.Fatalf("replay alias evidence was not preserved: left=%v right=%v", leftErr, rightErr)
+		}
+	})
+}
+
+func validSyncProgressFixture() syncProgress {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	return syncProgress{
+		Schema: syncProgressSchema, Upstream: "pgdg", Repository: "apt-test", Format: "apt",
+		ConfigSHA256: strings.Repeat("a", 64), SelectionSHA256: strings.Repeat("b", 64),
+		ReplaySHA256: emptySyncReplaySHA256, ReplayCount: 0,
+		ProvenanceInputSHA256: strings.Repeat("d", 64),
+		ProvenanceCommit:      strings.Repeat("c", 40), Phase: syncPhaseIngesting, CurrentUnit: "apt:main",
+		CompletedUnits: []string{}, CreatedAt: now, UpdatedAt: now,
 	}
 }
 
@@ -371,6 +569,60 @@ func TestCompletedSyncDownloadCleanupFailsClosedOnUnsafeEntry(t *testing.T) {
 	body, err := os.ReadFile(outside)
 	if err != nil || string(body) != "outside" {
 		t.Fatalf("cleanup changed symlink target: body=%q err=%v", body, err)
+	}
+}
+
+func TestSyncReplayExchangeRejectsDestinationAliasWithoutOverwrite(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	if err := os.Mkdir(stateDir, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := acquireSyncOperation(context.Background(), stateDir, "pgdg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer operation.Close()
+	record := syncReplayRecord{
+		Format: "deb", SHA256: strings.Repeat("a", 64), Size: 7,
+		Name: "example", Version: "1", Arch: "amd64", Basename: "example_1_amd64.deb", Component: "main",
+	}
+	if _, _, err := operation.WriteReplay([]syncReplayRecord{record}, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	replayPath := filepath.Join(operation.dir, syncReplayFilename)
+	original, err := os.ReadFile(replayPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "replay-alias")
+	previous := derivedStateControlBeforeExchangeHook
+	derivedStateControlBeforeExchangeHook = func(source, destination string) error {
+		if destination != syncReplayFilename || !strings.HasPrefix(source, ".replay-") {
+			return errors.New("unexpected sync replay exchange coordinates")
+		}
+		return os.Link(replayPath, alias)
+	}
+	t.Cleanup(func() { derivedStateControlBeforeExchangeHook = previous })
+	updated := record
+	updated.SHA256 = strings.Repeat("b", 64)
+	updated.Basename = "example_2_amd64.deb"
+	updated.Version = "2"
+	if _, _, err := operation.WriteReplay([]syncReplayRecord{updated}, "", 0); err == nil ||
+		!strings.Contains(err.Error(), "link count") {
+		t.Fatalf("aliased replay destination was overwritten: %v", err)
+	}
+	derivedStateControlBeforeExchangeHook = previous
+	current, currentErr := os.ReadFile(replayPath)
+	aliased, aliasErr := os.ReadFile(alias)
+	if currentErr != nil || aliasErr != nil ||
+		!reflect.DeepEqual(current, original) || !reflect.DeepEqual(aliased, original) {
+		t.Fatalf("failed replay exchange changed evidence current=%q alias=%q currentErr=%v aliasErr=%v", current, aliased, currentErr, aliasErr)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := operation.WriteReplay([]syncReplayRecord{updated}, "", 0); err != nil {
+		t.Fatalf("replay did not converge after external alias removal: %v", err)
 	}
 }
 

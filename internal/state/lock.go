@@ -26,11 +26,14 @@ const (
 	stateLeaseFaultIdentity      = "identity"
 	stateLeaseFaultBeforePublish = "before-publish"
 	stateLeaseFaultAfterPublish  = "after-publish"
+	stateLeaseFaultBeforeRemove  = "before-remove"
+	stateLeaseFaultAfterRemove   = "after-remove"
 
 	stateLockUnpublishedPrefix = "state.lock.unpublished-"
 
-	statePermissionAfterChildLstat = "after-child-lstat"
-	statePermissionBeforeRootChmod = "before-root-chmod"
+	statePermissionAfterChildLstat           = "after-child-lstat"
+	statePermissionBeforeRootChmod           = "before-root-chmod"
+	statePermissionAfterBootstrapParentLstat = "after-bootstrap-parent-lstat"
 )
 
 type lockRecord struct {
@@ -44,21 +47,24 @@ type lockRecord struct {
 }
 
 type Lock struct {
-	mu            sync.Mutex
-	path          string
-	statePath     string
-	stateRoot     *os.Root
-	stateIdentity os.FileInfo
-	locksRoot     *os.Root
-	locksFile     *os.File
-	locksIdentity os.FileInfo
-	leaseIdentity os.FileInfo
-	leaseFile     *os.File
-	localLeaseID  uint64
-	lockIdentity  os.FileInfo
-	lockFile      *os.File
-	localRecordID uint64
-	lockRecord    lockRecord
+	mu             sync.Mutex
+	path           string
+	parentPath     string
+	statePath      string
+	parentRoot     *os.Root
+	parentIdentity os.FileInfo
+	stateRoot      *os.Root
+	stateIdentity  os.FileInfo
+	locksRoot      *os.Root
+	locksFile      *os.File
+	locksIdentity  os.FileInfo
+	leaseIdentity  os.FileInfo
+	leaseFile      *os.File
+	localLeaseID   uint64
+	lockIdentity   os.FileInfo
+	lockFile       *os.File
+	localRecordID  uint64
+	lockRecord     lockRecord
 }
 
 var localStateLockLeases = struct {
@@ -68,6 +74,10 @@ var localStateLockLeases = struct {
 }{held: make(map[uint64]os.FileInfo)}
 
 var errStateLockPublicationCollision = errors.New("state lock appeared during atomic publication")
+
+var stateLockPublicationParentSync = func(directory *os.File) error {
+	return directory.Sync()
+}
 
 var stateLockLeaseTrySource = struct {
 	sync.RWMutex
@@ -160,10 +170,19 @@ func openAdvisoryLease(root *os.Root, name string, flags int, mode os.FileMode) 
 	}
 	opened, statErr := file.Stat()
 	current, lstatErr := root.Lstat(name)
-	if statErr != nil || lstatErr != nil || opened == nil || !opened.Mode().IsRegular() ||
-		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(opened, current) {
+	var openedAdmissionErr, currentAdmissionErr error
+	if opened != nil {
+		_, openedAdmissionErr = admitStateControlFile(opened, fmt.Sprintf("bound state advisory lease %s", name))
+	}
+	if current != nil {
+		_, currentAdmissionErr = admitStateControlFile(current, fmt.Sprintf("current state advisory lease %s", name))
+	}
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		openedAdmissionErr != nil || currentAdmissionErr != nil ||
+		!os.SameFile(opened, current) ||
+		!sameStateControlFileSecurity(opened, current) {
 		closeErr := file.Close()
-		return nil, nil, 0, false, errors.Join(statErr, lstatErr, closeErr, fmt.Errorf("state advisory lease %s changed while opening", name))
+		return nil, nil, 0, false, errors.Join(statErr, lstatErr, openedAdmissionErr, currentAdmissionErr, closeErr, fmt.Errorf("state advisory lease %s changed while opening", name))
 	}
 	for _, held := range localStateLockLeases.held {
 		if os.SameFile(held, opened) {
@@ -208,6 +227,9 @@ func openAdvisoryLease(root *os.Root, name string, flags int, mode os.FileMode) 
 		if faultErr := callStateLockLeaseFault(name, stateLeaseFaultChmod); faultErr != nil {
 			return failAfterAcquire(faultErr)
 		}
+		if err := verifyStateControlFileMutation(root, name, file, opened, "state advisory lease"); err != nil {
+			return failAfterAcquire(err)
+		}
 		if chmodErr := file.Chmod(mode.Perm()); chmodErr != nil {
 			return failAfterAcquire(chmodErr)
 		}
@@ -218,14 +240,52 @@ func openAdvisoryLease(root *os.Root, name string, flags int, mode os.FileMode) 
 	opened, statErr = file.Stat()
 	current, lstatErr = root.Lstat(name)
 	permissionsUnsafe := mode != 0 && opened != nil && opened.Mode().Perm() != mode.Perm()
-	if statErr != nil || lstatErr != nil || opened == nil || !opened.Mode().IsRegular() || permissionsUnsafe ||
-		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(opened, current) {
-		return failAfterAcquire(errors.Join(statErr, lstatErr, fmt.Errorf("state advisory lease %s changed while securing permissions", name)))
+	openedAdmissionErr, currentAdmissionErr = nil, nil
+	if opened != nil {
+		_, openedAdmissionErr = admitStateControlFile(opened, fmt.Sprintf("secured state advisory lease %s", name))
+	}
+	if current != nil {
+		_, currentAdmissionErr = admitStateControlFile(current, fmt.Sprintf("current secured state advisory lease %s", name))
+	}
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil || permissionsUnsafe ||
+		openedAdmissionErr != nil || currentAdmissionErr != nil ||
+		!os.SameFile(opened, current) ||
+		!sameStateControlFileSecurity(opened, current) {
+		return failAfterAcquire(errors.Join(statErr, lstatErr, openedAdmissionErr, currentAdmissionErr, fmt.Errorf("state advisory lease %s changed while securing permissions", name)))
 	}
 	localStateLockLeases.next++
 	leaseID := localStateLockLeases.next
 	localStateLockLeases.held[leaseID] = opened
 	return file, opened, leaseID, true, nil
+}
+
+func verifyStateControlFileMutation(root *os.Root, name string, file *os.File, identity os.FileInfo, description string) error {
+	if root == nil || file == nil || identity == nil || filepath.Base(name) != name || name == "" || name == "." {
+		return errors.New("state control-file mutation binding is incomplete")
+	}
+	opened, statErr := file.Stat()
+	current, lstatErr := root.Lstat(name)
+	var openedAdmissionErr, currentAdmissionErr error
+	if opened != nil {
+		_, openedAdmissionErr = admitStateControlFile(opened, "opened "+description)
+	}
+	if current != nil {
+		_, currentAdmissionErr = admitStateControlFile(current, "current "+description)
+	}
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		openedAdmissionErr != nil || currentAdmissionErr != nil ||
+		!os.SameFile(identity, opened) || !os.SameFile(identity, current) ||
+		!sameStateControlFileSecurity(identity, opened) ||
+		!sameStateControlFileSecurity(identity, current) {
+		return errors.Join(
+			statErr,
+			lstatErr,
+			openedAdmissionErr,
+			currentAdmissionErr,
+			fmt.Errorf("%s changed before mutation", description),
+		)
+	}
+	return nil
 }
 
 func removeCreatedLeaseEntryAfterFailure(root *os.Root, name string, file *os.File, identity os.FileInfo) error {
@@ -235,8 +295,9 @@ func removeCreatedLeaseEntryAfterFailure(root *os.Root, name string, file *os.Fi
 	opened, statErr := file.Stat()
 	current, lstatErr := root.Lstat(name)
 	if statErr != nil || lstatErr != nil || opened == nil || !opened.Mode().IsRegular() ||
-		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
-		!os.SameFile(identity, opened) || !os.SameFile(identity, current) {
+		current == nil || !os.SameFile(identity, opened) || !os.SameFile(identity, current) ||
+		!sameStateControlFileSecurity(identity, opened) ||
+		!sameStateControlFileSecurity(identity, current) {
 		return errors.Join(statErr, lstatErr, errors.New("refusing to remove a created state lease entry whose inode changed after advisory lease failure"))
 	}
 	if err := root.Remove(name); err != nil {
@@ -265,36 +326,44 @@ func closeStateLockLease(file *os.File, leaseID uint64) error {
 	return errors.Join(unlockErr, closeErr)
 }
 
-func removeLeasedStateLock(root *os.Root, directory *os.File, file *os.File, identity os.FileInfo) error {
+func removeLeasedStateLock(root *os.Root, directory *os.File, file *os.File, identity os.FileInfo) (bool, error) {
 	return removeLeasedStateEntry(root, directory, file, identity, "state.lock")
 }
 
-func removeLeasedStateEntry(root *os.Root, directory *os.File, file *os.File, identity os.FileInfo, name string) error {
+func removeLeasedStateEntry(root *os.Root, directory *os.File, file *os.File, identity os.FileInfo, name string) (bool, error) {
 	if root == nil || directory == nil || file == nil || identity == nil {
-		return errors.New("state lock removal lease is incomplete")
+		return false, errors.New("state lock removal lease is incomplete")
 	}
 	if filepath.Base(name) != name || name == "." || name == "" {
-		return errors.New("state lock removal name is unsafe")
+		return false, errors.New("state lock removal name is unsafe")
 	}
 	opened, statErr := file.Stat()
 	current, lstatErr := root.Lstat(name)
 	if statErr != nil || lstatErr != nil || opened == nil || !opened.Mode().IsRegular() ||
-		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
-		!os.SameFile(identity, opened) || !os.SameFile(identity, current) {
-		return errors.Join(statErr, lstatErr, errors.New("refusing to unlink a state lock outside the held advisory lease"))
+		current == nil || !os.SameFile(identity, opened) || !os.SameFile(identity, current) ||
+		!sameStateControlFileSecurity(identity, opened) ||
+		!sameStateControlFileSecurity(identity, current) {
+		return false, errors.Join(statErr, lstatErr, errors.New("refusing to unlink a state lock outside the held advisory lease"))
+	}
+	if err := callStateLockLeaseFault(name, stateLeaseFaultBeforeRemove); err != nil {
+		return false, err
+	}
+	if err := verifyStateControlFileMutation(root, name, file, identity, "state lock before unlink"); err != nil {
+		return false, err
 	}
 	if err := root.Remove(name); err != nil {
-		return err
+		return false, err
 	}
-	return directory.Sync()
+	if err := callStateLockLeaseFault(name, stateLeaseFaultAfterRemove); err != nil {
+		return true, err
+	}
+	return true, directory.Sync()
 }
 
 // publishPreparedStateLock makes the visible record crash-atomic. The record is
 // fully encoded and fsynced on a private inode while its advisory lease is
-// already held. A create-only hardlink then publishes those exact bytes as
-// state.lock in one namespace operation. A crash before the link leaves only
-// non-authoritative evidence; a crash after it leaves a complete recoverable
-// record, never a zero-byte or partially encoded authoritative lock.
+// already held. A native create-only rename publishes those exact bytes as
+// state.lock without ever creating a second hardlink alias.
 func publishPreparedStateLock(root *os.Root, directory *os.File, record lockRecord) (*os.File, os.FileInfo, uint64, bool, error) {
 	if root == nil || directory == nil {
 		return nil, nil, 0, false, errors.New("state lock publication root is unavailable")
@@ -315,6 +384,9 @@ func publishPreparedStateLock(root *os.Root, directory *os.File, record lockReco
 		leaseErr := closeStateLockLease(file, leaseID)
 		return nil, nil, 0, false, errors.Join(failure, cleanupErr, leaseErr)
 	}
+	if err := verifyStateControlFileMutation(root, pendingName, file, identity, "prepared state lock before write"); err != nil {
+		return fail(err)
+	}
 	if err := json.NewEncoder(file).Encode(record); err != nil {
 		return fail(fmt.Errorf("encode prepared state lock: %w", err))
 	}
@@ -326,13 +398,15 @@ func publishPreparedStateLock(root *os.Root, directory *os.File, record lockReco
 	if statErr != nil || lstatErr != nil || prepared == nil || current == nil ||
 		!prepared.Mode().IsRegular() || prepared.Mode().Perm() != 0o600 ||
 		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || current.Mode().Perm() != 0o600 ||
-		!os.SameFile(identity, prepared) || !os.SameFile(identity, current) {
+		!os.SameFile(identity, prepared) || !os.SameFile(identity, current) ||
+		!sameStateControlFileSecurity(identity, prepared) ||
+		!sameStateControlFileSecurity(identity, current) {
 		return fail(errors.Join(statErr, lstatErr, errors.New("prepared state lock changed before publication")))
 	}
 	if faultErr := callStateLockLeaseFault("state.lock", stateLeaseFaultBeforePublish); faultErr != nil {
 		return fail(faultErr)
 	}
-	if err := root.Link(pendingName, "state.lock"); err != nil {
+	if err := renameStateLockNoReplace(directory.Fd(), pendingName, "state.lock"); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			cleanupErr := removePreparedStateLockAttempt(root, directory, file, identity, pendingName, false)
 			leaseErr := closeStateLockLease(file, leaseID)
@@ -346,11 +420,14 @@ func publishPreparedStateLock(root *os.Root, directory *os.File, record lockReco
 	published = true
 	visible, visibleErr := root.Lstat("state.lock")
 	current, lstatErr = root.Lstat(pendingName)
-	if visibleErr != nil || lstatErr != nil || visible == nil || current == nil ||
+	if visibleErr != nil || !errors.Is(lstatErr, os.ErrNotExist) || visible == nil || current != nil ||
 		visible.Mode()&os.ModeSymlink != 0 || !visible.Mode().IsRegular() || visible.Mode().Perm() != 0o600 ||
-		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || current.Mode().Perm() != 0o600 ||
-		!os.SameFile(identity, visible) || !os.SameFile(identity, current) {
+		!os.SameFile(identity, visible) ||
+		!sameStateControlFileSecurity(identity, visible) {
 		return fail(errors.Join(visibleErr, lstatErr, errors.New("published state lock does not match the prepared inode")))
+	}
+	if err := stateLockPublicationParentSync(directory); err != nil {
+		return fail(fmt.Errorf("sync published state lock coordinate: %w", err))
 	}
 	observed, readErr := readLockFileAt(root, "state.lock", file, identity)
 	if readErr != nil || !sameLockRecord(record, observed) {
@@ -358,9 +435,6 @@ func publishPreparedStateLock(root *os.Root, directory *os.File, record lockReco
 	}
 	if faultErr := callStateLockLeaseFault("state.lock", stateLeaseFaultAfterPublish); faultErr != nil {
 		return fail(faultErr)
-	}
-	if err := removeLeasedStateEntry(root, directory, file, identity, pendingName); err != nil {
-		return fail(fmt.Errorf("remove unpublished state lock name: %w", err))
 	}
 	return file, identity, leaseID, true, nil
 }
@@ -378,8 +452,9 @@ func removePreparedStateLockAttempt(root *os.Root, directory *os.File, file *os.
 		}
 		opened, statErr := file.Stat()
 		if err != nil || statErr != nil || current == nil || opened == nil ||
-			current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
-			!os.SameFile(identity, current) || !os.SameFile(identity, opened) {
+			!os.SameFile(identity, current) || !os.SameFile(identity, opened) ||
+			!sameStateControlFileSecurity(identity, current) ||
+			!sameStateControlFileSecurity(identity, opened) {
 			cleanupErr = errors.Join(cleanupErr, err, statErr, fmt.Errorf("refusing to remove prepared state lock name %s after its inode changed", name))
 			return
 		}
@@ -401,20 +476,23 @@ func preserveLeasedStateLock(root *os.Root, directory *os.File, file *os.File, i
 	opened, statErr := file.Stat()
 	current, lstatErr := root.Lstat("state.lock")
 	if statErr != nil || lstatErr != nil || opened == nil || !opened.Mode().IsRegular() ||
-		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
-		!os.SameFile(identity, opened) || !os.SameFile(identity, current) {
+		current == nil || !os.SameFile(identity, opened) || !os.SameFile(identity, current) ||
+		!sameStateControlFileSecurity(identity, opened) ||
+		!sameStateControlFileSecurity(identity, current) {
 		return errors.Join(statErr, lstatErr, errors.New("refusing to preserve a state lock outside the held advisory lease"))
 	}
-	// Link is create-only and cannot overwrite prior recovery evidence. The
-	// source remains the visible leased lock until the evidence link exists.
-	if err := root.Link("state.lock", staleName); err != nil {
+	// The create-only rename preserves the leased inode as recovery evidence
+	// without ever giving a hostile writer a retained hardlink alias.
+	if err := renameStateLockNoReplace(directory.Fd(), "state.lock", staleName); err != nil {
 		return err
 	}
 	stale, staleErr := root.Lstat(staleName)
-	if staleErr != nil || stale.Mode()&os.ModeSymlink != 0 || !stale.Mode().IsRegular() || !os.SameFile(identity, stale) {
-		return errors.Join(staleErr, errors.New("preserved stale state lock does not match the leased inode"))
+	visible, visibleErr := root.Lstat("state.lock")
+	if staleErr != nil || !errors.Is(visibleErr, os.ErrNotExist) || stale == nil || visible != nil ||
+		!os.SameFile(identity, stale) || !sameStateControlFileSecurity(identity, stale) {
+		return errors.Join(staleErr, visibleErr, errors.New("preserved stale state lock does not match the leased inode"))
 	}
-	return removeLeasedStateLock(root, directory, file, identity)
+	return directory.Sync()
 }
 
 func bootstrapStateLockRoot(stateDir string) (string, error) {
@@ -423,69 +501,148 @@ func bootstrapStateLockRoot(stateDir string) (string, error) {
 		return "", err
 	}
 	parent := filepath.Dir(statePath)
+	stateName := filepath.Base(statePath)
+	if stateName == "." || stateName == string(filepath.Separator) || stateName == "" {
+		return "", errors.New("state root must be a child of a real parent directory")
+	}
 	parentInfo, err := os.Lstat(parent)
 	if err != nil || !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
 		return "", errors.Join(err, errors.New("state parent is not a real directory"))
 	}
-	stateInfo, err := os.Lstat(statePath)
+	if _, err := admitStateDirectory(parentInfo, "state immediate parent"); err != nil {
+		return "", err
+	}
+	if faultErr := callStatePermissionFault(statePermissionAfterBootstrapParentLstat, filepath.Base(parent)); faultErr != nil {
+		return "", faultErr
+	}
+	parentRoot, err := os.OpenRoot(parent)
+	if err != nil {
+		return "", fmt.Errorf("bind state immediate parent during bootstrap: %w", err)
+	}
+	defer parentRoot.Close()
+	boundParent, boundErr := parentRoot.Stat(".")
+	parentCurrent, parentErr := os.Lstat(parent)
+	if boundErr != nil || parentErr != nil || boundParent == nil || parentCurrent == nil ||
+		!os.SameFile(parentInfo, boundParent) || !os.SameFile(parentInfo, parentCurrent) ||
+		!sameStateDirectorySecurity(parentInfo, boundParent) ||
+		!sameStateDirectorySecurity(parentInfo, parentCurrent) {
+		return "", errors.Join(boundErr, parentErr, errors.New("state immediate parent changed while binding bootstrap"))
+	}
+	if _, err := admitStateDirectory(boundParent, "bound state immediate parent during bootstrap"); err != nil {
+		return "", err
+	}
+	stateInfo, err := parentRoot.Lstat(stateName)
 	if errors.Is(err, os.ErrNotExist) {
-		if err := os.Mkdir(statePath, 0o700); err != nil {
+		if err := parentRoot.Mkdir(stateName, 0o700); err != nil {
 			return "", err
 		}
-		stateInfo, err = os.Lstat(statePath)
+		stateInfo, err = parentRoot.Lstat(stateName)
 		if err != nil || !stateInfo.IsDir() || stateInfo.Mode()&os.ModeSymlink != 0 {
 			return "", errors.Join(err, errors.New("new state root is not a real directory"))
 		}
-		if err := secureCreatedDirectory(statePath, stateInfo, 0o700); err != nil {
+		if err := secureCreatedDirectoryAt(parentRoot, stateName, stateInfo, 0o700); err != nil {
 			return "", fmt.Errorf("secure new state root: %w", err)
 		}
-		if err := syncStateDirectory(parent); err != nil {
-			return "", err
+		parentFile, openErr := parentRoot.Open(".")
+		if openErr != nil {
+			return "", fmt.Errorf("open bound state parent for bootstrap sync: %w", openErr)
 		}
-		stateInfo, err = os.Lstat(statePath)
+		syncErr := parentFile.Sync()
+		closeErr := parentFile.Close()
+		if syncErr != nil || closeErr != nil {
+			return "", errors.Join(syncErr, closeErr)
+		}
+		stateInfo, err = parentRoot.Lstat(stateName)
 	}
-	if err != nil || !stateInfo.IsDir() || stateInfo.Mode()&os.ModeSymlink != 0 {
+	if err != nil || stateInfo == nil || !stateInfo.IsDir() || stateInfo.Mode()&os.ModeSymlink != 0 {
 		return "", errors.Join(err, errors.New("state root is not a real directory"))
 	}
 	if err := rejectWritableStateDirectory(stateInfo, "state root"); err != nil {
 		return "", err
 	}
+	pathState, pathStateErr := os.Lstat(statePath)
+	parentCurrent, parentErr = os.Lstat(parent)
+	boundParent, boundErr = parentRoot.Stat(".")
+	if pathStateErr != nil || parentErr != nil || boundErr != nil ||
+		pathState == nil || parentCurrent == nil || boundParent == nil ||
+		!os.SameFile(stateInfo, pathState) ||
+		!sameStateDirectorySecurity(stateInfo, pathState) ||
+		!os.SameFile(parentInfo, parentCurrent) || !os.SameFile(parentInfo, boundParent) ||
+		!sameStateDirectorySecurity(parentInfo, parentCurrent) ||
+		!sameStateDirectorySecurity(parentInfo, boundParent) {
+		return "", errors.Join(pathStateErr, parentErr, boundErr, errors.New("state bootstrap coordinate changed"))
+	}
 	return statePath, nil
 }
 
-func rejectWritableStateDirectory(info os.FileInfo, description string) error {
-	if info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%s is not a real directory", description)
+func secureCreatedDirectoryAt(root *os.Root, name string, identity os.FileInfo, mode os.FileMode) error {
+	if root == nil || filepath.Base(name) != name || name == "" || identity == nil {
+		return errors.New("created directory binding is incomplete")
 	}
-	if info.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("%s is group/other writable (mode %#o); refusing to establish a state lease", description, info.Mode().Perm())
-	}
-	return nil
-}
-
-func secureCreatedDirectory(path string, identity os.FileInfo, mode os.FileMode) error {
-	file, err := os.Open(path)
+	file, err := root.Open(name)
 	if err != nil {
 		return err
 	}
 	opened, statErr := file.Stat()
-	current, lstatErr := os.Lstat(path)
-	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
-		!opened.IsDir() || current.Mode()&os.ModeSymlink != 0 || !current.IsDir() ||
-		!os.SameFile(identity, opened) || !os.SameFile(identity, current) {
-		return errors.Join(statErr, lstatErr, file.Close(), errors.New("created directory changed while binding permissions"))
+	current, lstatErr := root.Lstat(name)
+	var openedAdmissionErr, currentAdmissionErr error
+	if opened != nil {
+		_, openedAdmissionErr = admitStateDirectory(opened, "opened new state directory")
+	}
+	if current != nil {
+		_, currentAdmissionErr = admitStateDirectory(current, "current new state directory")
+	}
+	if statErr != nil || lstatErr != nil || openedAdmissionErr != nil || currentAdmissionErr != nil ||
+		opened == nil || current == nil || !opened.IsDir() ||
+		current.Mode()&os.ModeSymlink != 0 || !current.IsDir() ||
+		!os.SameFile(identity, opened) || !os.SameFile(identity, current) ||
+		!sameStateDirectorySecurity(identity, opened) ||
+		!sameStateDirectorySecurity(identity, current) {
+		return errors.Join(
+			statErr,
+			lstatErr,
+			openedAdmissionErr,
+			currentAdmissionErr,
+			file.Close(),
+			errors.New("created directory changed while binding permissions"),
+		)
 	}
 	chmodErr := file.Chmod(mode.Perm())
 	syncErr := file.Sync()
 	after, afterErr := file.Stat()
-	current, currentErr := os.Lstat(path)
+	current, currentErr := root.Lstat(name)
+	var afterAdmissionErr, finalAdmissionErr error
+	if after != nil {
+		_, afterAdmissionErr = admitStateDirectory(after, "secured new state directory")
+	}
+	if current != nil {
+		_, finalAdmissionErr = admitStateDirectory(current, "current secured state directory")
+	}
 	closeErr := file.Close()
-	if chmodErr != nil || syncErr != nil || afterErr != nil || currentErr != nil || after == nil || current == nil ||
-		after.Mode().Perm() != mode.Perm() || current.Mode()&os.ModeSymlink != 0 ||
-		!os.SameFile(identity, after) || !os.SameFile(identity, current) {
-		return errors.Join(chmodErr, syncErr, afterErr, currentErr, closeErr, errors.New("created directory changed while securing permissions"))
+	if chmodErr != nil || syncErr != nil || afterErr != nil || currentErr != nil ||
+		afterAdmissionErr != nil || finalAdmissionErr != nil || after == nil || current == nil ||
+		after.Mode().Perm() != mode.Perm() || current.Mode().Perm() != mode.Perm() ||
+		current.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(identity, after) || !os.SameFile(identity, current) ||
+		!sameStateOwnership(identity, after, false) ||
+		!sameStateOwnership(identity, current, false) {
+		return errors.Join(
+			chmodErr,
+			syncErr,
+			afterErr,
+			currentErr,
+			afterAdmissionErr,
+			finalAdmissionErr,
+			closeErr,
+			errors.New("created directory changed while securing permissions"),
+		)
 	}
 	return closeErr
+}
+
+func rejectWritableStateDirectory(info os.FileInfo, description string) error {
+	_, err := admitStateDirectory(info, description)
+	return err
 }
 
 // preflightStateLockWithoutPersistentLease preserves compatibility with a
@@ -545,6 +702,32 @@ func AcquireLock(stateDir, operation string, recoverStale bool) (*Lock, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bootstrap protected state lock root: %w", err)
 	}
+	parentPath := filepath.Dir(statePath)
+	parentBefore, err := os.Lstat(parentPath)
+	if err != nil {
+		return nil, fmt.Errorf("inspect state immediate parent: %w", err)
+	}
+	if _, err := admitStateDirectory(parentBefore, "state immediate parent"); err != nil {
+		return nil, err
+	}
+	parentRoot, err := os.OpenRoot(parentPath)
+	if err != nil {
+		return nil, fmt.Errorf("bind state immediate parent: %w", err)
+	}
+	closeParent := true
+	defer func() {
+		if closeParent {
+			_ = parentRoot.Close()
+		}
+	}()
+	parentIdentity, parentStatErr := parentRoot.Stat(".")
+	parentCurrent, parentLstatErr := os.Lstat(parentPath)
+	if parentStatErr != nil || parentLstatErr != nil || parentIdentity == nil || parentCurrent == nil ||
+		!os.SameFile(parentBefore, parentIdentity) || !os.SameFile(parentBefore, parentCurrent) ||
+		!sameStateDirectorySecurity(parentBefore, parentIdentity) ||
+		!sameStateDirectorySecurity(parentBefore, parentCurrent) {
+		return nil, errors.Join(parentStatErr, parentLstatErr, errors.New("state immediate parent changed while binding"))
+	}
 	stateInfo, err := os.Lstat(statePath)
 	if err != nil || !stateInfo.IsDir() || stateInfo.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.Join(err, errors.New("state root is not a real directory"))
@@ -560,7 +743,8 @@ func AcquireLock(stateDir, operation string, recoverStale bool) (*Lock, error) {
 		}
 	}()
 	boundState, err := stateRoot.Stat(".")
-	if err != nil || !os.SameFile(stateInfo, boundState) {
+	if err != nil || boundState == nil || !os.SameFile(stateInfo, boundState) ||
+		!sameStateDirectorySecurity(stateInfo, boundState) {
 		return nil, errors.Join(err, errors.New("state root changed while binding"))
 	}
 	if err := rejectWritableStateDirectory(boundState, "bound state root"); err != nil {
@@ -595,8 +779,12 @@ func AcquireLock(stateDir, operation string, recoverStale bool) (*Lock, error) {
 		}
 	}()
 	boundLocks, err := locksRoot.Stat(".")
-	if err != nil || !os.SameFile(locksInfo, boundLocks) {
-		return nil, errors.Join(err, errors.New("state lock directory changed while binding"))
+	currentLocks, currentLocksErr := stateRoot.Lstat("locks")
+	if err != nil || currentLocksErr != nil || boundLocks == nil || currentLocks == nil ||
+		!os.SameFile(locksInfo, boundLocks) || !os.SameFile(locksInfo, currentLocks) ||
+		!sameStateDirectorySecurity(locksInfo, boundLocks) ||
+		!sameStateDirectorySecurity(locksInfo, currentLocks) {
+		return nil, errors.Join(err, currentLocksErr, errors.New("state lock directory changed while binding"))
 	}
 	if err := rejectWritableStateDirectory(boundLocks, "bound state lock directory"); err != nil {
 		return nil, err
@@ -611,10 +799,20 @@ func AcquireLock(stateDir, operation string, recoverStale bool) (*Lock, error) {
 		secured, statErr := createdDirectory.Stat()
 		closeErr := createdDirectory.Close()
 		current, lstatErr := stateRoot.Lstat("locks")
+		var securedAdmissionErr, currentAdmissionErr error
+		if secured != nil {
+			_, securedAdmissionErr = admitStateDirectory(secured, "secured new state lock directory")
+		}
+		if current != nil {
+			_, currentAdmissionErr = admitStateDirectory(current, "current secured state lock directory")
+		}
 		if chmodErr != nil || syncErr != nil || statErr != nil || closeErr != nil || lstatErr != nil || secured == nil ||
+			securedAdmissionErr != nil || currentAdmissionErr != nil || current == nil ||
 			secured.Mode().Perm() != 0o700 || current.Mode()&os.ModeSymlink != 0 ||
-			!os.SameFile(boundLocks, secured) || !os.SameFile(boundLocks, current) {
-			return nil, errors.Join(chmodErr, syncErr, statErr, closeErr, lstatErr, errors.New("new state lock directory changed while securing permissions"))
+			!os.SameFile(boundLocks, secured) || !os.SameFile(boundLocks, current) ||
+			!sameStateOwnership(boundLocks, secured, false) ||
+			!sameStateOwnership(boundLocks, current, false) {
+			return nil, errors.Join(chmodErr, syncErr, statErr, closeErr, lstatErr, securedAdmissionErr, currentAdmissionErr, errors.New("new state lock directory changed while securing permissions"))
 		}
 		boundLocks = secured
 	}
@@ -630,7 +828,9 @@ func AcquireLock(stateDir, operation string, recoverStale bool) (*Lock, error) {
 	}()
 	lockPath := filepath.Join(statePath, "locks", "state.lock")
 	lock := &Lock{
-		path: lockPath, statePath: statePath, stateRoot: stateRoot, stateIdentity: boundState,
+		path: lockPath, parentPath: parentPath, statePath: statePath,
+		parentRoot: parentRoot, parentIdentity: parentIdentity,
+		stateRoot: stateRoot, stateIdentity: boundState,
 		locksRoot: locksRoot, locksFile: locksFile, locksIdentity: boundLocks,
 	}
 	if err := lock.validatePathIdentity(); err != nil {
@@ -683,7 +883,7 @@ func AcquireLock(stateDir, operation string, recoverStale bool) (*Lock, error) {
 				lockIdentity, statErr := file.Stat()
 				if statErr != nil || lockIdentity == nil ||
 					!lockIdentity.Mode().IsRegular() || !os.SameFile(fileIdentity, lockIdentity) {
-					removeErr := removeLeasedStateLock(locksRoot, locksFile, file, fileIdentity)
+					_, removeErr := removeLeasedStateLock(locksRoot, locksFile, file, fileIdentity)
 					leaseErr := closeStateLockLease(file, recordLeaseID)
 					return nil, errors.Join(statErr, removeErr, leaseErr)
 				}
@@ -692,7 +892,7 @@ func AcquireLock(stateDir, operation string, recoverStale bool) (*Lock, error) {
 				lock.localRecordID = recordLeaseID
 				lock.lockRecord = record
 				closePublished := func() error {
-					removeErr := lock.removeOwnedLock()
+					_, removeErr := lock.removeOwnedLock()
 					leaseErr := closeStateLockLease(file, recordLeaseID)
 					lock.lockIdentity, lock.lockFile = nil, nil
 					lock.localRecordID = 0
@@ -709,13 +909,29 @@ func AcquireLock(stateDir, operation string, recoverStale bool) (*Lock, error) {
 				if prepareErr := prepareStateRootPermissions(stateRoot, boundState); prepareErr != nil {
 					return nil, fmt.Errorf("prepare protected state/serving corridor: %w", errors.Join(prepareErr, closePublished()))
 				}
+				preparedState, preparedStateErr := stateRoot.Stat(".")
+				preparedStatePath, preparedStatePathErr := os.Lstat(statePath)
+				if preparedStateErr != nil || preparedStatePathErr != nil || preparedState == nil || preparedStatePath == nil ||
+					!os.SameFile(boundState, preparedState) || !os.SameFile(boundState, preparedStatePath) ||
+					!sameStateDirectorySecurity(preparedState, preparedStatePath) {
+					return nil, fmt.Errorf(
+						"bind prepared state-root security identity: %w",
+						errors.Join(
+							preparedStateErr,
+							preparedStatePathErr,
+							errors.New("state root coordinate was replaced during permission reconciliation"),
+							closePublished(),
+						),
+					)
+				}
+				lock.stateIdentity = preparedState
 				if validateErr := lock.validatePathIdentity(); validateErr != nil {
 					return nil, fmt.Errorf("validate state after protected corridor preparation: %w", errors.Join(validateErr, closePublished()))
 				}
 				if err := errors.Join(locksFile.Sync(), lock.validatePathIdentity()); err != nil {
 					return nil, fmt.Errorf("validate acquired state lock: %w", errors.Join(err, closePublished()))
 				}
-				closeState, closeLocks, closeLocksFile = false, false, false
+				closeParent, closeState, closeLocks, closeLocksFile = false, false, false, false
 				leaseOpen = false
 				return lock, nil
 			}
@@ -818,19 +1034,45 @@ func (l *Lock) ValidateStateDir(stateDir string) error {
 }
 
 func (l *Lock) validatePathIdentity() error {
-	if l.stateRoot == nil || l.locksRoot == nil || l.locksFile == nil || l.stateIdentity == nil || l.locksIdentity == nil {
+	if l.parentRoot == nil || l.parentIdentity == nil || l.parentPath == "" ||
+		l.stateRoot == nil || l.locksRoot == nil || l.locksFile == nil ||
+		l.stateIdentity == nil || l.locksIdentity == nil {
 		return errors.New("state lock binding is closed")
 	}
+	boundParent, parentErr := l.parentRoot.Stat(".")
+	pathParent, pathParentErr := os.Lstat(l.parentPath)
+	parentState, parentStateErr := l.parentRoot.Lstat(filepath.Base(l.statePath))
 	boundState, stateErr := l.stateRoot.Stat(".")
 	boundLocks, locksErr := l.locksRoot.Stat(".")
 	locksFileInfo, locksFileErr := l.locksFile.Stat()
 	pathState, pathErr := os.Lstat(l.statePath)
 	stateLocks, stateLocksErr := l.stateRoot.Lstat("locks")
-	if stateErr != nil || locksErr != nil || locksFileErr != nil || pathErr != nil || stateLocksErr != nil ||
+	if parentErr != nil || pathParentErr != nil || parentStateErr != nil ||
+		stateErr != nil || locksErr != nil || locksFileErr != nil || pathErr != nil || stateLocksErr != nil ||
+		boundParent == nil || pathParent == nil || parentState == nil ||
+		!os.SameFile(l.parentIdentity, boundParent) || !os.SameFile(l.parentIdentity, pathParent) ||
+		!sameStateDirectorySecurity(l.parentIdentity, boundParent) ||
+		!sameStateDirectorySecurity(l.parentIdentity, pathParent) ||
 		pathState.Mode()&os.ModeSymlink != 0 || !pathState.IsDir() || stateLocks.Mode()&os.ModeSymlink != 0 || !stateLocks.IsDir() ||
+		!os.SameFile(l.stateIdentity, parentState) ||
 		!os.SameFile(l.stateIdentity, boundState) || !os.SameFile(l.stateIdentity, pathState) ||
-		!os.SameFile(l.locksIdentity, boundLocks) || !os.SameFile(l.locksIdentity, locksFileInfo) || !os.SameFile(l.locksIdentity, stateLocks) {
-		return errors.Join(stateErr, locksErr, locksFileErr, pathErr, stateLocksErr, errors.New("state or lock directory was replaced after lock acquisition"))
+		!sameStateDirectorySecurity(l.stateIdentity, parentState) ||
+		!sameStateDirectorySecurity(l.stateIdentity, boundState) ||
+		!sameStateDirectorySecurity(l.stateIdentity, pathState) ||
+		!os.SameFile(l.locksIdentity, boundLocks) || !os.SameFile(l.locksIdentity, locksFileInfo) || !os.SameFile(l.locksIdentity, stateLocks) ||
+		!sameStateDirectorySecurity(l.locksIdentity, boundLocks) ||
+		!sameStateDirectorySecurity(l.locksIdentity, locksFileInfo) ||
+		!sameStateDirectorySecurity(l.locksIdentity, stateLocks) {
+		return errors.Join(parentErr, pathParentErr, parentStateErr, stateErr, locksErr, locksFileErr, pathErr, stateLocksErr, errors.New("state or lock directory was replaced or its security identity changed after lock acquisition"))
+	}
+	if _, err := admitStateDirectory(boundParent, "bound state immediate parent"); err != nil {
+		return err
+	}
+	if _, err := admitStateDirectory(boundState, "bound state root"); err != nil {
+		return err
+	}
+	if _, err := admitStateDirectory(boundLocks, "bound state lock directory"); err != nil {
+		return err
 	}
 	if l.leaseIdentity != nil {
 		if l.leaseFile == nil || l.localLeaseID == 0 {
@@ -838,10 +1080,20 @@ func (l *Lock) validatePathIdentity() error {
 		}
 		opened, openedErr := l.leaseFile.Stat()
 		current, currentErr := l.locksRoot.Lstat("state.lease")
-		if openedErr != nil || currentErr != nil || opened == nil || !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 ||
-			current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || current.Mode().Perm() != 0o600 ||
-			!os.SameFile(l.leaseIdentity, opened) || !os.SameFile(l.leaseIdentity, current) {
-			return errors.Join(openedErr, currentErr, errors.New("persistent state lease was replaced or widened after acquisition"))
+		var openedAdmissionErr, currentAdmissionErr error
+		if opened != nil {
+			_, openedAdmissionErr = admitStateControlFile(opened, "bound persistent state lease")
+		}
+		if current != nil {
+			_, currentAdmissionErr = admitStateControlFile(current, "current persistent state lease")
+		}
+		if openedErr != nil || currentErr != nil || opened == nil || current == nil ||
+			openedAdmissionErr != nil || currentAdmissionErr != nil ||
+			opened.Mode().Perm() != 0o600 || current.Mode().Perm() != 0o600 ||
+			!os.SameFile(l.leaseIdentity, opened) || !os.SameFile(l.leaseIdentity, current) ||
+			!sameStateControlFileSecurity(l.leaseIdentity, opened) ||
+			!sameStateControlFileSecurity(l.leaseIdentity, current) {
+			return errors.Join(openedErr, currentErr, openedAdmissionErr, currentAdmissionErr, errors.New("persistent state lease was replaced or widened after acquisition"))
 		}
 	}
 	if l.lockIdentity != nil {
@@ -850,10 +1102,22 @@ func (l *Lock) validatePathIdentity() error {
 		}
 		opened, openedErr := l.lockFile.Stat()
 		current, err := l.locksRoot.Lstat("state.lock")
-		if openedErr != nil || err != nil || opened == nil || !opened.Mode().IsRegular() ||
-			current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
-			!os.SameFile(l.lockIdentity, opened) || !os.SameFile(l.lockIdentity, current) {
-			return errors.Join(openedErr, err, errors.New("state lock entry no longer belongs to this holder"))
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("state lock durable record is missing")
+		}
+		var openedAdmissionErr, currentAdmissionErr error
+		if opened != nil {
+			_, openedAdmissionErr = admitStateControlFile(opened, "bound state lock entry")
+		}
+		if current != nil {
+			_, currentAdmissionErr = admitStateControlFile(current, "current state lock entry")
+		}
+		if openedErr != nil || err != nil || opened == nil || current == nil ||
+			openedAdmissionErr != nil || currentAdmissionErr != nil ||
+			!os.SameFile(l.lockIdentity, opened) || !os.SameFile(l.lockIdentity, current) ||
+			!sameStateControlFileSecurity(l.lockIdentity, opened) ||
+			!sameStateControlFileSecurity(l.lockIdentity, current) {
+			return errors.Join(openedErr, err, openedAdmissionErr, currentAdmissionErr, errors.New("state lock entry no longer belongs to this holder"))
 		}
 		record, err := readLockFileAt(l.locksRoot, "state.lock", l.lockFile, l.lockIdentity)
 		if err != nil || !sameLockRecord(l.lockRecord, record) {
@@ -919,8 +1183,13 @@ func prepareStateRootPermissions(stateRoot *os.Root, stateIdentity os.FileInfo) 
 	boundState, boundErr := stateRoot.Stat(".")
 	if statErr != nil || boundErr != nil || openedState == nil || boundState == nil ||
 		!openedState.IsDir() || !boundState.IsDir() ||
-		!os.SameFile(stateIdentity, openedState) || !os.SameFile(stateIdentity, boundState) {
+		!os.SameFile(stateIdentity, openedState) || !os.SameFile(stateIdentity, boundState) ||
+		!sameStateDirectorySecurity(stateIdentity, openedState) ||
+		!sameStateDirectorySecurity(stateIdentity, boundState) {
 		return errors.Join(statErr, boundErr, errors.New("bound state root changed before permission reconciliation"))
+	}
+	if _, err := admitStateDirectory(openedState, "bound state root before permission reconciliation"); err != nil {
+		return err
 	}
 	entries, err := stateFile.ReadDir(-1)
 	if err != nil {
@@ -944,6 +1213,15 @@ func prepareStateRootPermissions(stateRoot *os.Root, stateIdentity os.FileInfo) 
 		default:
 			return fmt.Errorf("state child %s is neither a protected control file nor a serving directory", name)
 		}
+		if child.IsDir() {
+			if _, err := admitStateDirectory(child, fmt.Sprintf("state child directory %s", name)); err != nil {
+				return err
+			}
+		} else {
+			if _, err := admitStateControlFile(child, fmt.Sprintf("state child control file %s", name)); err != nil {
+				return err
+			}
+		}
 		if faultErr := callStatePermissionFault(statePermissionAfterChildLstat, name); faultErr != nil {
 			return faultErr
 		}
@@ -954,13 +1232,34 @@ func prepareStateRootPermissions(stateRoot *os.Root, stateIdentity os.FileInfo) 
 	if faultErr := callStatePermissionFault(statePermissionBeforeRootChmod, "."); faultErr != nil {
 		return faultErr
 	}
+	beforeChmod, beforeChmodErr := stateFile.Stat()
+	boundBeforeChmod, boundBeforeChmodErr := stateRoot.Stat(".")
+	if beforeChmodErr != nil || boundBeforeChmodErr != nil || beforeChmod == nil || boundBeforeChmod == nil ||
+		!os.SameFile(stateIdentity, beforeChmod) || !os.SameFile(stateIdentity, boundBeforeChmod) ||
+		!sameStateDirectorySecurity(openedState, beforeChmod) ||
+		!sameStateDirectorySecurity(openedState, boundBeforeChmod) {
+		return errors.Join(beforeChmodErr, boundBeforeChmodErr, errors.New("bound state root security changed before descriptor-bound chmod"))
+	}
+	if _, err := admitStateDirectory(beforeChmod, "bound state root immediately before chmod"); err != nil {
+		return err
+	}
 	chmodErr := stateFile.Chmod(0o711)
 	syncErr := stateFile.Sync()
 	afterState, afterErr := stateFile.Stat()
 	boundState, boundErr = stateRoot.Stat(".")
+	var afterAdmissionErr, boundAdmissionErr error
+	if afterState != nil {
+		_, afterAdmissionErr = admitStateDirectory(afterState, "secured bound state root")
+	}
+	if boundState != nil {
+		_, boundAdmissionErr = admitStateDirectory(boundState, "current secured state root")
+	}
 	if chmodErr != nil || syncErr != nil || afterErr != nil || boundErr != nil || afterState == nil || boundState == nil ||
-		afterState.Mode().Perm() != 0o711 || !os.SameFile(stateIdentity, afterState) || !os.SameFile(stateIdentity, boundState) {
-		return errors.Join(chmodErr, syncErr, afterErr, boundErr, errors.New("bound state root changed while securing permissions"))
+		afterAdmissionErr != nil || boundAdmissionErr != nil ||
+		afterState.Mode().Perm() != 0o711 || !os.SameFile(stateIdentity, afterState) || !os.SameFile(stateIdentity, boundState) ||
+		!sameStateOwnership(stateIdentity, afterState, false) ||
+		!sameStateOwnership(stateIdentity, boundState, false) {
+		return errors.Join(chmodErr, syncErr, afterErr, boundErr, afterAdmissionErr, boundAdmissionErr, errors.New("bound state root changed while securing permissions"))
 	}
 	closeState = false
 	return stateFile.Close()
@@ -990,14 +1289,46 @@ func secureBoundStateChild(stateRoot *os.Root, name string, identity os.FileInfo
 	if identity.IsDir() != opened.IsDir() || identity.Mode().IsRegular() != opened.Mode().IsRegular() {
 		return errors.New("state child type changed before descriptor-bound chmod")
 	}
+	if identity.IsDir() {
+		_, openedAdmissionErr := admitStateDirectory(opened, fmt.Sprintf("opened state child directory %s", name))
+		_, currentAdmissionErr := admitStateDirectory(current, fmt.Sprintf("current state child directory %s", name))
+		if openedAdmissionErr != nil || currentAdmissionErr != nil ||
+			!sameStateDirectorySecurity(identity, opened) ||
+			!sameStateDirectorySecurity(identity, current) {
+			return errors.Join(openedAdmissionErr, currentAdmissionErr, errors.New("state child directory security changed before descriptor-bound chmod"))
+		}
+	} else {
+		_, openedAdmissionErr := admitStateControlFile(opened, fmt.Sprintf("opened state child control file %s", name))
+		_, currentAdmissionErr := admitStateControlFile(current, fmt.Sprintf("current state child control file %s", name))
+		if openedAdmissionErr != nil || currentAdmissionErr != nil ||
+			!sameStateControlFileSecurity(identity, opened) ||
+			!sameStateControlFileSecurity(identity, current) {
+			return errors.Join(openedAdmissionErr, currentAdmissionErr, errors.New("state child control-file security changed before descriptor-bound chmod"))
+		}
+	}
 	chmodErr := file.Chmod(mode.Perm())
 	syncErr := file.Sync()
 	after, afterErr := file.Stat()
 	current, lstatErr = stateRoot.Lstat(name)
-	if chmodErr != nil || syncErr != nil || afterErr != nil || lstatErr != nil || after == nil || current == nil ||
+	var afterAdmissionErr, currentAdmissionErr error
+	if after != nil && identity.IsDir() {
+		_, afterAdmissionErr = admitStateDirectory(after, fmt.Sprintf("secured state child directory %s", name))
+	} else if after != nil {
+		_, afterAdmissionErr = admitStateControlFile(after, fmt.Sprintf("secured state child control file %s", name))
+	}
+	if current != nil && identity.IsDir() {
+		_, currentAdmissionErr = admitStateDirectory(current, fmt.Sprintf("current secured state child directory %s", name))
+	} else if current != nil {
+		_, currentAdmissionErr = admitStateControlFile(current, fmt.Sprintf("current secured state child control file %s", name))
+	}
+	if chmodErr != nil || syncErr != nil || afterErr != nil || lstatErr != nil ||
+		afterAdmissionErr != nil || currentAdmissionErr != nil || after == nil || current == nil ||
 		after.Mode().Perm() != mode.Perm() || current.Mode()&os.ModeSymlink != 0 ||
-		!os.SameFile(identity, after) || !os.SameFile(identity, current) {
-		return errors.Join(chmodErr, syncErr, afterErr, lstatErr, errors.New("state child changed during descriptor-bound chmod"))
+		current.Mode().Perm() != mode.Perm() ||
+		!os.SameFile(identity, after) || !os.SameFile(identity, current) ||
+		!sameStateOwnership(identity, after, identity.Mode().IsRegular()) ||
+		!sameStateOwnership(identity, current, identity.Mode().IsRegular()) {
+		return errors.Join(chmodErr, syncErr, afterErr, lstatErr, afterAdmissionErr, currentAdmissionErr, errors.New("state child changed during descriptor-bound chmod"))
 	}
 	closeFile = false
 	return file.Close()
@@ -1117,8 +1448,8 @@ func readLockFileAt(root *os.Root, name string, file *os.File, identity os.FileI
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return lockRecord{}, errors.Join(err, errors.New("lock entry is not a regular file"))
 	}
-	if info.Mode().Perm()&0o022 != 0 {
-		return lockRecord{}, fmt.Errorf("lock entry is group/other writable (mode %#o)", info.Mode().Perm())
+	if _, err := admitStateControlFile(info, fmt.Sprintf("lock entry %s", name)); err != nil {
+		return lockRecord{}, err
 	}
 	if info.Size() <= 0 || info.Size() > maxLockRecordBytes {
 		return lockRecord{}, fmt.Errorf("lock entry size %d is outside the accepted range", info.Size())
@@ -1127,7 +1458,9 @@ func readLockFileAt(root *os.Root, name string, file *os.File, identity os.FileI
 		return lockRecord{}, errors.New("lock entry lease is unavailable")
 	}
 	opened, err := file.Stat()
-	if err != nil || opened == nil || !os.SameFile(identity, info) || !os.SameFile(identity, opened) || !opened.Mode().IsRegular() {
+	if err != nil || opened == nil || !os.SameFile(identity, info) || !os.SameFile(identity, opened) ||
+		!sameStateControlFileSecurity(identity, info) ||
+		!sameStateControlFileSecurity(identity, opened) {
 		return lockRecord{}, errors.Join(err, errors.New("lock entry changed while opening"))
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
@@ -1145,7 +1478,10 @@ func readLockFileAt(root *os.Root, name string, file *os.File, identity os.FileI
 	}
 	after, statErr := file.Stat()
 	current, lstatErr := root.Lstat(name)
-	if decodeErr != nil || statErr != nil || lstatErr != nil || !os.SameFile(identity, after) || !os.SameFile(identity, current) {
+	if decodeErr != nil || statErr != nil || lstatErr != nil || after == nil || current == nil ||
+		!os.SameFile(identity, after) || !os.SameFile(identity, current) ||
+		!sameStateControlFileSecurity(identity, after) ||
+		!sameStateControlFileSecurity(identity, current) {
 		return lockRecord{}, errors.Join(decodeErr, statErr, lstatErr, errors.New("lock entry changed while reading"))
 	}
 	if _, err := record.kind(); err != nil {
@@ -1179,36 +1515,46 @@ func (l *Lock) Release() error {
 	if err := l.validateHolderProcessIdentity(); err != nil {
 		return err
 	}
-	removeErr := l.removeOwnedLock()
+	if err := l.validatePathIdentity(); err != nil {
+		return fmt.Errorf("refusing to release state lock after its bound coordinate changed: %w", err)
+	}
+	removed, removeErr := l.removeOwnedLock()
+	if removeErr != nil && !removed {
+		// No namespace mutation committed. Keep every descriptor and advisory
+		// lease live so this holder can retry exact removal.
+		return removeErr
+	}
 	recordLeaseErr := closeStateLockLease(l.lockFile, l.localRecordID)
 	persistentLeaseErr := closeStateLockLease(l.leaseFile, l.localLeaseID)
 	closeFileErr := l.locksFile.Close()
 	closeLocksErr := l.locksRoot.Close()
 	closeStateErr := l.stateRoot.Close()
+	closeParentErr := l.parentRoot.Close()
 	l.path = ""
-	l.stateRoot, l.locksRoot, l.locksFile = nil, nil, nil
-	l.stateIdentity, l.locksIdentity, l.leaseIdentity, l.lockIdentity = nil, nil, nil, nil
+	l.parentRoot, l.stateRoot, l.locksRoot, l.locksFile = nil, nil, nil, nil
+	l.parentIdentity, l.stateIdentity, l.locksIdentity, l.leaseIdentity, l.lockIdentity = nil, nil, nil, nil, nil
 	l.leaseFile, l.lockFile = nil, nil
 	l.localLeaseID, l.localRecordID = 0, 0
 	l.lockRecord = lockRecord{}
-	return errors.Join(removeErr, recordLeaseErr, persistentLeaseErr, closeFileErr, closeLocksErr, closeStateErr)
+	return errors.Join(removeErr, recordLeaseErr, persistentLeaseErr, closeFileErr, closeLocksErr, closeStateErr, closeParentErr)
 }
 
-func (l *Lock) removeOwnedLock() error {
+func (l *Lock) removeOwnedLock() (bool, error) {
 	if l == nil || l.locksRoot == nil || l.locksFile == nil || l.leaseFile == nil || l.leaseIdentity == nil || l.localLeaseID == 0 ||
 		l.lockFile == nil || l.lockIdentity == nil || l.localRecordID == 0 {
-		return errors.New("state lock ownership binding is unavailable")
+		return false, errors.New("state lock ownership binding is unavailable")
 	}
 	current, err := l.locksRoot.Lstat("state.lock")
 	if errors.Is(err, os.ErrNotExist) {
-		return errors.New("refusing to release a state lock whose durable record is missing")
+		return false, errors.New("refusing to release a state lock whose durable record is missing")
 	}
-	if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(l.lockIdentity, current) {
-		return errors.Join(err, errors.New("refusing to remove a state lock entry not owned by this holder"))
+	if err != nil || current == nil || !os.SameFile(l.lockIdentity, current) ||
+		!sameStateControlFileSecurity(l.lockIdentity, current) {
+		return false, errors.Join(err, errors.New("refusing to remove a state lock entry not owned by this holder"))
 	}
 	record, err := readLockFileAt(l.locksRoot, "state.lock", l.lockFile, l.lockIdentity)
 	if err != nil || !sameLockRecord(l.lockRecord, record) {
-		return errors.Join(err, errors.New("refusing to remove a state lock record not owned by this holder"))
+		return false, errors.Join(err, errors.New("refusing to remove a state lock record not owned by this holder"))
 	}
 	return removeLeasedStateLock(l.locksRoot, l.locksFile, l.lockFile, l.lockIdentity)
 }

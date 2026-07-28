@@ -30,6 +30,7 @@ const (
 	syncReplayFilename       = "replay.jsonl"
 	syncReplayMaxRecordBytes = 4096
 	syncReplayMaxRecords     = 10_000_000
+	syncReplayMaxBytes       = int64(syncReplayMaxRecords) * int64(syncReplayMaxRecordBytes+1)
 	emptySyncReplaySHA256    = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 )
 
@@ -177,6 +178,9 @@ func (o *syncOperation) WriteReplay(records []syncReplayRecord, expectedSHA stri
 	if o == nil || o.root == nil {
 		return "", 0, errors.New("sync replay store is unavailable")
 	}
+	if err := o.verifyBinding(); err != nil {
+		return "", 0, err
+	}
 	if len(records) > syncReplayMaxRecords {
 		return "", 0, errors.New("sync replay change set exceeds safety limit")
 	}
@@ -184,7 +188,16 @@ func (o *syncOperation) WriteReplay(records []syncReplayRecord, expectedSHA stri
 	if err != nil {
 		return "", 0, err
 	}
-	defer o.root.Remove(tmpName)
+	createdIdentity, statErr := tmp.Stat()
+	currentCreated, lstatErr := o.root.Lstat(tmpName)
+	if statErr != nil || lstatErr != nil ||
+		!privateSyncControlFile(createdIdentity) || !privateSyncControlFile(currentCreated) ||
+		!os.SameFile(createdIdentity, currentCreated) ||
+		!sameDerivedStateControlFileSecurity(createdIdentity, currentCreated) {
+		_ = tmp.Close()
+		return "", 0, errors.Join(statErr, lstatErr, errors.New("sync replay temporary was unsafe at creation"))
+	}
+	defer o.cleanupControlTemp(tmpName, createdIdentity)
 	hasher := sha256.New()
 	writer := bufio.NewWriterSize(io.MultiWriter(tmp, hasher), 64<<10)
 	for index, record := range records {
@@ -222,6 +235,14 @@ func (o *syncOperation) WriteReplay(records []syncReplayRecord, expectedSHA stri
 		_ = tmp.Close()
 		return "", 0, err
 	}
+	tmpIdentity, err := tmp.Stat()
+	currentTmp, currentTmpErr := o.root.Lstat(tmpName)
+	if err != nil || currentTmpErr != nil || !privateSyncControlFile(tmpIdentity) ||
+		!privateSyncControlFile(currentTmp) || !os.SameFile(tmpIdentity, currentTmp) ||
+		!sameDerivedStateControlFileSecurity(tmpIdentity, currentTmp) {
+		_ = tmp.Close()
+		return "", 0, errors.Join(err, currentTmpErr, errors.New("sync replay temporary changed while writing"))
+	}
 	if err := tmp.Close(); err != nil {
 		return "", 0, err
 	}
@@ -230,17 +251,20 @@ func (o *syncOperation) WriteReplay(records []syncReplayRecord, expectedSHA stri
 	if expectedSHA != "" && (digest != expectedSHA || count != expectedCount) {
 		return "", 0, errors.New("upstream change set differs from prepared durable sync intent")
 	}
-	if info, err := o.root.Lstat(syncReplayFilename); err == nil {
-		if !privateRegularFile(info) {
-			return "", 0, errors.New("refusing to replace unsafe sync replay file")
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	if err := o.verifyBinding(); err != nil {
 		return "", 0, err
 	}
-	if err := o.root.Rename(tmpName, syncReplayFilename); err != nil {
+	if _, err := o.installControlTemp(
+		tmpName,
+		tmpIdentity,
+		syncReplayFilename,
+		syncReplayMaxBytes,
+		nil,
+	); err != nil {
 		return "", 0, err
 	}
-	if err := syncRootDirectory(o.root); err != nil {
+	tmpIdentity = nil
+	if err := errors.Join(syncRootDirectory(o.root), o.verifyBinding()); err != nil {
 		return "", 0, err
 	}
 	return digest, count, nil
@@ -300,7 +324,13 @@ func (o *syncOperation) readReplayPass(progress *syncProgress, fn func(syncRepla
 			return errors.New("sync replay record count exceeds durable identity")
 		}
 		if fn != nil {
+			if err := o.verifyOpenControlFile(syncReplayFilename, file, info); err != nil {
+				return err
+			}
 			if err := fn(record); err != nil {
+				return err
+			}
+			if err := o.verifyOpenControlFile(syncReplayFilename, file, info); err != nil {
 				return err
 			}
 		}
@@ -311,7 +341,7 @@ func (o *syncOperation) readReplayPass(progress *syncProgress, fn func(syncRepla
 	if count != progress.ReplayCount || hex.EncodeToString(hasher.Sum(nil)) != progress.ReplaySHA256 {
 		return errors.New("sync replay digest or record count mismatch")
 	}
-	return nil
+	return o.verifyOpenControlFile(syncReplayFilename, file, info)
 }
 
 func decodeSyncReplayRecord(data []byte) (syncReplayRecord, error) {
@@ -342,27 +372,7 @@ func decodeSyncReplayRecord(data []byte) (syncReplayRecord, error) {
 }
 
 func (o *syncOperation) openPrivateFile(name string) (*os.File, os.FileInfo, error) {
-	if o == nil || o.root == nil {
-		return nil, nil, errors.New("sync operation is closed")
-	}
-	info, err := o.root.Lstat(name)
-	if err != nil {
-		return nil, nil, err
-	}
-	if !privateRegularFile(info) {
-		return nil, nil, errors.New("sync operation file must be a private regular file")
-	}
-	file, err := o.root.Open(name)
-	if err != nil {
-		return nil, nil, err
-	}
-	opened, statErr := file.Stat()
-	current, lstatErr := o.root.Lstat(name)
-	if statErr != nil || lstatErr != nil || !privateRegularFile(opened) || !privateRegularFile(current) || !os.SameFile(opened, current) {
-		_ = file.Close()
-		return nil, nil, errors.Join(statErr, lstatErr, errors.New("sync operation file changed while opening"))
-	}
-	return file, opened, nil
+	return o.openControlFile(name)
 }
 
 func (o *syncOperation) RemoveReplay() error {
@@ -376,13 +386,10 @@ func (o *syncOperation) RemoveReplay() error {
 	if err != nil {
 		return err
 	}
-	if !privateRegularFile(info) {
+	if !privateSyncControlFile(info) {
 		return errors.New("refusing to remove unsafe sync replay file")
 	}
-	if err := o.root.Remove(syncReplayFilename); err != nil {
-		return err
-	}
-	return syncRootDirectory(o.root)
+	return o.removeControlFile(syncReplayFilename, info)
 }
 
 // RemoveReplayDownloads removes all recognized transport residue only after

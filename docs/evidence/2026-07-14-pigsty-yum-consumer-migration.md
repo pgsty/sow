@@ -11,7 +11,9 @@ Result: **local executable path PASS; production endpoint and client cutover rem
   the two frozen cross-EL compatibility projections rather than a nonexistent
   per-release repository.
 - `docs/migration/yum-consumer-files.tsv` freezes the two renderers and nine
-  source files containing 28 managed definitions.
+  source files containing 22 managed definitions. The six EL8/9/10
+  architecture defaults now consume Percona directly, so only the two
+  still-SOW-hosted Percona definitions remain in this cutover scope.
 - `docs/migration/migrate-pigsty-yum-consumers.sh` provides read-only
   `audit`/`stage`/`verify`, digest-confirmed `apply`, and byte-exact
   `rollback`.
@@ -53,9 +55,9 @@ docs/migration/test-migrate-pigsty-yum-consumers.sh
 Observed:
 
 ```text
-mapped_definitions=28 already_migrated=
+mapped_definitions=22 already_migrated=
 audit=pass
-pigsty_yum_consumer_audit=pass mapped_definitions=28
+pigsty_yum_consumer_audit=pass mapped_definitions=22
 pigsty_yum_consumer_stage=pass source_unchanged=true
 pigsty_yum_consumer_apply=pass replay_idempotent=true mixed_state_recovered=true
 pigsty_yum_consumer_preflight_gate=pass rejected_before_mutation=true receipt_bound=true

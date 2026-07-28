@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/pgsty/sow/internal/state"
@@ -91,15 +92,10 @@ func writeYUMCompatibilityCutoverJournalBound(workflow yumCompatibilityWorkflow,
 		keep := true
 		defer func() {
 			if keep {
-				resultErr = errors.Join(resultErr, removeExactYUMCompatibilityBoundFile(workflow.root.stateRoot, temporary, temporaryInfo))
+				resultErr = errors.Join(resultErr, removeExactYUMCompatibilityBoundControlFile(workflow.root.stateRoot, temporary, temporaryInfo))
 			}
 		}()
-		// Link is the portable parent-bound no-replace commit for a regular
-		// journal. A competing coordinate is preserved and causes a conflict.
-		if err := workflow.root.stateRoot.Link(temporary, name); err != nil {
-			return err
-		}
-		if err := removeExactYUMCompatibilityBoundFile(workflow.root.stateRoot, temporary, temporaryInfo); err != nil {
+		if err := publishYUMCompatibilityBoundControlFileNoReplace(workflow.root.stateRoot, temporary, name, temporaryInfo); err != nil {
 			return err
 		}
 		keep = false
@@ -121,23 +117,62 @@ func writeYUMCompatibilityCutoverJournalBound(workflow yumCompatibilityWorkflow,
 		if err != nil {
 			return err
 		}
+		pendingCleanupIdentity := temporaryInfo
 		keep := true
 		defer func() {
 			if keep {
 				resultErr = errors.Join(
 					resultErr,
-					removeExactYUMCompatibilityBoundFile(workflow.root.stateRoot, temporary, temporaryInfo),
-					removeExactYUMCompatibilityBoundFile(workflow.root.stateRoot, pending, temporaryInfo),
+					removeExactYUMCompatibilityBoundControlFile(workflow.root.stateRoot, temporary, temporaryInfo),
+					removeExactYUMCompatibilityBoundControlFile(workflow.root.stateRoot, pending, pendingCleanupIdentity),
 				)
 			}
 		}()
-		if err := workflow.root.stateRoot.Link(temporary, pending); err != nil {
+		if err := publishYUMCompatibilityBoundControlFileNoReplace(workflow.root.stateRoot, temporary, pending, temporaryInfo); err != nil {
 			return err
 		}
-		if err := removeExactYUMCompatibilityBoundFile(workflow.root.stateRoot, temporary, temporaryInfo); err != nil {
+		pendingInfo, pendingErr := workflow.root.stateRoot.Lstat(pending)
+		if pendingErr != nil || pendingInfo == nil ||
+			!os.SameFile(temporaryInfo, pendingInfo) ||
+			!sameDerivedStateControlFileSecurity(temporaryInfo, pendingInfo) {
+			return errors.Join(pendingErr, errors.New("cutover journal pending phase changed before replacement"))
+		}
+		directory, err := workflow.root.stateRoot.Open(".")
+		if err != nil {
 			return err
 		}
-		if err := workflow.root.stateRoot.Rename(pending, name); err != nil {
+		exchange, exchangeErr := exchangeBoundDerivedStateControlFiles(
+			workflow.root.stateRoot,
+			directory,
+			pending,
+			temporaryInfo,
+			name,
+			maximumYUMCompatibilityWitnessBytes,
+			func(observed []byte) error {
+				prepared, err := decodeYUMCompatibilityCutoverJournalBody(observed, journal.ID)
+				if err != nil || prepared != current {
+					return errors.Join(err, errors.New("prepared cutover journal changed before phase exchange"))
+				}
+				return nil
+			},
+		)
+		closeErr := directory.Close()
+		if exchange.Exchanged && exchange.Displaced != nil {
+			pendingCleanupIdentity = exchange.Displaced
+			if exchangeErr != nil || closeErr != nil {
+				// The namespace already advanced. Preserve the complete
+				// committed/prepared pair for deterministic recovery.
+				keep = false
+			}
+		}
+		if exchangeErr != nil || closeErr != nil {
+			return errors.Join(exchangeErr, closeErr, errPartialYUMCompatibilityCutoverJournalNext)
+		}
+		if err := removeExactYUMCompatibilityBoundControlFile(
+			workflow.root.stateRoot,
+			pending,
+			pendingCleanupIdentity,
+		); err != nil {
 			return err
 		}
 		keep = false
@@ -158,22 +193,89 @@ func writeYUMCompatibilityBoundStateFile(root *os.Root, prefix string, body []by
 		return "", nil, err
 	}
 	name := prefix + nonce
+	info, err := writeYUMCompatibilityBoundControlFile(root, name, body)
+	return name, info, err
+}
+
+func writeYUMCompatibilityBoundControlFile(root *os.Root, name string, body []byte) (os.FileInfo, error) {
+	if root == nil || !validYUMCompatibilityTreeSegment(name) || len(body) == 0 ||
+		len(body) > maximumYUMCompatibilityWitnessBytes {
+		return nil, errors.New("bound YUM compatibility control-file write capability is invalid")
+	}
 	file, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return "", nil, err
+		return nil, err
+	}
+	created, statErr := file.Stat()
+	if statErr != nil || created == nil || created.Mode().Perm() != 0o600 {
+		closeErr := file.Close()
+		return nil, errors.Join(statErr, closeErr, errors.New("bound state temporary was unsafe at creation"))
+	}
+	if derivedStateControlBeforeWriteHook != nil {
+		if err := derivedStateControlBeforeWriteHook("yum-bound", name); err != nil {
+			closeErr := file.Close()
+			return nil, errors.Join(err, closeErr)
+		}
+	}
+	if _, err := verifyBoundDerivedStateControlFile(
+		root,
+		name,
+		file,
+		created,
+		"bound YUM compatibility journal before write",
+	); err != nil {
+		closeErr := file.Close()
+		return nil, errors.Join(err, closeErr)
 	}
 	_, writeErr := file.Write(body)
 	syncErr := file.Sync()
 	info, statErr := file.Stat()
 	closeErr := file.Close()
 	current, lstatErr := root.Lstat(name)
-	if writeErr != nil || syncErr != nil || statErr != nil || closeErr != nil || lstatErr != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || !os.SameFile(info, current) {
-		if info != nil {
-			_ = removeExactYUMCompatibilityBoundFile(root, name, info)
-		}
-		return "", nil, errors.Join(writeErr, syncErr, statErr, closeErr, lstatErr, errors.New("bound state temporary changed while writing"))
+	var infoAdmissionErr, currentAdmissionErr error
+	if info != nil {
+		_, infoAdmissionErr = admitDerivedStateControlFile(info, "bound YUM compatibility journal temporary")
 	}
-	return name, info, nil
+	if current != nil {
+		_, currentAdmissionErr = admitDerivedStateControlFile(current, "current bound YUM compatibility journal temporary")
+	}
+	if writeErr != nil || syncErr != nil || statErr != nil || closeErr != nil || lstatErr != nil ||
+		infoAdmissionErr != nil || currentAdmissionErr != nil || info == nil || current == nil ||
+		info.Mode().Perm() != 0o600 || current.Mode().Perm() != 0o600 ||
+		!os.SameFile(info, current) || !sameDerivedStateControlFileSecurity(info, current) {
+		if info != nil {
+			_ = removeExactYUMCompatibilityBoundControlFile(root, name, info)
+		}
+		return nil, errors.Join(writeErr, syncErr, statErr, closeErr, lstatErr, infoAdmissionErr, currentAdmissionErr, errors.New("bound state temporary changed while writing"))
+	}
+	return info, nil
+}
+
+func publishYUMCompatibilityBoundControlFileNoReplace(root *os.Root, source, destination string, expected os.FileInfo) error {
+	if root == nil || expected == nil || !validYUMCompatibilityTreeSegment(source) || !validYUMCompatibilityTreeSegment(destination) {
+		return errors.New("bound YUM compatibility control-file publication capability is invalid")
+	}
+	sourceInfo, err := root.Lstat(source)
+	if err != nil || sourceInfo == nil || !os.SameFile(expected, sourceInfo) ||
+		!sameDerivedStateControlFileSecurity(expected, sourceInfo) {
+		return errors.Join(err, errors.New("bound YUM compatibility control-file source changed before publication"))
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	if err := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), source, destination); err != nil {
+		return err
+	}
+	installed, installedErr := root.Lstat(destination)
+	_, sourceErr := root.Lstat(source)
+	if installedErr != nil || !errors.Is(sourceErr, os.ErrNotExist) || installed == nil ||
+		!os.SameFile(expected, installed) ||
+		!sameDerivedStateControlFileSecurity(expected, installed) {
+		return errors.Join(installedErr, sourceErr, errors.New("bound YUM compatibility control-file publication changed its identity"))
+	}
+	return directory.Sync()
 }
 
 func removeExactYUMCompatibilityBoundFile(root *os.Root, name string, expected os.FileInfo) error {
@@ -203,21 +305,68 @@ func removeExactYUMCompatibilityBoundFile(root *os.Root, name string, expected o
 	return syncYUMCompatibilityRootDirectory(root)
 }
 
+func removeExactYUMCompatibilityBoundControlFile(root *os.Root, name string, expected os.FileInfo) error {
+	if root == nil || expected == nil || !validYUMCompatibilityTreeSegment(name) {
+		return errors.New("exact bound control-file cleanup capability is unavailable")
+	}
+	if _, err := admitDerivedStateControlFile(expected, "expected bound YUM compatibility control file"); err != nil {
+		return err
+	}
+	info, err := root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil || info == nil || !os.SameFile(expected, info) ||
+		!sameDerivedStateControlFileSecurity(expected, info) {
+		return errors.Join(err, fmt.Errorf("bound control file %s was replaced or aliased; preserve it for audit", name))
+	}
+	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	opened, statErr := file.Stat()
+	current, lstatErr := root.Lstat(name)
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		!os.SameFile(expected, opened) || !os.SameFile(expected, current) ||
+		!sameDerivedStateControlFileSecurity(expected, opened) ||
+		!sameDerivedStateControlFileSecurity(expected, current) {
+		return errors.Join(statErr, lstatErr, fmt.Errorf("bound control file %s changed before cleanup", name))
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return commitExactPrivateStateFileRemoval(root, directory, file, expected, name, func() error {
+		after, statErr := file.Stat()
+		if statErr != nil || after == nil || !os.SameFile(expected, after) ||
+			!sameDerivedStateControlFileSecurity(expected, after) {
+			return errors.Join(statErr, fmt.Errorf("bound control file %s changed during cleanup", name))
+		}
+		return nil
+	})
+}
+
 func readYUMCompatibilityCutoverJournalBoundAt(root *os.Root, name, id string) (yumCompatibilityCutoverJournal, bool, error) {
 	var result yumCompatibilityCutoverJournal
 	info, err := root.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return result, false, nil
 	}
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > maximumYUMCompatibilityWitnessBytes {
+	if err != nil || info == nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Size() > maximumYUMCompatibilityWitnessBytes {
 		return result, false, errors.Join(err, fmt.Errorf("%w: cutover journal is not a bounded regular file", errPartialYUMCompatibilityCutoverJournalEncoding))
 	}
-	file, err := root.Open(name)
+	if _, err := admitDerivedStateControlFile(info, "bound YUM compatibility cutover journal"); err != nil {
+		return result, false, fmt.Errorf("%w: %v", errPartialYUMCompatibilityCutoverJournalEncoding, err)
+	}
+	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return result, false, err
 	}
 	opened, statErr := file.Stat()
-	if statErr != nil || !os.SameFile(info, opened) {
+	if statErr != nil || opened == nil || !os.SameFile(info, opened) ||
+		!sameDerivedStateControlFileSecurity(info, opened) {
 		return result, false, errors.Join(statErr, file.Close(), fmt.Errorf("%w: cutover journal changed while opening", errPartialYUMCompatibilityCutoverJournalEncoding))
 	}
 	body, readErr := io.ReadAll(io.LimitReader(file, maximumYUMCompatibilityWitnessBytes+1))
@@ -225,7 +374,11 @@ func readYUMCompatibilityCutoverJournalBoundAt(root *os.Root, name, id string) (
 	closeErr := file.Close()
 	current, lstatErr := root.Lstat(name)
 	if readErr != nil || restatErr != nil || closeErr != nil || lstatErr != nil || len(body) > maximumYUMCompatibilityWitnessBytes ||
-		!os.SameFile(opened, after) || !os.SameFile(opened, current) || int64(len(body)) != opened.Size() {
+		after == nil || current == nil ||
+		!os.SameFile(opened, after) || !os.SameFile(opened, current) ||
+		!sameDerivedStateControlFileSecurity(info, after) ||
+		!sameDerivedStateControlFileSecurity(info, current) ||
+		int64(len(body)) != opened.Size() {
 		return result, false, errors.Join(readErr, restatErr, closeErr, lstatErr, fmt.Errorf("%w: cutover journal changed while reading", errPartialYUMCompatibilityCutoverJournalEncoding))
 	}
 	result, err = decodeYUMCompatibilityCutoverJournalBody(body, id)
@@ -244,6 +397,9 @@ func readYUMCompatibilityCutoverJournalPairBound(workflow yumCompatibilityWorkfl
 	next := base + ".next"
 	nextInfo, nextErr := workflow.root.stateRoot.Lstat(next)
 	if nextErr == nil {
+		if _, admissionErr := admitDerivedStateControlFile(nextInfo, "pending bound YUM compatibility cutover journal"); admissionErr != nil {
+			return pair, admissionErr
+		}
 		if !recover {
 			return pair, fmt.Errorf("incomplete cutover journal phase update exists at %s; rerun the same compatibility command with --recover", next)
 		}
@@ -273,19 +429,14 @@ func readYUMCompatibilityCutoverJournalPairBound(workflow yumCompatibilityWorkfl
 		return pair, errors.Join(mainErr, nextErr, errors.New("cutover journal pair is not two safe regular files"))
 	}
 	if os.SameFile(mainInfo, nextInfo) {
-		if pair.Main.Phase != yumCompatibilityCutoverPrepared || pair.Next.Phase != yumCompatibilityCutoverPrepared || !sameYUMCompatibilityCutoverJournalIdentity(pair.Main, pair.Next) {
-			return pair, errors.New("atomically installed cutover journal pair is inconsistent")
-		}
-		if err := workflow.root.stateRoot.Remove(next); err != nil {
-			return pair, err
-		}
-		if err := syncYUMCompatibilityRootDirectory(workflow.root.stateRoot); err != nil {
-			return pair, err
-		}
-		pair.Next, pair.NextExists = yumCompatibilityCutoverJournal{}, false
-		return pair, nil
+		return pair, errors.New("cutover journal pair is hardlink-aliased; preserve both names for operator audit")
 	}
-	if pair.Main.Phase != yumCompatibilityCutoverPrepared || pair.Next.Phase != yumCompatibilityCutoverCommitted || !sameYUMCompatibilityCutoverJournalIdentity(pair.Main, pair.Next) {
+	forwardPair := pair.Main.Phase == yumCompatibilityCutoverPrepared &&
+		pair.Next.Phase == yumCompatibilityCutoverCommitted
+	exchangedPair := pair.Main.Phase == yumCompatibilityCutoverCommitted &&
+		pair.Next.Phase == yumCompatibilityCutoverPrepared
+	if (!forwardPair && !exchangedPair) ||
+		!sameYUMCompatibilityCutoverJournalIdentity(pair.Main, pair.Next) {
 		return pair, errors.New("cutover journal pending phase update differs from the exact prepared event")
 	}
 	return pair, nil
@@ -297,7 +448,14 @@ func removeYUMCompatibilityCutoverJournalBound(workflow yumCompatibilityWorkflow
 		return err
 	}
 	for _, target := range []string{name, name + ".next"} {
-		if err := workflow.root.stateRoot.Remove(target); err != nil && !errors.Is(err, os.ErrNotExist) {
+		info, statErr := workflow.root.stateRoot.Lstat(target)
+		if errors.Is(statErr, os.ErrNotExist) {
+			continue
+		}
+		if statErr != nil {
+			return statErr
+		}
+		if err := removeExactYUMCompatibilityBoundControlFile(workflow.root.stateRoot, target, info); err != nil {
 			return err
 		}
 	}
@@ -312,7 +470,15 @@ func removeYUMCompatibilityCutoverNextBound(workflow yumCompatibilityWorkflow, i
 	if err != nil {
 		return err
 	}
-	if err := workflow.root.stateRoot.Remove(name + ".next"); err != nil && !errors.Is(err, os.ErrNotExist) {
+	target := name + ".next"
+	info, statErr := workflow.root.stateRoot.Lstat(target)
+	if errors.Is(statErr, os.ErrNotExist) {
+		return syncYUMCompatibilityRootDirectory(workflow.root.stateRoot)
+	}
+	if statErr != nil {
+		return statErr
+	}
+	if err := removeExactYUMCompatibilityBoundControlFile(workflow.root.stateRoot, target, info); err != nil {
 		return err
 	}
 	return syncYUMCompatibilityRootDirectory(workflow.root.stateRoot)

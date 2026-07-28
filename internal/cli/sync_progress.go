@@ -43,6 +43,7 @@ var (
 	syncProgressSHA256Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	syncProgressGitPattern    = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	syncProgressTxPattern     = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	syncControlTempPattern    = regexp.MustCompile(`^\.(?:progress|replay)-[0-9a-f]{32}$`)
 	syncOperationOpen         sync.Mutex
 )
 
@@ -70,9 +71,11 @@ type syncProgress struct {
 }
 
 type syncOperation struct {
-	dir      string
-	root     *os.Root
-	lockFile *os.File
+	dir          string
+	root         *os.Root
+	dirIdentity  os.FileInfo
+	lockFile     *os.File
+	lockIdentity os.FileInfo
 }
 
 type durableSyncPartialError struct {
@@ -107,7 +110,7 @@ func acquireSyncOperation(ctx context.Context, stateDir, upstreamID string) (*sy
 	if err != nil {
 		return nil, err
 	}
-	root, err := os.OpenRoot(dir)
+	dir, root, dirIdentity, err := bindAdmittedDerivedStateDirectory(dir, "sync operation directory")
 	if err != nil {
 		return nil, fmt.Errorf("open sync operation directory: %w", err)
 	}
@@ -118,7 +121,7 @@ func acquireSyncOperation(ctx context.Context, stateDir, upstreamID string) (*sy
 	// disappears after SIGKILL, unlike a stale PID-file lock.
 	syncOperationOpen.Lock()
 	prior, priorErr := root.Lstat(lockName)
-	if priorErr == nil && !privateRegularFile(prior) {
+	if priorErr == nil && !privateSyncControlFile(prior) {
 		syncOperationOpen.Unlock()
 		root.Close()
 		return nil, errors.New("sync operation lock must be a private regular file")
@@ -128,12 +131,18 @@ func acquireSyncOperation(ctx context.Context, stateDir, upstreamID string) (*sy
 		root.Close()
 		return nil, priorErr
 	}
-	lockFile, err := root.OpenFile(lockName, os.O_CREATE|os.O_RDWR, 0o600)
+	lockFile, err := root.OpenFile(lockName, os.O_CREATE|os.O_RDWR|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0o600)
+	var lockIdentity os.FileInfo
 	if err == nil {
 		opened, statErr := lockFile.Stat()
 		current, lstatErr := root.Lstat(lockName)
-		if statErr != nil || lstatErr != nil || !privateRegularFile(opened) || !privateRegularFile(current) || !os.SameFile(opened, current) {
+		if statErr != nil || lstatErr != nil ||
+			!privateSyncControlFile(opened) || !privateSyncControlFile(current) ||
+			!os.SameFile(opened, current) ||
+			!sameDerivedStateControlFileSecurity(opened, current) {
 			err = errors.Join(statErr, lstatErr, errors.New("sync operation lock changed while opening"))
+		} else {
+			lockIdentity = opened
 		}
 	}
 	syncOperationOpen.Unlock()
@@ -152,48 +161,264 @@ func acquireSyncOperation(ctx context.Context, stateDir, upstreamID string) (*sy
 		}
 		return nil, fmt.Errorf("lock sync upstream %s: %w", upstreamID, err)
 	}
-	return &syncOperation{dir: dir, root: root, lockFile: lockFile}, nil
+	operation := &syncOperation{
+		dir: dir, root: root, dirIdentity: dirIdentity,
+		lockFile: lockFile, lockIdentity: lockIdentity,
+	}
+	if err := operation.verifyBinding(); err != nil {
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+		_ = root.Close()
+		return nil, err
+	}
+	if err := operation.cleanupControlTemps(); err != nil {
+		_ = operation.Close()
+		return nil, fmt.Errorf("clean interrupted sync control temporary: %w", err)
+	}
+	return operation, nil
 }
 
 func ensureSyncOperationDirectory(stateDir, upstreamID string) (string, error) {
-	stateInfo, err := os.Lstat(stateDir)
-	if err != nil || !stateInfo.IsDir() || stateInfo.Mode()&os.ModeSymlink != 0 {
-		return "", errors.Join(err, errors.New("sync state root must be a real directory"))
-	}
-	syncDir := filepath.Join(stateDir, "sync")
-	if err := ensurePrivateDirectory(syncDir); err != nil {
+	syncDir, _, err := ensureDerivedStateControlDirectory(stateDir, "sync", "sync control directory", true)
+	if err != nil {
 		return "", fmt.Errorf("prepare sync directory: %w", err)
 	}
-	upstreamDir := filepath.Join(syncDir, upstreamID)
-	if err := ensurePrivateDirectory(upstreamDir); err != nil {
+	upstreamDir, _, err := ensureDerivedStateControlDirectory(syncDir, upstreamID, "upstream sync control directory", true)
+	if err != nil {
 		return "", fmt.Errorf("prepare upstream sync directory: %w", err)
 	}
 	return upstreamDir, nil
 }
 
-func ensurePrivateDirectory(path string) error {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.Mkdir(path, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-			return err
-		}
-		info, err = os.Lstat(path)
-	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.Join(err, errors.New("path is not a real directory"))
-	}
-	if err := os.Chmod(path, 0o700); err != nil {
-		return err
-	}
-	info, err = os.Lstat(path)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
-		return errors.Join(err, errors.New("private directory changed while preparing"))
-	}
-	return syncDirectoryPath(filepath.Dir(path))
-}
-
 func privateRegularFile(info os.FileInfo) bool {
 	return info != nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && info.Mode().Perm() == 0o600
+}
+
+func privateSyncControlFile(info os.FileInfo) bool {
+	_, err := admitDerivedStateControlFile(info, "sync control file")
+	return err == nil && privateRegularFile(info)
+}
+
+func (o *syncOperation) verifyBinding() error {
+	if o == nil || o.root == nil || o.dirIdentity == nil || o.lockFile == nil || o.lockIdentity == nil {
+		return errors.New("sync operation binding is incomplete")
+	}
+	if err := verifyBoundDerivedStateRoot(o.root, o.dir, o.dirIdentity); err != nil {
+		return err
+	}
+	opened, statErr := o.lockFile.Stat()
+	current, lstatErr := o.root.Lstat(".operation.lock")
+	var openedAdmissionErr, currentAdmissionErr error
+	if opened != nil {
+		_, openedAdmissionErr = admitDerivedStateControlFile(opened, "opened sync operation lock")
+	}
+	if current != nil {
+		_, currentAdmissionErr = admitDerivedStateControlFile(current, "current sync operation lock")
+	}
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		openedAdmissionErr != nil || currentAdmissionErr != nil ||
+		!os.SameFile(o.lockIdentity, opened) || !os.SameFile(o.lockIdentity, current) ||
+		!sameDerivedStateControlFileSecurity(o.lockIdentity, opened) ||
+		!sameDerivedStateControlFileSecurity(o.lockIdentity, current) ||
+		opened.Size() != o.lockIdentity.Size() || current.Size() != o.lockIdentity.Size() ||
+		!opened.ModTime().Equal(o.lockIdentity.ModTime()) ||
+		!current.ModTime().Equal(o.lockIdentity.ModTime()) {
+		return errors.Join(statErr, lstatErr, openedAdmissionErr, currentAdmissionErr, errors.New("sync operation lock or directory changed after acquisition"))
+	}
+	return nil
+}
+
+func (o *syncOperation) openControlFile(name string) (*os.File, os.FileInfo, error) {
+	if filepath.Base(name) != name || name == "" || name == "." {
+		return nil, nil, errors.New("sync control-file coordinate is invalid")
+	}
+	if err := o.verifyBinding(); err != nil {
+		return nil, nil, err
+	}
+	info, err := o.root.Lstat(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !privateSyncControlFile(info) {
+		return nil, nil, errors.New("sync operation file must be a private single-link control file")
+	}
+	file, err := o.root.OpenFile(name, os.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := o.verifyOpenControlFile(name, file, info); err != nil {
+		file.Close()
+		return nil, nil, err
+	}
+	return file, info, nil
+}
+
+func (o *syncOperation) verifyOpenControlFile(name string, file *os.File, identity os.FileInfo) error {
+	if file == nil || identity == nil {
+		return errors.New("sync open control-file binding is incomplete")
+	}
+	if err := o.verifyBinding(); err != nil {
+		return err
+	}
+	opened, statErr := file.Stat()
+	current, lstatErr := o.root.Lstat(name)
+	var openedAdmissionErr, currentAdmissionErr error
+	if opened != nil {
+		_, openedAdmissionErr = admitDerivedStateControlFile(opened, "opened sync control file")
+	}
+	if current != nil {
+		_, currentAdmissionErr = admitDerivedStateControlFile(current, "current sync control file")
+	}
+	if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+		openedAdmissionErr != nil || currentAdmissionErr != nil ||
+		!os.SameFile(identity, opened) || !os.SameFile(identity, current) ||
+		!sameDerivedStateControlFileSecurity(identity, opened) ||
+		!sameDerivedStateControlFileSecurity(identity, current) ||
+		opened.Size() != identity.Size() || current.Size() != identity.Size() ||
+		!opened.ModTime().Equal(identity.ModTime()) ||
+		!current.ModTime().Equal(identity.ModTime()) {
+		return errors.Join(statErr, lstatErr, openedAdmissionErr, currentAdmissionErr, fmt.Errorf("sync control file %s changed while bound", name))
+	}
+	return nil
+}
+
+func (o *syncOperation) removeControlFile(name string, expected os.FileInfo) error {
+	if o == nil || o.root == nil || expected == nil {
+		return errors.New("sync control-file cleanup binding is incomplete")
+	}
+	file, identity, err := o.openControlFile(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if !os.SameFile(expected, identity) ||
+		!sameDerivedStateControlFileSecurity(expected, identity) {
+		return fmt.Errorf("sync control file %s changed before cleanup", name)
+	}
+	directory, err := o.root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return commitExactPrivateStateFileRemoval(o.root, directory, file, expected, name, func() error {
+		after, statErr := file.Stat()
+		if statErr != nil || after == nil || !os.SameFile(expected, after) ||
+			!sameDerivedStateControlFileSecurity(expected, after) ||
+			after.Size() != expected.Size() ||
+			!after.ModTime().Equal(expected.ModTime()) {
+			return errors.Join(statErr, fmt.Errorf("sync control file %s changed during cleanup", name))
+		}
+		return o.verifyBinding()
+	})
+}
+
+func (o *syncOperation) cleanupControlTemp(name string, created os.FileInfo) {
+	if o == nil || o.root == nil || created == nil {
+		return
+	}
+	current, err := o.root.Lstat(name)
+	if err != nil || !privateSyncControlFile(current) ||
+		!os.SameFile(created, current) ||
+		!sameDerivedStateControlFileSecurity(created, current) {
+		return
+	}
+	_ = o.removeControlFile(name, current)
+}
+
+func (o *syncOperation) cleanupControlTemps() error {
+	if o == nil || o.root == nil {
+		return errors.New("sync control temporary cleanup binding is incomplete")
+	}
+	if err := o.verifyBinding(); err != nil {
+		return err
+	}
+	directory, err := o.root.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if readErr != nil || closeErr != nil {
+		return errors.Join(readErr, closeErr)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		name := entry.Name()
+		if !syncControlTempPattern.MatchString(name) {
+			continue
+		}
+		info, err := o.root.Lstat(name)
+		if err != nil {
+			return err
+		}
+		if !privateSyncControlFile(info) {
+			return fmt.Errorf("unsafe sync control temporary %s is preserved for audit", name)
+		}
+		if err := o.removeControlFile(name, info); err != nil {
+			return err
+		}
+	}
+	return o.verifyBinding()
+}
+
+func (o *syncOperation) installControlTemp(
+	temporary string,
+	temporaryIdentity os.FileInfo,
+	destination string,
+	destinationMaximum int64,
+	validateDestination func([]byte) error,
+) (derivedStateControlExchangeResult, error) {
+	var result derivedStateControlExchangeResult
+	if o == nil || o.root == nil || temporaryIdentity == nil ||
+		filepath.Base(temporary) != temporary || filepath.Base(destination) != destination ||
+		temporary == destination {
+		return result, errors.New("sync control-file installation binding is invalid")
+	}
+	if err := o.verifyBinding(); err != nil {
+		return result, err
+	}
+	directory, err := o.root.Open(".")
+	if err != nil {
+		return result, err
+	}
+	defer directory.Close()
+	destinationInfo, destinationErr := o.root.Lstat(destination)
+	if errors.Is(destinationErr, os.ErrNotExist) {
+		if err := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), temporary, destination); err != nil {
+			return result, err
+		}
+		result.Exchanged = true
+		installed, installedErr := o.root.Lstat(destination)
+		_, temporaryErr := o.root.Lstat(temporary)
+		if installedErr != nil || !errors.Is(temporaryErr, os.ErrNotExist) ||
+			installed == nil || !os.SameFile(temporaryIdentity, installed) ||
+			!sameDerivedStateControlFileSecurity(temporaryIdentity, installed) {
+			return result, errors.Join(installedErr, temporaryErr, errors.New("sync control-file no-replace publication changed its identity"))
+		}
+		return result, errors.Join(directory.Sync(), o.verifyBinding())
+	}
+	if destinationErr != nil || !privateSyncControlFile(destinationInfo) {
+		return result, errors.Join(destinationErr, fmt.Errorf("sync control-file destination %s is unsafe", destination))
+	}
+	result, err = exchangeBoundDerivedStateControlFiles(
+		o.root,
+		directory,
+		temporary,
+		temporaryIdentity,
+		destination,
+		destinationMaximum,
+		validateDestination,
+	)
+	if err != nil {
+		return result, err
+	}
+	if err := o.removeControlFile(temporary, result.Displaced); err != nil {
+		return result, err
+	}
+	return result, o.verifyBinding()
 }
 
 func (o *syncOperation) Close() error {
@@ -204,10 +429,12 @@ func (o *syncOperation) Close() error {
 	if o.lockFile != nil {
 		result = errors.Join(result, unix.Flock(int(o.lockFile.Fd()), unix.LOCK_UN), o.lockFile.Close())
 		o.lockFile = nil
+		o.lockIdentity = nil
 	}
 	if o.root != nil {
 		result = errors.Join(result, o.root.Close())
 		o.root = nil
+		o.dirIdentity = nil
 	}
 	return result
 }
@@ -216,6 +443,9 @@ func (o *syncOperation) Load() (*syncProgress, error) {
 	if o == nil || o.root == nil {
 		return nil, errors.New("sync operation is closed")
 	}
+	if err := o.verifyBinding(); err != nil {
+		return nil, err
+	}
 	info, err := o.root.Lstat(syncProgressFilename)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -223,23 +453,18 @@ func (o *syncOperation) Load() (*syncProgress, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !privateRegularFile(info) {
-		return nil, errors.New("sync progress must be a private regular file")
+	if !privateSyncControlFile(info) {
+		return nil, errors.New("sync progress must be a private single-link control file")
 	}
-	file, err := o.root.Open(syncProgressFilename)
+	file, identity, err := o.openControlFile(syncProgressFilename)
 	if err != nil {
 		return nil, err
 	}
-	opened, statErr := file.Stat()
-	current, lstatErr := o.root.Lstat(syncProgressFilename)
-	if statErr != nil || lstatErr != nil || !privateRegularFile(opened) || !privateRegularFile(current) || !os.SameFile(opened, current) {
-		_ = file.Close()
-		return nil, errors.Join(statErr, lstatErr, errors.New("sync progress changed while opening"))
-	}
 	data, readErr := io.ReadAll(io.LimitReader(file, syncProgressMaxBytes+1))
+	verifyErr := o.verifyOpenControlFile(syncProgressFilename, file, identity)
 	closeErr := file.Close()
-	if readErr != nil || closeErr != nil {
-		return nil, errors.Join(readErr, closeErr)
+	if readErr != nil || verifyErr != nil || closeErr != nil {
+		return nil, errors.Join(readErr, verifyErr, closeErr)
 	}
 	if len(data) > syncProgressMaxBytes {
 		return nil, errors.New("sync progress exceeds safety limit")
@@ -255,22 +480,27 @@ func (o *syncOperation) Write(progress *syncProgress) error {
 	if o == nil || o.root == nil || progress == nil {
 		return errors.New("sync progress store is unavailable")
 	}
-	data, err := progress.canonical()
-	if err != nil {
+	if err := o.verifyBinding(); err != nil {
 		return err
 	}
-	if info, err := o.root.Lstat(syncProgressFilename); err == nil {
-		if !privateRegularFile(info) {
-			return errors.New("refusing to replace unsafe sync progress file")
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	data, err := progress.canonical()
+	if err != nil {
 		return err
 	}
 	tmp, tmpName, err := createSyncProgressTemp(o.root)
 	if err != nil {
 		return err
 	}
-	defer o.root.Remove(tmpName)
+	createdIdentity, statErr := tmp.Stat()
+	currentCreated, lstatErr := o.root.Lstat(tmpName)
+	if statErr != nil || lstatErr != nil ||
+		!privateSyncControlFile(createdIdentity) || !privateSyncControlFile(currentCreated) ||
+		!os.SameFile(createdIdentity, currentCreated) ||
+		!sameDerivedStateControlFileSecurity(createdIdentity, currentCreated) {
+		_ = tmp.Close()
+		return errors.Join(statErr, lstatErr, errors.New("sync progress temporary was unsafe at creation"))
+	}
+	defer o.cleanupControlTemp(tmpName, createdIdentity)
 	if _, err := tmp.Write(data); err != nil {
 		_ = tmp.Close()
 		return err
@@ -279,17 +509,36 @@ func (o *syncOperation) Write(progress *syncProgress) error {
 		_ = tmp.Close()
 		return err
 	}
+	tmpIdentity, err := tmp.Stat()
+	currentTmp, currentTmpErr := o.root.Lstat(tmpName)
+	if err != nil || currentTmpErr != nil || !privateSyncControlFile(tmpIdentity) ||
+		!privateSyncControlFile(currentTmp) || !os.SameFile(tmpIdentity, currentTmp) ||
+		!sameDerivedStateControlFileSecurity(tmpIdentity, currentTmp) {
+		_ = tmp.Close()
+		return errors.Join(err, currentTmpErr, errors.New("sync progress temporary changed while writing"))
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := o.root.Rename(tmpName, syncProgressFilename); err != nil {
+	if err := o.verifyBinding(); err != nil {
 		return err
 	}
-	info, err := o.root.Lstat(syncProgressFilename)
-	if err != nil || !privateRegularFile(info) {
-		return errors.Join(err, errors.New("atomic sync progress result is unsafe"))
+	if _, err := o.installControlTemp(
+		tmpName,
+		tmpIdentity,
+		syncProgressFilename,
+		syncProgressMaxBytes,
+		func(prior []byte) error {
+			if _, err := decodeSyncProgress(prior); err != nil {
+				return fmt.Errorf("existing sync progress is not replaceable: %w", err)
+			}
+			return nil
+		},
+	); err != nil {
+		return err
 	}
-	return syncRootDirectory(o.root)
+	tmpIdentity = nil
+	return errors.Join(syncRootDirectory(o.root), o.verifyBinding())
 }
 
 func (o *syncOperation) RemoveProgress() error {
@@ -303,13 +552,10 @@ func (o *syncOperation) RemoveProgress() error {
 	if err != nil {
 		return err
 	}
-	if !privateRegularFile(info) {
+	if !privateSyncControlFile(info) {
 		return errors.New("refusing to remove unsafe sync progress file")
 	}
-	if err := o.root.Remove(syncProgressFilename); err != nil {
-		return err
-	}
-	return syncRootDirectory(o.root)
+	return o.removeControlFile(syncProgressFilename, info)
 }
 
 func createSyncProgressTemp(root *os.Root) (*os.File, string, error) {

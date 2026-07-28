@@ -427,6 +427,53 @@ func TestExactPrivateStateRemovalRevalidatesLastUnlinkBoundary(t *testing.T) {
 	projectionStateBeforeUnlinkHook = previous
 }
 
+func TestExactPrivateStateRemovalRejectsHardlinkAddedAtUnlinkBoundary(t *testing.T) {
+	stateRoot := t.TempDir()
+	name := "owned.tmp-" + strings.Repeat("e", 32)
+	path := filepath.Join(stateRoot, name)
+	body := []byte("single-link control evidence")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	file, identity, err := bindExactProjectionResidue(root, name, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	directory, err := root.Open(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directory.Close()
+	alias := filepath.Join(t.TempDir(), "hostile-alias")
+	previous := projectionStateBeforeUnlinkHook
+	projectionStateBeforeUnlinkHook = func(relative string) error {
+		return os.Link(filepath.Join(stateRoot, relative), alias)
+	}
+	t.Cleanup(func() { projectionStateBeforeUnlinkHook = previous })
+	err = commitExactPrivateStateFileRemoval(root, directory, file, identity, name, func() error { return nil })
+	projectionStateBeforeUnlinkHook = previous
+	if err == nil || !strings.Contains(err.Error(), "link count") {
+		t.Fatalf("exact removal accepted a new hardlink alias: %v", err)
+	}
+	restored, restoredErr := os.Lstat(path)
+	aliased, aliasErr := os.Lstat(alias)
+	if restoredErr != nil || aliasErr != nil || !os.SameFile(restored, aliased) {
+		t.Fatalf("failed hardlink admission did not preserve both names: restored=%v alias=%v", restoredErr, aliasErr)
+	}
+	for _, filename := range []string{path, alias} {
+		got, readErr := os.ReadFile(filename)
+		if readErr != nil || !bytes.Equal(got, body) {
+			t.Fatalf("preserved hardlink evidence %s body=%q err=%v", filename, got, readErr)
+		}
+	}
+}
+
 func assertProjectionResidueReplacementPreserved(t *testing.T, stateRoot, name string, cleanup func() error) {
 	t.Helper()
 	path := filepath.Join(stateRoot, name)

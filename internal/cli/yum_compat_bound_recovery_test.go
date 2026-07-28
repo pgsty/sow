@@ -103,6 +103,99 @@ func assertYUMCompatibilityCrashJournalPreserved(t *testing.T, filename string, 
 	}
 }
 
+func TestYUMCompatibilityCutoverPhaseExchangesRejectDestinationAlias(t *testing.T) {
+	t.Run("bound", func(t *testing.T) {
+		fixture := newYUMCompatibilityContractFixture(t, "")
+		id := fixture.cfg.CompatibilityProjections[0].ID
+		_, journal := fixtureYUMCompatibilityCutover(t, fixture, false)
+		workflow := bindYUMCompatibilityRecoveryFixture(t, fixture)
+		if err := writeYUMCompatibilityCutoverJournalBound(workflow, journal, true); err != nil {
+			t.Fatal(err)
+		}
+		base := yumCompatibilityCutoverJournalPath(fixture.cfg, id)
+		before, err := os.ReadFile(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		alias := filepath.Join(t.TempDir(), "bound-cutover-phase-alias")
+		previous := derivedStateControlBeforeExchangeHook
+		fired := false
+		derivedStateControlBeforeExchangeHook = func(_, destination string) error {
+			if fired || destination != filepath.Base(base) {
+				return nil
+			}
+			fired = true
+			return os.Link(base, alias)
+		}
+		t.Cleanup(func() { derivedStateControlBeforeExchangeHook = previous })
+		journal.Phase = yumCompatibilityCutoverCommitted
+		if err := writeYUMCompatibilityCutoverJournalBound(workflow, journal, false); err == nil ||
+			!strings.Contains(err.Error(), "link count") {
+			t.Fatalf("hardlink-aliased bound phase destination was overwritten: %v", err)
+		}
+		derivedStateControlBeforeExchangeHook = previous
+		if !fired {
+			t.Fatal("bound phase destination race was not injected")
+		}
+		assertUnchangedHardlinkEvidence(t, base, alias, before)
+		if err := os.Remove(alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeYUMCompatibilityCutoverJournalBound(workflow, journal, false); err != nil {
+			t.Fatalf("bound phase retry after removing alias: %v", err)
+		}
+		observed, exists, err := readYUMCompatibilityCutoverJournalBoundAt(workflow.root.stateRoot, filepath.Base(base), id)
+		if err != nil || !exists || observed.Phase != yumCompatibilityCutoverCommitted {
+			t.Fatalf("bound phase retry observed=%+v exists=%t err=%v", observed, exists, err)
+		}
+	})
+
+	t.Run("self-bound", func(t *testing.T) {
+		fixture := newYUMCompatibilityContractFixture(t, "")
+		id := fixture.cfg.CompatibilityProjections[0].ID
+		_, journal := fixtureYUMCompatibilityCutover(t, fixture, false)
+		if err := writeYUMCompatibilityCutoverJournal(fixture.cfg, journal, true); err != nil {
+			t.Fatal(err)
+		}
+		base := yumCompatibilityCutoverJournalPath(fixture.cfg, id)
+		before, err := os.ReadFile(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		alias := filepath.Join(t.TempDir(), "self-bound-cutover-phase-alias")
+		previous := derivedStateControlBeforeExchangeHook
+		fired := false
+		derivedStateControlBeforeExchangeHook = func(_, destination string) error {
+			if fired || destination != filepath.Base(base) {
+				return nil
+			}
+			fired = true
+			return os.Link(base, alias)
+		}
+		t.Cleanup(func() { derivedStateControlBeforeExchangeHook = previous })
+		journal.Phase = yumCompatibilityCutoverCommitted
+		if err := writeYUMCompatibilityCutoverJournal(fixture.cfg, journal, false); err == nil ||
+			!strings.Contains(err.Error(), "link count") {
+			t.Fatalf("hardlink-aliased self-bound phase destination was overwritten: %v", err)
+		}
+		derivedStateControlBeforeExchangeHook = previous
+		if !fired {
+			t.Fatal("self-bound phase destination race was not injected")
+		}
+		assertUnchangedHardlinkEvidence(t, base, alias, before)
+		if err := os.Remove(alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeYUMCompatibilityCutoverJournal(fixture.cfg, journal, false); err != nil {
+			t.Fatalf("self-bound phase retry after removing alias: %v", err)
+		}
+		observed, exists, err := readYUMCompatibilityCutoverJournalAt(base, id)
+		if err != nil || !exists || observed.Phase != yumCompatibilityCutoverCommitted {
+			t.Fatalf("self-bound phase retry observed=%+v exists=%t err=%v", observed, exists, err)
+		}
+	})
+}
+
 func TestYUMCompatibilityBoundCutoverRecoveryConvergesCrashStates(t *testing.T) {
 	t.Run("prepared-event-requires-explicit-recovery", func(t *testing.T) {
 		fixture := newYUMCompatibilityContractFixture(t, "")

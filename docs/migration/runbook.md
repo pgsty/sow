@@ -643,7 +643,7 @@ serving TSV 和随后真实隔离 client 三层验收。对所有已配置 suite
 
 强 generation tree 可用不等于旧 `baseurl=` consumer 已切换。先对真实 Pigsty source
 做只读审计，并把 renderer/config 改动 stage 到 checkout 外；`audit` 和 `stage` 都不得
-改源树。当前 allowlist 是两个 renderer、九个配置文件和 28 个 managed definition，任何
+改源树。当前 allowlist 是两个 renderer、九个配置文件和 22 个 managed definition，任何
 未知、漏失或重复定义都会失败闭锁。
 
 ```bash
@@ -693,7 +693,7 @@ RPM source key。先由单一 Go CLI 产生短时、不可覆盖的 endpoint rec
   --workers 8 --chunk-entries 4096
 ```
 
-preflight 会把 28 个定义展开为全部 release × arch × region binding，逐项绑定当前 canonical
+preflight 会把 22 个定义展开为全部 release × arch × region binding，逐项绑定当前 canonical
 generation/checkpoint/plan 与 target aggregate inventory；inventory 中 trust object 的
 size/SHA-256、从 CDN 读取的 bytes 和本地 bundle 必须三者完全一致。metadata 与 RPM
 验签都使用客户端实际导入的 aggregate certificate/keyring。每个唯一 endpoint 都必须完成 mirrorlist → exact generation →

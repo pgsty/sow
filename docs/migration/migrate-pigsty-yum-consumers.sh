@@ -122,7 +122,7 @@ require_regular_inventory() {
 	done < "$FILES"
 }
 
-# Validate the exact 28 reviewed definitions. Other SOW-hosted raw default
+# Validate the exact 22 reviewed definitions. Other SOW-hosted raw default
 # URLs fail closed instead of being silently omitted from the migration map.
 audit_consumer_inventory() {
 	set --
@@ -171,7 +171,7 @@ audit_consumer_inventory() {
 			for (f in expected_file) if (count_file[f] != expected_file[f]) {
 				print "definition count for " f " is " count_file[f] ", expected " expected_file[f] > "/dev/stderr"; bad=1
 			}
-			if (total != 28) { print "mapped definition total is " total ", expected 28" > "/dev/stderr"; bad=1 }
+			if (total != 22) { print "mapped definition total is " total ", expected 22" > "/dev/stderr"; bad=1 }
 			print "mapped_definitions=" total " already_migrated=" migrated
 			exit bad ? 1 : 0
 		}
@@ -347,7 +347,7 @@ verify_migrated_contract() {
 		}
 		END {
 			for (name in expected) if (count[name] != expected[name]) { print "migrated count mismatch for " name > "/dev/stderr"; bad=1 }
-			if (total != 28) { print "migrated definition total is " total ", expected 28" > "/dev/stderr"; bad=1 }
+			if (total != 22) { print "migrated definition total is " total ", expected 22" > "/dev/stderr"; bad=1 }
 			exit bad ? 1 : 0
 		}
 	' "$@" || die "migrated consumer contract is incomplete"

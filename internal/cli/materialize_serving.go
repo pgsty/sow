@@ -1414,15 +1414,26 @@ func removeLocalServingJournal(stateRoot, id string) error {
 	if err != nil || !exists {
 		return errors.Join(err, errors.New("local serving journal directory is missing"))
 	}
-	filename := filepath.Join(directory, id+".json")
-	info, err := os.Lstat(filename)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return errors.Join(err, errors.New("local serving journal is not a regular non-symlink file"))
-	}
-	if err := os.Remove(filename); err != nil {
-		return err
-	}
-	return syncLocalDirectory(directory)
+	name := id + ".json"
+	return removeExactProjectionIntent(directory, name, localServingJournalMaxBytes, func(body []byte) error {
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		var journal localServingJournal
+		if err := decoder.Decode(&journal); err != nil {
+			return err
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+			return errors.New("local serving journal has trailing JSON")
+		}
+		if err := journal.validate(); err != nil {
+			return err
+		}
+		if journal.ID != id {
+			return errors.New("local serving journal ID changed before removal")
+		}
+		return nil
+	})
 }
 
 func listLocalServingJournals(stateRoot string) ([]localServingJournal, error) {
@@ -1466,51 +1477,30 @@ func listLocalServingJournals(stateRoot string) ([]localServingJournal, error) {
 }
 
 func localServingJournalDirectory(stateRoot string, create bool) (string, bool, error) {
-	stateAbs, err := filepath.Abs(stateRoot)
-	if err != nil {
-		return "", false, err
-	}
-	stateInfo, err := os.Lstat(stateAbs)
-	if err != nil || !stateInfo.IsDir() || stateInfo.Mode()&os.ModeSymlink != 0 {
-		return "", false, errors.Join(err, errors.New("state root is not a real directory"))
-	}
-	repositoryInfo, err := os.Lstat(filepath.Dir(stateAbs))
-	if err != nil || !repositoryInfo.IsDir() || repositoryInfo.Mode()&os.ModeSymlink != 0 {
-		return "", false, errors.Join(err, errors.New("state root parent is not a real directory"))
-	}
-	root, err := os.OpenRoot(stateAbs)
-	if err != nil {
-		return "", false, err
-	}
-	defer root.Close()
-	const relative = "serving-journal"
-	info, err := root.Lstat(relative)
-	if errors.Is(err, os.ErrNotExist) && !create {
-		return filepath.Join(stateAbs, relative), false, nil
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		if err := root.Mkdir(relative, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
-			return "", false, err
-		}
-		info, err = root.Lstat(relative)
-	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return "", false, errors.Join(err, errors.New("local serving journal parent is not a real directory"))
-	}
-	return filepath.Join(stateAbs, relative), true, nil
+	return ensureDerivedStateControlDirectory(
+		stateRoot,
+		"serving-journal",
+		"local serving journal directory",
+		create,
+	)
 }
 
 func readBoundedExactRegularFile(directory, name string, limit int64) ([]byte, error) {
-	filename := filepath.Join(directory, name)
-	before, err := os.Lstat(filename)
-	if err != nil || !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Size() > limit {
-		return nil, errors.Join(err, fmt.Errorf("%s is not an exact regular file within the %d-byte limit", name, limit))
+	if filepath.Base(name) != name || name == "" || name == "." || limit < 0 {
+		return nil, errors.New("derived state control-file read coordinate is invalid")
 	}
-	root, err := os.OpenRoot(directory)
+	directory, root, directoryIdentity, err := bindAdmittedDerivedStateDirectory(directory, "derived state control-file directory")
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
+	before, err := root.Lstat(name)
+	if err != nil || !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Size() > limit {
+		return nil, errors.Join(err, fmt.Errorf("%s is not an exact regular file within the %d-byte limit", name, limit))
+	}
+	if _, err := admitDerivedStateControlFile(before, fmt.Sprintf("derived state control file %s", name)); err != nil {
+		return nil, err
+	}
 	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
@@ -1528,8 +1518,13 @@ func readBoundedExactRegularFile(directory, name string, limit int64) ([]byte, e
 	}
 	if after == nil || current == nil || len(body) > int(limit) || !os.SameFile(before, after) || !os.SameFile(before, current) ||
 		before.Size() != after.Size() || before.Size() != current.Size() || before.Mode() != after.Mode() || before.Mode() != current.Mode() ||
-		!before.ModTime().Equal(after.ModTime()) || !before.ModTime().Equal(current.ModTime()) {
+		!before.ModTime().Equal(after.ModTime()) || !before.ModTime().Equal(current.ModTime()) ||
+		!sameDerivedStateControlFileSecurity(before, after) ||
+		!sameDerivedStateControlFileSecurity(before, current) {
 		return nil, errors.New("local serving journal exceeded its limit or changed while reading")
+	}
+	if err := verifyBoundDerivedStateRoot(root, directory, directoryIdentity); err != nil {
+		return nil, err
 	}
 	return body, nil
 }

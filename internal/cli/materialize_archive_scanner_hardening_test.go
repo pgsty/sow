@@ -133,6 +133,94 @@ func TestOfflineArchiveResidueCleanupDoesNotFollowStageDirectorySymlink(t *testi
 	}
 }
 
+func TestOfflineArchiveStageInstallRejectsWritableStageDirectoryWithoutMutation(t *testing.T) {
+	stateRoot := t.TempDir()
+	source := filepath.Join(stateRoot, "completed-archive.tgz")
+	body := []byte("completed archive bytes\n")
+	if err := os.WriteFile(source, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(source, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	digest, size, err := fileSHA256AndSize(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+	if err := os.Mkdir(stageDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stageDirectory, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	result := archiveResult{Stage: source, Size: size, SHA256: digest}
+	if _, err := installOfflineArchiveProjectionStage(stateRoot, result, strings.Repeat("a", 32)); err == nil ||
+		!strings.Contains(err.Error(), "group/other writable") {
+		t.Fatalf("writable archive stage directory was admitted: %v", err)
+	}
+	info, err := os.Lstat(stageDirectory)
+	if err != nil || info.Mode().Perm() != 0o777 {
+		t.Fatalf("writable stage directory was changed: mode=%v err=%v", info.Mode().Perm(), err)
+	}
+	entries, err := os.ReadDir(stageDirectory)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("writable stage directory received entries=%v err=%v", entries, err)
+	}
+	after, err := os.ReadFile(source)
+	if err != nil || !bytes.Equal(after, body) {
+		t.Fatalf("archive source changed: body=%q err=%v", after, err)
+	}
+}
+
+func TestOfflineArchiveStageDiscardPreservesReplacementAtUnlinkBoundary(t *testing.T) {
+	stateRoot := t.TempDir()
+	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
+	if err := os.Mkdir(stageDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := offlineArchiveProjectionStagePrefix + strings.Repeat("b", 32) + ".tgz"
+	stageRelative := filepath.Join(offlineArchiveProjectionStageDir, name)
+	stage := filepath.Join(stageDirectory, name)
+	original := []byte("admitted archive stage\n")
+	replacement := []byte("replacement archive stage\n")
+	if err := os.WriteFile(stage, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stage, 0o444); err != nil {
+		t.Fatal(err)
+	}
+	displaced := filepath.Join(t.TempDir(), "admitted-stage.tgz")
+	previous := projectionStateBeforeUnlinkHook
+	fired := false
+	projectionStateBeforeUnlinkHook = func(quarantine string) error {
+		if fired {
+			return nil
+		}
+		fired = true
+		quarantinePath := filepath.Join(stageDirectory, quarantine)
+		if err := os.Rename(quarantinePath, displaced); err != nil {
+			return err
+		}
+		if err := os.WriteFile(quarantinePath, replacement, 0o600); err != nil {
+			return err
+		}
+		return os.Chmod(quarantinePath, 0o444)
+	}
+	t.Cleanup(func() { projectionStateBeforeUnlinkHook = previous })
+	err := discardOfflineArchiveProjectionStage(stateRoot, stageRelative)
+	projectionStateBeforeUnlinkHook = previous
+	if !fired || err == nil || !strings.Contains(err.Error(), "changed before unlink") {
+		t.Fatalf("archive stage unlink race fired=%t err=%v", fired, err)
+	}
+	if body, readErr := os.ReadFile(stage); readErr != nil || !bytes.Equal(body, replacement) {
+		t.Fatalf("replacement stage was removed: body=%q err=%v", body, readErr)
+	}
+	if body, readErr := os.ReadFile(displaced); readErr != nil || !bytes.Equal(body, original) {
+		t.Fatalf("admitted stage evidence changed: body=%q err=%v", body, readErr)
+	}
+}
+
 func TestOfflineArchiveIntentTempCleanupPreservesConcurrentReplacement(t *testing.T) {
 	stateRoot := filepath.Join(t.TempDir(), ".sow")
 	if err := os.Mkdir(stateRoot, 0o700); err != nil {
@@ -483,7 +571,7 @@ func TestSOWProcessInitNormalizesRestrictiveOwnerUmask(t *testing.T) {
 	}
 }
 
-func TestDerivedStateWriterRejectsSameInodeModeMutation(t *testing.T) {
+func TestDerivedStateWriterRejectsSameInodeModeMutationAndPreservesEvidence(t *testing.T) {
 	stateRoot := t.TempDir()
 	previous := derivedStateWriteHook
 	derivedStateWriteHook = func(relative string) error {
@@ -492,15 +580,51 @@ func TestDerivedStateWriterRejectsSameInodeModeMutation(t *testing.T) {
 	t.Cleanup(func() { derivedStateWriteHook = previous })
 	err := writeDerivedStateFile(stateRoot, "mode-mutated.json", []byte("{}\n"))
 	derivedStateWriteHook = previous
-	if err == nil || !strings.Contains(err.Error(), "temporary changed while writing") {
+	if err == nil || !strings.Contains(err.Error(), "temporary before write changed before mutation") {
 		t.Fatalf("same-inode mode mutation error=%v", err)
 	}
 	if _, statErr := os.Lstat(filepath.Join(stateRoot, "mode-mutated.json")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("mode-mutated state was published: %v", statErr)
 	}
 	entries, readErr := os.ReadDir(stateRoot)
-	if readErr != nil || len(entries) != 0 {
-		t.Fatalf("mode-mutated temporary was not cleaned entries=%v err=%v", entries, readErr)
+	if readErr != nil || len(entries) != 1 ||
+		!strings.HasPrefix(entries[0].Name(), "mode-mutated.json.tmp-") {
+		t.Fatalf("mode-mutated temporary evidence was not preserved exactly once entries=%v err=%v", entries, readErr)
+	}
+	info, statErr := entries[0].Info()
+	if statErr != nil || info.Mode().Perm() != 0o400 {
+		t.Fatalf("preserved mode-mutated evidence changed: info=%v err=%v", info, statErr)
+	}
+}
+
+func TestDerivedStateWriterRejectsHardlinkBeforeWriteWithoutMutatingAlias(t *testing.T) {
+	stateRoot := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "external-alias")
+	previous := derivedStateWriteHook
+	derivedStateWriteHook = func(relative string) error {
+		return os.Link(filepath.Join(stateRoot, filepath.Base(relative)), alias)
+	}
+	t.Cleanup(func() { derivedStateWriteHook = previous })
+	err := writeDerivedStateFile(stateRoot, "aliased.json", []byte("must not reach alias\n"))
+	derivedStateWriteHook = previous
+	if err == nil || !strings.Contains(err.Error(), "link count") {
+		t.Fatalf("hardlinked temporary was not rejected before write: %v", err)
+	}
+	aliasInfo, statErr := os.Lstat(alias)
+	if statErr != nil || aliasInfo.Size() != 0 || aliasInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("external alias was mutated before rejection: info=%v err=%v", aliasInfo, statErr)
+	}
+	aliasBody, readErr := os.ReadFile(alias)
+	if readErr != nil || len(aliasBody) != 0 {
+		t.Fatalf("external alias received derived-state bytes: body=%q err=%v", aliasBody, readErr)
+	}
+	if _, statErr := os.Lstat(filepath.Join(stateRoot, "aliased.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("aliased state was published: %v", statErr)
+	}
+	entries, readErr := os.ReadDir(stateRoot)
+	if readErr != nil || len(entries) != 1 ||
+		!strings.HasPrefix(entries[0].Name(), "aliased.json.tmp-") {
+		t.Fatalf("aliased temporary evidence was not preserved entries=%v err=%v", entries, readErr)
 	}
 }
 
@@ -567,7 +691,7 @@ func TestOfflineArchiveIntentTempCleanupRevalidatesFinalUnlinkBoundary(t *testin
 	t.Cleanup(func() { projectionStateBeforeUnlinkHook = previous })
 	err := cleanupOfflineArchiveProjectionResidue(stateRoot, true)
 	projectionStateBeforeUnlinkHook = previous
-	if err == nil || !strings.Contains(err.Error(), "quarantine changed before unlink") {
+	if err == nil || !strings.Contains(err.Error(), "changed before unlink") {
 		t.Fatalf("final unlink replacement error=%v", err)
 	}
 	if body, readErr := os.ReadFile(path); readErr != nil || string(body) != "final unlink replacement\n" {

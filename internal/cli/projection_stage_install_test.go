@@ -199,6 +199,57 @@ func TestProjectionStageInstallRepairsRestrictiveUmask(t *testing.T) {
 	}
 }
 
+func TestProjectionStageRejectsHardlinkBeforeMutation(t *testing.T) {
+	for index, phase := range []string{"before-chmod", "before-write"} {
+		t.Run(phase, func(t *testing.T) {
+			stateRoot := t.TempDir()
+			relative := assetProjectionStagePrefix + strings.Repeat(string(rune('8'+index)), 32) + ".tsv"
+			alias := filepath.Join(t.TempDir(), "projection-stage-alias")
+			previousHook := projectionStageInstallHook
+			fired := false
+			projectionStageInstallHook = func(observed, candidate string) error {
+				if fired || observed != phase {
+					return nil
+				}
+				fired = true
+				return os.Link(candidate, alias)
+			}
+			t.Cleanup(func() { projectionStageInstallHook = previousHook })
+			previousUmask := unix.Umask(0)
+			if phase == "before-chmod" {
+				unix.Umask(0o777)
+			}
+			defer unix.Umask(previousUmask)
+
+			if _, _, err := installProjectionStageBytes(stateRoot, relative, []byte("must not reach alias")); err == nil ||
+				!strings.Contains(err.Error(), "link count") {
+				t.Fatalf("hardlink-aliased projection stage was mutated: %v", err)
+			}
+			projectionStageInstallHook = previousHook
+			if !fired {
+				t.Fatal("hardlink race was not injected")
+			}
+			aliasInfo, err := os.Lstat(alias)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if aliasInfo.Size() != 0 {
+				t.Fatalf("projection stage alias received %d bytes before rejection", aliasInfo.Size())
+			}
+			wantMode := os.FileMode(0o600)
+			if phase == "before-chmod" {
+				wantMode = 0
+			}
+			if aliasInfo.Mode().Perm() != wantMode {
+				t.Fatalf("projection stage alias mode=%#o want=%#o", aliasInfo.Mode().Perm(), wantMode)
+			}
+			if _, err := os.Lstat(filepath.Join(stateRoot, relative)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("hardlink-aliased projection stage was published: %v", err)
+			}
+		})
+	}
+}
+
 func TestOfflineArchiveExactOpenRejectsFIFOReplacementWithoutBlocking(t *testing.T) {
 	source := writeProjectionStageSource(t, []byte("ordinary source"))
 	previous := offlineArchiveInputBeforeOpenHook

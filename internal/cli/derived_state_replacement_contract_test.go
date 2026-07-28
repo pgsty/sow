@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -840,6 +841,62 @@ func TestDerivedStateReplacementCarrierReadRejectsMtimeChange(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(stateRoot, main)); err != nil {
 		t.Fatalf("mtime-mutated carrier was removed: %v", err)
+	}
+}
+
+func TestDerivedStateReplacementCarrierRejectsHardlinkBeforeChmodOrWrite(t *testing.T) {
+	stateRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(stateRoot, "state.json"), []byte("prior\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "replacement-carrier-alias")
+	previousSealer := derivedStateDirectoryMutationSealer
+	fired := false
+	derivedStateDirectoryMutationSealer = func(directory *os.File, sequence uint64) (derivedStateDirectoryMutationEpoch, error) {
+		if !fired {
+			entries, err := os.ReadDir(stateRoot)
+			if err != nil {
+				return derivedStateDirectoryMutationEpoch{}, err
+			}
+			for _, entry := range entries {
+				if _, _, ok := parseDerivedStateReplacementCarrierName(entry.Name()); !ok {
+					continue
+				}
+				info, err := entry.Info()
+				if err != nil {
+					return derivedStateDirectoryMutationEpoch{}, err
+				}
+				if info.Size() != 0 {
+					continue
+				}
+				if err := os.Link(filepath.Join(stateRoot, entry.Name()), alias); err != nil {
+					return derivedStateDirectoryMutationEpoch{}, err
+				}
+				fired = true
+				break
+			}
+		}
+		return previousSealer(directory, sequence)
+	}
+	t.Cleanup(func() { derivedStateDirectoryMutationSealer = previousSealer })
+	previousUmask := syscall.Umask(0o777)
+	defer syscall.Umask(previousUmask)
+
+	result, err := writeDerivedStateFileOutcome(stateRoot, "state.json", []byte("candidate\n"))
+	derivedStateDirectoryMutationSealer = previousSealer
+	if !fired || err == nil || !strings.Contains(err.Error(), "link count") {
+		t.Fatalf("hardlink carrier race fired=%t result=%+v err=%v", fired, result, err)
+	}
+	aliasInfo, err := os.Lstat(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aliasInfo.Size() != 0 || aliasInfo.Mode().Perm() != 0 {
+		t.Fatalf("carrier alias was mutated before rejection: size=%d mode=%#o", aliasInfo.Size(), aliasInfo.Mode().Perm())
+	}
+	body, err := os.ReadFile(filepath.Join(stateRoot, "state.json"))
+	if err != nil || string(body) != "prior\n" {
+		t.Fatalf("canonical destination changed: body=%q err=%v", body, err)
 	}
 }
 

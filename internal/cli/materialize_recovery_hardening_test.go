@@ -258,7 +258,7 @@ func TestLocalServingJournalRecoveryCleansOnlyExactTempsAndBoundsReaders(t *test
 		if err := os.Symlink(realRoot, aliasParent); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := listLocalServingJournals(filepath.Join(aliasParent, ".sow")); err == nil || !strings.Contains(err.Error(), "state root parent") {
+		if _, err := listLocalServingJournals(filepath.Join(aliasParent, ".sow")); err == nil || !strings.Contains(err.Error(), "immediate parent") {
 			t.Fatalf("symlinked state-root parent accepted: %v", err)
 		}
 	})

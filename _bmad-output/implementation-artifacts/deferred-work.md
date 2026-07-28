@@ -47,6 +47,8 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md`
   summary: Derived-state admission should freeze directory ownership/writeability and reject foreign hardlink aliases when the threat model includes same-host hostile writers.
   evidence: Root and leaf identity checks reject coordinate replacement but do not reject group/other-writable directories or require link count one, so another principal with write access could retain an alias and mutate the installed inode after verification.
+  status: resolved
+  resolution: V-82 establishes the effective UID as the local control-state authority, rejects group/other-writable control directories, freezes UID/GID/mode across descriptor and pathname revalidation, and requires mutable control files to be private regular files with link count one. Native no-replace state-lock publication and exact pre-unlink revalidation close the adjacent lock alias windows while payload hardlinks remain supported. Two independent post-fix reviews returned `[]`; exhaustive ordinary/race, real apt/dnf/Nginx, local MinIO, edge, 50k, static, four-platform and reproducible clean-delivery gates passed without production access. See `_bmad-output/implementation-artifacts/spec-derived-state-hostile-writer-admission.md`, `docs/adr/0043-derived-state-hostile-writer-admission.md`, and `docs/evidence/2026-07-28-derived-state-hostile-writer-admission.md`.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-projection-stage-install-rollback-identity.md`
   summary: Canonical `Store.Apply` reopens staged pathnames after journaling, so a post-prepare replacement can commit bytes that are not bound to the durable projection intent.

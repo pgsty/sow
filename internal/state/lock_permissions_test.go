@@ -19,18 +19,18 @@ func TestAcquireLockBuildsTraverseOnlyServingCorridorAndProtectsControlChildren(
 		filepath.Join(stateRoot, "materialized"),
 		filepath.Join(stateRoot, "origin"),
 	} {
-		if err := os.MkdirAll(directory, 0o777); err != nil {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Chmod(directory, 0o777); err != nil {
+		if err := os.Chmod(directory, 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	directSecret := filepath.Join(stateRoot, "secret")
-	if err := os.WriteFile(directSecret, []byte("secret\n"), 0o666); err != nil {
+	if err := os.WriteFile(directSecret, []byte("secret\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(directSecret, 0o666); err != nil {
+	if err := os.Chmod(directSecret, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	lock, err := AcquireLock(stateRoot, "permission-test", false)
@@ -63,6 +63,25 @@ func TestAcquireLockRejectsSymlinkedStateChildBeforeOpeningCorridor(t *testing.T
 }
 
 func TestAcquireLockRejectsWritableExistingStateDirectoriesWithoutMutation(t *testing.T) {
+	t.Run("immediate parent", func(t *testing.T) {
+		parent := t.TempDir()
+		stateRoot := filepath.Join(parent, ".sow")
+		if err := os.Mkdir(stateRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(parent, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshotFilesystemEntry(t, stateRoot)
+		if _, err := AcquireLock(stateRoot, "unsafe-state-parent", false); err == nil || !strings.Contains(err.Error(), "group/other writable") {
+			t.Fatalf("writable immediate parent was accepted: %v", err)
+		}
+		assertFilesystemEntryUnchanged(t, stateRoot, before)
+		if _, err := os.Lstat(filepath.Join(stateRoot, "locks")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("unsafe immediate-parent rejection created locks: %v", err)
+		}
+	})
+
 	t.Run("state root", func(t *testing.T) {
 		stateRoot := filepath.Join(t.TempDir(), ".sow")
 		if err := os.Mkdir(stateRoot, 0o700); err != nil {
@@ -119,6 +138,85 @@ func TestAcquireLockRejectsWritableExistingStateDirectoriesWithoutMutation(t *te
 	})
 }
 
+func TestStateLockRejectsHardlinkAliases(t *testing.T) {
+	t.Run("preexisting persistent lease alias", func(t *testing.T) {
+		stateRoot := filepath.Join(t.TempDir(), ".sow")
+		locksRoot := filepath.Join(stateRoot, "locks")
+		if err := os.MkdirAll(locksRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		lease := filepath.Join(locksRoot, "state.lease")
+		alias := filepath.Join(locksRoot, "state.lease.alias")
+		if err := os.WriteFile(lease, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(lease, alias); err != nil {
+			t.Fatal(err)
+		}
+		before := snapshotFilesystemEntry(t, lease)
+		if _, err := AcquireLock(stateRoot, "aliased-lease", false); err == nil || !strings.Contains(err.Error(), "link count 2") {
+			t.Fatalf("aliased persistent lease was accepted: %v", err)
+		}
+		assertFilesystemEntryUnchanged(t, lease, before)
+		if _, err := os.Lstat(filepath.Join(locksRoot, "state.lock")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("aliased lease rejection published a lock record: %v", err)
+		}
+	})
+
+	t.Run("active record alias", func(t *testing.T) {
+		stateRoot := filepath.Join(t.TempDir(), ".sow")
+		lock, err := AcquireLock(stateRoot, "active-alias", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lockPath := filepath.Join(stateRoot, "locks", "state.lock")
+		alias := filepath.Join(stateRoot, "locks", "state.lock.alias")
+		if err := os.Link(lockPath, alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := lock.Validate(); err == nil || !strings.Contains(err.Error(), "link count 2") {
+			t.Fatalf("active record alias was accepted: %v", err)
+		}
+		if err := os.Remove(alias); err != nil {
+			t.Fatal(err)
+		}
+		if err := lock.Validate(); err != nil {
+			t.Fatalf("holder did not converge after alias removal: %v", err)
+		}
+		if err := lock.Release(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestStateLockRejectsImmediateParentModeDriftAndConverges(t *testing.T) {
+	parent := t.TempDir()
+	stateRoot := filepath.Join(parent, ".sow")
+	lock, err := AcquireLock(stateRoot, "parent-mode-drift", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentInfo, err := os.Lstat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o720); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Validate(); err == nil || !strings.Contains(err.Error(), "security identity changed") {
+		t.Fatalf("immediate-parent mode drift was accepted: %v", err)
+	}
+	if err := os.Chmod(parent, parentInfo.Mode().Perm()); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Validate(); err != nil {
+		t.Fatalf("holder did not converge after restoring parent mode: %v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPermissionReconciliationNeverFollowsSwappedStateChildSymlink(t *testing.T) {
 	stateRoot := filepath.Join(t.TempDir(), ".sow")
 	if err := os.Mkdir(stateRoot, 0o700); err != nil {
@@ -165,6 +263,85 @@ func TestPermissionReconciliationNeverFollowsSwappedStateChildSymlink(t *testing
 	}
 	if _, err := os.Lstat(filepath.Join(stateRoot, "locks", "state.lock")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failed permission reconciliation retained state.lock: %v", err)
+	}
+}
+
+func TestStateBootstrapNeverCreatesThroughReplacedParent(t *testing.T) {
+	parent := t.TempDir()
+	repository := filepath.Join(parent, "repository")
+	displaced := repository + ".original"
+	if err := os.Mkdir(repository, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	replacementCanary := filepath.Join(repository, "replacement-canary")
+	swapped := false
+	restore := replaceStatePermissionFault(func(stage, _ string) error {
+		if stage != statePermissionAfterBootstrapParentLstat || swapped {
+			return nil
+		}
+		swapped = true
+		if err := os.Rename(repository, displaced); err != nil {
+			return err
+		}
+		if err := os.Mkdir(repository, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(replacementCanary, []byte("replacement must survive\n"), 0o600)
+	})
+	defer restore()
+	stateRoot := filepath.Join(repository, ".sow")
+	if _, err := AcquireLock(stateRoot, "bootstrap-parent-swap", false); err == nil ||
+		!strings.Contains(err.Error(), "parent changed") {
+		t.Fatalf("bootstrap accepted a replaced immediate parent: %v", err)
+	}
+	if !swapped {
+		t.Fatal("bootstrap parent fault seam was not reached")
+	}
+	if _, err := os.Lstat(stateRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("bootstrap created state through the replacement parent: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(displaced, ".sow")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("bootstrap mutated the displaced original parent: %v", err)
+	}
+	if body, err := os.ReadFile(replacementCanary); err != nil || string(body) != "replacement must survive\n" {
+		t.Fatalf("replacement parent canary changed: body=%q err=%v", body, err)
+	}
+}
+
+func TestPermissionReconciliationRejectsHardlinkAliasBeforeChmod(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), ".sow")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(stateRoot, "secret")
+	if err := os.WriteFile(secret, []byte("secret\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "secret-alias")
+	linked := false
+	restore := replaceStatePermissionFault(func(stage, name string) error {
+		if stage != statePermissionAfterChildLstat || name != "secret" || linked {
+			return nil
+		}
+		linked = true
+		return os.Link(secret, alias)
+	})
+	defer restore()
+	if _, err := AcquireLock(stateRoot, "child-hardlink-alias", false); err == nil ||
+		!strings.Contains(err.Error(), "link count") {
+		t.Fatalf("permission reconciliation accepted a new control-file hardlink: %v", err)
+	}
+	if !linked {
+		t.Fatal("control-file hardlink fault seam was not reached")
+	}
+	secretInfo, secretErr := os.Lstat(secret)
+	aliasInfo, aliasErr := os.Lstat(alias)
+	if secretErr != nil || aliasErr != nil || !os.SameFile(secretInfo, aliasInfo) ||
+		secretInfo.Mode().Perm() != 0o640 || aliasInfo.Mode().Perm() != 0o640 {
+		t.Fatalf("hardlink evidence changed: secret=%v alias=%v secretErr=%v aliasErr=%v", secretInfo, aliasInfo, secretErr, aliasErr)
+	}
+	if body, err := os.ReadFile(alias); err != nil || string(body) != "secret\n" {
+		t.Fatalf("hardlink evidence body=%q err=%v", body, err)
 	}
 }
 
@@ -238,8 +415,8 @@ func TestLockRootSwapFailsValidationAndReleaseCannotDeleteReplacementLock(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := first.Release(); err != nil {
-		t.Fatalf("release bound original lock: %v", err)
+	if err := first.Release(); err == nil || !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("release accepted a replaced lock coordinate: %v", err)
 	}
 	replacementAfter, err := os.Lstat(replacementLock)
 	if err != nil || !os.SameFile(replacementBefore, replacementAfter) {
@@ -251,7 +428,16 @@ func TestLockRootSwapFailsValidationAndReleaseCannotDeleteReplacementLock(t *tes
 	if err := second.Release(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Lstat(filepath.Join(displaced, ".sow", "locks", "state.lock")); !os.IsNotExist(err) {
+	if err := os.RemoveAll(repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(displaced, repositoryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("release bound original lock after restoring its coordinate: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(repositoryPath, ".sow", "locks", "state.lock")); !os.IsNotExist(err) {
 		t.Fatalf("original bound lock remains after release: %v", err)
 	}
 }

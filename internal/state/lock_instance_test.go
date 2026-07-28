@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -393,12 +394,13 @@ func TestStateLockRespectsLegacyRecordOnlyFlock(t *testing.T) {
 		t.Fatalf("legacy record helper exit: %v stderr=%s", err, stderr.String())
 	}
 	waited = true
-	lock, err := AcquireLock(statePath, "new-holder", false)
-	if err != nil {
-		t.Fatalf("new protocol did not proceed after legacy record flock release: %v", err)
+	if _, err := AcquireLock(statePath, "new-holder", false); err == nil || !strings.Contains(err.Error(), "group/other writable") {
+		t.Fatalf("unsafe control child was repaired or accepted after legacy record flock release: %v", err)
 	}
-	if err := lock.Release(); err != nil {
-		t.Fatal(err)
+	afterUnsafe, err := os.Lstat(controlPath)
+	if err != nil || afterUnsafe.Mode().Perm() != beforeControl.Mode().Perm() ||
+		!afterUnsafe.ModTime().Equal(beforeControl.ModTime()) {
+		t.Fatalf("unsafe control child changed after rejection: before=%v after=%v err=%v", beforeControl, afterUnsafe, err)
 	}
 }
 
@@ -805,6 +807,54 @@ func TestStateLockCreatePostFlockFailureLeavesNoOrphan(t *testing.T) {
 	}
 }
 
+func TestStateLockLeaseRejectsHardlinkBeforeChmodWithoutMutatingAlias(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), ".sow")
+	if err := os.MkdirAll(filepath.Join(statePath, "locks"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(statePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(statePath, "locks"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "state-lock-alias")
+	fired := false
+	restoreFault := replaceStateLockLeaseFault(func(name, stage string) error {
+		if fired || stage != stateLeaseFaultChmod || !strings.HasPrefix(name, stateLockUnpublishedPrefix) {
+			return nil
+		}
+		fired = true
+		return os.Link(filepath.Join(statePath, "locks", name), alias)
+	})
+	defer restoreFault()
+	previousUmask := syscall.Umask(0o777)
+	defer syscall.Umask(previousUmask)
+
+	if _, err := AcquireLock(statePath, "hardlink-before-chmod", false); err == nil ||
+		!strings.Contains(err.Error(), "link count") {
+		t.Fatalf("hardlink-aliased lease was chmodded or admitted: %v", err)
+	}
+	if !fired {
+		t.Fatal("hardlink race was not injected")
+	}
+	aliasInfo, err := os.Lstat(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aliasInfo.Mode().Perm() != 0 {
+		t.Fatalf("hardlink alias mode changed before rejection: %#o", aliasInfo.Mode().Perm())
+	}
+	pending, err := filepath.Glob(filepath.Join(statePath, "locks", stateLockUnpublishedPrefix+"*"))
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("hardlink evidence paths=%v err=%v", pending, err)
+	}
+	pendingInfo, err := os.Lstat(pending[0])
+	if err != nil || !os.SameFile(aliasInfo, pendingInfo) {
+		t.Fatalf("hardlink evidence was not preserved: pending=%v err=%v", pendingInfo, err)
+	}
+}
+
 func TestStateLockPublicationCrashNeverLeavesPartialAuthoritativeRecord(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -825,33 +875,41 @@ func TestStateLockPublicationCrashNeverLeavesPartialAuthoritativeRecord(t *testi
 				t.Fatalf("publication crash helper exit=%v want=%d", err, stateLockCrashExitCode)
 			}
 
+			lockPath := filepath.Join(statePath, "locks", "state.lock")
+			visibleInfo, visibleErr := os.Lstat(lockPath)
 			pending := unpublishedLockFiles(t, statePath)
-			if len(pending) != 1 {
-				t.Fatalf("publication crash pending evidence=%v want exactly one", pending)
+			var evidencePath string
+			if test.visibleAfterExit {
+				if len(pending) != 0 {
+					t.Fatalf("post-publish crash retained a hardlink-era pending alias: %v", pending)
+				}
+				if visibleErr != nil || visibleInfo == nil || !visibleInfo.Mode().IsRegular() || visibleInfo.Mode().Perm() != 0o600 {
+					t.Fatalf("post-publish crash did not leave one complete canonical record: visible=%v err=%v", visibleInfo, visibleErr)
+				}
+				evidencePath = lockPath
+			} else {
+				if len(pending) != 1 {
+					t.Fatalf("pre-publish crash pending evidence=%v want exactly one", pending)
+				}
+				if !errors.Is(visibleErr, os.ErrNotExist) {
+					t.Fatalf("pre-publish crash exposed an authoritative state.lock: %v", visibleErr)
+				}
+				evidencePath = pending[0]
 			}
-			pendingInfo, err := os.Lstat(pending[0])
-			if err != nil || !pendingInfo.Mode().IsRegular() || pendingInfo.Mode().Perm() != 0o600 {
-				t.Fatalf("unpublished lock evidence is unsafe: info=%v err=%v", pendingInfo, err)
+			evidenceInfo, err := os.Lstat(evidencePath)
+			if err != nil || evidenceInfo == nil || !evidenceInfo.Mode().IsRegular() || evidenceInfo.Mode().Perm() != 0o600 {
+				t.Fatalf("crash lock evidence is unsafe: info=%v err=%v", evidenceInfo, err)
 			}
-			pendingBody, err := os.ReadFile(pending[0])
+			evidenceBody, err := os.ReadFile(evidencePath)
 			if err != nil {
 				t.Fatal(err)
 			}
-			pendingRecord := decodeLockRecordFixture(t, pendingBody)
-			if _, err := pendingRecord.kind(); err != nil || pendingRecord.PID != command.Process.Pid {
-				t.Fatalf("unpublished lock record is incomplete: record=%+v err=%v child_pid=%d", pendingRecord, err, command.Process.Pid)
+			evidenceRecord := decodeLockRecordFixture(t, evidenceBody)
+			if _, err := evidenceRecord.kind(); err != nil || evidenceRecord.PID != command.Process.Pid {
+				t.Fatalf("crash lock record is incomplete: record=%+v err=%v child_pid=%d", evidenceRecord, err, command.Process.Pid)
 			}
 
-			lockPath := filepath.Join(statePath, "locks", "state.lock")
-			visibleInfo, visibleErr := os.Lstat(lockPath)
 			if test.visibleAfterExit {
-				if visibleErr != nil || !os.SameFile(pendingInfo, visibleInfo) {
-					t.Fatalf("post-publish crash did not leave the exact complete prepared inode: visible=%v err=%v", visibleInfo, visibleErr)
-				}
-				visibleBody := readLockBytes(t, statePath)
-				if !bytes.Equal(pendingBody, visibleBody) {
-					t.Fatal("post-publish crash exposed bytes different from the prepared record")
-				}
 				if _, err := AcquireLock(statePath, "after-publish-crash", false); err == nil || !strings.Contains(err.Error(), "rerun with --recover") {
 					t.Fatalf("complete crashed publication was not reported as recoverable stale evidence: %v", err)
 				}
@@ -864,16 +922,13 @@ func TestStateLockPublicationCrashNeverLeavesPartialAuthoritativeRecord(t *testi
 					t.Fatalf("post-publish crash recovery stale evidence=%v want one", stale)
 				}
 				staleBody, err := os.ReadFile(stale[0])
-				if err != nil || !bytes.Equal(staleBody, pendingBody) {
+				if err != nil || !bytes.Equal(staleBody, evidenceBody) {
 					t.Fatalf("post-publish crash recovery changed old evidence: err=%v", err)
 				}
 				if err := lock.Release(); err != nil {
 					t.Fatal(err)
 				}
 			} else {
-				if !errors.Is(visibleErr, os.ErrNotExist) {
-					t.Fatalf("pre-publish crash exposed an authoritative state.lock: %v", visibleErr)
-				}
 				lock, err := AcquireLock(statePath, "after-unpublished-crash", false)
 				if err != nil {
 					t.Fatalf("unpublished crash evidence incorrectly required recovery: %v", err)
@@ -883,10 +938,12 @@ func TestStateLockPublicationCrashNeverLeavesPartialAuthoritativeRecord(t *testi
 				}
 			}
 
-			afterPending, err := os.Lstat(pending[0])
-			afterBody, readErr := os.ReadFile(pending[0])
-			if err != nil || readErr != nil || !os.SameFile(pendingInfo, afterPending) || !bytes.Equal(pendingBody, afterBody) {
-				t.Fatalf("later acquisition changed unpublished crash evidence: stat=%v read=%v", err, readErr)
+			if !test.visibleAfterExit {
+				afterEvidence, err := os.Lstat(evidencePath)
+				afterBody, readErr := os.ReadFile(evidencePath)
+				if err != nil || readErr != nil || !os.SameFile(evidenceInfo, afterEvidence) || !bytes.Equal(evidenceBody, afterBody) {
+					t.Fatalf("later acquisition changed unpublished crash evidence: stat=%v read=%v", err, readErr)
+				}
 			}
 			if _, err := os.Lstat(lockPath); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("successful release retained authoritative state.lock: %v", err)
@@ -926,6 +983,52 @@ func TestStateLockPublicationFailureRemovesPreparedAndVisibleNames(t *testing.T)
 			}
 		})
 	}
+}
+
+func TestStateLockPublicationSyncIsRequiredBeforePublishedHook(t *testing.T) {
+	t.Run("sync failure rolls back visible coordinate", func(t *testing.T) {
+		injected := errors.New("injected publication parent sync failure")
+		previousSync := stateLockPublicationParentSync
+		stateLockPublicationParentSync = func(*os.File) error { return injected }
+		t.Cleanup(func() { stateLockPublicationParentSync = previousSync })
+		statePath := filepath.Join(t.TempDir(), ".sow")
+		if _, err := AcquireLock(statePath, "publication-sync-failure", false); !errors.Is(err, injected) {
+			t.Fatalf("publication sync failure was not returned: %v", err)
+		}
+		for _, name := range []string{"state.lock"} {
+			if _, err := os.Lstat(filepath.Join(statePath, "locks", name)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("publication sync failure retained %s: %v", name, err)
+			}
+		}
+		if pending := unpublishedLockFiles(t, statePath); len(pending) != 0 {
+			t.Fatalf("publication sync failure retained prepared names: %v", pending)
+		}
+	})
+
+	t.Run("durability barrier precedes published hook", func(t *testing.T) {
+		previousSync := stateLockPublicationParentSync
+		synced := false
+		stateLockPublicationParentSync = func(directory *os.File) error {
+			synced = true
+			return directory.Sync()
+		}
+		t.Cleanup(func() { stateLockPublicationParentSync = previousSync })
+		injected := errors.New("stop after durable publication")
+		restoreFault := replaceStateLockLeaseFault(func(name, stage string) error {
+			if name == "state.lock" && stage == stateLeaseFaultAfterPublish {
+				if !synced {
+					return errors.New("published hook ran before parent sync")
+				}
+				return injected
+			}
+			return nil
+		})
+		defer restoreFault()
+		statePath := filepath.Join(t.TempDir(), ".sow")
+		if _, err := AcquireLock(statePath, "publication-sync-order", false); !errors.Is(err, injected) {
+			t.Fatalf("post-sync publication hook did not run in order: %v", err)
+		}
+	})
 }
 
 func TestPartialUnpublishedStateLockIsPreservedButNeverAuthoritative(t *testing.T) {
@@ -1114,8 +1217,18 @@ func TestPersistentStateLeaseReplacementFailsValidationAndCannotBypassRecordFloc
 	if after := readLockBytes(t, statePath); !bytes.Equal(before, after) {
 		t.Fatal("replacement-lease contender changed the held record")
 	}
+	if err := first.Release(); err == nil || !strings.Contains(err.Error(), "persistent state lease") {
+		t.Fatalf("release did not preserve a replaced persistent lease: %v", err)
+	}
+	replacementPath := leasePath + ".replacement"
+	if err := os.Rename(leasePath, replacementPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(displacedPath, leasePath); err != nil {
+		t.Fatal(err)
+	}
 	if err := first.Release(); err != nil {
-		t.Fatalf("bound holder could not safely release after lease path replacement: %v", err)
+		t.Fatalf("bound holder could not retry release after restoring its exact persistent lease: %v", err)
 	}
 	second, err := AcquireLock(statePath, "replacement-holder", false)
 	if err != nil {
@@ -1132,15 +1245,20 @@ func TestStateLockReleaseReportsMissingDurableRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(filepath.Join(statePath, "locks", "state.lock")); err != nil {
+	lockPath := filepath.Join(statePath, "locks", "state.lock")
+	displacedPath := filepath.Join(statePath, "locks", "state.lock.displaced-test")
+	if err := os.Rename(lockPath, displacedPath); err != nil {
 		t.Fatal(err)
 	}
 	if err := lock.Release(); err == nil || !strings.Contains(err.Error(), "durable record is missing") {
 		t.Fatalf("release did not report the missing durable record: %v", err)
 	}
-
-	// Release still closes its advisory leases after reporting the durable
-	// identity failure, so a subsequent operation can create a fresh record.
+	if err := os.Rename(displacedPath, lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatalf("holder could not retry release after restoring its exact durable record: %v", err)
+	}
 	next, err := AcquireLock(statePath, "after-release-failure", false)
 	if err != nil {
 		t.Fatalf("release failure stranded the advisory lease: %v", err)
@@ -1150,8 +1268,72 @@ func TestStateLockReleaseReportsMissingDurableRecord(t *testing.T) {
 	}
 }
 
+func TestStateLockReleaseRetainsLeaseWhenExactRemovalDidNotCommit(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), ".sow")
+	lock, err := AcquireLock(statePath, "retryable-release", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected pre-remove failure")
+	restore := replaceStateLockLeaseFault(func(name, stage string) error {
+		if name == "state.lock" && stage == stateLeaseFaultBeforeRemove {
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(restore)
+	if err := lock.Release(); !errors.Is(err, injected) {
+		t.Fatalf("release did not report pre-remove failure: %v", err)
+	}
+	if err := lock.Validate(); err != nil {
+		t.Fatalf("pre-remove failure discarded the live binding: %v", err)
+	}
+	if _, err := AcquireLock(statePath, "blocked-contender", false); err == nil ||
+		!strings.Contains(err.Error(), "active process instance") {
+		t.Fatalf("pre-remove failure released the persistent lease: %v", err)
+	}
+	restore()
+	if err := lock.Release(); err != nil {
+		t.Fatalf("release retry after pre-remove failure: %v", err)
+	}
+	next, err := AcquireLock(statePath, "after-retry", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStateLockReleaseClosesLeaseAfterRemovalCommittedWithSyncError(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), ".sow")
+	lock, err := AcquireLock(statePath, "committed-release", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected post-remove sync failure")
+	restore := replaceStateLockLeaseFault(func(name, stage string) error {
+		if name == "state.lock" && stage == stateLeaseFaultAfterRemove {
+			return injected
+		}
+		return nil
+	})
+	t.Cleanup(restore)
+	if err := lock.Release(); !errors.Is(err, injected) {
+		t.Fatalf("release did not report committed removal sync failure: %v", err)
+	}
+	restore()
+	next, err := AcquireLock(statePath, "after-committed-removal", false)
+	if err != nil {
+		t.Fatalf("committed removal sync failure stranded the lease: %v", err)
+	}
+	if err := next.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPersistentStateLeasePermissionsArePrivateAndNonRegularEntryFailsClosed(t *testing.T) {
-	t.Run("widened regular lease is reconciled", func(t *testing.T) {
+	t.Run("widened regular lease is rejected without mutation", func(t *testing.T) {
 		statePath := filepath.Join(t.TempDir(), ".sow")
 		locksPath := filepath.Join(statePath, "locks")
 		if err := os.MkdirAll(locksPath, 0o700); err != nil {
@@ -1164,16 +1346,14 @@ func TestPersistentStateLeasePermissionsArePrivateAndNonRegularEntryFailsClosed(
 		if err := os.Chmod(leasePath, 0o666); err != nil {
 			t.Fatal(err)
 		}
-		lock, err := AcquireLock(statePath, "permission-reconcile", false)
-		if err != nil {
-			t.Fatal(err)
+		before := snapshotFilesystemEntry(t, leasePath)
+		if _, err := AcquireLock(statePath, "permission-reconcile", false); err == nil ||
+			!strings.Contains(err.Error(), "group/other writable") {
+			t.Fatalf("widened persistent lease was accepted: %v", err)
 		}
-		info, err := os.Lstat(leasePath)
-		if err != nil || info.Mode().Perm() != 0o600 {
-			t.Fatalf("persistent lease mode=%v err=%v want=0600", info, err)
-		}
-		if err := lock.Release(); err != nil {
-			t.Fatal(err)
+		assertFilesystemEntryUnchanged(t, leasePath, before)
+		if _, err := os.Lstat(filepath.Join(locksPath, "state.lock")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("widened lease rejection created state.lock: %v", err)
 		}
 	})
 	t.Run("directory lease is rejected", func(t *testing.T) {
@@ -1289,7 +1469,7 @@ func TestExistingStateLockClassificationFailuresDoNotMutateEvidence(t *testing.T
 				writeLockRecordFixture(t, statePath, fixtureV1LockRecord(definitelyDeadPID(t), fixtureProcessIdentity("402")))
 			},
 			recover: true,
-			want:    "cannot be recovered automatically",
+			want:    "group/other writable",
 			mode:    0o620,
 		},
 	}
@@ -1332,6 +1512,10 @@ func TestStateLockHolderDetectsInPlaceIdentityTamper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	originalBody, err := os.ReadFile(filepath.Join(statePath, "locks", "state.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	record := readLockRecordFixture(t, statePath)
 	if record.LockID == strings.Repeat("a", 64) {
 		record.LockID = strings.Repeat("b", 64)
@@ -1352,11 +1536,67 @@ func TestStateLockHolderDetectsInPlaceIdentityTamper(t *testing.T) {
 	if err := lock.Validate(); err == nil || !strings.Contains(err.Error(), "no longer identifies") {
 		t.Fatalf("holder accepted in-place lock identity tamper: %v", err)
 	}
-	if err := lock.Release(); err == nil || !strings.Contains(err.Error(), "not owned") {
+	if err := lock.Release(); err == nil || !strings.Contains(err.Error(), "no longer identifies") {
 		t.Fatalf("release removed a tampered lock identity: %v", err)
 	}
 	if _, err := os.Lstat(lockPath); err != nil {
 		t.Fatalf("tampered lock evidence was removed: %v", err)
+	}
+	file, err = os.OpenFile(lockPath, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, writeErr := file.Write(originalBody)
+	syncErr = file.Sync()
+	closeErr = file.Close()
+	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatalf("holder could not retry release after restoring its exact record: %v", err)
+	}
+}
+
+func TestStateLockReleaseRejectsHardlinkAtUnlinkBoundary(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), ".sow")
+	lock, err := AcquireLock(statePath, "unlink-boundary", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(statePath, "locks", "state.lock")
+	alias := filepath.Join(t.TempDir(), "state-lock-alias")
+	linked := false
+	restore := replaceStateLockLeaseFault(func(name, stage string) error {
+		if linked || name != "state.lock" || stage != stateLeaseFaultBeforeRemove {
+			return nil
+		}
+		linked = true
+		return os.Link(lockPath, alias)
+	})
+	defer restore()
+
+	if err := lock.Release(); err == nil || !strings.Contains(err.Error(), "link count") {
+		t.Fatalf("release accepted a hardlink introduced at the unlink boundary: %v", err)
+	}
+	if !linked {
+		t.Fatal("unlink-boundary fault seam was not reached")
+	}
+	lockInfo, lockErr := os.Lstat(lockPath)
+	aliasInfo, aliasErr := os.Lstat(alias)
+	if lockErr != nil || aliasErr != nil || !os.SameFile(lockInfo, aliasInfo) {
+		t.Fatalf("release removed hardlinked lock evidence: lock=%v alias=%v lockErr=%v aliasErr=%v", lockInfo, aliasInfo, lockErr, aliasErr)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Validate(); err != nil {
+		t.Fatalf("holder could not revalidate after external alias removal: %v", err)
+	}
+	if err := lock.Release(); err != nil {
+		t.Fatalf("holder could not retry exact release after alias removal: %v", err)
+	}
+	if _, err := os.Lstat(lockPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("state lock remains after successful retry: %v", err)
 	}
 }
 
