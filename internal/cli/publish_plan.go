@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -1927,6 +1929,224 @@ var derivedStateWriteHook func(string) error
 var derivedStateBeforeInstallHook func(string) error
 var derivedStateAfterVerifyHook func(string) error
 
+// These derived-state directory seams are replaceable only by focused
+// durability/failure-injection tests. Production synchronizes the exact bound
+// parent and never installs a traversal hook.
+var derivedStateDirectorySync = func(parent *os.Root, _ string) error {
+	return syncBoundArchiveDirectory(parent)
+}
+var derivedStateDirectoryBeforeCreateHook func(string) error
+var derivedStateDirectoryAfterStageMkdirHook func(string) error
+var derivedStateDirectoryBeforeStageInstallHook func(string) error
+var derivedStateDirectoryBeforeBindHook func(string) error
+var derivedStateDirectoryAfterSyncHook func(string) error
+var derivedStateDirectoryBeforeRemovalHook func(string) error
+var derivedStateDirectoryAfterRemovalHook func(string) error
+var derivedStateDirectoryRecoveryScanHook func(string)
+var derivedStateDirectoryRecoveryAfterLstatHook func(string) error
+var derivedStateDirectoryBeforeFinalCacheHook func(string) error
+var derivedStateDirectoryParentSync = func(parent *os.File) error {
+	return parent.Sync()
+}
+
+type derivedStateDirectoryCachedIdentity struct {
+	info       os.FileInfo
+	token      string
+	validUntil time.Time
+}
+
+type derivedStateDirectoryMutationEpoch struct {
+	token      string
+	validUntil time.Time
+}
+
+var derivedStateDirectoryStageState = struct {
+	sync.Mutex
+	active       map[string]os.FileInfo
+	dirty        map[string]struct{}
+	cleanParents map[string]derivedStateDirectoryCachedIdentity
+}{
+	active:       make(map[string]os.FileInfo),
+	dirty:        make(map[string]struct{}),
+	cleanParents: make(map[string]derivedStateDirectoryCachedIdentity),
+}
+
+type derivedStateDirectoryWriterLock struct {
+	mutex sync.Mutex
+	refs  int
+}
+
+var derivedStateDirectoryWriterLocks = struct {
+	sync.Mutex
+	entries map[string]*derivedStateDirectoryWriterLock
+}{
+	entries: make(map[string]*derivedStateDirectoryWriterLock),
+}
+
+func lockDerivedStateDirectoryWriter(path string) func() {
+	derivedStateDirectoryWriterLocks.Lock()
+	entry := derivedStateDirectoryWriterLocks.entries[path]
+	if entry == nil {
+		entry = &derivedStateDirectoryWriterLock{}
+		derivedStateDirectoryWriterLocks.entries[path] = entry
+	}
+	entry.refs++
+	derivedStateDirectoryWriterLocks.Unlock()
+
+	entry.mutex.Lock()
+	return func() {
+		entry.mutex.Unlock()
+		derivedStateDirectoryWriterLocks.Lock()
+		entry.refs--
+		if entry.refs == 0 {
+			delete(derivedStateDirectoryWriterLocks.entries, path)
+		}
+		derivedStateDirectoryWriterLocks.Unlock()
+	}
+}
+
+func cacheDerivedStateDirectoryIdentity(info os.FileInfo) (derivedStateDirectoryCachedIdentity, bool) {
+	if info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return derivedStateDirectoryCachedIdentity{}, false
+	}
+	token, ok := derivedStateDirectoryIdentityToken(info)
+	if !ok {
+		return derivedStateDirectoryCachedIdentity{}, false
+	}
+	return derivedStateDirectoryCachedIdentity{info: info, token: token}, true
+}
+
+func sameCachedDerivedStateDirectoryIdentity(cached derivedStateDirectoryCachedIdentity, current os.FileInfo) bool {
+	token, ok := derivedStateDirectoryIdentityToken(current)
+	return ok && cached.info != nil && !cached.validUntil.IsZero() && time.Now().Before(cached.validUntil) &&
+		os.SameFile(cached.info, current) &&
+		cached.info.Mode() == current.Mode() && cached.token == token
+}
+
+type derivedStateDirectoryMutationGuard struct {
+	root       *os.Root
+	directory  *os.File
+	cacheKey   string
+	relative   string
+	expected   os.FileInfo
+	token      string
+	validUntil time.Time
+}
+
+func newDerivedStateDirectoryMutationGuard(root *os.Root, directory *os.File, stateRoot, relative string, expected os.FileInfo) (*derivedStateDirectoryMutationGuard, error) {
+	if stateRoot == "" || !filepath.IsAbs(stateRoot) {
+		return nil, errors.New("derived state directory mutation guard lacks an absolute cache coordinate")
+	}
+	guard := &derivedStateDirectoryMutationGuard{
+		root:      root,
+		directory: directory,
+		cacheKey:  filepath.Join(stateRoot, relative),
+		relative:  relative,
+		expected:  expected,
+	}
+	if err := guard.admitKnownMutation(); err != nil {
+		return nil, err
+	}
+	return guard, nil
+}
+
+func (g *derivedStateDirectoryMutationGuard) current() (os.FileInfo, error) {
+	if g == nil || g.root == nil || g.directory == nil || g.relative == "" || g.expected == nil {
+		return nil, errors.New("derived state directory mutation guard is invalid")
+	}
+	fresh, statErr := g.directory.Stat()
+	current, lstatErr := g.root.Lstat(g.relative)
+	if statErr != nil || lstatErr != nil || fresh == nil || current == nil ||
+		!os.SameFile(g.expected, fresh) || !os.SameFile(g.expected, current) ||
+		fresh.Mode() != g.expected.Mode() || current.Mode() != g.expected.Mode() {
+		return nil, errors.Join(statErr, lstatErr, errors.New("derived state directory changed across mutation guard"))
+	}
+	return fresh, nil
+}
+
+func (g *derivedStateDirectoryMutationGuard) admitKnownMutation() error {
+	if _, err := g.current(); err != nil {
+		return err
+	}
+	epoch, err := derivedStateDirectoryMutationSealer(
+		g.directory,
+		atomic.AddUint64(&derivedStateDirectoryMutationSealCounter, 1),
+	)
+	if err != nil {
+		return err
+	}
+	if epoch.token == "" || epoch.validUntil.IsZero() {
+		// Some writable filesystems do not let a non-owner set directory
+		// timestamps. Correctness then falls back to a full recovery scan at
+		// every guard boundary and never admits a clean-cache entry.
+		derivedStateDirectoryStageState.Lock()
+		delete(derivedStateDirectoryStageState.cleanParents, g.cacheKey)
+		derivedStateDirectoryStageState.Unlock()
+		g.token = ""
+		g.validUntil = time.Time{}
+		return nil
+	}
+	fresh, err := g.current()
+	if err != nil {
+		return err
+	}
+	currentToken, ok := derivedStateDirectoryIdentityToken(fresh)
+	if !ok || currentToken != epoch.token {
+		return errors.New("derived state directory changed while sealing a known mutation")
+	}
+	g.token = epoch.token
+	g.validUntil = epoch.validUntil
+	return nil
+}
+
+func (g *derivedStateDirectoryMutationGuard) recoverUnexpectedMutation(root, parent *os.Root, parentHandle *os.File, stateRoot string, rootIdentity os.FileInfo) error {
+	fresh, err := g.current()
+	if err != nil {
+		return err
+	}
+	token, ok := derivedStateDirectoryIdentityToken(fresh)
+	if !ok {
+		return errors.New("derived state directory lacks a stable recovery identity")
+	}
+	if g.token != "" && !g.validUntil.IsZero() && time.Now().Before(g.validUntil) && token == g.token {
+		return nil
+	}
+	if g.token == "" || g.validUntil.IsZero() {
+		derivedStateDirectoryStageState.Lock()
+		delete(derivedStateDirectoryStageState.cleanParents, g.cacheKey)
+		derivedStateDirectoryStageState.Unlock()
+	}
+	if err := recoverDerivedStateDirectoryStages(root, parent, parentHandle, stateRoot, g.relative, rootIdentity, fresh); err != nil {
+		return err
+	}
+	return g.admitKnownMutation()
+}
+
+func claimDerivedStateDirectoryStage(path string, parentIdentity os.FileInfo) bool {
+	if parentIdentity == nil || !parentIdentity.IsDir() || parentIdentity.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	derivedStateDirectoryStageState.Lock()
+	defer derivedStateDirectoryStageState.Unlock()
+	if _, exists := derivedStateDirectoryStageState.active[path]; exists {
+		return false
+	}
+	delete(derivedStateDirectoryStageState.cleanParents, filepath.Dir(path))
+	derivedStateDirectoryStageState.active[path] = parentIdentity
+	return true
+}
+
+func finishDerivedStateDirectoryStage(path string, clean bool) {
+	derivedStateDirectoryStageState.Lock()
+	delete(derivedStateDirectoryStageState.active, path)
+	if clean {
+		delete(derivedStateDirectoryStageState.dirty, path)
+	} else {
+		derivedStateDirectoryStageState.dirty[path] = struct{}{}
+	}
+	derivedStateDirectoryStageState.Unlock()
+}
+
 func isDerivedStateTemporaryName(name, canonical string) bool {
 	suffix, ok := strings.CutPrefix(name, canonical)
 	if !ok || suffix == "" {
@@ -1966,6 +2186,31 @@ func exactLowerHex(value string, lengths ...int) bool {
 	return true
 }
 
+const derivedStateDirectoryStagePrefix = ".tmp-derived-directory-"
+const derivedStateDirectoryStageQuarantineSuffix = ".quarantine"
+const derivedStateDirectoryStagePreservedMarker = ".preserved-"
+
+var errDerivedStateDirectoryStagePreserved = errors.New("derived state directory replacement preserved")
+var derivedStateDirectoryPreserveCounter uint64
+var derivedStateDirectoryMutationSealCounter uint64
+var derivedStateDirectoryMutationSealer = sealDerivedStateDirectoryMutation
+
+func derivedStateDirectoryStageBase(name string) (string, bool) {
+	value, ok := strings.CutPrefix(name, derivedStateDirectoryStagePrefix)
+	if !ok {
+		return "", false
+	}
+	value = strings.TrimSuffix(value, derivedStateDirectoryStageQuarantineSuffix)
+	if !exactLowerHex(value, 32) {
+		return "", false
+	}
+	base := derivedStateDirectoryStagePrefix + value
+	if name != base && name != base+derivedStateDirectoryStageQuarantineSuffix {
+		return "", false
+	}
+	return base, true
+}
+
 func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr error) {
 	if relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return errors.New("unsafe derived state path")
@@ -1993,34 +2238,37 @@ func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr e
 		return err
 	}
 	directory := filepath.Dir(relative)
-	if err := root.MkdirAll(directory, 0o700); err != nil {
-		return err
-	}
-	prefix := ""
-	var directoryIdentity os.FileInfo
-	for _, component := range strings.Split(directory, string(filepath.Separator)) {
-		prefix = filepath.Join(prefix, component)
-		info, err := root.Lstat(prefix)
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return errors.Join(err, fmt.Errorf("derived state directory %s is not a real directory", prefix))
-		}
-		directoryIdentity = info
-	}
-	parent, err := root.OpenRoot(directory)
+	unlockDirectoryWriter := lockDerivedStateDirectoryWriter(filepath.Join(stateRoot, directory))
+	defer unlockDirectoryWriter()
+	parent, directoryHandle, directoryIdentity, err := bindOrCreateDurableDerivedStateDirectory(root, stateRoot, rootIdentity, directory)
 	if err != nil {
 		return err
 	}
 	defer parent.Close()
-	directoryHandle, err := bindDerivedStateDirectory(root, parent, directory, directoryIdentity)
+	defer directoryHandle.Close()
+	mutationGuard, err := newDerivedStateDirectoryMutationGuard(root, directoryHandle, stateRoot, directory, directoryIdentity)
 	if err != nil {
 		return err
 	}
-	defer directoryHandle.Close()
+	recoverUnexpectedDirectoryMutation := func() error {
+		if err := verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity); err != nil {
+			return err
+		}
+		return mutationGuard.recoverUnexpectedMutation(root, parent, directoryHandle, stateRoot, rootIdentity)
+	}
 	nonce, err := state.NewTransactionID()
 	if err != nil {
 		return err
 	}
 	destination := filepath.Base(relative)
+	_, destinationErr := parent.Lstat(destination)
+	destinationWasAbsent := errors.Is(destinationErr, os.ErrNotExist)
+	if destinationErr != nil && !destinationWasAbsent {
+		return destinationErr
+	}
+	if err := recoverUnexpectedDirectoryMutation(); err != nil {
+		return err
+	}
 	temporary := destination + ".tmp-" + nonce
 	file, err := parent.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
@@ -2044,6 +2292,9 @@ func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr e
 			}
 		}
 	}()
+	if err := mutationGuard.admitKnownMutation(); err != nil {
+		return err
+	}
 	if err := file.Chmod(0o600); err != nil {
 		return err
 	}
@@ -2086,13 +2337,907 @@ func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr e
 	); err != nil {
 		return err
 	}
-	installed, err := installExactDerivedStateTemporary(parent, directoryHandle, file, identity, expectedDigest, temporary, destination)
+	if err := recoverUnexpectedDirectoryMutation(); err != nil {
+		return err
+	}
+	installed, err := installExactDerivedStateTemporary(parent, directoryHandle, file, identity, expectedDigest, temporary, destination, mutationGuard, recoverUnexpectedDirectoryMutation)
 	committed = installed
-	return errors.Join(
+	resultErr = errors.Join(
 		err,
 		verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
 		verifyBoundDerivedStateDirectory(root, directoryHandle, directory, directoryIdentity),
 	)
+	if resultErr != nil || !installed {
+		return resultErr
+	}
+	if err := recoverUnexpectedDirectoryMutation(); err != nil {
+		return err
+	}
+	if derivedStateDirectoryBeforeFinalCacheHook != nil {
+		if err := derivedStateDirectoryBeforeFinalCacheHook(directory); err != nil {
+			return err
+		}
+	}
+	return markDerivedStateDirectoryRecoveryClean(
+		root,
+		parent,
+		directoryHandle,
+		stateRoot,
+		directory,
+		rootIdentity,
+		directoryIdentity,
+		destinationWasAbsent,
+		mutationGuard,
+		recoverUnexpectedDirectoryMutation,
+	)
+}
+
+func markDerivedStateDirectoryRecoveryClean(
+	root, parent *os.Root,
+	directory *os.File,
+	stateRoot, relative string,
+	rootIdentity, expected os.FileInfo,
+	destinationWasAbsent bool,
+	mutationGuard *derivedStateDirectoryMutationGuard,
+	recoverUnexpectedMutation func() error,
+) error {
+	if root == nil || parent == nil || directory == nil || stateRoot == "" || relative == "" ||
+		rootIdentity == nil || expected == nil || mutationGuard == nil || recoverUnexpectedMutation == nil {
+		return errors.New("derived state recovery cache binding is invalid")
+	}
+	if err := recoverUnexpectedMutation(); err != nil {
+		return err
+	}
+	fresh, statErr := directory.Stat()
+	current, lstatErr := root.Lstat(relative)
+	if statErr != nil || lstatErr != nil || fresh == nil || current == nil ||
+		!os.SameFile(expected, fresh) || !os.SameFile(expected, current) ||
+		fresh.Mode() != expected.Mode() || current.Mode() != expected.Mode() {
+		return errors.Join(statErr, lstatErr, errors.New("derived state directory changed before final recovery cache admission"))
+	}
+	freshToken, tokenOK := derivedStateDirectoryIdentityToken(fresh)
+	sealed := mutationGuard.token != "" && !mutationGuard.validUntil.IsZero() && time.Now().Before(mutationGuard.validUntil)
+	if sealed && (!tokenOK || freshToken != mutationGuard.token) {
+		return errors.New("derived state directory mutation seal changed before final recovery cache admission")
+	}
+	expectedLinks, expectedLinksOK := derivedStateDirectoryLinkCount(expected)
+	freshLinks, freshLinksOK := derivedStateDirectoryLinkCount(fresh)
+	if !expectedLinksOK || !freshLinksOK {
+		return errors.New("derived state directory lacks a stable link-count identity")
+	}
+	expectedLinkDelta := derivedStateDirectoryExpectedLinkDelta(destinationWasAbsent)
+	if expectedLinks > ^uint64(0)-expectedLinkDelta || expectedLinks+expectedLinkDelta != freshLinks {
+		// Regular-file staging does not change the parent directory's link
+		// count. A changed count means a subdirectory appeared or disappeared
+		// after the admission scan; rescan before cache admission so a strict
+		// crash-stage name cannot be laundered into the clean cache.
+		if err := recoverDerivedStateDirectoryStages(root, parent, directory, stateRoot, relative, rootIdentity, fresh); err != nil {
+			return err
+		}
+		if err := mutationGuard.admitKnownMutation(); err != nil {
+			return err
+		}
+	}
+	if err := recoverUnexpectedMutation(); err != nil {
+		return err
+	}
+	if err := verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity); err != nil {
+		return err
+	}
+	finalIdentity, finalStatErr := directory.Stat()
+	finalPathIdentity, finalPathErr := root.Lstat(relative)
+	if finalStatErr != nil || finalPathErr != nil || finalIdentity == nil || finalPathIdentity == nil ||
+		!os.SameFile(expected, finalIdentity) || !os.SameFile(expected, finalPathIdentity) ||
+		finalIdentity.Mode() != expected.Mode() || finalPathIdentity.Mode() != expected.Mode() {
+		return errors.Join(finalStatErr, finalPathErr, errors.New("derived state directory changed at final recovery cache admission"))
+	}
+	finalToken, finalTokenOK := derivedStateDirectoryIdentityToken(finalIdentity)
+	sealed = mutationGuard.token != "" && !mutationGuard.validUntil.IsZero() && time.Now().Before(mutationGuard.validUntil)
+	if sealed && (!finalTokenOK || finalToken != mutationGuard.token) {
+		return errors.New("derived state directory mutation seal changed at final recovery cache admission")
+	}
+	if err := verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity); err != nil {
+		return err
+	}
+	if !sealed {
+		return nil
+	}
+	cached, ok := cacheDerivedStateDirectoryIdentity(finalIdentity)
+	if !ok {
+		return errors.New("derived state directory lacks a stable recovery-cache identity")
+	}
+	cached.validUntil = mutationGuard.validUntil
+	parentKey := filepath.Join(stateRoot, relative)
+	derivedStateDirectoryStageState.Lock()
+	defer derivedStateDirectoryStageState.Unlock()
+	for active := range derivedStateDirectoryStageState.active {
+		if filepath.Dir(active) == parentKey {
+			return nil
+		}
+	}
+	for dirty := range derivedStateDirectoryStageState.dirty {
+		if filepath.Dir(dirty) == parentKey {
+			return nil
+		}
+	}
+	derivedStateDirectoryStageState.cleanParents[parentKey] = cached
+	return nil
+}
+
+// bindOrCreateDurableDerivedStateDirectory walks a state-root-relative
+// directory one component at a time. A newly-created child is bound before its
+// entry is made durable by syncing the exact parent, and every retained
+// capability is checked again before traversal continues.
+func bindOrCreateDurableDerivedStateDirectory(root *os.Root, stateRoot string, rootIdentity os.FileInfo, relative string) (*os.Root, *os.File, os.FileInfo, error) {
+	if root == nil || stateRoot == "" || !filepath.IsAbs(stateRoot) || rootIdentity == nil || !rootIdentity.IsDir() || rootIdentity.Mode()&os.ModeSymlink != 0 ||
+		relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return nil, nil, nil, errors.New("derived state directory traversal binding is invalid")
+	}
+	current, err := root.OpenRoot(".")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	currentIdentity, err := current.Stat(".")
+	if err != nil || currentIdentity == nil || !os.SameFile(rootIdentity, currentIdentity) || currentIdentity.Mode() != rootIdentity.Mode() {
+		_ = current.Close()
+		return nil, nil, nil, errors.Join(err, errors.New("derived state root changed while starting directory traversal"))
+	}
+	currentHandle, err := bindDerivedStateDirectory(root, current, ".", currentIdentity)
+	if err != nil {
+		_ = current.Close()
+		return nil, nil, nil, err
+	}
+	fail := func(cause error) (*os.Root, *os.File, os.FileInfo, error) {
+		closeHandleErr := currentHandle.Close()
+		closeRootErr := current.Close()
+		if errors.Is(closeHandleErr, os.ErrClosed) {
+			closeHandleErr = nil
+		}
+		if errors.Is(closeRootErr, os.ErrClosed) {
+			closeRootErr = nil
+		}
+		return nil, nil, nil, errors.Join(cause, closeHandleErr, closeRootErr)
+	}
+	if err := verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity); err != nil {
+		return fail(err)
+	}
+	if relative == "." {
+		if err := recoverDerivedStateDirectoryStages(root, current, currentHandle, stateRoot, ".", rootIdentity, currentIdentity); err != nil {
+			return fail(err)
+		}
+		return current, currentHandle, currentIdentity, nil
+	}
+
+	currentRelative := "."
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		if component == "" || component == "." || component == ".." || filepath.Base(component) != component {
+			return fail(errors.New("derived state directory contains an unsafe component"))
+		}
+		if err := errors.Join(
+			verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
+			verifyBoundDerivedStateDirectory(root, currentHandle, currentRelative, currentIdentity),
+		); err != nil {
+			return fail(err)
+		}
+		if err := recoverDerivedStateDirectoryStages(root, current, currentHandle, stateRoot, currentRelative, rootIdentity, currentIdentity); err != nil {
+			return fail(err)
+		}
+
+		nextRelative := filepath.Join(currentRelative, component)
+		before, statErr := current.Lstat(component)
+		created := false
+		var next *os.Root
+		var nextHandle *os.File
+		var opened os.FileInfo
+		if errors.Is(statErr, os.ErrNotExist) {
+			if derivedStateDirectoryBeforeCreateHook != nil {
+				if err := derivedStateDirectoryBeforeCreateHook(nextRelative); err != nil {
+					return fail(err)
+				}
+			}
+			stageName, stageKey, stagedRoot, stagedHandle, stagedIdentity, stageErr := createBoundDerivedStateDirectoryStage(root, current, stateRoot, currentRelative, currentIdentity)
+			stageClean := false
+			if stageKey != "" {
+				defer func(key string, clean *bool) {
+					finishDerivedStateDirectoryStage(key, *clean)
+				}(stageKey, &stageClean)
+			}
+			if stageErr != nil {
+				return fail(stageErr)
+			}
+			closeStage := func() error {
+				return errors.Join(stagedHandle.Close(), stagedRoot.Close())
+			}
+			stageRelative := filepath.Join(currentRelative, stageName)
+			var stageAdmissionErr error
+			if derivedStateDirectoryBeforeStageInstallHook != nil {
+				stageAdmissionErr = derivedStateDirectoryBeforeStageInstallHook(stageRelative)
+			}
+			stageAdmissionErr = errors.Join(
+				stageAdmissionErr,
+				verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
+				verifyBoundDerivedStateDirectory(root, currentHandle, currentRelative, currentIdentity),
+				verifyBoundDerivedStateDirectory(root, stagedHandle, stageRelative, stagedIdentity),
+			)
+			if stageAdmissionErr != nil {
+				cleanupErr := removeExactEmptyDerivedStateDirectory(current, currentHandle, stagedRoot, stagedHandle, stageName, stageName, stagedIdentity)
+				stageClean = cleanupErr == nil || errors.Is(cleanupErr, errDerivedStateDirectoryStagePreserved)
+				closeErr := closeStage()
+				return fail(errors.Join(stageAdmissionErr, cleanupErr, closeErr))
+			}
+			renameErr := renameYUMCompatibilityCandidateNoReplace(currentHandle.Fd(), stageName, component)
+			if renameErr != nil {
+				cleanupErr := removeExactEmptyDerivedStateDirectory(current, currentHandle, stagedRoot, stagedHandle, stageName, stageName, stagedIdentity)
+				stageClean = cleanupErr == nil || errors.Is(cleanupErr, errDerivedStateDirectoryStagePreserved)
+				closeErr := closeStage()
+				if cleanupErr != nil {
+					return fail(errors.Join(renameErr, cleanupErr, closeErr, fmt.Errorf("derived state directory stage %s requires recovery", stageName)))
+				}
+				if !errors.Is(renameErr, os.ErrExist) {
+					return fail(errors.Join(renameErr, closeErr))
+				}
+				if closeErr != nil {
+					return fail(closeErr)
+				}
+				// A concurrent winner is not claimed as this invocation's create.
+				// Re-observe it as an existing coordinate and durably sync its
+				// parent before reuse below.
+				before, statErr = current.Lstat(component)
+			} else {
+				created = true
+				next = stagedRoot
+				nextHandle = stagedHandle
+				opened = stagedIdentity
+				stageCurrent, stageErr := current.Lstat(stageName)
+				if stageErr == nil || stageCurrent != nil || !errors.Is(stageErr, os.ErrNotExist) {
+					_ = closeStage()
+					return fail(errors.Join(stageErr, fmt.Errorf("derived state directory stage %s remained after install", stageName)))
+				}
+				// The private stage coordinate is now absent. Later failures may
+				// roll back the canonical component, but they cannot make this
+				// random stage name recoverable again.
+				stageClean = true
+				if derivedStateDirectoryBeforeBindHook != nil {
+					if err := derivedStateDirectoryBeforeBindHook(nextRelative); err != nil {
+						_ = closeStage()
+						return fail(err)
+					}
+				}
+				currentChild, currentErr := current.Lstat(component)
+				if currentErr != nil || currentChild == nil || currentChild.Mode() != os.ModeDir|0o700 ||
+					!os.SameFile(opened, currentChild) {
+					stageClean = false
+					cleanupErr := removeExactEmptyDerivedStateDirectory(current, currentHandle, stagedRoot, stagedHandle, component, stageName, stagedIdentity)
+					stageClean = cleanupErr == nil || errors.Is(cleanupErr, errDerivedStateDirectoryStagePreserved)
+					closeErr := closeStage()
+					return fail(errors.Join(currentErr, cleanupErr, closeErr, fmt.Errorf("derived state directory %s changed while installing", nextRelative)))
+				}
+				before, statErr = currentChild, nil
+			}
+		}
+		if !created {
+			if statErr != nil || before == nil || before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
+				return fail(errors.Join(statErr, fmt.Errorf("derived state directory %s is not a real directory", nextRelative)))
+			}
+			if derivedStateDirectoryBeforeBindHook != nil {
+				if err := derivedStateDirectoryBeforeBindHook(nextRelative); err != nil {
+					return fail(err)
+				}
+			}
+
+			var openErr error
+			next, openErr = current.OpenRoot(component)
+			if openErr != nil {
+				return fail(openErr)
+			}
+			var openedErr error
+			opened, openedErr = next.Stat(".")
+			after, afterErr := current.Lstat(component)
+			if openedErr != nil || afterErr != nil || opened == nil || after == nil ||
+				opened.Mode()&os.ModeSymlink != 0 || after.Mode()&os.ModeSymlink != 0 || !opened.IsDir() || !after.IsDir() ||
+				!os.SameFile(before, opened) || !os.SameFile(before, after) || opened.Mode() != before.Mode() || after.Mode() != before.Mode() {
+				_ = next.Close()
+				return fail(errors.Join(openedErr, afterErr, fmt.Errorf("derived state directory %s changed while binding", nextRelative)))
+			}
+			var bindErr error
+			nextHandle, bindErr = bindDerivedStateDirectory(root, next, nextRelative, opened)
+			if bindErr != nil {
+				_ = next.Close()
+				return fail(bindErr)
+			}
+		}
+		closeNext := func() {
+			_ = nextHandle.Close()
+			_ = next.Close()
+		}
+
+		// Existing entries are also parent-synced. This is the durable replay
+		// proof for a coordinate that may have survived a prior failed fsync or
+		// a concurrent creator whose completion is not observable here.
+		if err := derivedStateDirectorySync(current, nextRelative); err != nil {
+			closeNext()
+			return fail(fmt.Errorf("sync parent for derived state directory %s: %w", nextRelative, err))
+		}
+		if created {
+			if derivedStateDirectoryAfterSyncHook != nil {
+				if err := derivedStateDirectoryAfterSyncHook(nextRelative); err != nil {
+					closeNext()
+					return fail(err)
+				}
+			}
+		}
+		if err := errors.Join(
+			verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
+			verifyBoundDerivedStateDirectory(root, currentHandle, currentRelative, currentIdentity),
+			verifyBoundDerivedStateDirectory(root, nextHandle, nextRelative, opened),
+		); err != nil {
+			closeNext()
+			return fail(err)
+		}
+
+		_ = currentHandle.Close()
+		_ = current.Close()
+		current = next
+		currentHandle = nextHandle
+		currentIdentity = opened
+		currentRelative = nextRelative
+	}
+	if err := errors.Join(
+		verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
+		verifyBoundDerivedStateDirectory(root, currentHandle, currentRelative, currentIdentity),
+	); err != nil {
+		return fail(err)
+	}
+	if err := recoverDerivedStateDirectoryStages(root, current, currentHandle, stateRoot, currentRelative, rootIdentity, currentIdentity); err != nil {
+		return fail(err)
+	}
+	return current, currentHandle, currentIdentity, nil
+}
+
+func mkdirExactPrivateDerivedStateDirectory(parent *os.Root, name string) error {
+	if parent == nil || filepath.Base(name) != name || name == "" || name == "." || name == ".." {
+		return errors.New("derived state private directory creation binding is invalid")
+	}
+	// Owner-mask normalization happens once, before concurrent execution, in
+	// umask_unix.go. Never mutate the process-global umask on a live write path.
+	return parent.Mkdir(name, 0o700)
+}
+
+func createBoundDerivedStateDirectoryStage(root, parent *os.Root, stateRoot, parentRelative string, parentIdentity os.FileInfo) (string, string, *os.Root, *os.File, os.FileInfo, error) {
+	if root == nil || parent == nil || stateRoot == "" || !filepath.IsAbs(stateRoot) || parentRelative == "" ||
+		parentIdentity == nil || !parentIdentity.IsDir() || parentIdentity.Mode()&os.ModeSymlink != 0 {
+		return "", "", nil, nil, nil, errors.New("derived state directory stage binding is invalid")
+	}
+	for attempt := 0; attempt < 32; attempt++ {
+		nonce, err := state.NewTransactionID()
+		if err != nil {
+			return "", "", nil, nil, nil, err
+		}
+		name := derivedStateDirectoryStagePrefix + nonce
+		stageRelative := filepath.Join(parentRelative, name)
+		stageKey := filepath.Join(stateRoot, stageRelative)
+		if !claimDerivedStateDirectoryStage(stageKey, parentIdentity) {
+			continue
+		}
+		if err := mkdirExactPrivateDerivedStateDirectory(parent, name); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				finishDerivedStateDirectoryStage(stageKey, false)
+				continue
+			}
+			finishDerivedStateDirectoryStage(stageKey, true)
+			return "", "", nil, nil, nil, err
+		}
+		before, statErr := parent.Lstat(name)
+		if statErr != nil || before == nil || before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
+			return name, stageKey, nil, nil, nil, errors.Join(statErr, fmt.Errorf("derived state directory stage %s requires replay recovery after failing real-directory admission", stageRelative))
+		}
+		stage, openErr := parent.OpenRoot(name)
+		if openErr != nil {
+			return name, stageKey, nil, nil, nil, fmt.Errorf("derived state directory stage %s requires replay recovery: %w", stageRelative, openErr)
+		}
+		opened, openedErr := stage.Stat(".")
+		after, afterErr := parent.Lstat(name)
+		if openedErr != nil || afterErr != nil || opened == nil || after == nil ||
+			opened.Mode()&os.ModeSymlink != 0 || after.Mode()&os.ModeSymlink != 0 || !opened.IsDir() || !after.IsDir() ||
+			!os.SameFile(before, opened) || !os.SameFile(before, after) {
+			_ = stage.Close()
+			return name, stageKey, nil, nil, nil, errors.Join(openedErr, afterErr, fmt.Errorf("derived state directory stage %s requires replay recovery after changing while binding", stageRelative))
+		}
+		handle, bindErr := bindDerivedStateDirectory(root, stage, stageRelative, opened)
+		if bindErr != nil {
+			_ = stage.Close()
+			return name, stageKey, nil, nil, nil, errors.Join(bindErr, fmt.Errorf("derived state directory stage %s requires replay recovery", stageRelative))
+		}
+		if chmodErr := handle.Chmod(0o700); chmodErr != nil {
+			_ = handle.Close()
+			_ = stage.Close()
+			return name, stageKey, nil, nil, nil, errors.Join(chmodErr, fmt.Errorf("derived state directory stage %s requires replay recovery after private-mode repair", stageRelative))
+		}
+		hardened, hardenedErr := handle.Stat()
+		stageCurrent, stageErr := stage.Stat(".")
+		pathCurrent, pathErr := parent.Lstat(name)
+		if hardenedErr != nil || stageErr != nil || pathErr != nil || hardened == nil || stageCurrent == nil || pathCurrent == nil ||
+			hardened.Mode() != os.ModeDir|0o700 || stageCurrent.Mode() != os.ModeDir|0o700 || pathCurrent.Mode() != os.ModeDir|0o700 ||
+			!os.SameFile(before, hardened) || !os.SameFile(before, stageCurrent) || !os.SameFile(before, pathCurrent) {
+			_ = handle.Close()
+			_ = stage.Close()
+			return name, stageKey, nil, nil, nil, errors.Join(hardenedErr, stageErr, pathErr, fmt.Errorf("derived state directory stage %s requires replay recovery after failing exact private mode", stageRelative))
+		}
+		if err := verifyBoundDerivedStateDirectory(root, handle, stageRelative, hardened); err != nil {
+			_ = handle.Close()
+			_ = stage.Close()
+			return name, stageKey, nil, nil, nil, errors.Join(err, fmt.Errorf("derived state directory stage %s requires replay recovery after mode repair", stageRelative))
+		}
+		if derivedStateDirectoryAfterStageMkdirHook != nil {
+			if err := derivedStateDirectoryAfterStageMkdirHook(stageRelative); err != nil {
+				_ = handle.Close()
+				_ = stage.Close()
+				return name, stageKey, nil, nil, nil, fmt.Errorf("derived state directory stage %s requires replay recovery: %w", stageRelative, err)
+			}
+		}
+		return name, stageKey, stage, handle, hardened, nil
+	}
+	return "", "", nil, nil, nil, errors.New("cannot allocate a unique derived state directory stage")
+}
+
+func recoverDerivedStateDirectoryStages(root, parent *os.Root, parentHandle *os.File, stateRoot, parentRelative string, rootIdentity, parentIdentity os.FileInfo) error {
+	if root == nil || parent == nil || parentHandle == nil || stateRoot == "" || parentRelative == "" || rootIdentity == nil || parentIdentity == nil {
+		return errors.New("derived state directory stage recovery binding is invalid")
+	}
+	parentKey := filepath.Join(stateRoot, parentRelative)
+	derivedStateDirectoryStageState.Lock()
+	defer derivedStateDirectoryStageState.Unlock()
+	if cleanIdentity, clean := derivedStateDirectoryStageState.cleanParents[parentKey]; clean {
+		if sameCachedDerivedStateDirectoryIdentity(cleanIdentity, parentIdentity) {
+			return nil
+		}
+		delete(derivedStateDirectoryStageState.cleanParents, parentKey)
+	}
+	if derivedStateDirectoryRecoveryScanHook != nil {
+		derivedStateDirectoryRecoveryScanHook(parentRelative)
+	}
+	observed := make(map[string]struct{})
+	directory, err := parent.Open(".")
+	if err != nil {
+		return err
+	}
+	closeDirectory := func(cause error) error { return errors.Join(cause, directory.Close()) }
+	recordStageFailure := func(stageKey string, cause error) error {
+		delete(derivedStateDirectoryStageState.active, stageKey)
+		if errors.Is(cause, errDerivedStateDirectoryStagePreserved) {
+			delete(derivedStateDirectoryStageState.dirty, stageKey)
+		} else {
+			derivedStateDirectoryStageState.dirty[stageKey] = struct{}{}
+		}
+		return closeDirectory(cause)
+	}
+	preserveChangedCoordinate := func(cause error, name, base string, admitted os.FileInfo) error {
+		current, currentErr := parent.Lstat(name)
+		if errors.Is(currentErr, os.ErrNotExist) {
+			return errors.Join(cause, fmt.Errorf("%w after %s disappeared", errDerivedStateDirectoryStagePreserved, name))
+		}
+		if currentErr != nil || current == nil || admitted == nil || os.SameFile(admitted, current) {
+			return errors.Join(cause, currentErr)
+		}
+		paths, preserveErr := preserveDerivedStateDirectoryReplacement(parent, parentHandle, base, name)
+		if preserveErr != nil {
+			return errors.Join(cause, preserveErr)
+		}
+		return errors.Join(cause, fmt.Errorf("%w at %s", errDerivedStateDirectoryStagePreserved, paths))
+	}
+	for {
+		entries, readErr := directory.ReadDir(128)
+		for _, entry := range entries {
+			name := entry.Name()
+			base, ok := derivedStateDirectoryStageBase(name)
+			if !ok {
+				continue
+			}
+			stageKey := filepath.Join(parentKey, base)
+			observed[stageKey] = struct{}{}
+			if _, active := derivedStateDirectoryStageState.active[stageKey]; active {
+				continue
+			}
+			// Recovery owns this exact stage key until the bound quarantine
+			// transaction either commits or returns an error. This closes two
+			// concurrent scanners over the same stale directory entry.
+			derivedStateDirectoryStageState.active[stageKey] = parentIdentity
+			stageRelative := filepath.Join(parentRelative, name)
+			before, statErr := parent.Lstat(name)
+			if errors.Is(statErr, os.ErrNotExist) {
+				delete(derivedStateDirectoryStageState.active, stageKey)
+				delete(derivedStateDirectoryStageState.dirty, stageKey)
+				if err := errors.Join(
+					verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
+					verifyBoundDerivedStateDirectory(root, parentHandle, parentRelative, parentIdentity),
+				); err != nil {
+					return closeDirectory(err)
+				}
+				continue
+			}
+			recoverableMode := before != nil &&
+				(before.Mode() == os.ModeDir|0o700 || before.Mode() == os.ModeDir|os.ModeSetgid|0o700)
+			if statErr != nil || before == nil || !recoverableMode {
+				return recordStageFailure(stageKey, errors.Join(statErr, fmt.Errorf("derived state directory stage residue %s is not an owner-private crash-recoverable directory", stageRelative)))
+			}
+			if derivedStateDirectoryRecoveryAfterLstatHook != nil {
+				if hookErr := derivedStateDirectoryRecoveryAfterLstatHook(stageRelative); hookErr != nil {
+					return recordStageFailure(stageKey, preserveChangedCoordinate(hookErr, name, base, before))
+				}
+			}
+			stage, openErr := parent.OpenRoot(name)
+			if openErr != nil {
+				return recordStageFailure(stageKey, preserveChangedCoordinate(openErr, name, base, before))
+			}
+			opened, openedErr := stage.Stat(".")
+			after, afterErr := parent.Lstat(name)
+			if openedErr != nil || afterErr != nil || opened == nil || after == nil ||
+				opened.Mode() != before.Mode() || after.Mode() != before.Mode() ||
+				!os.SameFile(before, opened) || !os.SameFile(before, after) {
+				_ = stage.Close()
+				cause := errors.Join(openedErr, afterErr, fmt.Errorf("derived state directory stage residue %s changed while binding", stageRelative))
+				return recordStageFailure(stageKey, preserveChangedCoordinate(cause, name, base, before))
+			}
+			handle, bindErr := bindDerivedStateDirectory(root, stage, stageRelative, opened)
+			if bindErr != nil {
+				_ = stage.Close()
+				return recordStageFailure(stageKey, preserveChangedCoordinate(bindErr, name, base, before))
+			}
+			if opened.Mode() != os.ModeDir|0o700 {
+				if chmodErr := handle.Chmod(0o700); chmodErr != nil {
+					_ = handle.Close()
+					_ = stage.Close()
+					cause := errors.Join(chmodErr, fmt.Errorf("repair crash residue mode for %s", stageRelative))
+					return recordStageFailure(stageKey, preserveChangedCoordinate(cause, name, base, before))
+				}
+				hardened, hardenedErr := handle.Stat()
+				stageCurrent, stageErr := stage.Stat(".")
+				pathCurrent, pathErr := parent.Lstat(name)
+				if hardenedErr != nil || stageErr != nil || pathErr != nil || hardened == nil || stageCurrent == nil || pathCurrent == nil ||
+					hardened.Mode() != os.ModeDir|0o700 || stageCurrent.Mode() != os.ModeDir|0o700 || pathCurrent.Mode() != os.ModeDir|0o700 ||
+					!os.SameFile(before, hardened) || !os.SameFile(before, stageCurrent) || !os.SameFile(before, pathCurrent) {
+					_ = handle.Close()
+					_ = stage.Close()
+					cause := errors.Join(hardenedErr, stageErr, pathErr, fmt.Errorf("crash residue %s changed while repairing private mode", stageRelative))
+					return recordStageFailure(stageKey, preserveChangedCoordinate(cause, name, base, before))
+				}
+				opened = hardened
+			}
+			removeErr := removeExactEmptyDerivedStateDirectory(parent, parentHandle, stage, handle, name, base, opened)
+			closeStageErr := errors.Join(handle.Close(), stage.Close())
+			delete(derivedStateDirectoryStageState.active, stageKey)
+			if removeErr != nil || closeStageErr != nil {
+				if errors.Is(removeErr, errDerivedStateDirectoryStagePreserved) && closeStageErr == nil {
+					delete(derivedStateDirectoryStageState.dirty, stageKey)
+				} else {
+					derivedStateDirectoryStageState.dirty[stageKey] = struct{}{}
+				}
+				return closeDirectory(errors.Join(removeErr, closeStageErr, fmt.Errorf("recover derived state directory stage %s", stageRelative)))
+			}
+			delete(derivedStateDirectoryStageState.dirty, stageKey)
+			if err := errors.Join(
+				verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
+				verifyBoundDerivedStateDirectory(root, parentHandle, parentRelative, parentIdentity),
+			); err != nil {
+				return closeDirectory(err)
+			}
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return closeDirectory(readErr)
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+	}
+	if err := directory.Close(); err != nil {
+		return err
+	}
+	if err := derivedStateDirectoryParentSync(parentHandle); err != nil {
+		return fmt.Errorf("sync derived state directory after recovery scan: %w", err)
+	}
+	if err := errors.Join(
+		verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
+		verifyBoundDerivedStateDirectory(root, parentHandle, parentRelative, parentIdentity),
+	); err != nil {
+		return err
+	}
+	finalIdentity, finalStatErr := parentHandle.Stat()
+	finalPathIdentity, finalPathErr := root.Lstat(parentRelative)
+	if finalStatErr != nil || finalPathErr != nil || finalIdentity == nil || finalPathIdentity == nil ||
+		!os.SameFile(parentIdentity, finalIdentity) || !os.SameFile(parentIdentity, finalPathIdentity) ||
+		finalIdentity.Mode() != parentIdentity.Mode() || finalPathIdentity.Mode() != parentIdentity.Mode() {
+		return errors.Join(finalStatErr, finalPathErr, errors.New("derived state directory changed after recovery scan"))
+	}
+	for dirty := range derivedStateDirectoryStageState.dirty {
+		if filepath.Dir(dirty) == parentKey {
+			if _, exists := observed[dirty]; !exists {
+				delete(derivedStateDirectoryStageState.dirty, dirty)
+			}
+		}
+	}
+	return nil
+}
+
+func preserveDerivedStateDirectoryReplacement(parent *os.Root, parentHandle *os.File, base, source string) (string, error) {
+	parsedBase, validBase := derivedStateDirectoryStageBase(base)
+	if parent == nil || parentHandle == nil || !validBase || parsedBase != base ||
+		filepath.Base(source) != source || source == "" || source == "." || source == ".." {
+		return "", errors.New("derived state replacement preservation binding is invalid")
+	}
+	preservedPaths := make([]string, 0, 2)
+	for replacement := 0; replacement < 32; replacement++ {
+		before, beforeErr := parent.Lstat(source)
+		if errors.Is(beforeErr, os.ErrNotExist) && len(preservedPaths) > 0 {
+			return strings.Join(preservedPaths, ","), nil
+		}
+		if beforeErr != nil || before == nil {
+			return strings.Join(preservedPaths, ","), errors.Join(beforeErr, fmt.Errorf("derived state directory replacement retained at %s", source))
+		}
+		preserved := ""
+		for allocation := 0; allocation < 64; allocation++ {
+			nonce, nonceErr := state.NewTransactionID()
+			if nonceErr != nil {
+				nonce = fmt.Sprintf("%032x", atomic.AddUint64(&derivedStateDirectoryPreserveCounter, 1))
+			}
+			candidate := base + derivedStateDirectoryStagePreservedMarker + nonce
+			renameErr := renameYUMCompatibilityCandidateNoReplace(parentHandle.Fd(), source, candidate)
+			if errors.Is(renameErr, os.ErrExist) {
+				continue
+			}
+			if renameErr != nil {
+				return strings.Join(preservedPaths, ","), errors.Join(renameErr, fmt.Errorf("derived state directory replacement retained at %s", source))
+			}
+			preserved = candidate
+			break
+		}
+		if preserved == "" {
+			return strings.Join(preservedPaths, ","), fmt.Errorf("cannot allocate a preserved derived state directory name for %s", source)
+		}
+		after, afterErr := parent.Lstat(preserved)
+		if afterErr != nil || after == nil || !os.SameFile(before, after) {
+			return strings.Join(append(preservedPaths, preserved), ","), errors.Join(afterErr, fmt.Errorf("derived state directory replacement identity changed at %s", preserved))
+		}
+		preservedPaths = append(preservedPaths, preserved)
+		syncErr := derivedStateDirectoryParentSync(parentHandle)
+		_, sourceErr := parent.Lstat(source)
+		if errors.Is(sourceErr, os.ErrNotExist) {
+			if syncErr != nil {
+				return strings.Join(preservedPaths, ","), errors.Join(syncErr, fmt.Errorf("sync preserved derived state directory replacement at %s", preserved))
+			}
+			return strings.Join(preservedPaths, ","), nil
+		}
+		if sourceErr != nil {
+			return strings.Join(preservedPaths, ","), errors.Join(syncErr, sourceErr)
+		}
+		if syncErr != nil {
+			// Preserve the newly observed occupant before reporting the failed
+			// durability barrier. A later clean rescan will retry the barrier.
+			continue
+		}
+		// A second actor reoccupied the recoverable source while the first
+		// replacement was being preserved. Preserve that identity too.
+	}
+	return strings.Join(preservedPaths, ","), fmt.Errorf("derived state directory coordinate %s was continuously reoccupied", source)
+}
+
+func removeExactEmptyDerivedStateDirectory(parent *os.Root, parentHandle *os.File, stage *os.Root, stageHandle *os.File, coordinate, quarantineBase string, expected os.FileInfo) error {
+	base, validBase := derivedStateDirectoryStageBase(quarantineBase)
+	if parent == nil || parentHandle == nil || stage == nil || stageHandle == nil || expected == nil ||
+		filepath.Base(coordinate) != coordinate || coordinate == "" || coordinate == "." || coordinate == ".." ||
+		!validBase || base != quarantineBase || !expected.IsDir() || expected.Mode()&os.ModeSymlink != 0 {
+		return errors.New("derived state directory stage removal binding is invalid")
+	}
+	quarantine := base + derivedStateDirectoryStageQuarantineSuffix
+	alreadyQuarantined := coordinate == quarantine
+	moved := false
+	preserveReplacement := func(source string) (string, error) {
+		return preserveDerivedStateDirectoryReplacement(parent, parentHandle, base, source)
+	}
+	preserveRetiredReplacements := func(cause error, sources ...string) error {
+		preserved := make([]string, 0, len(sources))
+		seen := make(map[string]struct{}, len(sources))
+		for _, source := range sources {
+			if _, duplicate := seen[source]; !duplicate {
+				seen[source] = struct{}{}
+			}
+		}
+		var lastErr error
+		for round := 0; round < 32; round++ {
+			for source := range seen {
+				_, statErr := parent.Lstat(source)
+				if errors.Is(statErr, os.ErrNotExist) {
+					continue
+				}
+				if statErr != nil {
+					return errors.Join(cause, statErr)
+				}
+				paths, preserveErr := preserveReplacement(source)
+				if paths != "" {
+					preserved = append(preserved, paths)
+				}
+				lastErr = errors.Join(lastErr, preserveErr)
+			}
+			syncErr := derivedStateDirectoryParentSync(parentHandle)
+			allAbsent := true
+			for source := range seen {
+				_, statErr := parent.Lstat(source)
+				if statErr == nil {
+					allAbsent = false
+					continue
+				}
+				if !errors.Is(statErr, os.ErrNotExist) {
+					return errors.Join(cause, statErr)
+				}
+			}
+			if allAbsent {
+				if syncErr != nil {
+					return errors.Join(cause, lastErr, syncErr)
+				}
+				return errors.Join(cause, fmt.Errorf("%w at %s", errDerivedStateDirectoryStagePreserved, strings.Join(preserved, ",")))
+			}
+			lastErr = errors.Join(lastErr, syncErr)
+			// A later successful parent sync covers all prior preservation
+			// renames, so keep draining reoccupations after a transient failure.
+		}
+		return errors.Join(cause, lastErr, fmt.Errorf("derived state directory recovery coordinates were continuously reoccupied; preserved=%s", strings.Join(preserved, ",")))
+	}
+	restore := func(cause error) error {
+		if !moved {
+			return cause
+		}
+		preserved := make([]string, 0, 1)
+		for attempt := 0; attempt < 32; attempt++ {
+			restoreErr := renameYUMCompatibilityCandidateNoReplace(parentHandle.Fd(), quarantine, coordinate)
+			if restoreErr == nil {
+				syncErr := derivedStateDirectoryParentSync(parentHandle)
+				restored, restoredErr := parent.Lstat(coordinate)
+				quarantined, quarantineErr := parent.Lstat(quarantine)
+				if restoredErr == nil && restored != nil && os.SameFile(expected, restored) && errors.Is(quarantineErr, os.ErrNotExist) {
+					if len(preserved) > 0 {
+						return errors.Join(cause, syncErr, fmt.Errorf("foreign derived state directory replacements preserved at %s", strings.Join(preserved, ",")))
+					}
+					return errors.Join(cause, syncErr)
+				}
+				if quarantineErr == nil && quarantined != nil && os.SameFile(expected, quarantined) {
+					if restoredErr == nil && restored != nil && !os.SameFile(expected, restored) {
+						paths, preserveErr := preserveReplacement(coordinate)
+						if preserveErr != nil {
+							return errors.Join(cause, syncErr, preserveErr)
+						}
+						preserved = append(preserved, paths)
+					}
+					continue
+				}
+				return preserveRetiredReplacements(
+					errors.Join(cause, syncErr, restoredErr, quarantineErr, errors.New("restored derived state directory changed before revalidation")),
+					coordinate, quarantine,
+				)
+			}
+			if !errors.Is(restoreErr, os.ErrExist) {
+				return errors.Join(cause, restoreErr, fmt.Errorf("derived state directory replacement retained at %s", quarantine))
+			}
+			paths, preserveErr := preserveReplacement(coordinate)
+			if preserveErr != nil {
+				return errors.Join(cause, restoreErr, preserveErr, fmt.Errorf("derived state directory replacement retained at %s", quarantine))
+			}
+			if paths != "" {
+				preserved = append(preserved, paths)
+			}
+		}
+		return errors.Join(cause, fmt.Errorf("cannot restore derived state directory quarantine after repeated coordinate reoccupation at %s", coordinate))
+	}
+	restoreOrPreserve := func(cause error) error {
+		current, currentErr := parent.Lstat(quarantine)
+		if currentErr == nil && current != nil && os.SameFile(expected, current) {
+			return restore(cause)
+		}
+		if errors.Is(currentErr, os.ErrNotExist) {
+			return preserveRetiredReplacements(errors.Join(cause, errors.New("derived state directory quarantine disappeared")), coordinate, quarantine)
+		}
+		sources := []string{quarantine}
+		if moved {
+			sources = append(sources, coordinate)
+		}
+		return preserveRetiredReplacements(errors.Join(cause, currentErr), sources...)
+	}
+	verifyCoordinate := func(name string) error {
+		opened, statErr := stageHandle.Stat()
+		current, lstatErr := parent.Lstat(name)
+		if statErr != nil || lstatErr != nil || opened == nil || current == nil ||
+			opened.Mode()&os.ModeSymlink != 0 || current.Mode()&os.ModeSymlink != 0 || !opened.IsDir() || !current.IsDir() ||
+			!os.SameFile(expected, opened) || !os.SameFile(expected, current) {
+			return errors.Join(statErr, lstatErr, errors.New("derived state directory stage changed before removal"))
+		}
+		return nil
+	}
+	verifyEmpty := func() error {
+		directory, err := stage.Open(".")
+		if err != nil {
+			return err
+		}
+		entries, readErr := directory.ReadDir(1)
+		closeErr := directory.Close()
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return errors.Join(readErr, closeErr)
+		}
+		if len(entries) != 0 {
+			return errors.Join(closeErr, errors.New("derived state directory stage is not empty"))
+		}
+		return closeErr
+	}
+	verifyAbsent := func(name string) error {
+		_, err := parent.Lstat(name)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("derived state directory coordinate %s was reoccupied", name)
+	}
+	if alreadyQuarantined {
+		if err := errors.Join(verifyCoordinate(quarantine), verifyEmpty()); err != nil {
+			return restoreOrPreserve(err)
+		}
+	} else {
+		if err := errors.Join(verifyCoordinate(coordinate), verifyEmpty()); err != nil {
+			current, currentErr := parent.Lstat(coordinate)
+			if currentErr == nil && current != nil && !os.SameFile(expected, current) {
+				return preserveRetiredReplacements(err, coordinate, quarantine)
+			}
+			return errors.Join(err, currentErr)
+		}
+		if err := renameYUMCompatibilityCandidateNoReplace(parentHandle.Fd(), coordinate, quarantine); err != nil {
+			return err
+		}
+		moved = true
+		if err := errors.Join(verifyAbsent(coordinate), verifyCoordinate(quarantine), verifyEmpty()); err != nil {
+			return restoreOrPreserve(err)
+		}
+	}
+	if err := derivedStateDirectoryParentSync(parentHandle); err != nil {
+		return restore(fmt.Errorf("sync derived state directory quarantine: %w", err))
+	}
+	if derivedStateDirectoryBeforeRemovalHook != nil {
+		if err := derivedStateDirectoryBeforeRemovalHook(quarantine); err != nil {
+			return restoreOrPreserve(err)
+		}
+	}
+	if err := errors.Join(verifyCoordinate(quarantine), verifyEmpty()); err != nil {
+		return restoreOrPreserve(err)
+	}
+	if moved {
+		if err := verifyAbsent(coordinate); err != nil {
+			return restore(err)
+		}
+	}
+	if err := parent.Remove(quarantine); err != nil {
+		return restore(fmt.Errorf("remove exact derived state directory quarantine: %w", err))
+	}
+	var postRemoveErr error
+	if derivedStateDirectoryAfterRemovalHook != nil {
+		if err := derivedStateDirectoryAfterRemovalHook(quarantine); err != nil {
+			postRemoveErr = err
+		}
+	}
+	syncErr := derivedStateDirectoryParentSync(parentHandle)
+	finalSources := []string{quarantine}
+	if moved {
+		finalSources = append(finalSources, coordinate)
+	}
+	var reoccupied []string
+	for _, source := range finalSources {
+		if err := verifyAbsent(source); err != nil {
+			reoccupied = append(reoccupied, source)
+		}
+	}
+	if len(reoccupied) > 0 {
+		postRemoveErr = errors.Join(
+			postRemoveErr,
+			preserveRetiredReplacements(errors.New("derived state directory coordinate was reoccupied after exact removal"), reoccupied...),
+		)
+	}
+	return errors.Join(postRemoveErr, syncErr)
 }
 
 func verifyBoundDerivedStateRoot(root *os.Root, path string, expected os.FileInfo) error {
@@ -2142,8 +3287,8 @@ func verifyBoundDerivedStateDirectory(root *os.Root, directory *os.File, relativ
 	return nil
 }
 
-func installExactDerivedStateTemporary(parent *os.Root, directory, file *os.File, expected os.FileInfo, expectedDigest [sha256.Size]byte, source, destination string) (bool, error) {
-	if parent == nil || directory == nil || file == nil || expected == nil ||
+func installExactDerivedStateTemporary(parent *os.Root, directory, file *os.File, expected os.FileInfo, expectedDigest [sha256.Size]byte, source, destination string, mutationGuard *derivedStateDirectoryMutationGuard, recoverUnexpectedMutation func() error) (bool, error) {
+	if parent == nil || directory == nil || file == nil || expected == nil || mutationGuard == nil || recoverUnexpectedMutation == nil ||
 		filepath.Base(source) != source || filepath.Base(destination) != destination || source == destination || source == "" || destination == "" {
 		return false, errors.New("derived state install binding is invalid")
 	}
@@ -2152,16 +3297,23 @@ func installExactDerivedStateTemporary(parent *os.Root, directory, file *os.File
 		return false, err
 	}
 	isolation := destination + ".tmp-install-" + nonce
-	if err := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), source, isolation); err != nil {
-		return false, err
-	}
 	restore := func(cause error) (bool, error) {
 		restoreErr := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), isolation, source)
 		syncErr := directory.Sync()
 		if restoreErr != nil {
 			return false, errors.Join(cause, restoreErr, syncErr, fmt.Errorf("derived state install candidate retained at %s", isolation))
 		}
-		return false, errors.Join(cause, syncErr)
+		guardErr := mutationGuard.admitKnownMutation()
+		return false, errors.Join(cause, syncErr, guardErr)
+	}
+	if err := recoverUnexpectedMutation(); err != nil {
+		return false, err
+	}
+	if err := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), source, isolation); err != nil {
+		return false, err
+	}
+	if err := mutationGuard.admitKnownMutation(); err != nil {
+		return restore(err)
 	}
 	isolated, lstatErr := parent.Lstat(isolation)
 	opened, statErr := file.Stat()
@@ -2190,8 +3342,14 @@ func installExactDerivedStateTemporary(parent *os.Root, directory, file *os.File
 	if err := verifyExactDerivedStateBytes(file, expected, expectedDigest); err != nil {
 		return restore(err)
 	}
+	if err := recoverUnexpectedMutation(); err != nil {
+		return restore(err)
+	}
 	if err := parent.Rename(isolation, destination); err != nil {
 		return restore(err)
+	}
+	if err := mutationGuard.admitKnownMutation(); err != nil {
+		return true, err
 	}
 	installed, lstatErr := parent.Lstat(destination)
 	opened, statErr = file.Stat()

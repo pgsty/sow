@@ -35,6 +35,8 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md`
   summary: Shared derived-state directory creation needs a recursively durable mkdir protocol.
   evidence: `writeDerivedStateFile` uses `Root.MkdirAll` and fsyncs only the leaf after file installation; transaction-specific callers sometimes pre-create and fsync one parent, but arbitrary newly created ancestor entries are not generically proven durable.
+  status: resolved
+  resolution: V-80 replaces `MkdirAll` with component-wise private stage creation, descriptor/inode binding, no-replace installation, exact-parent fsync and root/parent/child revalidation. Strict crash-stage recovery, concurrent first-writer convergence, inherited-umask repair, replacement preservation, bounded streaming scans, short-lived directory mutation epochs and a no-cache/full-scan fallback for unsupported seals are covered by ordinary/race/fault-injection tests. See `_bmad-output/implementation-artifacts/spec-derived-state-recursive-directory-durability.md` and `docs/evidence/2026-07-26-derived-state-recursive-directory-durability.md`.
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md`
   summary: Canonical derived-state replacement needs an explicit committed-versus-rolled-back result for destination and fsync failures.

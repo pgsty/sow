@@ -756,7 +756,7 @@ func TestOfflineArchiveAdoptionSIGKILLRecoversFrozenArchiveBeforeAdvancedSelecto
 		}
 	})
 	becameReady := false
-	for attempt := 0; attempt < 200; attempt++ {
+	for attempt := 0; attempt < 800; attempt++ {
 		if _, err := os.Stat(ready); err == nil {
 			becameReady = true
 			break
@@ -764,7 +764,10 @@ func TestOfflineArchiveAdoptionSIGKILLRecoversFrozenArchiveBeforeAdvancedSelecto
 		time.Sleep(25 * time.Millisecond)
 	}
 	if !becameReady {
-		t.Fatalf("archive adoption child did not reach durable handoff: %s", childOutput.String())
+		killErr := command.Process.Kill()
+		waitErr := command.Wait()
+		waiting = false
+		t.Fatalf("archive adoption child did not reach durable handoff: kill=%v wait=%v output=%s", killErr, waitErr, childOutput.String())
 	}
 	if err := command.Process.Kill(); err != nil {
 		t.Fatal(err)

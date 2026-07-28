@@ -2,10 +2,12 @@
 .github/workflows/ci.yml
 .gitignore
 _bmad-output/implementation-artifacts/spec-canonical-apply-stage-identity.md
+_bmad-output/implementation-artifacts/spec-derived-state-recursive-directory-durability.md
 _bmad-output/implementation-artifacts/spec-offline-archive-residue-removal-identity.md
 cmd/sow/main.go
 docs/evidence/2026-07-22-canonical-apply-stage-identity.md
 docs/evidence/2026-07-22-offline-archive-residue-removal-identity.md
+docs/evidence/2026-07-26-derived-state-recursive-directory-durability.md
 edge/README.md
 edge/basic/nginx.conf.example
 edge/build.mjs
@@ -82,6 +84,8 @@ internal/cli/asset_projection_test.go
 internal/cli/audit_fixes_test.go
 internal/cli/catalog.go
 internal/cli/config_complexity_test.go
+internal/cli/derived_state_identity_darwin.go
+internal/cli/derived_state_identity_linux.go
 internal/cli/derived_state_recovery_contract_test.go
 internal/cli/edge_contract.go
 internal/cli/edge_contract_test.go
