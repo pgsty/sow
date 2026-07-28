@@ -511,7 +511,8 @@ func writeAssetProjectionIntent(stateRoot string, intent assetProjectionIntent) 
 	if err != nil {
 		return err
 	}
-	return writeDerivedStateFile(stateRoot, assetProjectionIntentRelative, body)
+	result, err := writeDerivedStateFileOutcome(stateRoot, assetProjectionIntentRelative, body)
+	return consumeDerivedStateReplacement(result, err)
 }
 
 func installAssetProjectionIntent(stateRoot string, intent assetProjectionIntent, boundRoot os.FileInfo) error {
@@ -592,6 +593,9 @@ func decodeAssetProjectionIntent(body []byte) (assetProjectionIntent, error) {
 }
 
 func cleanupAssetProjectionIntentResidue(stateRoot string, recover bool) error {
+	if err := recoverDerivedStateReplacementTransactions(stateRoot, ".", recover); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(stateRoot)
 	if err != nil {
 		return err

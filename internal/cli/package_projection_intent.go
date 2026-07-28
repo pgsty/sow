@@ -314,7 +314,8 @@ func writePackageProjectionIntent(stateRoot string, intent packageProjectionInte
 	if err != nil {
 		return err
 	}
-	return writeDerivedStateFile(stateRoot, packageProjectionIntentRelative, body)
+	result, err := writeDerivedStateFileOutcome(stateRoot, packageProjectionIntentRelative, body)
+	return consumeDerivedStateReplacement(result, err)
 }
 
 func installPackageProjectionIntent(stateRoot string, intent packageProjectionIntent, boundRoot os.FileInfo) error {
@@ -463,13 +464,17 @@ func writePackageProjectionCompletionReceipt(stateRoot string, intent packagePro
 	if err != nil || len(body) > packageProjectionCompletionMax {
 		return packageProjectionCompletionReceipt{}, errors.Join(err, errors.New("package projection completion receipt exceeds size limit"))
 	}
-	if err := writeDerivedStateFile(stateRoot, relative, body); err != nil {
+	result, err := writeDerivedStateFileOutcome(stateRoot, relative, body)
+	if err := consumeDerivedStateReplacement(result, err); err != nil {
 		return packageProjectionCompletionReceipt{}, err
 	}
 	return receipt, nil
 }
 
 func cleanupPackageProjectionIntentResidue(stateRoot string, recover bool) error {
+	if err := recoverDerivedStateReplacementTransactions(stateRoot, ".", recover); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(stateRoot)
 	if err != nil {
 		return err

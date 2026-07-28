@@ -752,8 +752,11 @@ func finishMaterializationSelectedSet(cfg *config.Config, snapshot *materializat
 		recordedDrift = snapshot.rawRequireAll(cfg, materializeTrustSelectedSetFinal)
 	}
 	if recordedDrift != nil {
-		_ = snapshot.persistMaterializationSelectionPhase(cfg, materializationSelectionDrifted)
-		return fmt.Errorf("materialization selected-set trust barrier failed; restore the frozen trust and retry the exact operation with --recover: %w", recordedDrift)
+		persistErr := snapshot.persistMaterializationSelectionPhase(cfg, materializationSelectionDrifted)
+		return errors.Join(
+			fmt.Errorf("materialization selected-set trust barrier failed; restore the frozen trust and retry the exact operation with --recover: %w", recordedDrift),
+			persistErr,
+		)
 	}
 	if !complete {
 		return errors.New("materialization selected set did not complete every durable unit; retry the exact operation with --recover")
@@ -835,12 +838,14 @@ func (snapshot *materializationTrustSnapshot) handleMaterializationTrustResult(c
 			snapshot.selection.journal.Phase = materializationSelectionMaterializing
 		}
 		if err := writeMaterializationSelectionJournal(cfg.StatePath(), snapshot.selection.journal); err != nil {
+			failure := errors.Join(trustErr, fmt.Errorf("persist completed materialization unit: %w", err))
 			if snapshot.firstDrift == nil {
-				snapshot.firstDrift = fmt.Errorf("persist completed materialization unit: %w", err)
+				snapshot.firstDrift = failure
 			}
-			// The unit is already live. Continue under the frozen trust so later
-			// units converge; the final barrier will retain the prepared fence.
-			return nil
+			return errors.Join(
+				trustErr,
+				fmt.Errorf("persist completed materialization unit before continuing the selected set: %w", err),
+			)
 		}
 	}
 	if trustErr != nil {
@@ -849,7 +854,12 @@ func (snapshot *materializationTrustSnapshot) handleMaterializationTrustResult(c
 		}
 		if snapshot.selection != nil {
 			snapshot.selection.journal.Phase = materializationSelectionDrifted
-			_ = writeMaterializationSelectionJournal(cfg.StatePath(), snapshot.selection.journal)
+			if err := writeMaterializationSelectionJournal(cfg.StatePath(), snapshot.selection.journal); err != nil {
+				return errors.Join(
+					trustErr,
+					fmt.Errorf("persist drifted materialization selected set before stopping: %w", err),
+				)
+			}
 		}
 		// Once one directly-hostable unit has crossed its post-boundary, a
 		// trust change cannot safely abort into a mixed selected set. Every
@@ -1090,7 +1100,8 @@ func writeMaterializationSelectionJournal(stateRoot string, journal materializat
 	if len(body) > materializationSelectionJournalMaxBytes {
 		return errors.New("materialization selection journal exceeds its size limit")
 	}
-	return writeDerivedStateFile(stateRoot, filepath.FromSlash(materializationSelectionJournalRelative), body)
+	result, err := writeDerivedStateFileOutcome(stateRoot, filepath.FromSlash(materializationSelectionJournalRelative), body)
+	return consumeDerivedStateReplacement(result, err)
 }
 
 func readMaterializationSelectionJournal(stateRoot string) (materializationSelectionJournal, bool, error) {
@@ -1159,6 +1170,9 @@ func removeMaterializationSelectionJournal(stateRoot string) error {
 func cleanupMaterializationSelectionJournalTemps(stateRoot string) error {
 	directory, exists, err := materializationSelectionJournalDirectory(stateRoot, false)
 	if err != nil || !exists {
+		return err
+	}
+	if err := recoverDerivedStateReplacementTransactions(stateRoot, "materialization-journal", true); err != nil {
 		return err
 	}
 	entries, err := os.ReadDir(directory)

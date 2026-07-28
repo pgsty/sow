@@ -1402,7 +1402,8 @@ func updateLocalServingJournal(stateRoot string, journal localServingJournal) er
 	if err != nil {
 		return err
 	}
-	return writeDerivedStateFile(stateRoot, localServingJournalRelative(journal.ID), body)
+	result, err := writeDerivedStateFileOutcome(stateRoot, localServingJournalRelative(journal.ID), body)
+	return consumeDerivedStateReplacement(result, err)
 }
 
 func removeLocalServingJournal(stateRoot, id string) error {
@@ -1536,6 +1537,9 @@ func readBoundedExactRegularFile(directory, name string, limit int64) ([]byte, e
 func cleanupLocalServingJournalTemps(stateRoot string) error {
 	directory, exists, err := localServingJournalDirectory(stateRoot, false)
 	if err != nil || !exists {
+		return err
+	}
+	if err := recoverDerivedStateReplacementTransactions(stateRoot, "serving-journal", true); err != nil {
 		return err
 	}
 	entries, err := os.ReadDir(directory)

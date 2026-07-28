@@ -39,9 +39,9 @@ var offlineArchiveProjectionStageSync = syncBoundArchiveDirectory
 var offlineArchiveProjectionStageDiscard = discardOfflineArchiveProjectionStage
 
 // offlineArchiveProjectionIntentWrite is replaceable only by focused
-// durability tests that emulate rename success followed by directory-fsync
-// failure.
-var offlineArchiveProjectionIntentWrite = writeDerivedStateFile
+// durability tests. Its explicit result prevents stage ownership from being
+// inferred from a read-back after a late writer failure.
+var offlineArchiveProjectionIntentWrite = writeDerivedStateFileOutcome
 
 // offlineArchiveProjectionResidueBeforeReturnHook is the deterministic seam
 // used to prove that successful no-delete branches still revalidate their
@@ -110,16 +110,17 @@ func (intent offlineArchiveProjectionIntent) validate() error {
 	return nil
 }
 
-func writeOfflineArchiveProjectionIntent(stateRoot string, intent offlineArchiveProjectionIntent) error {
+func writeOfflineArchiveProjectionIntentOutcome(stateRoot string, intent offlineArchiveProjectionIntent) (derivedStateReplacementResult, error) {
+	notCommitted := derivedStateReplacementResult{Outcome: derivedStateReplacementNotCommitted}
 	if err := intent.validate(); err != nil {
-		return err
+		return notCommitted, err
 	}
 	body, err := json.Marshal(intent)
 	if err != nil {
-		return err
+		return notCommitted, err
 	}
 	if len(body) > offlineArchiveProjectionIntentMaxBytes {
-		return errors.New("pending offline archive projection intent exceeds size limit")
+		return notCommitted, errors.New("pending offline archive projection intent exceeds size limit")
 	}
 	return offlineArchiveProjectionIntentWrite(stateRoot, offlineArchiveProjectionIntentRelative, body)
 }
@@ -292,16 +293,21 @@ func prepareOfflineArchiveProjectionIntent(cfg *config.Config, source offlineArc
 	}
 	intent.Source.Refs = append([]offlineArchiveSourceRef(nil), source.Refs...)
 	intent.ID, _ = offlineArchiveProjectionIntentID(intent)
-	if err := writeOfflineArchiveProjectionIntent(cfg.StatePath(), intent); err != nil {
-		current, exists, readErr := readOfflineArchiveProjectionIntent(cfg.StatePath())
-		if readErr == nil && exists && current.ID == intent.ID {
-			// Atomic rename may have succeeded even when the subsequent parent
-			// directory fsync reported failure. Keep the already-fsynced stage:
-			// the exact installed intent is a recoverable, fail-closed owner.
+	writeResult, writeErr := writeOfflineArchiveProjectionIntentOutcome(cfg.StatePath(), intent)
+	if err := consumeDerivedStateReplacement(writeResult, writeErr); err != nil {
+		switch writeResult.Outcome {
+		case derivedStateReplacementCommitted:
 			keepStage = true
-			return intent, errors.Join(err, errors.New("offline archive projection intent may require --recover after directory sync failure"))
+			return intent, errors.Join(err, errors.New("offline archive projection intent committed with cleanup error; retry with --recover"))
+		case derivedStateReplacementRecoveryRequired:
+			keepStage = true
+			return intent, errors.Join(err, errors.New("offline archive projection intent requires replacement recovery"))
+		case derivedStateReplacementNotCommitted:
+			return offlineArchiveProjectionIntent{}, err
+		default:
+			keepStage = true
+			return intent, errors.Join(err, errors.New("offline archive projection intent returned an invalid fail-closed outcome"))
 		}
-		return offlineArchiveProjectionIntent{}, errors.Join(err, readErr)
 	}
 	keepStage = true
 	return intent, nil
@@ -363,6 +369,9 @@ func removeOfflineArchiveProjectionIntent(stateRoot string, intent offlineArchiv
 func cleanupOfflineArchiveProjectionResidue(stateRoot string, recover bool) error {
 	stateAbs, err := archiveAbsolutePath(stateRoot)
 	if err != nil {
+		return err
+	}
+	if err := recoverDerivedStateReplacementTransactions(stateRoot, ".", recover); err != nil {
 		return err
 	}
 	root, stageRoot, err := bindOfflineArchiveProjectionRoots(stateRoot, false)

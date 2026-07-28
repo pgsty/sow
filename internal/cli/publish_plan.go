@@ -333,7 +333,7 @@ func buildTargetPublication(ctx context.Context, cfg *config.Config, canonical *
 	if planErr != nil || closeErr != nil {
 		return publication, errors.Join(planErr, closeErr)
 	}
-	if err := augmentPublicationPlan(cfg, target, prepared, generation, txDir, classifier, &plan); err != nil {
+	if err := augmentPublicationPlan(cfg, target, prepared, generation, txDir, values.recover, classifier, &plan); err != nil {
 		return publication, err
 	}
 	if err := markAdoptedImmutableObjects(canonical, target, observation.oldManifestPath, &plan); err != nil {
@@ -1643,7 +1643,7 @@ func resolveStablePublicationPools(canonical *state.Store, cfg *config.Config, p
 	return result, nil
 }
 
-func augmentPublicationPlan(cfg *config.Config, target string, prepared preparedPublication, generation pub.TargetGeneration, txDir string, classifier publicationClassifier, plan *pub.Plan) error {
+func augmentPublicationPlan(cfg *config.Config, target string, prepared preparedPublication, generation pub.TargetGeneration, txDir string, recover bool, classifier publicationClassifier, plan *pub.Plan) error {
 	if plan == nil {
 		return errors.New("nil publication plan")
 	}
@@ -1763,7 +1763,7 @@ func augmentPublicationPlan(cfg *config.Config, target string, prepared prepared
 		}
 	}
 	if prepared.view == "snapshot" {
-		source, body, err := writeSnapshotRouteSource(cfg, target, prepared.snapshotID, generation.Generation)
+		source, body, err := writeSnapshotRouteSource(cfg, target, prepared.snapshotID, generation.Generation, recover)
 		if err != nil {
 			return err
 		}
@@ -1790,7 +1790,7 @@ func augmentPublicationPlan(cfg *config.Config, target string, prepared prepared
 			if !publishChannel {
 				continue
 			}
-			channelSource, channelBody, err := writeChannelSource(cfg, target, channel)
+			channelSource, channelBody, err := writeChannelSource(cfg, target, channel, recover)
 			if err != nil {
 				return err
 			}
@@ -1817,7 +1817,7 @@ func augmentPublicationPlan(cfg *config.Config, target string, prepared prepared
 			}
 			rendered := []byte(clientURL + "\n")
 			if prepared.view != "stable" {
-				mirrorSource, err := writeStaticMirrorlistSource(cfg, target, prepared.view, projection, rendered)
+				mirrorSource, err := writeStaticMirrorlistSource(cfg, target, prepared.view, projection, rendered, recover)
 				if err != nil {
 					return err
 				}
@@ -1839,10 +1839,11 @@ func augmentPublicationPlan(cfg *config.Config, target string, prepared prepared
 	return nil
 }
 
-func writeStaticMirrorlistSource(cfg *config.Config, target, viewName string, projection publicationProjection, body []byte) (string, error) {
+func writeStaticMirrorlistSource(cfg *config.Config, target, viewName string, projection publicationProjection, body []byte, recover bool) (string, error) {
 	repo, osName, arch := projection.channelCoordinates()
 	stateRelative := filepath.ToSlash(filepath.Join("generated", "mirrorlists", target, viewName, repo, osName, arch+".txt"))
-	if err := writeDerivedStateFile(cfg.StatePath(), stateRelative, body); err != nil {
+	result, err := writeDerivedStateFileOutcomeWithRecovery(cfg.StatePath(), stateRelative, body, recover)
+	if err := consumeDerivedStateReplacement(result, err); err != nil {
 		return "", err
 	}
 	return filepath.ToSlash(filepath.Join(".sow", stateRelative)), nil
@@ -1857,13 +1858,14 @@ func snapshotCDNPath(snapshotID string, projection publicationProjection, source
 	return path.Join("pro/v1/basic/_sow/v1/snapshots", snapshotID, kind, projection.remotePathRoot(), relative)
 }
 
-func writeSnapshotRouteSource(cfg *config.Config, target, snapshotID string, generation uint64) (string, []byte, error) {
+func writeSnapshotRouteSource(cfg *config.Config, target, snapshotID string, generation uint64, recover bool) (string, []byte, error) {
 	body, err := pub.SnapshotRouteBody(snapshotID, generation)
 	if err != nil {
 		return "", nil, err
 	}
 	stateRelative := filepath.ToSlash(filepath.Join("generated", "snapshot-routes", target, snapshotID+".json"))
-	if err := writeDerivedStateFile(cfg.StatePath(), stateRelative, body); err != nil {
+	result, err := writeDerivedStateFileOutcomeWithRecovery(cfg.StatePath(), stateRelative, body, recover)
+	if err := consumeDerivedStateReplacement(result, err); err != nil {
 		return "", nil, err
 	}
 	return filepath.ToSlash(filepath.Join(".sow", stateRelative)), body, nil
@@ -1910,7 +1912,7 @@ func trimPublicationNamespace(remoteKey string) string {
 	return remoteKey
 }
 
-func writeChannelSource(cfg *config.Config, target string, channel pub.ChannelState) (string, []byte, error) {
+func writeChannelSource(cfg *config.Config, target string, channel pub.ChannelState, recover bool) (string, []byte, error) {
 	body, err := channel.CanonicalBody()
 	if err != nil {
 		return "", nil, err
@@ -1919,7 +1921,8 @@ func writeChannelSource(cfg *config.Config, target string, channel pub.ChannelSt
 		return "", nil, errors.New("channel body does not match canonical target state")
 	}
 	stateRelative := filepath.ToSlash(filepath.Join("generated", "channels", target, channel.View, channel.Repo, channel.OS, channel.Arch+".json"))
-	if err := writeDerivedStateFile(cfg.StatePath(), stateRelative, body); err != nil {
+	result, err := writeDerivedStateFileOutcomeWithRecovery(cfg.StatePath(), stateRelative, body, recover)
+	if err := consumeDerivedStateReplacement(result, err); err != nil {
 		return "", nil, err
 	}
 	return filepath.ToSlash(filepath.Join(".sow", stateRelative)), body, nil
@@ -2211,7 +2214,10 @@ func derivedStateDirectoryStageBase(name string) (string, bool) {
 	return base, true
 }
 
-func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr error) {
+func writeDerivedStateFileTransaction(stateRoot, relative string, body []byte, result *derivedStateReplacementResult, recover bool) (resultErr error) {
+	if result == nil {
+		return errors.New("derived state replacement result is required")
+	}
 	if relative == "" || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return errors.New("unsafe derived state path")
 	}
@@ -2256,11 +2262,30 @@ func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr e
 		}
 		return mutationGuard.recoverUnexpectedMutation(root, parent, directoryHandle, stateRoot, rootIdentity)
 	}
+	sets, err := listDerivedStateReplacementCarrierSets(directoryHandle)
+	if err != nil {
+		return err
+	}
+	if len(sets) != 0 {
+		if !recover {
+			return errors.Join(
+				errors.New("interrupted derived state replacement requires --recover"),
+				errDerivedStateReplacementRecoveryRequired,
+			)
+		}
+		if err := recoverBoundDerivedStateReplacementTransactions(parent, directoryHandle, mutationGuard, recoverUnexpectedDirectoryMutation); err != nil {
+			return err
+		}
+	}
+	result.Outcome = derivedStateReplacementNotCommitted
 	nonce, err := state.NewTransactionID()
 	if err != nil {
 		return err
 	}
 	destination := filepath.Base(relative)
+	if isDerivedStateReplacementReservedName(destination) {
+		return errors.New("derived state destination uses a reserved replacement coordinate")
+	}
 	_, destinationErr := parent.Lstat(destination)
 	destinationWasAbsent := errors.Is(destinationErr, os.ErrNotExist)
 	if destinationErr != nil && !destinationWasAbsent {
@@ -2279,17 +2304,17 @@ func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr e
 		file.Close()
 		return errors.Join(err, errors.New("derived state temporary is not a private regular file"))
 	}
-	committed := false
 	defer func() {
-		if !committed {
-			cleanupErr := removeExactDerivedStateTemporary(parent, temporary, identity)
-			closeErr := file.Close()
-			if errors.Is(closeErr, os.ErrClosed) {
-				closeErr = nil
-			}
-			if closeErr != nil || cleanupErr != nil {
-				resultErr = errors.Join(resultErr, fmt.Errorf("clean failed derived state temporary: %w", errors.Join(closeErr, cleanupErr)))
-			}
+		var cleanupErr error
+		if result.Outcome == derivedStateReplacementNotCommitted {
+			cleanupErr = removeExactDerivedStateTemporary(parent, temporary, identity)
+		}
+		closeErr := file.Close()
+		if errors.Is(closeErr, os.ErrClosed) {
+			closeErr = nil
+		}
+		if closeErr != nil || cleanupErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("finalize derived state temporary: %w", errors.Join(closeErr, cleanupErr)))
 		}
 	}()
 	if err := mutationGuard.admitKnownMutation(); err != nil {
@@ -2340,25 +2365,60 @@ func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr e
 	if err := recoverUnexpectedDirectoryMutation(); err != nil {
 		return err
 	}
-	installed, err := installExactDerivedStateTemporary(parent, directoryHandle, file, identity, expectedDigest, temporary, destination, mutationGuard, recoverUnexpectedDirectoryMutation)
-	committed = installed
-	resultErr = errors.Join(
-		err,
-		verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
-		verifyBoundDerivedStateDirectory(root, directoryHandle, directory, directoryIdentity),
-	)
-	if resultErr != nil || !installed {
+	replacement, err := installExactDerivedStateTemporaryOutcome(parent, directoryHandle, file, identity, expectedDigest, temporary, destination, mutationGuard, recoverUnexpectedDirectoryMutation)
+	*result = replacement
+	reconcileCommittedOutcome := func(cause error) error {
+		if result.Outcome != derivedStateReplacementCommitted {
+			return cause
+		}
+		proofErr := errors.Join(
+			verifyBoundDerivedStateRoot(root, stateRoot, rootIdentity),
+			verifyBoundDerivedStateDirectory(root, directoryHandle, directory, directoryIdentity),
+			verifyDerivedStateReplacementCoordinate(parent, destination, result.DestinationIdentity),
+		)
+		if proofErr == nil {
+			return cause
+		}
+		result.Outcome = derivedStateReplacementRecoveryRequired
+		return errors.Join(cause, proofErr, errDerivedStateReplacementRecoveryRequired)
+	}
+	resultErr = reconcileCommittedOutcome(err)
+	if resultErr != nil || replacement.Outcome != derivedStateReplacementCommitted {
 		return resultErr
 	}
 	if err := recoverUnexpectedDirectoryMutation(); err != nil {
-		return err
+		return reconcileCommittedOutcome(err)
 	}
 	if derivedStateDirectoryBeforeFinalCacheHook != nil {
 		if err := derivedStateDirectoryBeforeFinalCacheHook(directory); err != nil {
-			return err
+			return reconcileCommittedOutcome(err)
 		}
 	}
-	return markDerivedStateDirectoryRecoveryClean(
+	if err := reconcileCommittedOutcome(nil); err != nil {
+		return err
+	}
+	cleanupOutcome, cleanupErr := recoverBoundDerivedStateReplacementTransaction(
+		parent,
+		directoryHandle,
+		replacement.TransactionID,
+		mutationGuard,
+		recoverUnexpectedDirectoryMutation,
+	)
+	result.Outcome = cleanupOutcome
+	if cleanupErr != nil {
+		return reconcileCommittedOutcome(cleanupErr)
+	}
+	if cleanupOutcome != derivedStateReplacementCommitted {
+		result.Outcome = derivedStateReplacementRecoveryRequired
+		return errors.Join(
+			errors.New("committed derived state replacement replay changed outcome"),
+			errDerivedStateReplacementRecoveryRequired,
+		)
+	}
+	if err := reconcileCommittedOutcome(nil); err != nil {
+		return err
+	}
+	return reconcileCommittedOutcome(markDerivedStateDirectoryRecoveryClean(
 		root,
 		parent,
 		directoryHandle,
@@ -2369,7 +2429,7 @@ func writeDerivedStateFile(stateRoot, relative string, body []byte) (resultErr e
 		destinationWasAbsent,
 		mutationGuard,
 		recoverUnexpectedDirectoryMutation,
-	)
+	))
 }
 
 func markDerivedStateDirectoryRecoveryClean(
@@ -3285,81 +3345,6 @@ func verifyBoundDerivedStateDirectory(root *os.Root, directory *os.File, relativ
 		return errors.Join(statErr, lstatErr, errors.New("derived state directory coordinate changed"))
 	}
 	return nil
-}
-
-func installExactDerivedStateTemporary(parent *os.Root, directory, file *os.File, expected os.FileInfo, expectedDigest [sha256.Size]byte, source, destination string, mutationGuard *derivedStateDirectoryMutationGuard, recoverUnexpectedMutation func() error) (bool, error) {
-	if parent == nil || directory == nil || file == nil || expected == nil || mutationGuard == nil || recoverUnexpectedMutation == nil ||
-		filepath.Base(source) != source || filepath.Base(destination) != destination || source == destination || source == "" || destination == "" {
-		return false, errors.New("derived state install binding is invalid")
-	}
-	nonce, err := state.NewTransactionID()
-	if err != nil {
-		return false, err
-	}
-	isolation := destination + ".tmp-install-" + nonce
-	restore := func(cause error) (bool, error) {
-		restoreErr := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), isolation, source)
-		syncErr := directory.Sync()
-		if restoreErr != nil {
-			return false, errors.Join(cause, restoreErr, syncErr, fmt.Errorf("derived state install candidate retained at %s", isolation))
-		}
-		guardErr := mutationGuard.admitKnownMutation()
-		return false, errors.Join(cause, syncErr, guardErr)
-	}
-	if err := recoverUnexpectedMutation(); err != nil {
-		return false, err
-	}
-	if err := renameYUMCompatibilityCandidateNoReplace(directory.Fd(), source, isolation); err != nil {
-		return false, err
-	}
-	if err := mutationGuard.admitKnownMutation(); err != nil {
-		return restore(err)
-	}
-	isolated, lstatErr := parent.Lstat(isolation)
-	opened, statErr := file.Stat()
-	if lstatErr != nil || statErr != nil || isolated == nil || opened == nil ||
-		isolated.Mode()&os.ModeSymlink != 0 || !isolated.Mode().IsRegular() ||
-		!os.SameFile(expected, isolated) || !os.SameFile(expected, opened) ||
-		opened.Size() != expected.Size() || opened.Mode() != expected.Mode() || !opened.ModTime().Equal(expected.ModTime()) {
-		return restore(errors.Join(lstatErr, statErr, errors.New("derived state install candidate changed before publication")))
-	}
-	if err := verifyExactDerivedStateBytes(file, expected, expectedDigest); err != nil {
-		return restore(err)
-	}
-	if derivedStateAfterVerifyHook != nil {
-		if err := derivedStateAfterVerifyHook(isolation); err != nil {
-			return restore(err)
-		}
-	}
-	isolated, lstatErr = parent.Lstat(isolation)
-	opened, statErr = file.Stat()
-	if lstatErr != nil || statErr != nil || isolated == nil || opened == nil ||
-		isolated.Mode()&os.ModeSymlink != 0 || !isolated.Mode().IsRegular() ||
-		!os.SameFile(expected, isolated) || !os.SameFile(expected, opened) ||
-		opened.Size() != expected.Size() || opened.Mode() != expected.Mode() || !opened.ModTime().Equal(expected.ModTime()) {
-		return restore(errors.Join(lstatErr, statErr, errors.New("derived state install candidate changed after verification")))
-	}
-	if err := verifyExactDerivedStateBytes(file, expected, expectedDigest); err != nil {
-		return restore(err)
-	}
-	if err := recoverUnexpectedMutation(); err != nil {
-		return restore(err)
-	}
-	if err := parent.Rename(isolation, destination); err != nil {
-		return restore(err)
-	}
-	if err := mutationGuard.admitKnownMutation(); err != nil {
-		return true, err
-	}
-	installed, lstatErr := parent.Lstat(destination)
-	opened, statErr = file.Stat()
-	verifyErr := verifyExactDerivedStateBytes(file, expected, expectedDigest)
-	closeErr := file.Close()
-	if lstatErr != nil || statErr != nil || installed == nil || opened == nil ||
-		!os.SameFile(expected, installed) || !os.SameFile(expected, opened) || verifyErr != nil || closeErr != nil {
-		return true, errors.Join(lstatErr, statErr, verifyErr, closeErr, errors.New("derived state destination changed during installation"))
-	}
-	return true, directory.Sync()
 }
 
 func verifyExactDerivedStateBytes(file *os.File, expected os.FileInfo, expectedDigest [sha256.Size]byte) error {

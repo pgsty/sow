@@ -62,6 +62,7 @@ docs/adr/0038-yum-consumer-preflight-receipt.md
 docs/adr/0039-caret-url-wire-canonicalization.md
 docs/adr/0040-bounded-configuration-topology.md
 docs/adr/0041-preserved-projection-orphan-quarantine.md
+docs/adr/0042-derived-state-replacement-outcome.md
 docs/architecture.md
 docs/client-installation.md
 docs/evidence/2026-07-11-client-compat.md

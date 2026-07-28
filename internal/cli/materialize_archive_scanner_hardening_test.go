@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -831,11 +833,12 @@ func TestOfflineArchiveIntentDirectorySyncFailureKeepsRecoverableStage(t *testin
 	destination := filepath.Join(root, "offline", "intent-sync.tgz")
 
 	previous := offlineArchiveProjectionIntentWrite
-	offlineArchiveProjectionIntentWrite = func(stateRoot, relative string, body []byte) error {
-		if err := writeDerivedStateFile(stateRoot, relative, body); err != nil {
-			return err
+	offlineArchiveProjectionIntentWrite = func(stateRoot, relative string, body []byte) (derivedStateReplacementResult, error) {
+		result, err := writeDerivedStateFileOutcome(stateRoot, relative, body)
+		if err != nil {
+			return result, err
 		}
-		return errors.New("injected offline archive intent directory sync failure")
+		return result, errors.New("injected offline archive intent directory sync failure")
 	}
 	code, stdout, stderr := runArchiveTaintCLI(t,
 		"materialize", "latest", "--config", configPath, "--repo", "public-assets", "--tgz", destination,
@@ -886,8 +889,8 @@ func TestOfflineArchiveIntentWriteFailureReportsStageCleanupDrift(t *testing.T) 
 
 	previous := offlineArchiveProjectionIntentWrite
 	previousDiscard := offlineArchiveProjectionStageDiscard
-	offlineArchiveProjectionIntentWrite = func(string, string, []byte) error {
-		return errors.New("injected offline archive intent write failure")
+	offlineArchiveProjectionIntentWrite = func(string, string, []byte) (derivedStateReplacementResult, error) {
+		return derivedStateReplacementResult{Outcome: derivedStateReplacementNotCommitted}, errors.New("injected offline archive intent write failure")
 	}
 	offlineArchiveProjectionStageDiscard = func(string, string) error {
 		return errors.New("injected offline archive projection stage cleanup failure")
@@ -946,8 +949,8 @@ func TestOfflineArchiveIntentWriteFailureRemovesUnownedStage(t *testing.T) {
 	stageDirectory := filepath.Join(stateRoot, offlineArchiveProjectionStageDir)
 
 	previous := offlineArchiveProjectionIntentWrite
-	offlineArchiveProjectionIntentWrite = func(string, string, []byte) error {
-		return errors.New("injected offline archive intent write failure")
+	offlineArchiveProjectionIntentWrite = func(string, string, []byte) (derivedStateReplacementResult, error) {
+		return derivedStateReplacementResult{Outcome: derivedStateReplacementNotCommitted}, errors.New("injected offline archive intent write failure")
 	}
 	t.Cleanup(func() { offlineArchiveProjectionIntentWrite = previous })
 	code, stdout, stderr := runArchiveTaintCLI(t,
@@ -1122,6 +1125,45 @@ func testOfflineArchiveProjectionIntent(t *testing.T, transactionID string) offl
 		t.Fatalf("invalid ownership fixture: %v", err)
 	}
 	return intent
+}
+
+func TestOfflineArchiveOversizeIntentIsProvenNotCommitted(t *testing.T) {
+	intent := testOfflineArchiveProjectionIntent(t, strings.Repeat("b", 32))
+	repo := strings.Repeat("r", 200)
+	intent.Source.Refs = make([]offlineArchiveSourceRef, 0, 1800)
+	for index := 0; index < cap(intent.Source.Refs); index++ {
+		osName := fmt.Sprintf("%010d%s", index, strings.Repeat("o", 100))
+		intent.Source.Refs = append(intent.Source.Refs, offlineArchiveSourceRef{
+			Name:   "refs/sow/views/latest/" + repo + "/" + osName + "/all",
+			Commit: strings.Repeat("2", 40),
+			Path:   "views/latest/" + repo + "/" + osName + "/all.json",
+			Repo:   repo,
+			OS:     osName,
+			Arch:   "all",
+		})
+	}
+	var err error
+	intent.ID, err = offlineArchiveProjectionIntentID(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := intent.validate(); err != nil {
+		t.Fatalf("oversize fixture is not otherwise valid: %v", err)
+	}
+	body, err := json.Marshal(intent)
+	if err != nil || len(body) <= offlineArchiveProjectionIntentMaxBytes {
+		t.Fatalf("oversize fixture bytes=%d err=%v", len(body), err)
+	}
+	stateRoot := t.TempDir()
+	result, err := writeOfflineArchiveProjectionIntentOutcome(stateRoot, intent)
+	if result.Outcome != derivedStateReplacementNotCommitted ||
+		err == nil || !strings.Contains(err.Error(), "exceeds size limit") {
+		t.Fatalf("oversize outcome=%+v err=%v", result, err)
+	}
+	if _, err := os.Lstat(filepath.Join(stateRoot, offlineArchiveProjectionIntentRelative)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("oversize preflight installed an intent: %v", err)
+	}
+	assertNoDerivedStateReplacementResidue(t, stateRoot)
 }
 
 type offlineArchiveModeInfo struct {

@@ -393,6 +393,9 @@ func cleanupLocalServingRemovalTemps(stateRoot string) error {
 	if err != nil || !exists {
 		return err
 	}
+	if err := recoverDerivedStateReplacementTransactions(stateRoot, "serving-removal-journal", true); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(directory)
 	if err != nil {
 		return err
@@ -739,7 +742,8 @@ func updateLocalServingRemovalJournal(stateRoot string, journal localServingRemo
 	if err != nil {
 		return err
 	}
-	return writeDerivedStateFile(stateRoot, filepath.Join("serving-removal-journal", journal.ID+".json"), body)
+	result, err := writeDerivedStateFileOutcome(stateRoot, filepath.Join("serving-removal-journal", journal.ID+".json"), body)
+	return consumeDerivedStateReplacement(result, err)
 }
 
 func listLocalServingRemovalJournals(stateRoot string) ([]localServingRemovalJournal, error) {

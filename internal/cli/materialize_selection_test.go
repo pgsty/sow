@@ -403,3 +403,94 @@ func TestMaterializationSelectionFinishRetainsEveryStartedErrorUntilExplicitSucc
 		t.Fatalf("completed fence survived explicit success: exists=%t err=%v", exists, err)
 	}
 }
+
+func TestMaterializationSelectionStopsWhenCompletedUnitJournalWriteFails(t *testing.T) {
+	fixture := setupMaterializationSelectionFixture(t)
+	owner, err := beginMaterializationSelectedSet(fixture.cfg, fixture.canonical, fixture.snapshot, "materialize", false, fixture.units)
+	if err != nil || !owner {
+		t.Fatalf("begin owner=%t err=%v", owner, err)
+	}
+	if err := fixture.snapshot.handleMaterializationTrustResult(fixture.cfg, fixture.units[0].ID, materializeTrustPayloadBefore, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	injected := errors.New("injected completed-unit journal sync failure")
+	previous := derivedStateReplacementParentSync
+	fired := false
+	derivedStateReplacementParentSync = func(parent *os.File, phase string) error {
+		if phase == "prepared" && !fired {
+			fired = true
+			return injected
+		}
+		return parent.Sync()
+	}
+	t.Cleanup(func() { derivedStateReplacementParentSync = previous })
+	handleErr := fixture.snapshot.handleMaterializationTrustResult(fixture.cfg, fixture.units[0].ID, materializeTrustAPTCommitAfter, nil)
+	derivedStateReplacementParentSync = previous
+	if !fired || !errors.Is(handleErr, injected) || !strings.Contains(handleErr.Error(), "before continuing the selected set") {
+		t.Fatalf("completed-unit journal failure fired=%t err=%v", fired, handleErr)
+	}
+
+	journal, exists, err := readMaterializationSelectionJournal(fixture.cfg.StatePath())
+	if err != nil || !exists || journal.Phase != materializationSelectionMaterializing || len(journal.CompletedUnits) != 0 {
+		t.Fatalf("failed journal replacement changed the durable selected set: journal=%+v exists=%t err=%v", journal, exists, err)
+	}
+	if fixture.snapshot.firstDrift == nil || !errors.Is(fixture.snapshot.firstDrift, injected) {
+		t.Fatalf("journal failure was not retained as the first drift: %v", fixture.snapshot.firstDrift)
+	}
+	if err := finishMaterializationSelectedSet(fixture.cfg, fixture.snapshot, owner, handleErr); err != nil {
+		t.Fatalf("retain failed selected set: %v", err)
+	}
+	if _, exists, err := readMaterializationSelectionJournal(fixture.cfg.StatePath()); err != nil || !exists {
+		t.Fatalf("failed selected set lost its recovery fence: exists=%t err=%v", exists, err)
+	}
+}
+
+func TestMaterializationSelectionRetainsTrustAndJournalFailuresTogether(t *testing.T) {
+	fixture := setupMaterializationSelectionFixture(t)
+	owner, err := beginMaterializationSelectedSet(fixture.cfg, fixture.canonical, fixture.snapshot, "materialize", false, fixture.units)
+	if err != nil || !owner {
+		t.Fatalf("begin owner=%t err=%v", owner, err)
+	}
+	if err := fixture.snapshot.handleMaterializationTrustResult(fixture.cfg, fixture.units[0].ID, materializeTrustPayloadBefore, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.snapshot.handleMaterializationTrustResult(fixture.cfg, fixture.units[0].ID, materializeTrustAPTCommitAfter, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	trustErr := errors.New("injected post-boundary trust change")
+	journalErr := errors.New("injected drift-journal sync failure")
+	previous := derivedStateReplacementParentSync
+	fired := false
+	derivedStateReplacementParentSync = func(parent *os.File, phase string) error {
+		if phase == "prepared" && !fired {
+			fired = true
+			return journalErr
+		}
+		return parent.Sync()
+	}
+	t.Cleanup(func() { derivedStateReplacementParentSync = previous })
+	handleErr := fixture.snapshot.handleMaterializationTrustResult(
+		fixture.cfg,
+		fixture.units[1].ID,
+		materializeTrustAPTCommitAfter,
+		trustErr,
+	)
+	derivedStateReplacementParentSync = previous
+	if !fired || !errors.Is(handleErr, trustErr) || !errors.Is(handleErr, journalErr) {
+		t.Fatalf("combined trust/journal failure fired=%t err=%v", fired, handleErr)
+	}
+	if fixture.snapshot.firstDrift == nil ||
+		!errors.Is(fixture.snapshot.firstDrift, trustErr) ||
+		!errors.Is(fixture.snapshot.firstDrift, journalErr) {
+		t.Fatalf("combined failure was not retained as first drift: %v", fixture.snapshot.firstDrift)
+	}
+	journal, exists, err := readMaterializationSelectionJournal(fixture.cfg.StatePath())
+	if err != nil || !exists || len(journal.CompletedUnits) != 1 || journal.CompletedUnits[0] != fixture.units[0].ID {
+		t.Fatalf("failed second-unit update changed durable completed set: journal=%+v exists=%t err=%v", journal, exists, err)
+	}
+	if err := finishMaterializationSelectedSet(fixture.cfg, fixture.snapshot, owner, handleErr); err != nil {
+		t.Fatalf("retain combined-failure selected set: %v", err)
+	}
+}
