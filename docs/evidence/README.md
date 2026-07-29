@@ -10,6 +10,14 @@ Cloudflare 生产仓库、bucket、Zone、domain。既有生产只读基线仅�
 readiness；owner 另行明确授权了仅命中空 `pro` 桶、带 exact bucket 确认与 run-owned digest
 allowlist 的 storage-only 协议测试。destructive/full-POC、Worker/CDN、provider-deployment 与
 bootstrap registry 仍保持关闭。
+2026-07-29 的
+[current-source MVP/readiness 复验](2026-07-29-mvp-and-cloudflare-bootstrap-readiness.md)
+确认干净 `22d3bd7` 已具备可运行的本地 MVP：真实 CLI APT+YUM
+adopt/materialize/verify/fsck、publish race、disposable MinIO S3、四平台 CGO-free
+build 与 bootstrap/readiness 离线套件均通过；Cloudflare plan/registry 从当前源码
+重建后逐字节相同。该轮清空所有云凭据，没有生产或云写入。真实 Worker/route/purge/cache
+与回滚仍等待 scoped test token；HTTP Requests Logpush 另受 Cloudflare Enterprise
+计划与 `Logs Write` 权限约束，COS/EdgeOne 与生产迁移也仍是独立外部证据层。
 2026-07-19 的 V-25 又把 bootstrap 与 provider log-sink 的 reusable lease key
 从 plan/deployment 版本身份中分离：同一资源/专用 raw bucket 始终只有一个稳定 key，历史
 idle/expired 版本可 CAS 重放而 live holder 仍阻塞；readiness receipt/seal 的本地半对中断也可
