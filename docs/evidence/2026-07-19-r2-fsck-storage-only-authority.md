@@ -89,6 +89,21 @@ The independent recursive `rclone lsf cf:pro` check returned zero objects. No
 other bucket, Cloudflare control plane, CO/COS or production repository was
 contacted.
 
+## 2026-07-29 current-source revalidation
+
+The clean `26f29c0` tree reran the storage-only authority gate as
+`sow-r2-fsck-20260729-150400`. The storage credential existed only in the test
+process environment and the CDN credential remained explicitly absent. The
+test passed in `36.22s` (package `37.468s`):
+
+```text
+real R2 fsck PASS run=sow-r2-fsck-20260729-150400 adoption=true replay=true drift_rejected=true cas_restore=true cdn_credentials=false control_plane=false custom_domain=false empty_before=true empty_after=true
+```
+
+The independent recursive `rclone lsf cf:pro` check again returned exit status
+zero and no objects. No Cloudflare control-plane API, custom domain, other
+bucket, CO/COS, or production repository was contacted.
+
 ## 本地/协议回归
 
 以下门禁覆盖 R2/COS capability separation：

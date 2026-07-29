@@ -3,6 +3,7 @@ _bmad-output/brainstorming/brainstorm-sow-repo-cli-2026-07-11/brainstorm-intent.
 _bmad-output/implementation-artifacts/spec-cloudflare-static-entitlement-bootstrap.md
 _bmad-output/implementation-artifacts/spec-config-cardinality-complexity-bounds.md
 _bmad-output/implementation-artifacts/spec-config-input-and-rpm-provenance-hardening.md
+_bmad-output/implementation-artifacts/spec-current-source-real-r2-revalidation.md
 _bmad-output/implementation-artifacts/spec-dead-code-static-analysis-closure.md
 _bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md
 _bmad-output/implementation-artifacts/spec-full-provider-checkpoint-fenced-delete.md

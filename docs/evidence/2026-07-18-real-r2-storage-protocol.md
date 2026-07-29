@@ -136,6 +136,24 @@ An independent recursive `rclone lsf cf:pro` immediately afterwards returned
 zero objects. No other bucket, Cloudflare control-plane API, CO/COS or production
 repository was contacted.
 
+## 2026-07-29 current-source revalidation
+
+Commit `26f29c0` and its clean working tree reran the exact pinned resource as
+`sow-r2-storage-20260729-150000`. The R2 credential was reconstructed only in
+the test process environment from the existing `rclone cf:` reference; neither
+credential field was printed or written. The current test passed in `42.09s`
+(package `43.575s`):
+
+```text
+real R2 storage PASS run=sow-r2-storage-20260729-150000 operations=create-only+cas-race+head+stream-get+main-beta-custom-domain+copy-source-cas+delete-capability-probe+identity-bound-unconditional-cleanup+custom-domain-post-delete-observation conditional_delete=false custom_domain_present=main=CURRENT-MISS/FRA,beta=CURRENT-MISS/FRA custom_domain_after_delete=main=STALE-HIT/FRA/max-age=1800,beta=STALE-HIT/FRA/max-age=1800 empty_before=true empty_after=true
+```
+
+An independent `rclone lsf cf:pro --recursive --max-depth -1` returned exit
+status zero and no objects. Only the owner-designated `pro` bucket and its
+`pro.pigsty.io`/`beta.pro.pigsty.io` raw custom domains were used. No
+Cloudflare control-plane request, other bucket, CO/COS, or production
+repository was contacted.
+
 ## 能力判定
 
 | 原语 | 真实结果 | 产品处理 |

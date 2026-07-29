@@ -2246,3 +2246,53 @@ Archives:
 
 Independent `cmp` returned 0 and both SHA-256 values matched. This ledger is
 outside both delivery manifests and does not perturb the recorded identity.
+
+## 2026-07-29 V-85 current R2 revalidation delivery
+
+V-85 supersedes the prior delivery identity after the clean `26f29c0` product
+tree reran all three owner-authorized real R2 gates and the resulting evidence,
+traceability row, one-shot spec, and delivery allowlist were frozen. The exact
+non-production runs were:
+
+- `sow-r2-storage-20260729-150000`: real R2 storage and raw main/beta custom
+  domains, `42.09s` (package `43.575s`);
+- `sow-r2-publish-20260729-150100`: actual CLI with real R2 storage and
+  network-fenced local purge/CDN adapters, `131.02s` (package `131.875s`);
+- `sow-r2-fsck-20260729-150400`: storage-only adoption, drift rejection, CAS
+  restore, and replay, `36.22s` (package `37.468s`).
+
+Each test enforced an empty bucket before mutation and reported
+`empty_after=true`; an independent
+`rclone lsf cf:pro --recursive --max-depth -1` after every test exited zero
+with empty stdout. The existing `cf:` credential was reconstructed only in
+each test process environment; this run did not copy it into a new file or
+log. No other bucket, Cloudflare production repository, CO/COS, or production
+origin was accessed.
+
+Two isolated clean deliveries then used only the local read-only module
+download cache:
+
+```text
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v85-final-a-20260729
+SOW_CLEAN_GOPROXY=file:///Users/vonng/go/pkg/mod/cache/download \
+  test/compat/test-clean-delivery.sh /tmp/sow-v85-final-b-20260729
+
+PRODUCT_SOURCE_SHA256=779fc940f70fc372976adc8acf9b39cffdc0b70724fd04113a7de44fcf3c3cfd
+PRODUCT_SOURCE_FILES=593
+DELIVERY_CONTENT_SHA256=a90dbc15a24e4f8d2dd9aa3d7bc100ba67527ac90474bbc779a15f0c5c3aaf78
+DELIVERY_FILES=797
+ARCHIVE_SHA256=35da9de431764935366373439aec81e5bf5b2fedf19dbc09f1119f5aed67b809
+```
+
+Archives:
+
+- `/tmp/sow-v85-final-a-20260729/sow-delivery-a90dbc15a24e4f8d.tgz`
+- `/tmp/sow-v85-final-b-20260729/sow-delivery-a90dbc15a24e4f8d.tgz`
+
+Independent `cmp` returned 0. This validation ledger remains outside both
+delivery manifests, so recording V-85 does not perturb the identity it
+records. The Goal remains active because a scoped Cloudflare control token,
+real Worker/purge/cache-log proof, COS/EdgeOne non-production resources, and
+production migration evidence are still absent; production resources remain
+forbidden test targets.

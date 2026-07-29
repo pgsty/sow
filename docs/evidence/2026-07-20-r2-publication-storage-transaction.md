@@ -145,6 +145,23 @@ The independent recursive `rclone lsf cf:pro` check returned zero objects. No
 other bucket, Cloudflare control-plane endpoint, CO/COS or production repository
 was contacted.
 
+## 2026-07-29 current-source revalidation
+
+The clean `26f29c0` tree reran the same actual-CLI/hybrid-control transaction as
+`sow-r2-publish-20260729-150100`. The R2 credential existed only in the test
+process environment; the test replaced the Cloudflare API token with its
+documented local non-secret adapter value and prohibited a control-plane
+socket. The test passed in `131.02s` (package `131.875s`):
+
+```text
+real R2 publication storage transaction PASS run=sow-r2-publish-20260729-150100 generation=1 puts=8 purge_adapter_calls=1 local_cdn_gets=2 drift_rejected=true cas_restore=true replay_unchanged=true remote_adoption=true full_fsck=true real_cf_control_plane=false real_custom_domain=false empty_before=true empty_after=true
+```
+
+An independent `rclone lsf cf:pro --recursive --max-depth -1` returned exit
+status zero and no objects. This refresh proves the current product bytes
+against real R2 storage; it still does not claim a real Cloudflare purge,
+Worker, custom-domain transaction, COS/EdgeOne, or production migration.
+
 ## 需求状态边界
 
 - FR-04：真实产品 publisher 已完成 R2 checkpoint create/CAS/final readback 和 generation 1
