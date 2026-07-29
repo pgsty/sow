@@ -1178,6 +1178,11 @@ function parseBoundedCacheSeconds(value) {
   return seconds;
 }
 
+const CLOUDFLARE_RAY_PATTERN = /^[0-9a-f]{16,32}-[A-Z]{3}$/i;
+const LOWER_SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const PROVIDER_PROBE_PATTERN = /^[A-Za-z0-9_-]{22,64}$/;
+const OBSERVABLE_CACHE_STATUSES = new Set(["HIT", "MISS", "EXPIRED", "STALE", "UPDATING", "REVALIDATED"]);
+
 export function createCloudflareHandler(environment, platform = globalThis) {
   const runtime = readEdgeRuntimeConfiguration(environment);
   const staticVerifier = createStaticEnvironmentVerifier(environment);
@@ -1197,7 +1202,57 @@ export function createCloudflareHandler(environment, platform = globalThis) {
 		compatibility: runtime.compatibility,
 		originTransport: origin.transport,
   };
-  return createSowEdgeHandler(dependencies);
+  const handler = createSowEdgeHandler(dependencies);
+  return async (request) => {
+    const response = await handler(request);
+    emitCloudflareProviderEvent(request, response, platform);
+    return response;
+  };
+}
+
+// Workers Trace Events Logpush is available on Workers Paid while zone HTTP
+// request logs require Enterprise. Emit one bounded, secret-free record that a
+// deployed-bundle attestation can join to the client-visible CF-Ray. The raw
+// URL and credential are deliberately absent; only the clean origin digest is
+// recorded.
+function emitCloudflareProviderEvent(request, response, platform) {
+  try {
+    if (!(request instanceof Request) || !(response instanceof Response)) return;
+    if (response.headers.get("X-SOW-Origin-Transport") !== "https-bearer") return;
+    const probeID = request.headers.get("X-SOW-Provider-Probe") || "";
+    if (!PROVIDER_PROBE_PATTERN.test(probeID)) return;
+    const requestID = request.headers.get("CF-Ray") || "";
+    const colo = typeof request.cf?.colo === "string" ? request.cf.colo.trim().toUpperCase() : "";
+    if (!CLOUDFLARE_RAY_PATTERN.test(requestID) || requestID.slice(-3).toUpperCase() !== colo) return;
+    const requestIDBase = requestID.slice(0, -4).toLowerCase();
+    const cleanURLSHA256 = response.headers.get("X-SOW-Clean-URL-SHA256") || "";
+    const cacheStatus = response.headers.get("X-SOW-Origin-Cache-Status") || "";
+    if (!LOWER_SHA256_PATTERN.test(cleanURLSHA256) || !OBSERVABLE_CACHE_STATUSES.has(cacheStatus)) return;
+    const age = boundedHeaderInteger(response.headers.get("X-SOW-Origin-Cache-Age"));
+    const maxAge = boundedHeaderInteger(response.headers.get("X-SOW-Origin-Cache-Max-Age"));
+    if ((age === -1) !== (maxAge === -1) || age >= 0 && (maxAge <= age || maxAge > 315360000)) return;
+    const logger = platform?.console?.log;
+    if (typeof logger !== "function") return;
+    logger.call(platform.console, JSON.stringify({
+      schema: "sow-cloudflare-edge-provider-log/v1",
+      probe_id: probeID,
+      request_id: requestIDBase,
+      provider_request_id: `trace-${requestIDBase}`,
+      colo,
+      clean_url_sha256: cleanURLSHA256,
+      cache_status: cacheStatus,
+      cache_age_seconds: age,
+      cache_max_age_seconds: maxAge,
+      status: response.status,
+    }));
+  } catch {
+    // Provider evidence must never change request behavior.
+  }
+}
+
+function boundedHeaderInteger(value) {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]{0,8})$/.test(value)) return -1;
+  return Number(value);
 }
 
 function createCloudflareOriginFetcher(environment, platform, runtime) {

@@ -4,6 +4,12 @@
 本轮所有真实云、onboarding 与 evidence opt-in 均显式设为 `0`，没有读取云凭据、构造真实供应商
 客户端或写入 `pro`。CO/COS/Cloudflare 生产仓库始终不在测试范围。
 
+> 2026-07-29 修订：Workers Paid provider-attestation 要求 auth Worker
+> `logpush=true`，origin 与 provider verifier `logpush=false`。这改变了 auth
+> bundle 与 bootstrap plan；本文当日 bundle/plan 只能作为历史证据。当前 plan、
+> registry 与离线验证见
+> [Workers Paid follow-up](2026-07-29-cloudflare-workers-paid-provider-attestation.md)。
+
 ## 已关闭的安全缺口
 
 - readiness `.seal` 已从可由本地攻击者重算的 SHA/size envelope 升级为当前 Ed25519 v3：

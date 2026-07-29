@@ -22,8 +22,15 @@ The current source contains a usable local MVP rather than a command skeleton:
   credentials or network mutation.
 
 This is an MVP/current-source readiness result, not completion of the full PRD.
-Real Cloudflare Worker/route/purge/cache behavior, Cloudflare HTTP request logs,
+Real Cloudflare Worker/route/purge/cache behavior, Cloudflare provider logs,
 COS/EdgeOne, and production migration remain separate evidence layers.
+
+> Superseded bootstrap identity: the Workers Paid provider-attestation
+> correction changed the auth Worker bundle after this clean-revision run.
+> Plan `12c7410a…025c`, auth bundle `85389273…fa0c`, and registry
+> `78f400b8…cab0` below are historical evidence only and must not be used.
+> Current hashes and corrected tests are recorded in
+> [the follow-up evidence](2026-07-29-cloudflare-workers-paid-provider-attestation.md).
 
 ## Reproducible checks
 
@@ -147,14 +154,13 @@ yet been created, so the following claims remain open:
 1. deploy the two test Workers, bind only the exact test routes, publish a
    canary, exercise token/Basic paths, prove MISS/HIT and minimal purge, capture
    the deployment receipt, then roll back;
-2. capture provider HTTP request logs. Cloudflare's current official
-   [Logpush documentation](https://developers.cloudflare.com/logs/logpush/)
-   lists HTTP Requests Logpush as Enterprise-only, and the
-   [R2 destination procedure](https://developers.cloudflare.com/logs/logpush/logpush-job/enable-destinations/r2/)
-   requires `Logs Write` plus R2 write credentials. The prepared short-lived
-   bootstrap token deliberately lacks `Logs Write`; provider log evidence
-   therefore needs an Enterprise-capable test zone or an explicitly accepted
-   alternative evidence contract;
+2. capture provider Workers Trace Events. The corrected contract uses the
+   account-scoped `workers_trace_events` dataset available on Workers Paid,
+   rather than Enterprise-only HTTP Requests. Creating/updating the exact task
+   still requires account `Logs Edit` plus dedicated R2 writer, reader, and
+   lease-control identities. The prepared bootstrap token deliberately lacks
+   that separate permission; see the
+   [follow-up evidence](2026-07-29-cloudflare-workers-paid-provider-attestation.md);
 3. execute the equivalent COS/EdgeOne acceptance with separate nonproduction
    credentials/resources;
 4. execute production migration/cutover evidence only under a separately

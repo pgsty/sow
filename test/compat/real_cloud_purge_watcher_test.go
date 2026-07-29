@@ -1312,7 +1312,7 @@ func newOptInDetachedRealCloudPurgeWatcherRuntime(root string, environment realC
 				token = environment.EdgeProTokenA
 			}
 			return requestRealEdgeMultiPoP(ctx, observer, vendor.Vendor, baseURL, token, wanted.Role,
-				wantedBody, allSecrets)
+				strings.TrimSpace(os.Getenv(realCloudRunIDEnv)), wantedBody, allSecrets)
 		},
 	}, nil
 }

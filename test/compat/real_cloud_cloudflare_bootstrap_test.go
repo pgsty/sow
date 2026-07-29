@@ -73,6 +73,7 @@ type realCloudCloudflareBootstrapSecurityObservation struct {
 	OwnershipTag       string
 	CompatibilityDate  string
 	CompatibilityFlags []string
+	LogpushEnabled     bool
 	ExposureDisabled   bool
 	Digest             string
 }
@@ -607,7 +608,7 @@ func (control *realCloudCloudflareSDKBootstrapControl) Inspect(ctx context.Conte
 	default:
 		return state, errors.New("unknown Cloudflare bootstrap Worker role")
 	}
-	evidence, err := collectRealCloudCloudflareActiveWorker(ctx, control.client, plan.AccountID, script, repositoryBundle, expectedSHA, runtimeContract, false)
+	evidence, err := collectRealCloudCloudflareActiveWorker(ctx, control.client, plan.AccountID, script, repositoryBundle, expectedSHA, runtimeContract, role == "auth", false)
 	if err != nil {
 		return state, err
 	}
@@ -668,8 +669,9 @@ func (control *realCloudCloudflareSDKBootstrapControl) inspectSecurityObservatio
 		}
 		expectedDate, expectedFlags = plan.TokenVerifierCompatibilityDate, plan.TokenVerifierCompatibilityFlags
 	}
+	expectedLogpush := role == "auth"
 	if settings.CompatibilityDate != expectedDate || !equalRealCloudStrings(settings.CompatibilityFlags, expectedFlags) ||
-		settings.Logpush || settings.CacheOptions.Enabled || settings.CacheOptions.CrossVersionCache ||
+		settings.Logpush != expectedLogpush || settings.CacheOptions.Enabled || settings.CacheOptions.CrossVersionCache ||
 		settings.Limits.CPUMs != 0 || settings.Limits.Subrequests != 0 ||
 		settings.Placement.Mode != "" || settings.Placement.Host != "" || settings.Placement.Hostname != "" || settings.Placement.Region != "" || settings.Placement.Target != nil ||
 		settings.UsageModel != workers.ScriptScriptAndVersionSettingGetResponseUsageModelStandard ||
@@ -686,7 +688,7 @@ func (control *realCloudCloudflareSDKBootstrapControl) inspectSecurityObservatio
 	observation = realCloudCloudflareBootstrapSecurityObservation{
 		OwnershipMessage: settings.Annotations.WorkersMessage, OwnershipTag: settings.Annotations.WorkersTag,
 		CompatibilityDate: settings.CompatibilityDate, CompatibilityFlags: append([]string(nil), settings.CompatibilityFlags...),
-		ExposureDisabled: !exposure.Enabled && !exposure.PreviewsEnabled,
+		LogpushEnabled: settings.Logpush, ExposureDisabled: !exposure.Enabled && !exposure.PreviewsEnabled,
 	}
 	body, _ := json.Marshal(observation)
 	observation.Digest = realCloudLowerSHA256(body)
@@ -1717,7 +1719,7 @@ func (control *realCloudCloudflareSDKBootstrapControl) Upload(ctx context.Contex
 			CacheOptions: cloudflareapi.F(workers.ScriptUpdateParamsMetadataCacheOptions{
 				Enabled: cloudflareapi.F(false), CrossVersionCache: cloudflareapi.F(false),
 			}),
-			Logpush: cloudflareapi.F(false), MainModule: cloudflareapi.F("worker.mjs"),
+			Logpush: cloudflareapi.F(role == "auth"), MainModule: cloudflareapi.F("worker.mjs"),
 			Limits: cloudflareapi.F(workers.ScriptUpdateParamsMetadataLimits{
 				CPUMs: cloudflareapi.F(int64(0)), Subrequests: cloudflareapi.F(int64(0)),
 			}),
@@ -4539,7 +4541,7 @@ func TestRealCloudCloudflareBootstrapOfficialSDKMutationContract(t *testing.T) {
 						metadata.Annotations.Message == message && metadata.Annotations.Tag == tag &&
 						!metadata.CacheOptions.Enabled && !metadata.CacheOptions.CrossVersionCache && !metadata.Observability.Enabled &&
 						metadata.Limits.CPUMs == 0 && metadata.Limits.Subrequests == 0 && metadata.UsageModel == "standard" &&
-						!metadata.Logpush && metadata.Tags != nil && len(metadata.Tags) == 0 && metadata.TailConsumers != nil && len(metadata.TailConsumers) == 0 &&
+						metadata.Logpush == (script == plan.AuthScript) && metadata.Tags != nil && len(metadata.Tags) == 0 && metadata.TailConsumers != nil && len(metadata.TailConsumers) == 0 &&
 						!bytes.Contains(partBody, []byte("secret"))
 				case "files":
 					seenFile = part.FileName() == "worker.mjs" && part.Header.Get("Content-Type") == "application/javascript+module" && bytes.Equal(partBody, wantedBundle)
@@ -4981,7 +4983,7 @@ func TestRealCloudCloudflareBootstrapOfficialSDKInspectContract(t *testing.T) {
 						"bindings":    bindings, "cache_options": map[string]any{"enabled": false, "cross_version_cache": false},
 						"compatibility_date": plan.CompatibilityDate, "compatibility_flags": plan.CompatibilityFlags,
 						"limits": map[string]any{"cpu_ms": 0, "subrequests": 0}, "placement": map[string]any{}, "usage_model": "standard",
-						"logpush": false, "observability": map[string]any{"enabled": test.observabilityEnabled,
+						"logpush": true, "observability": map[string]any{"enabled": test.observabilityEnabled,
 							"logs":   map[string]any{"enabled": false, "invocation_logs": false, "destinations": []any{}, "persist": false},
 							"traces": map[string]any{"enabled": false, "destinations": []any{}, "persist": false}},
 						"tags": []any{}, "tail_consumers": []any{},

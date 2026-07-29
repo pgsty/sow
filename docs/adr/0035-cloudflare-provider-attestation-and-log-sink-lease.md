@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-17
+- Amended: 2026-07-29
 - Scope: dedicated non-production provider evidence only
 
 ## Context
@@ -21,7 +22,7 @@ edge contract than SOW intends.
 
 ## Decision
 
-Provider attestation config and deployment identity v4 use the product
+Provider attestation config and deployment identity v5 use the product
 `edge.token_verifier` reference as a strict union discriminator. In
 `provider://id` mode they pin a separate compatibility date and sorted, unique
 flag inventory for the auth, origin and token-verifier Workers. In
@@ -34,8 +35,10 @@ observations:
 
 - immutable version runtime uses the exact date/flags, `standard` usage model,
   zero/default limits and no migration tag;
-- script settings have no cache, placement, Logpush, observability, tags or
-  tail consumers and contain no unknown top-level/nested fields;
+- script settings have no cache, placement, observability, tags or tail
+  consumers and contain no unknown top-level/nested fields; the auth Worker
+  alone has `logpush=true`, while origin and provider verifier require
+  `logpush=false`;
 - schedule inventory is explicitly present and empty;
 - workers.dev and preview exposure are explicitly disabled.
 
@@ -52,7 +55,7 @@ attestation digest with the durable acceptance-ledger binding before reading a
 log/API credential. A self-consistent provider config therefore cannot replace
 the run's default static product config.
 
-Raw provider attestation v4 records the verifier kind and non-secret binding
+Raw provider attestation v5 records the verifier kind and non-secret binding
 name. Provider mode retains independent security digests for all three Workers;
 static mode records no third-Worker identity, ETag or digest and proves the
 secret only through the auth Worker binding name/type and redacted runtime
@@ -156,9 +159,35 @@ publisher, raw reader, Cloudflare Logpush
 writer and EdgeOne writer identities. Exporter writer credentials remain
 write-only and never receive List/Get/Delete.
 
-Cloudflare Logpush verification selects the configured job by exact ID and
-audits every other enabled job for reviewed-host or raw-bucket overlap. A safe
-unrelated shared-zone job no longer causes a post-mutation false failure.
+Cloudflare evidence uses the account-scoped `workers_trace_events` dataset,
+not the Enterprise-only zone `http_requests` dataset. This is the provider
+path available on
+[Workers Paid](https://developers.cloudflare.com/workers/observability/logs/logpush/)
+and therefore preserves NFR-07. The job is
+full-sample NDJSON, filters exact auth `ScriptName` plus `Outcome=ok`, and
+exports only `EventTimestampMs`, `Logs`, `Outcome`, `ScriptName` and
+`ScriptVersion`. `Event` and `Exceptions` are deliberately omitted so the raw
+sink cannot receive a visitor URL, headers, token or unrelated exception text.
+The auth Worker emits one bounded ten-field JSON console record only for an
+explicit, route-safe `X-SOW-Provider-Probe` run ID. The shared request builder
+does not forward that header to origin. Ordinary invocations therefore have an
+empty `Logs` array and are ignored; records for another valid run ID are also
+ignored after shape validation. A current-run record must bind the active
+provider-owned script/version/timestamps to the visitor `CF-Ray` base and colo,
+the clean URL digest, cache status/freshness and successful status. Unknown,
+duplicate, truncated, URL-bearing, wrong-version or unjoinable records fail
+closed.
+
+The configured Workers Trace job is selected by exact ID from the account
+inventory. Every other enabled account job is rejected if it can include the
+reviewed auth Worker or write the SOW raw bucket. The zone inventory is still
+read independently: any enabled HTTP job that can include main/beta or any
+zone job that can write the raw bucket fails closed. Safe unrelated account
+and zone jobs may coexist. Because Cloudflare documents roughly 10–15 minutes
+for [destination changes to propagate](https://developers.cloudflare.com/logs/logpush/logpush-job/api-configuration/),
+the durable acceptance program configures
+the sink in its first step and enforces a 16-minute gate before the first
+provider probe, including after recovery replay.
 
 ## Consequences
 
@@ -167,10 +196,16 @@ unrelated shared-zone job no longer causes a post-mutation false failure.
 - New Worker/runtime fields introduced by Cloudflare fail closed until reviewed
   and represented in the contract.
 - Log-sink setup needs one additional narrowly scoped R2 control credential.
+- Creating or changing the account Workers Trace job additionally requires an
+  account-scoped `Logs Edit` token (the generic filter API documentation calls
+  the write capability `Logs Write`); this is a permission requirement, not an
+  Enterprise-plan requirement.
 - That credential is scoped only to Get and conditional Put on the dedicated
   raw bucket's exact `.sow/provider-log-sink-lease.json` key; it needs no
   payload prefix or Delete authority.
-- The shipped resource, bootstrap and provider-deployment registries remain
-  empty. These changes have only loopback/fake-store evidence and do not claim
-  that POC-06 or any real Cloudflare/COS operation passed.
+- The Cloudflare bootstrap registry pins only the owner-authorized disposable
+  `pro` plan produced by the corrected bundle. The full dual-cloud resource and
+  provider-deployment registries remain closed. These changes have only
+  loopback/fake-store evidence and do not claim that POC-06 or any real
+  Cloudflare/COS operation passed.
 - CO/COS and Cloudflare production repositories remain forbidden test targets.

@@ -29,6 +29,7 @@ const (
 	realCloudSecretScratchSuffix  = ".secrets"
 	realCloudSecretRegistryName   = ".sow-real-cloud-secret-registry.json"
 	realCloudSecretRegistrySchema = "sow-real-cloud-secret-registry/v1"
+	realCloudCFLogpushPropagation = 16 * time.Minute
 )
 
 var errRealCloudProviderAPIAttestationRequired = errors.New("real-cloud acceptance requires in-repo provider API raw-export attestation and deployed edge build identity; operator-supplied joined JSONL and fixed contract headers cannot close the ledger")
@@ -63,6 +64,7 @@ type realCloudAcceptanceProgram struct {
 	mode            string
 	activeStepID    string
 	cliCursor       int
+	cfLogpushSetAt  time.Time
 
 	firstPackage      string
 	secondPackage     string
@@ -446,6 +448,7 @@ func (program *realCloudAcceptanceProgram) run() {
 	}
 	if program.mode == "recover" && program.ledger.StepCompleted("edge-reservation-connectivity-preflight") {
 		program.reconcileProviderRawSinks("")
+		program.awaitCloudflareLogpushPropagation()
 	}
 
 	program.step("edge-reservation-connectivity-preflight", []string{"anonymous-edge-connectivity", "provider-raw-sink-reconcile", "cf", "cos"}, "@provider", func() any {
@@ -601,6 +604,54 @@ func (program *realCloudAcceptanceProgram) reconcileProviderRawSinks(activeStep 
 	if err := prepareRealCloudProviderPerRunRawSinks(program.t.Context(), program.environment, program.identity.RunID, program.identity.ConfigSHA256, os.Getenv); err != nil {
 		assertNoRealCloudSecret(program.t, "provider raw-log sink setup error", []byte(err.Error()), program.secretFragments)
 		program.t.Fatalf("prepare exact ledger-bound per-run provider raw-log sinks: %v", err)
+	}
+	program.cfLogpushSetAt = time.Now().UTC()
+}
+
+func (program *realCloudAcceptanceProgram) awaitCloudflareLogpushPropagation() {
+	program.t.Helper()
+	for {
+		remaining, err := realCloudCloudflareLogpushPropagationRemaining(program.cfLogpushSetAt, time.Now().UTC())
+		if err != nil {
+			program.t.Fatalf("Cloudflare Workers Trace sink propagation gate: %v", err)
+		}
+		if remaining == 0 {
+			return
+		}
+		wait := min(remaining, 30*time.Second)
+		program.t.Logf("waiting for Cloudflare Workers Trace destination propagation remaining=%s", remaining.Round(time.Second))
+		timer := time.NewTimer(wait)
+		select {
+		case <-timer.C:
+		case <-program.t.Context().Done():
+			timer.Stop()
+			program.t.Fatalf("Cloudflare Workers Trace destination propagation interrupted: %v", program.t.Context().Err())
+		}
+	}
+}
+
+func realCloudCloudflareLogpushPropagationRemaining(configuredAt, now time.Time) (time.Duration, error) {
+	if configuredAt.IsZero() || now.IsZero() || now.Before(configuredAt) {
+		return 0, errors.New("configuration time is missing or moves backwards")
+	}
+	remaining := configuredAt.Add(realCloudCFLogpushPropagation).Sub(now)
+	if remaining <= 0 {
+		return 0, nil
+	}
+	return remaining, nil
+}
+
+func TestRealCloudCloudflareLogpushPropagationGateIsConservative(t *testing.T) {
+	configuredAt := time.Date(2026, 7, 29, 1, 0, 0, 0, time.UTC)
+	remaining, err := realCloudCloudflareLogpushPropagationRemaining(configuredAt, configuredAt.Add(15*time.Minute))
+	if err != nil || remaining != time.Minute {
+		t.Fatalf("propagation remaining=%s err=%v", remaining, err)
+	}
+	if remaining, err = realCloudCloudflareLogpushPropagationRemaining(configuredAt, configuredAt.Add(realCloudCFLogpushPropagation)); err != nil || remaining != 0 {
+		t.Fatalf("completed propagation remaining=%s err=%v", remaining, err)
+	}
+	if _, err := realCloudCloudflareLogpushPropagationRemaining(time.Time{}, configuredAt); err == nil {
+		t.Fatal("missing Cloudflare Logpush configuration time was accepted")
 	}
 }
 
@@ -948,6 +999,7 @@ func (program *realCloudAcceptanceProgram) runStableGenerations() {
 	})
 
 	program.step("edge-stage-g4", []string{"multi-pop", "generation=4", "cf", "edgeone"}, "@token-a,@token-b", func() any {
+		program.awaitCloudflareLogpushPropagation()
 		stage, exists := program.loadActiveStage(4)
 		if !exists {
 			cf := readRealCloudPublication(t, program.root, "cf")

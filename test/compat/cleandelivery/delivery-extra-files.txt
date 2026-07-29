@@ -1,6 +1,7 @@
 README.md
 _bmad-output/brainstorming/brainstorm-sow-repo-cli-2026-07-11/brainstorm-intent.md
 _bmad-output/implementation-artifacts/spec-cloudflare-static-entitlement-bootstrap.md
+_bmad-output/implementation-artifacts/spec-cloudflare-workers-paid-provider-attestation.md
 _bmad-output/implementation-artifacts/spec-config-cardinality-complexity-bounds.md
 _bmad-output/implementation-artifacts/spec-config-input-and-rpm-provenance-hardening.md
 _bmad-output/implementation-artifacts/spec-current-source-real-r2-revalidation.md
@@ -167,6 +168,8 @@ docs/evidence/2026-07-22-projection-stage-cleanup-identity.md
 docs/evidence/2026-07-22-projection-stage-install-rollback-identity.md
 docs/evidence/2026-07-22-reconcile-prune-identity.md
 docs/evidence/2026-07-22-upstream-proof-order-determinism.md
+docs/evidence/2026-07-29-cloudflare-workers-paid-provider-attestation.md
+docs/evidence/2026-07-29-mvp-and-cloudflare-bootstrap-readiness.md
 docs/evidence/README.md
 docs/examples/sow-pgdg.yaml
 docs/migration/audit-legacy-targets.sh

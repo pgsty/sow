@@ -51,10 +51,13 @@ runtime/security 与整区相关 inventory 连续双读，日志配置 mutation 
 控制面与原始对象独立重建同一 joined-v3 闭包，否则以
 `provider API raw-export attestation required` 失败并保留最后一步 `Current`。collector 绑定：
 
-- Cloudflare account/zone、配置中钉住且启用的 `http_requests` Logpush job、精确 NDJSON 字段、
-  未合并 subrequest、与发布桶不同的 provider-only R2 log bucket/stable raw root，以及供应商动态
-  生成的每个对象的 key/size/ETag/字节摘要；共享 zone 中其他启用 job 不能复用该 raw bucket，
-  `http_requests` filter 还必须可证明不包含 main/beta host，未知 filter 失败关闭；
+- Cloudflare account/zone、配置中钉住且启用的 account
+  `workers_trace_events` Logpush job、精确 NDJSON 字段、100% sample、auth
+  `ScriptName` + `Outcome=ok` filter、与发布桶不同的 provider-only R2 log
+  bucket/stable raw root，以及供应商动态生成的每个对象的
+  key/size/ETag/字节摘要；其他启用 account job 不能包含 auth Worker 或复用该
+  raw bucket；共享 zone inventory 也独立读取，其他启用 zone job 不能复用 raw
+  bucket，HTTP filter 还必须可证明不包含 main/beta host，未知 filter 失败关闭；
 - Cloudflare auth Worker、service-only R2 origin Worker 与外部 token verifier 的 active
   deployment/version/ETag/content identity；auth 的 `ORIGIN` 与 `TOKEN_VERIFIER` service
   binding、origin 唯一 `REPOSITORY` R2 binding、main/beta exact routes（共享 zone 的其他 route
@@ -74,9 +77,12 @@ runtime/security 与整区相关 inventory 连续双读，日志配置 mutation 
   `https-bearer` non-secret/secret-name 闭包，以及 main/beta host 到精确 FunctionID 的 direct trigger
   rules；该模式只允许 `SOW_ORIGIN_BEARER` 与 `SOW_TOKEN_VERIFIER_BEARER`，出现 COS SigV4
   ID/key/session token 即失败；task/function 查询还要求 `TotalCount=1`，不能接受截断页；
-- collector source/build/config identity、确定性产品配置摘要、reader/writer 独立身份摘要，以及 Cloudflare `ParentRayID`、EdgeOne
-  `ParentRequestID` 对 active request 的完整、无额外、无缺失原始 JSONL 重建；原始 URL 必须
-  已去 token/query，最终 ledger 只保存 URL-free/secret-free 摘要与资源身份。
+- collector source/build/config identity、确定性产品配置摘要、reader/writer 独立身份摘要；
+  Cloudflare 以 provider-owned `ScriptName`/`ScriptVersion`/timestamp envelope
+  包裹的受限 Worker event 关联 active `CF-Ray`/colo/clean digest，EdgeOne 仍以
+  `ParentRequestID` 关联 active request。两端都必须从完整、无额外、无缺失的原始 JSONL
+  重建；Cloudflare raw export 根本不包含 URL/header/token 字段，EdgeOne 原始 URL
+  必须已去 token/query，最终 ledger 只保存 URL-free/secret-free 摘要与资源身份。
 
 `edgeone_token_verifier_deployment_sha256` 目前是管理员 registry 中的必填部署身份，不是 collector
 从通用 HTTPS verifier URL 反查出的供应商 API 事实；collector 不把这个配置摘要伪报为真实部署
@@ -198,8 +204,9 @@ SIGKILL 后孤儿 watcher 继续完成两 vendor/四 observer 证据；这只关
    与受保护字节都变化，而 clean URL 摘要保持不变。这一同步阶段只证明主动请求和可关联的
    request ID，不冒充供应商 PoP 证据。Cloudflare/EdgeOne 日志通常异步到达，随后由独立、
    只读的 `TestRealCloudEdgeMultiPoPEvidenceAcceptance` 读取 active artifact 与 collector 归一化
-   joined JSONL：Cloudflare 以主请求 `RayID`/`EdgeColoID`/`EdgeColoCode` 关联 Worker 子请求
-   `ParentRayID`/`CacheCacheStatus`；EdgeOne 以主请求 `RequestID`/`EdgeServerID`/
+   joined JSONL：Cloudflare 用主动响应的 `CF-Ray`/colo 关联 provider-owned
+   Workers Trace envelope 中的十字段 Worker event，并绑定 active script/version、
+   clean URL digest 与 cache freshness；EdgeOne 以主请求 `RequestID`/`EdgeServerID`/
    `EdgeServerIP`/`EdgeSeverRegion` 关联函数子请求 `ParentRequestID`/`EdgeCacheStatus`。验收要求
    Cloudflare 不伪造不存在的 edge IP，而由不同 colo/node 证明不同 PoP；EdgeOne evidence
    仅把 `EdgeSeverRegion` 规范化为大写 ISO 3166-1 alpha-2 country，不接受或推断更细粒度
@@ -212,7 +219,8 @@ SIGKILL 后孤儿 watcher 继续完成两 vendor/四 observer 证据；这只关
    generation/vendor 记录及全部 stage/pre-purge child log 精确闭包：不接受额外、未知、重复、
    跨 run、parent/child ID 碰撞或 seal 后追加。两代 joined log 均须逐 request ID、generation、
    transaction、cache status、body/clean digest 与因果时间窗绑定。
-   字段依据见 [Cloudflare HTTP request logs](https://developers.cloudflare.com/logs/logpush/logpush-job/datasets/zone/http_requests/)、
+   字段依据见 [Cloudflare Workers Trace Events](https://developers.cloudflare.com/logs/logpush/logpush-job/datasets/account/workers_trace_events/)、
+   [Cloudflare Workers Logpush](https://developers.cloudflare.com/workers/observability/logs/logpush/)、
    [Cloudflare CF-Ray](https://developers.cloudflare.com/fundamentals/reference/http-headers/)、
    [EdgeOne L7 日志字段](https://cloud.tencent.com/document/product/1552/105791)、
    [EdgeOne 实时日志](https://cloud.tencent.com/document/product/1552/96007) 与
@@ -355,7 +363,7 @@ POC-06，也不代替后续双云故障、purge、cache 与 provider-log 验收�
 | `SOW_REAL_EDGEONE_ZONE_ID` | EdgeOne zone ID |
 | `SOW_REAL_CLOUD_WORKSPACE` | 本次单一 destructive run 的持久工作区绝对路径；不得位于产品仓库内 |
 | `SOW_REAL_CLOUD_RUN_ID` | 绑定本次配置、确认值、公开签名 key 与外部 edge artifact 的稳定 run ID |
-| `SOW_REAL_CLOUD_PROVIDER_ATTESTATION_JSON` | 单行 canonical JSON v4；从 attestation 外部绑定实际生成的产品配置字节/摘要与 strict verifier union。默认 `env://NAME` 只允许 CF auth+origin、两端 exact static secret name 和空 provider 字段；EO live runtime 必须把 secret 标为 `secret` 且不返回值，同名 plaintext 失败。`provider://ID` 才要求第三个 Worker、verifier 内容/redacted binding/逐 Worker runtime、EO URL/bearer/deployment。两种模式都绑定 account/zone/Logpush、EO immutable area/function/default-domain、两个隔离 raw sink 与 reader/writer/log-control identity digest；完整 stable identity 还必须命中独立 provider-deployment registry，未知字段、v3 或非 canonical 表示失败 |
+| `SOW_REAL_CLOUD_PROVIDER_ATTESTATION_JSON` | 单行 canonical JSON v5；从 attestation 外部绑定实际生成的产品配置字节/摘要与 strict verifier union。默认 `env://NAME` 只允许 CF auth+origin、两端 exact static secret name 和空 provider 字段；EO live runtime 必须把 secret 标为 `secret` 且不返回值，同名 plaintext 失败。`provider://ID` 才要求第三个 Worker、verifier 内容/redacted binding/逐 Worker runtime、EO URL/bearer/deployment。两种模式都绑定 account/zone/Logpush、EO immutable area/function/default-domain、两个隔离 raw sink 与 reader/writer/log-control identity digest；完整 stable identity 还必须命中独立 provider-deployment registry，未知字段、v4 或非 canonical 表示失败 |
 | `SOW_REAL_CLOUD_MODE` | `fresh` 或 `recover`；当前 recover 只允许重放已登记的同一 publish 操作，见下方限制 |
 | `SOW_REAL_EDGE_OBSERVERS_JSON` | 2–8 个 `{"id":"...","proxy_env":"SOW_REAL_EDGE_PROXY_..."}` observer 的严格 JSON 数组；ID、env 名、代理 endpoint 均不得重复 |
 | `SOW_REAL_EDGE_ACTIVE_OBSERVATIONS_JSONL` | 仓库外绝对路径；父目录须预先存在且非 symlink；完成文件使用 `sow-real-edge-active/v5` 并要求同名 `.seal` |
@@ -372,7 +380,7 @@ object key；配置不预言 key。collector 使用 provider-side Prefix ListObj
 占位值不能用于运行，尤其不能替换成任何 CO/COS/Cloudflare 生产资源：
 
 ```json
-{"schema":"sow-real-cloud-provider-attestation-config/v4","product_config_sha256":"<64-lower-hex-deterministic-product-config-digest>","cloudflare":{"account_id":"dedicated-test-account","zone_id":"dedicated-test-zone","logpush_job_id":1,"worker_script":"sow-test-auth","worker_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[]},"origin_worker_script":"sow-test-origin","origin_worker_environment":"","origin_worker_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[]},"token_verifier_service":"","token_verifier_environment":"","token_verifier_runtime":{"compatibility_date":"","compatibility_flags":null},"token_verifier_content_sha256":"","token_verifier_bindings_sha256":"","raw_reader_access_key_sha256":"<64-lower-hex-reader-id-digest>","raw_writer_access_key_sha256":"<64-lower-hex-writer-id-digest>","log_control_access_key_sha256":"<64-lower-hex-log-control-id-digest>","raw_bucket":"sow-test-cf-provider-logs","raw_root":"sow-provider-logs/cloudflare/"},"edgeone":{"zone_id":"dedicated-test-zone","realtime_log_task_id":"sow-test-log-task","realtime_log_area":"overseas","function_id":"sow-test-function","function_domain_sha256":"<64-lower-hex-dedicated-default-domain-digest>","raw_reader_access_key_sha256":"<64-lower-hex-reader-id-digest>","raw_writer_access_key_sha256":"<64-lower-hex-writer-id-digest>","raw_bucket":"sow-test-eo-provider-logs-1250000000","raw_root":"sow-provider-logs/edgeone/"},"runtime":{"token_verifier":"env://SOW_REAL_EDGE_STATIC_ENTITLEMENTS","public_prefixes":["apt","pkg","yum"],"public_keys":["keys/test.asc"],"edgeone_token_verifier_url":"","edgeone_token_verifier_deployment_sha256":"","cloudflare_secret_names":["SOW_ORIGIN_BEARER","SOW_REAL_EDGE_STATIC_ENTITLEMENTS"],"edgeone_secret_names":["SOW_ORIGIN_BEARER","SOW_REAL_EDGE_STATIC_ENTITLEMENTS"]}}
+{"schema":"sow-real-cloud-provider-attestation-config/v5","product_config_sha256":"<64-lower-hex-deterministic-product-config-digest>","cloudflare":{"account_id":"dedicated-test-account","zone_id":"dedicated-test-zone","logpush_job_id":1,"worker_script":"sow-test-auth","worker_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[]},"origin_worker_script":"sow-test-origin","origin_worker_environment":"","origin_worker_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[]},"token_verifier_service":"","token_verifier_environment":"","token_verifier_runtime":{"compatibility_date":"","compatibility_flags":null},"token_verifier_content_sha256":"","token_verifier_bindings_sha256":"","raw_reader_access_key_sha256":"<64-lower-hex-reader-id-digest>","raw_writer_access_key_sha256":"<64-lower-hex-writer-id-digest>","log_control_access_key_sha256":"<64-lower-hex-log-control-id-digest>","raw_bucket":"sow-test-cf-provider-logs","raw_root":"sow-provider-logs/cloudflare/"},"edgeone":{"zone_id":"dedicated-test-zone","realtime_log_task_id":"sow-test-log-task","realtime_log_area":"overseas","function_id":"sow-test-function","function_domain_sha256":"<64-lower-hex-dedicated-default-domain-digest>","raw_reader_access_key_sha256":"<64-lower-hex-reader-id-digest>","raw_writer_access_key_sha256":"<64-lower-hex-writer-id-digest>","raw_bucket":"sow-test-eo-provider-logs-1250000000","raw_root":"sow-provider-logs/edgeone/"},"runtime":{"token_verifier":"env://SOW_REAL_EDGE_STATIC_ENTITLEMENTS","public_prefixes":["apt","pkg","yum"],"public_keys":["keys/test.asc"],"edgeone_token_verifier_url":"","edgeone_token_verifier_deployment_sha256":"","cloudflare_secret_names":["SOW_ORIGIN_BEARER","SOW_REAL_EDGE_STATIC_ENTITLEMENTS"],"edgeone_secret_names":["SOW_ORIGIN_BEARER","SOW_REAL_EDGE_STATIC_ENTITLEMENTS"]}}
 ```
 
 秘密必须由当前进程的 secret manager/env 注入，不得写进仓库、临时配置、命令行或
@@ -382,7 +390,7 @@ CF provider-log lease control 凭据的严格 JSON schema 为：
 | 变量 | JSON 字段 |
 |---|---|
 | `SOW_REAL_CF_STORAGE_JSON` | `access_key_id`, `secret_access_key`, 可选 `session_token` |
-| `SOW_REAL_CF_CDN_JSON` | `api_token`, `basic_username`, `basic_password`；Cloudflare readiness 的 token 至少具备 exact account `Workers R2 Storage Read` 与 exact zone `Zone Read`，完整 POC 再另按部署/purge/Logpush 操作收窄授权 |
+| `SOW_REAL_CF_CDN_JSON` | `api_token`, `basic_username`, `basic_password`；Cloudflare readiness 的 token 至少具备 exact account `Workers R2 Storage Read` 与 exact zone `Zone Read`，完整 POC 再另按部署/purge操作收窄授权；account Workers Trace task 的创建/更新另需 exact account `Logs Edit`（generic filter API 文档称 `Logs Write`），不是 Enterprise 计划要求 |
 | `SOW_REAL_EDGE_STATIC_ENTITLEMENTS` | 默认 static verifier 的 strict compact JSON secret；Cloudflare bootstrap 只在持有 lease 且 readiness 复核后读取并以 `secret_text` 注入。EdgeOne 平台可在同名 secret 下保存按其 main/beta audience 收窄的独立文档；值和 token digest 清单不得进入配置、registry、receipt 或日志 |
 | `SOW_REAL_COS_STORAGE_JSON` | `access_key_id`, `secret_access_key`, 可选 `session_token` |
 | `SOW_REAL_COS_CDN_JSON` | `secret_id`, `secret_key`, 可选 `session_token`, 以及 `basic_username`, `basic_password` |
@@ -635,15 +643,20 @@ pattern 规则确定不可能匹配 `pro.pigsty.io` 或 `beta.pro.pigsty.io` 的
 SOW auth Worker 不得有第三条 route。完整 inventory identity 会进入 provider control digest，
 连续两次读取必须一致；缺失 custom-domain service/certificate/zone identity 也失败关闭。
 
-共享 Zone 的 Logpush inventory 使用相同的“只绑定相关闭包”原则。钉住的 SOW job 必须精确
-覆盖 main+beta；无关 enabled job 仅在 destination 不含 SOW raw bucket 且其 `http_requests`
-filter 可证明排除两个 reviewed host 时允许。未知、畸形或不支持的 filter 保守地视为重叠。
-无关 job 只有在上述不相交性可证时才允许；完整 Logpush inventory 仍进入 provider control digest。
+钉住的 SOW job 是 account `workers_trace_events` job，必须精确过滤 auth
+`ScriptName` 与 `Outcome=ok`；其他 enabled account job 仅在不会包含 auth Worker 且
+destination 不含 SOW raw bucket 时允许。共享 Zone 的 Logpush inventory 仍使用“只绑定
+相关闭包”原则：无关 enabled zone job 仅在 destination 不含 raw bucket，且其 HTTP filter
+可证明排除两个 reviewed host 时允许。未知、畸形或不支持的 filter 保守地视为重叠。
+无关 job 只有在上述不相交性可证时才允许；完整 account/zone inventory 均进入 provider
+control digest。
 setup 在两个 provider safety read 都通过后、任何 Logpush/realtime-log mutation 前取得独立 R2
 conditional lease，每次 mutation 前续租，全部成功后把 exact live ETag CAS 为 canonical idle
 marker。跨供应商部分失败保留 live 租约至五分钟到期，再由下一次 run CAS 接管并幂等重放；
 下一次正常 run 也只能以 idle marker ETag 做 CAS。write-only exporter credential 不承担此职责，
-且 lease-control 身份不需要 DeleteObject 权限。
+且 lease-control 身份不需要 DeleteObject 权限。Cloudflare 文档说明 destination 更新约需
+10–15 分钟传播；acceptance ledger 会持久化配置时间并在首次 probe（包括 recovery
+reconfiguration）前自动等待满 16 分钟，不依赖操作员手工计时。
 
 ## 通过条件
 
@@ -697,7 +710,8 @@ marker。跨供应商部分失败保留 live 租约至五分钟到期，再由�
   同时有效时把它并入 active artifact。这一层仍
   只叫 active observation，不叫 provider-confirmed multi-PoP；
 - 后置只读验收必须把 active request ID 与 collector-normalized provider joined logs 一一绑定。
-  Cloudflare 每个 observer 需要不同 `EdgeColoCode`/`EdgeColoID` 且 `node_ip` 为空；EdgeOne
+  Cloudflare 每个 observer 需要不同 Trace event `colo`/provider request ID 且
+  `node_ip` 为空；EdgeOne
   需要不同 ISO country、公开 `EdgeServerIP` 与 `EdgeServerID`，三项缺一不可。active/provider
   两个 artifact 都必须有匹配 run ID 的完成 seal；provider export 必须精确覆盖所有 stage 与
   pre-purge parent，不能有额外/未知记录、复用 child/parent ID 或 parent-child 碰撞。两家每代的

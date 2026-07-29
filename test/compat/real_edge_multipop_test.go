@@ -84,8 +84,9 @@ type realEdgeProviderLog struct {
 	// Schema identifies a collector-normalized join, not one raw provider
 	// event. RequestID is the child/subrequest identity and ParentRequestID must
 	// equal the visitor-facing ID captured from CF-Ray or EO-LOG-UUID. For
-	// Cloudflare the collector joins main RayID/EdgeColo fields with Worker
-	// subrequest RayID/ParentRayID/CacheCacheStatus. For EdgeOne it joins main
+	// Cloudflare the collector joins a provider-owned Workers Trace envelope
+	// (script/version/timestamp) with the auth Worker's secret-free structured
+	// event (CF-Ray base/colo/clean-cache digest). For EdgeOne it joins main
 	// RequestID/EdgeServer fields with function-subrequest
 	// RequestID/ParentRequestID/EdgeCacheStatus.
 	Schema          string `json:"schema"`
@@ -544,7 +545,7 @@ func captureRealCloudEdgeMultiPoPStage(
 				role, token = "prime", environment.EdgeProTokenA
 			}
 			observation, probeErr := requestRealEdgeMultiPoP(
-				t.Context(), observer, input.vendor, input.baseURL, token, role, wanted, allSecrets,
+				t.Context(), observer, input.vendor, input.baseURL, token, role, runIdentity.RunID, wanted, allSecrets,
 			)
 			if probeErr != nil {
 				t.Fatalf("%s observer=%s role=%s multi-PoP probe failed: %v", input.vendor, observer.ID, role, probeErr)
@@ -594,7 +595,7 @@ func captureRealCloudEdgePrePurge(
 		}
 		for index, observer := range observers {
 			observation, probeErr := requestRealEdgeMultiPoP(
-				t.Context(), observer, input.vendor, input.baseURL, environment.EdgeProTokenB, "cross-pop", wanted, allSecrets,
+				t.Context(), observer, input.vendor, input.baseURL, environment.EdgeProTokenB, "cross-pop", prior.RunID, wanted, allSecrets,
 			)
 			if probeErr != nil {
 				t.Fatalf("%s observer=%s pre-purge HIT failed: %v", input.vendor, observer.ID, probeErr)
@@ -791,7 +792,7 @@ func parseRealEdgeProxyURL(raw string) (*url.URL, string, error) {
 func requestRealEdgeMultiPoP(
 	ctx context.Context,
 	observer realEdgeObserver,
-	vendor, baseURL, token, role string,
+	vendor, baseURL, token, role, providerProbeID string,
 	wanted []byte,
 	secretFragments []string,
 ) (realEdgeMultiPoPObservation, error) {
@@ -823,6 +824,12 @@ func requestRealEdgeMultiPoP(
 		return realEdgeMultiPoPObservation{}, errors.New("construct edge probe request")
 	}
 	request.Header.Set("Accept-Encoding", "identity")
+	if vendor == "cloudflare" {
+		if !validRealCloudRunID(providerProbeID) {
+			return realEdgeMultiPoPObservation{}, errors.New("Cloudflare provider probe identity is invalid")
+		}
+		request.Header.Set("X-SOW-Provider-Probe", providerProbeID)
+	}
 	response, err := client.Do(request)
 	if err != nil {
 		// Deliberately omit the underlying error: proxy errors can echo a URL

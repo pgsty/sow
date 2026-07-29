@@ -31,7 +31,7 @@ const (
 	realCloudCloudflareBootstrapRegistryEntrySchema = "sow-real-cloud-pinned-cloudflare-bootstrap/v1"
 	realCloudCloudflareBootstrapPlanSchema          = "sow-real-cloud-cloudflare-bootstrap-plan/v3"
 	realCloudCloudflareBootstrapDescriptorSchema    = "sow-real-cloud-cloudflare-bootstrap-descriptor/v3"
-	realCloudCloudflareBootstrapRegistrySHA256      = "78f400b82ad3c2986ab0ca33ee512e0f6c127ab8dc04e0aa929d73ebb07fcab0"
+	realCloudCloudflareBootstrapRegistrySHA256      = "87f7861e0f645d822c1dd237cf4f23a75149b3a90fb10c473295692430bcdf9c"
 	realCloudCloudflareAuthBundlePath               = "edge/dist/cloudflare-worker.mjs"
 	realCloudCloudflareOriginBundlePath             = "edge/dist/cloudflare-origin-worker.mjs"
 	realCloudCloudflareBootstrapOwnership           = "manage-exact-auth-origin-workers-and-main-beta-routes-only"

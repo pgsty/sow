@@ -26,6 +26,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	cloudflareapi "github.com/cloudflare/cloudflare-go/v7"
 	"github.com/cloudflare/cloudflare-go/v7/logpush"
@@ -48,13 +50,13 @@ const (
 	realCloudProviderLogWriterCredentialCF    = "SOW_REAL_CF_LOG_WRITER_JSON"
 	realCloudProviderLogWriterCredentialCOS   = "SOW_REAL_COS_LOG_WRITER_JSON"
 	realCloudProviderLogControlCredentialCF   = "SOW_REAL_CF_LOG_CONTROL_JSON"
-	realCloudProviderAttestationSchema        = "sow-real-cloud-provider-attestation-config/v4"
-	realCloudProviderCollectorSchema          = "sow-real-cloud-provider-raw-attestation/v4"
+	realCloudProviderAttestationSchema        = "sow-real-cloud-provider-attestation-config/v5"
+	realCloudProviderCollectorSchema          = "sow-real-cloud-provider-raw-attestation/v5"
 	realCloudProviderCollectorSource          = "test/compat/real_cloud_provider_attestation_test.go"
 	realCloudProviderDeploymentRegistryPath   = "test/compat/testdata/real_cloud_nonproduction_provider_deployment_registry.json"
 	realCloudProviderDeploymentRegistrySchema = "sow-real-cloud-pinned-provider-deployment-registry/v1"
 	realCloudProviderDeploymentEntrySchema    = "sow-real-cloud-pinned-provider-deployment/v1"
-	realCloudProviderDeploymentIdentitySchema = "sow-real-cloud-provider-deployment-identity/v4"
+	realCloudProviderDeploymentIdentitySchema = "sow-real-cloud-provider-deployment-identity/v5"
 	realCloudProviderDeploymentRegistrySHA256 = "3eac7304de5472c532fbfcd93f93cc69a5baa778c9c851280e692e0f9d633e52"
 	realCloudProviderMaxRawBytes              = 8 << 20
 	realCloudProviderMaxContentBytes          = 2 << 20
@@ -67,7 +69,7 @@ const (
 
 var (
 	realCloudCloudflareRawFields = []string{
-		"CacheCacheStatus", "ClientRequestURI", "EdgeColoCode", "EdgeColoID", "EdgeStartTimestamp", "ParentRayID", "RayID",
+		"EventTimestampMs", "Logs", "Outcome", "ScriptName", "ScriptVersion",
 	}
 	realCloudEdgeOneRawFields = []string{
 		"EdgeCacheStatus", "EdgeFunctionSubrequest", "EdgeServerID", "EdgeServerIP", "EdgeSeverRegion", "ParentRequestID",
@@ -794,6 +796,12 @@ func prepareRealCloudProviderPerRunRawSinksAfterGate(
 	if zoneErr != nil {
 		return fmt.Errorf("Cloudflare non-production zone safety gate rejected provider log setup: %w", zoneErr)
 	}
+	if err := preflightRealCloudCloudflareLogpushIsolation(ctx, clients.cloudflare, environment, configuration.Cloudflare); err != nil {
+		return err
+	}
+	if err := preflightRealCloudEdgeOneLogTaskIsolation(ctx, clients.edgeOne, configuration.EdgeOne); err != nil {
+		return err
+	}
 	holder, err := newRealCloudCloudflareBootstrapLeaseHolder()
 	if err != nil {
 		return err
@@ -802,23 +810,25 @@ func prepareRealCloudProviderPerRunRawSinksAfterGate(
 	if err != nil {
 		return err
 	}
-	cfFilter := realCloudCloudflareHostFilter(environment)
+	cfFilter := realCloudCloudflareWorkerFilter(configuration.Cloudflare)
 	cfDestination := realCloudCloudflareDestinationURL(configuration.Cloudflare, runID, cfWriter)
 	if err := heldLease.renew(ctx, time.Now()); err != nil {
 		return err
 	}
 	updated, err := clients.cloudflare.Logpush.Jobs.Update(ctx, configuration.Cloudflare.LogpushJobID, logpush.JobUpdateParams{
-		ZoneID: cloudflareapi.F(configuration.Cloudflare.ZoneID), DestinationConf: cloudflareapi.F(cfDestination), Enabled: cloudflareapi.F(true), Filter: cloudflareapi.F(cfFilter),
+		AccountID: cloudflareapi.F(configuration.Cloudflare.AccountID), DestinationConf: cloudflareapi.F(cfDestination), Enabled: cloudflareapi.F(true), Filter: cloudflareapi.F(cfFilter),
 		OutputOptions: cloudflareapi.F(logpush.OutputOptionsParam{
-			FieldNames: cloudflareapi.F(append([]string(nil), realCloudCloudflareRawFields...)), MergeSubrequests: cloudflareapi.F(false),
-			OutputType: cloudflareapi.F(logpush.OutputOptionsOutputTypeNdjson), SampleRate: cloudflareapi.F(1.0), TimestampFormat: cloudflareapi.F(logpush.OutputOptionsTimestampFormatRfc3339ns),
+			FieldNames: cloudflareapi.F(append([]string(nil), realCloudCloudflareRawFields...)),
+			OutputType: cloudflareapi.F(logpush.OutputOptionsOutputTypeNdjson), SampleRate: cloudflareapi.F(1.0),
 		}),
 	})
 	cfDestination = ""
+	if updated != nil {
+		defer func() { *updated = logpush.LogpushJob{} }()
+	}
 	if err != nil || updated == nil {
 		return errors.New("configure Cloudflare per-run Logpush sink")
 	}
-	*updated = logpush.LogpushJob{}
 	if err := heldLease.renew(ctx, time.Now()); err != nil {
 		return err
 	}
@@ -845,16 +855,18 @@ func prepareRealCloudProviderPerRunRawSinksAfterGate(
 	if err != nil {
 		return errors.New("configure EdgeOne per-run realtime-log sink")
 	}
-	jobs, err := clients.cloudflare.Logpush.Jobs.List(ctx, logpush.JobListParams{ZoneID: cloudflareapi.F(configuration.Cloudflare.ZoneID)})
-	if err != nil || jobs == nil {
-		return errors.New("verify Cloudflare per-run Logpush sink")
+	jobs, err := clients.cloudflare.Logpush.Jobs.List(ctx, logpush.JobListParams{AccountID: cloudflareapi.F(configuration.Cloudflare.AccountID)})
+	if jobs != nil {
+		defer func() {
+			for index := range jobs.Result {
+				jobs.Result[index] = logpush.LogpushJob{}
+			}
+			*jobs = *newCloudflareLogpushPage()
+		}()
 	}
-	defer func() {
-		for index := range jobs.Result {
-			jobs.Result[index] = logpush.LogpushJob{}
-		}
-		*jobs = *newCloudflareLogpushPage()
-	}()
+	if err != nil || jobs == nil {
+		return errors.New("verify Cloudflare per-run Workers Trace Events sink")
+	}
 	configuredJob, err := selectRealCloudCloudflareLogpushJob(jobs.Result, environment, configuration.Cloudflare)
 	if err != nil {
 		return err
@@ -862,13 +874,33 @@ func prepareRealCloudProviderPerRunRawSinksAfterGate(
 	if _, _, err := validateRealCloudCloudflareLogpushJob(&jobs.Result[configuredJob], environment, configuration.Cloudflare); err != nil {
 		return err
 	}
+	zoneJobs, err := clients.cloudflare.Logpush.Jobs.List(ctx, logpush.JobListParams{ZoneID: cloudflareapi.F(configuration.Cloudflare.ZoneID)})
+	if zoneJobs != nil {
+		defer func() {
+			for index := range zoneJobs.Result {
+				zoneJobs.Result[index] = logpush.LogpushJob{}
+			}
+			*zoneJobs = *newCloudflareLogpushPage()
+		}()
+	}
+	if err != nil || zoneJobs == nil {
+		return errors.New("verify Cloudflare zone Logpush isolation")
+	}
+	if err := validateRealCloudCloudflareZoneLogpushJobs(zoneJobs.Result, environment, configuration.Cloudflare); err != nil {
+		return err
+	}
 	taskRequest := teo.NewDescribeRealtimeLogDeliveryTasksRequest()
 	taskRequest.ZoneId = stringPointer(configuration.EdgeOne.ZoneID)
 	taskRequest.Offset = int64Pointer(0)
 	taskRequest.Limit = uint64Pointer(1000)
 	taskResponse, err := clients.edgeOne.DescribeRealtimeLogDeliveryTasksWithContext(ctx, taskRequest)
-	if err != nil || taskResponse == nil || taskResponse.Response == nil || taskResponse.Response.TotalCount == nil ||
-		*taskResponse.Response.TotalCount != 1 || len(taskResponse.Response.RealtimeLogDeliveryTasks) != 1 {
+	if taskResponse != nil && taskResponse.Response != nil {
+		defer clearRealCloudEdgeOneLogTasks(taskResponse.Response.RealtimeLogDeliveryTasks)
+	}
+	if err != nil || taskResponse == nil || taskResponse.Response == nil {
+		return errors.New("verify EdgeOne per-run realtime-log sink")
+	}
+	if taskResponse.Response.TotalCount == nil || *taskResponse.Response.TotalCount != 1 || len(taskResponse.Response.RealtimeLogDeliveryTasks) != 1 {
 		return errors.New("verify EdgeOne per-run realtime-log sink")
 	}
 	if _, _, err := validateRealCloudEdgeOneLogTask(taskResponse.Response.RealtimeLogDeliveryTasks[0], environment, configuration.EdgeOne); err != nil {
@@ -876,6 +908,94 @@ func prepareRealCloudProviderPerRunRawSinksAfterGate(
 	}
 	if err := heldLease.release(ctx); err != nil {
 		return err
+	}
+	return nil
+}
+
+func preflightRealCloudCloudflareLogpushIsolation(
+	ctx context.Context,
+	client *cloudflareapi.Client,
+	environment realCloudEnvironment,
+	configuration realCloudCloudflareAttestationConfig,
+) error {
+	if client == nil {
+		return errors.New("preflight Cloudflare Logpush client is missing")
+	}
+	accountJobs, err := client.Logpush.Jobs.List(ctx, logpush.JobListParams{AccountID: cloudflareapi.F(configuration.AccountID)})
+	if accountJobs != nil {
+		defer func() {
+			for index := range accountJobs.Result {
+				accountJobs.Result[index] = logpush.LogpushJob{}
+			}
+			*accountJobs = *newCloudflareLogpushPage()
+		}()
+	}
+	if err != nil || accountJobs == nil {
+		return errors.New("preflight Cloudflare account Workers Trace Events inventory")
+	}
+	configuredJob, err := selectRealCloudCloudflareLogpushJob(accountJobs.Result, environment, configuration)
+	if err != nil {
+		return fmt.Errorf("preflight Cloudflare account Logpush isolation: %w", err)
+	}
+	if accountJobs.Result[configuredJob].Dataset != logpush.LogpushJobDatasetWorkersTraceEvents {
+		return errors.New("preflight Cloudflare configured Logpush job is not Workers Trace Events")
+	}
+	zoneJobs, err := client.Logpush.Jobs.List(ctx, logpush.JobListParams{ZoneID: cloudflareapi.F(configuration.ZoneID)})
+	if zoneJobs != nil {
+		defer func() {
+			for index := range zoneJobs.Result {
+				zoneJobs.Result[index] = logpush.LogpushJob{}
+			}
+			*zoneJobs = *newCloudflareLogpushPage()
+		}()
+	}
+	if err != nil || zoneJobs == nil {
+		return errors.New("preflight Cloudflare zone Logpush isolation inventory")
+	}
+	if err := validateRealCloudCloudflareZoneLogpushJobs(zoneJobs.Result, environment, configuration); err != nil {
+		return fmt.Errorf("preflight Cloudflare zone Logpush isolation: %w", err)
+	}
+	return nil
+}
+
+func clearRealCloudEdgeOneLogTasks(tasks []*teo.RealtimeLogDeliveryTask) {
+	for _, task := range tasks {
+		if task != nil {
+			if task.S3 != nil && task.S3.AccessKey != nil {
+				*task.S3.AccessKey = ""
+			}
+			*task = teo.RealtimeLogDeliveryTask{}
+		}
+	}
+}
+
+func preflightRealCloudEdgeOneLogTaskIsolation(
+	ctx context.Context,
+	client *teo.Client,
+	configuration realCloudEdgeOneAttestationConfig,
+) error {
+	if client == nil {
+		return errors.New("preflight EdgeOne client is missing")
+	}
+	request := teo.NewDescribeRealtimeLogDeliveryTasksRequest()
+	request.ZoneId = stringPointer(configuration.ZoneID)
+	request.Offset = int64Pointer(0)
+	request.Limit = uint64Pointer(1000)
+	response, err := client.DescribeRealtimeLogDeliveryTasksWithContext(ctx, request)
+	if response != nil && response.Response != nil {
+		defer clearRealCloudEdgeOneLogTasks(response.Response.RealtimeLogDeliveryTasks)
+	}
+	if err != nil || response == nil || response.Response == nil {
+		return errors.New("preflight EdgeOne realtime log task inventory query failed")
+	}
+	if response.Response.TotalCount == nil || *response.Response.TotalCount != 1 || len(response.Response.RealtimeLogDeliveryTasks) != 1 {
+		return errors.New("preflight EdgeOne realtime log task inventory is non-exact")
+	}
+	task := response.Response.RealtimeLogDeliveryTasks[0]
+	if task == nil || stringValue(task.TaskId) != configuration.RealtimeLogTaskID ||
+		strings.ToLower(stringValue(task.TaskType)) != "s3" || stringValue(task.LogType) != "l7-access-logs" ||
+		stringValue(task.Area) != configuration.RealtimeLogArea || !validRealCloudEdgeOneLogArea(configuration.RealtimeLogArea) {
+		return errors.New("preflight EdgeOne realtime log task identity, type, or immutable area differs")
 	}
 	return nil
 }
@@ -1499,7 +1619,9 @@ func collectRealCloudProviderRawAttestationAfterGate(
 		return realCloudProviderRawAttestation{}, errors.New("raw provider export contains forbidden secret or entitlement material")
 	}
 
-	reconstructed, redactedSHA, err := reconstructRealCloudProviderLogs(environment, stages, cfRaw, eoRaw)
+	reconstructed, redactedSHA, err := reconstructRealCloudProviderLogs(
+		environment, configuration.Cloudflare.WorkerScript, cfControl.auth.versionID, stages, cfRaw, eoRaw,
+	)
 	if err != nil {
 		return realCloudProviderRawAttestation{}, err
 	}
@@ -1634,9 +1756,9 @@ func collectRealCloudCloudflareControl(ctx context.Context, environment realClou
 	if err != nil {
 		return result, err
 	}
-	jobs, err := client.Logpush.Jobs.List(ctx, logpush.JobListParams{ZoneID: cloudflareapi.F(configuration.ZoneID)})
+	jobs, err := client.Logpush.Jobs.List(ctx, logpush.JobListParams{AccountID: cloudflareapi.F(configuration.AccountID)})
 	if err != nil || jobs == nil {
-		return result, errors.New("Cloudflare dedicated zone Logpush inventory query failed")
+		return result, errors.New("Cloudflare account Workers Trace Events inventory query failed")
 	}
 	defer func() {
 		for index := range jobs.Result {
@@ -1652,13 +1774,26 @@ func collectRealCloudCloudflareControl(ctx context.Context, environment realClou
 	if err != nil {
 		return result, err
 	}
+	zoneJobs, err := client.Logpush.Jobs.List(ctx, logpush.JobListParams{ZoneID: cloudflareapi.F(configuration.ZoneID)})
+	if err != nil || zoneJobs == nil {
+		return result, errors.New("Cloudflare zone Logpush isolation inventory query failed")
+	}
+	defer func() {
+		for index := range zoneJobs.Result {
+			zoneJobs.Result[index] = logpush.LogpushJob{}
+		}
+		*zoneJobs = *newCloudflareLogpushPage()
+	}()
+	if err := validateRealCloudCloudflareZoneLogpushJobs(zoneJobs.Result, environment, configuration); err != nil {
+		return result, err
+	}
 	result.auth, err = collectRealCloudCloudflareActiveWorker(ctx, client, configuration.AccountID, configuration.WorkerScript,
-		"edge/dist/cloudflare-worker.mjs", "", configuration.WorkerRuntime, true)
+		"edge/dist/cloudflare-worker.mjs", "", configuration.WorkerRuntime, true, true)
 	if err != nil {
 		return result, fmt.Errorf("Cloudflare auth Worker attestation: %w", err)
 	}
 	result.origin, err = collectRealCloudCloudflareActiveWorker(ctx, client, configuration.AccountID, configuration.OriginWorkerScript,
-		"edge/dist/cloudflare-origin-worker.mjs", "", configuration.OriginWorkerRuntime, true)
+		"edge/dist/cloudflare-origin-worker.mjs", "", configuration.OriginWorkerRuntime, false, true)
 	if err != nil {
 		return result, fmt.Errorf("Cloudflare origin Worker attestation: %w", err)
 	}
@@ -1668,7 +1803,7 @@ func collectRealCloudCloudflareControl(ctx context.Context, environment realClou
 	}
 	if verifier.Kind == "provider" {
 		result.verifier, err = collectRealCloudCloudflareActiveWorker(ctx, client, configuration.AccountID, configuration.TokenVerifierService,
-			"", configuration.TokenVerifierContentSHA256, configuration.TokenVerifierRuntime, true)
+			"", configuration.TokenVerifierContentSHA256, configuration.TokenVerifierRuntime, false, true)
 		if err != nil {
 			return result, fmt.Errorf("Cloudflare token verifier Worker attestation: %w", err)
 		}
@@ -1697,13 +1832,13 @@ func collectRealCloudCloudflareControl(ctx context.Context, environment realClou
 	return result, nil
 }
 
-func selectRealCloudCloudflareLogpushJob(jobs []logpush.LogpushJob, environment realCloudEnvironment, configuration realCloudCloudflareAttestationConfig) (int, error) {
+func selectRealCloudCloudflareLogpushJob(jobs []logpush.LogpushJob, _ realCloudEnvironment, configuration realCloudCloudflareAttestationConfig) (int, error) {
 	configuredJob := -1
 	for index := range jobs {
 		job := &jobs[index]
 		if job.ID == configuration.LogpushJobID {
 			if configuredJob >= 0 {
-				return -1, errors.New("Cloudflare shared zone repeats the configured SOW Logpush job")
+				return -1, errors.New("Cloudflare account repeats the configured SOW Workers Trace Events job")
 			}
 			configuredJob = index
 			continue
@@ -1711,17 +1846,34 @@ func selectRealCloudCloudflareLogpushJob(jobs []logpush.LogpushJob, environment 
 		if !job.Enabled {
 			continue
 		}
-		if strings.Contains(job.DestinationConf, configuration.RawBucket) {
+		if realCloudCloudflareLogpushJobMayWriteBucket(job, configuration.RawBucket) {
 			return -1, errors.New("Cloudflare unrelated enabled Logpush job can write the SOW raw bucket")
 		}
-		if job.Dataset == logpush.LogpushJobDatasetHTTPRequests && realCloudCloudflareLogpushJobMayIncludeHosts(job, hostOnly(environment.CFCDNBase), hostOnly(environment.CFBetaCDNBase)) {
-			return -1, errors.New("Cloudflare unrelated enabled HTTP Logpush job can include a reviewed host")
+		if job.Dataset == logpush.LogpushJobDatasetWorkersTraceEvents && realCloudCloudflareLogpushJobMayIncludeScript(job, configuration.WorkerScript) {
+			return -1, errors.New("Cloudflare unrelated enabled Workers Trace Events job can include the reviewed auth Worker")
 		}
 	}
 	if configuredJob < 0 {
-		return -1, errors.New("Cloudflare shared zone omits the configured SOW Logpush job")
+		return -1, errors.New("Cloudflare account omits the configured SOW Workers Trace Events job")
 	}
 	return configuredJob, nil
+}
+
+func validateRealCloudCloudflareZoneLogpushJobs(jobs []logpush.LogpushJob, environment realCloudEnvironment, configuration realCloudCloudflareAttestationConfig) error {
+	for index := range jobs {
+		job := &jobs[index]
+		if !job.Enabled {
+			continue
+		}
+		if realCloudCloudflareLogpushJobMayWriteBucket(job, configuration.RawBucket) {
+			return errors.New("Cloudflare zone Logpush job can write the SOW raw bucket")
+		}
+		if job.Dataset == logpush.LogpushJobDatasetHTTPRequests &&
+			realCloudCloudflareLogpushJobMayIncludeHosts(job, hostOnly(environment.CFCDNBase), hostOnly(environment.CFBetaCDNBase)) {
+			return errors.New("Cloudflare zone HTTP Logpush job can include a reviewed host")
+		}
+	}
+	return nil
 }
 
 // newCloudflareLogpushPage exists so the SDK page, including its private raw
@@ -1736,6 +1888,7 @@ func collectRealCloudCloudflareActiveWorker(
 	client *cloudflareapi.Client,
 	accountID, script, repositoryBundle, expectedSHA string,
 	runtimeContract realCloudCloudflareWorkerRuntimeContract,
+	expectedLogpush bool,
 	attestSecurity bool,
 ) (realCloudCloudflareWorkerEvidence, error) {
 	var result realCloudCloudflareWorkerEvidence
@@ -1790,11 +1943,11 @@ func collectRealCloudCloudflareActiveWorker(
 		if bindingErr != nil {
 			return result, errors.New("active version binding inventory cannot be compared with mutable settings")
 		}
-		securitySHA, err = collectRealCloudCloudflareWorkerSecurityObservation(ctx, client, accountID, script, runtimeContract, expectedBindingsSHA)
+		securitySHA, err = collectRealCloudCloudflareWorkerSecurityObservation(ctx, client, accountID, script, runtimeContract, expectedBindingsSHA, expectedLogpush)
 		if err != nil {
 			return result, err
 		}
-		stableSecuritySHA, stableErr := collectRealCloudCloudflareWorkerSecurityObservation(ctx, client, accountID, script, runtimeContract, expectedBindingsSHA)
+		stableSecuritySHA, stableErr := collectRealCloudCloudflareWorkerSecurityObservation(ctx, client, accountID, script, runtimeContract, expectedBindingsSHA, expectedLogpush)
 		if stableErr != nil || stableSecuritySHA != securitySHA {
 			return result, errors.New("active Worker runtime, trigger, telemetry, or public exposure changed while attested")
 		}
@@ -1950,11 +2103,14 @@ func validRealCloudCloudflareEmptyJSONArray(raw json.RawMessage) bool {
 	return validRealCloudCloudflareJSONArray(raw, func(json.RawMessage) bool { return false })
 }
 
-func validRealCloudCloudflareWorkerSettingsRaw(raw, expectedBindingsSHA string) bool {
+func validRealCloudCloudflareWorkerSettingsRaw(raw, expectedBindingsSHA string, expectedLogpush bool) bool {
 	jsonStringArray := func(value json.RawMessage) bool {
 		return validRealCloudCloudflareJSONArray(value, validRealCloudCloudflareJSONString)
 	}
 	jsonFalse := func(value json.RawMessage) bool { return string(bytes.TrimSpace(value)) == "false" }
+	jsonExpectedLogpush := func(value json.RawMessage) bool {
+		return string(bytes.TrimSpace(value)) == strconv.FormatBool(expectedLogpush)
+	}
 	jsonZero := func(value json.RawMessage) bool { return string(bytes.TrimSpace(value)) == "0" }
 	return validRealCloudCloudflareExactJSONObject([]byte(raw), map[string]func(json.RawMessage) bool{
 		"annotations": func(value json.RawMessage) bool {
@@ -1982,7 +2138,7 @@ func validRealCloudCloudflareWorkerSettingsRaw(raw, expectedBindingsSHA string) 
 				"subrequests": jsonZero,
 			})
 		},
-		"logpush": jsonFalse,
+		"logpush": jsonExpectedLogpush,
 		"observability": func(value json.RawMessage) bool {
 			return validRealCloudCloudflareExactJSONObject(value, map[string]func(json.RawMessage) bool{
 				"enabled":            jsonFalse,
@@ -2124,6 +2280,7 @@ func collectRealCloudCloudflareWorkerSecurityObservation(
 	accountID, script string,
 	runtimeContract realCloudCloudflareWorkerRuntimeContract,
 	expectedBindingsSHA string,
+	expectedLogpush bool,
 ) (string, error) {
 	settings, err := client.Workers.Scripts.ScriptAndVersionSettings.Get(ctx, script, workers.ScriptScriptAndVersionSettingGetParams{
 		AccountID: cloudflareapi.F(accountID),
@@ -2131,7 +2288,7 @@ func collectRealCloudCloudflareWorkerSecurityObservation(
 	if err != nil || settings == nil {
 		return "", errors.New("Cloudflare Worker settings query failed")
 	}
-	if !validRealCloudCloudflareWorkerSettingsRaw(settings.JSON.RawJSON(), expectedBindingsSHA) ||
+	if !validRealCloudCloudflareWorkerSettingsRaw(settings.JSON.RawJSON(), expectedBindingsSHA, expectedLogpush) ||
 		settings.JSON.CompatibilityDate.IsMissing() || settings.JSON.CompatibilityFlags.IsMissing() || settings.JSON.CacheOptions.IsMissing() ||
 		settings.JSON.Limits.IsMissing() || settings.JSON.Logpush.IsMissing() || settings.JSON.Observability.IsMissing() ||
 		settings.JSON.Placement.IsMissing() || settings.JSON.Tags.IsMissing() || settings.JSON.TailConsumers.IsMissing() || settings.JSON.UsageModel.IsMissing() ||
@@ -2141,7 +2298,7 @@ func collectRealCloudCloudflareWorkerSecurityObservation(
 		return "", errors.New("Cloudflare Worker settings response is incomplete or contains unreviewed fields")
 	}
 	if settings.CompatibilityDate != runtimeContract.CompatibilityDate || !equalRealCloudStrings(settings.CompatibilityFlags, runtimeContract.CompatibilityFlags) ||
-		settings.Logpush || settings.CacheOptions.Enabled || settings.CacheOptions.CrossVersionCache ||
+		settings.Logpush != expectedLogpush || settings.CacheOptions.Enabled || settings.CacheOptions.CrossVersionCache ||
 		settings.Limits.CPUMs != 0 || settings.Limits.Subrequests != 0 ||
 		settings.Placement.Mode != "" || settings.Placement.Host != "" || settings.Placement.Hostname != "" || settings.Placement.Region != "" || settings.Placement.Target != nil ||
 		settings.UsageModel != workers.ScriptScriptAndVersionSettingGetResponseUsageModelStandard ||
@@ -2169,8 +2326,9 @@ func collectRealCloudCloudflareWorkerSecurityObservation(
 		CompatibilityDate  string   `json:"compatibility_date"`
 		CompatibilityFlags []string `json:"compatibility_flags"`
 		UsageModel         string   `json:"usage_model"`
+		Logpush            bool     `json:"logpush"`
 		Closed             bool     `json:"closed"`
-	}{script, settings.CompatibilityDate, append([]string(nil), settings.CompatibilityFlags...), string(settings.UsageModel), true})
+	}{script, settings.CompatibilityDate, append([]string(nil), settings.CompatibilityFlags...), string(settings.UsageModel), settings.Logpush, true})
 	return realCloudLowerSHA256(body), nil
 }
 
@@ -2730,6 +2888,14 @@ func realCloudCloudflareHostFilter(environment realCloudEnvironment) string {
 	return string(body)
 }
 
+func realCloudCloudflareWorkerFilter(configuration realCloudCloudflareAttestationConfig) string {
+	body, _ := json.Marshal(map[string]any{"where": map[string]any{"and": []map[string]string{
+		{"key": "ScriptName", "operator": "eq", "value": configuration.WorkerScript},
+		{"key": "Outcome", "operator": "eq", "value": "ok"},
+	}}})
+	return string(body)
+}
+
 type realCloudFilterTruth uint8
 
 const (
@@ -2756,10 +2922,55 @@ func realCloudCloudflareLogpushJobMayIncludeHosts(job *logpush.LogpushJob, hosts
 	return false
 }
 
+func realCloudCloudflareLogpushJobMayIncludeScript(job *logpush.LogpushJob, script string) bool {
+	if job == nil {
+		return true
+	}
+	var raw struct {
+		Filter string `json:"filter"`
+	}
+	if err := json.Unmarshal([]byte(job.JSON.RawJSON()), &raw); err != nil || raw.Filter == "" {
+		return true
+	}
+	return realCloudCloudflareFilterMayIncludeScript(raw.Filter, script)
+}
+
+func realCloudCloudflareLogpushJobMayWriteBucket(job *logpush.LogpushJob, bucket string) bool {
+	if job == nil || !validDedicatedRealCloudBucket(bucket) {
+		return true
+	}
+	raw := strings.TrimSpace(job.DestinationConf)
+	parsed, err := url.Parse(raw)
+	if err != nil || raw == "" || parsed.Scheme == "" || parsed.Host == "" {
+		return true
+	}
+	if strings.EqualFold(parsed.Hostname(), bucket) {
+		return true
+	}
+	decodedPath, err := url.PathUnescape(parsed.EscapedPath())
+	if err != nil {
+		return true
+	}
+	wanted := strings.ToLower(bucket)
+	return strings.Contains(strings.ToLower(decodedPath), wanted) ||
+		strings.Contains(strings.ToLower(parsed.RawQuery), wanted)
+}
+
 func realCloudCloudflareFilterMayIncludeHost(raw, host string) bool {
 	if raw == "" || raw != strings.TrimSpace(raw) || host == "" || host != strings.ToLower(host) {
 		return true
 	}
+	return realCloudCloudflareFilterMayIncludeValue(raw, "ClientRequestHost", host, true)
+}
+
+func realCloudCloudflareFilterMayIncludeScript(raw, script string) bool {
+	if raw == "" || raw != strings.TrimSpace(raw) || !validRealCloudProviderIdentifier(script, 128) {
+		return true
+	}
+	return realCloudCloudflareFilterMayIncludeValue(raw, "ScriptName", script, false)
+}
+
+func realCloudCloudflareFilterMayIncludeValue(raw, field, wanted string, fold bool) bool {
 	var expression any
 	decoder := json.NewDecoder(strings.NewReader(raw))
 	decoder.UseNumber()
@@ -2770,16 +2981,16 @@ func realCloudCloudflareFilterMayIncludeHost(raw, host string) bool {
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return true
 	}
-	return evaluateRealCloudCloudflareHostFilter(expression, host) != realCloudFilterFalse
+	return evaluateRealCloudCloudflareExactFilter(expression, field, wanted, fold) != realCloudFilterFalse
 }
 
-func evaluateRealCloudCloudflareHostFilter(value any, host string) realCloudFilterTruth {
+func evaluateRealCloudCloudflareExactFilter(value any, field, wanted string, fold bool) realCloudFilterTruth {
 	object, ok := value.(map[string]any)
 	if !ok || len(object) == 0 {
 		return realCloudFilterUnknown
 	}
 	if where, found := object["where"]; found && len(object) == 1 {
-		return evaluateRealCloudCloudflareHostFilter(where, host)
+		return evaluateRealCloudCloudflareExactFilter(where, field, wanted, fold)
 	}
 	for _, operator := range []string{"and", "or"} {
 		raw, found := object[operator]
@@ -2793,7 +3004,7 @@ func evaluateRealCloudCloudflareHostFilter(value any, host string) realCloudFilt
 		if operator == "and" {
 			result := realCloudFilterTrue
 			for _, item := range items {
-				current := evaluateRealCloudCloudflareHostFilter(item, host)
+				current := evaluateRealCloudCloudflareExactFilter(item, field, wanted, fold)
 				if current == realCloudFilterFalse {
 					return realCloudFilterFalse
 				}
@@ -2805,7 +3016,7 @@ func evaluateRealCloudCloudflareHostFilter(value any, host string) realCloudFilt
 		}
 		result := realCloudFilterFalse
 		for _, item := range items {
-			current := evaluateRealCloudCloudflareHostFilter(item, host)
+			current := evaluateRealCloudCloudflareExactFilter(item, field, wanted, fold)
 			if current == realCloudFilterTrue {
 				return realCloudFilterTrue
 			}
@@ -2818,17 +3029,21 @@ func evaluateRealCloudCloudflareHostFilter(value any, host string) realCloudFilt
 	key, keyOK := object["key"].(string)
 	operator, operatorOK := object["operator"].(string)
 	operand, operandOK := object["value"].(string)
-	if len(object) != 3 || !keyOK || !operatorOK || !operandOK || key != "ClientRequestHost" {
+	if len(object) != 3 || !keyOK || !operatorOK || !operandOK || key != field {
 		return realCloudFilterUnknown
+	}
+	equal := operand == wanted
+	if fold {
+		equal = strings.EqualFold(operand, wanted)
 	}
 	switch operator {
 	case "eq":
-		if strings.EqualFold(operand, host) {
+		if equal {
 			return realCloudFilterTrue
 		}
 		return realCloudFilterFalse
-	case "neq":
-		if strings.EqualFold(operand, host) {
+	case "!eq":
+		if equal {
 			return realCloudFilterFalse
 		}
 		return realCloudFilterTrue
@@ -2845,6 +3060,8 @@ func TestRealCloudCloudflareLogpushHostOverlapIsConservative(t *testing.T) {
 	}{
 		{`{"where":{"key":"ClientRequestHost","operator":"eq","value":"other.pigsty.io"}}`, false},
 		{`{"where":{"key":"ClientRequestHost","operator":"eq","value":"pro.pigsty.io"}}`, true},
+		{`{"where":{"key":"ClientRequestHost","operator":"!eq","value":"pro.pigsty.io"}}`, false},
+		{`{"where":{"key":"ClientRequestHost","operator":"!eq","value":"other.pigsty.io"}}`, true},
 		{`{"where":{"or":[{"key":"ClientRequestHost","operator":"eq","value":"other.pigsty.io"},{"key":"ClientRequestHost","operator":"eq","value":"pro.pigsty.io"}]}}`, true},
 		{`{"where":{"and":[{"key":"ClientRequestHost","operator":"eq","value":"other.pigsty.io"},{"key":"EdgeResponseStatus","operator":"eq","value":"200"}]}}`, false},
 		{`{"where":{"and":[{"key":"ClientRequestHost","operator":"eq","value":"pro.pigsty.io"},{"key":"EdgeResponseStatus","operator":"eq","value":"200"}]}}`, true},
@@ -2853,6 +3070,47 @@ func TestRealCloudCloudflareLogpushHostOverlapIsConservative(t *testing.T) {
 	} {
 		if got := realCloudCloudflareFilterMayIncludeHost(test.filter, host); got != test.match {
 			t.Fatalf("filter %q overlap=%t want=%t", test.filter, got, test.match)
+		}
+	}
+}
+
+func TestRealCloudCloudflareWorkersTraceFilterOverlapIsConservative(t *testing.T) {
+	script := "sow-pro-auth-v86"
+	for _, test := range []struct {
+		filter string
+		match  bool
+	}{
+		{`{"where":{"key":"ScriptName","operator":"eq","value":"other-worker"}}`, false},
+		{`{"where":{"key":"ScriptName","operator":"eq","value":"sow-pro-auth-v86"}}`, true},
+		{`{"where":{"key":"ScriptName","operator":"!eq","value":"sow-pro-auth-v86"}}`, false},
+		{`{"where":{"key":"ScriptName","operator":"!eq","value":"other-worker"}}`, true},
+		{`{"where":{"or":[{"key":"ScriptName","operator":"eq","value":"other-worker"},{"key":"ScriptName","operator":"eq","value":"sow-pro-auth-v86"}]}}`, true},
+		{`{"where":{"and":[{"key":"ScriptName","operator":"eq","value":"other-worker"},{"key":"Outcome","operator":"eq","value":"ok"}]}}`, false},
+		{`{"where":{"key":"ScriptName","operator":"contains","value":"sow-pro"}}`, true},
+		{`not-json`, true},
+	} {
+		if got := realCloudCloudflareFilterMayIncludeScript(test.filter, script); got != test.match {
+			t.Fatalf("filter %q overlap=%t want=%t", test.filter, got, test.match)
+		}
+	}
+}
+
+func TestRealCloudCloudflareLogpushBucketOverlapIsConservative(t *testing.T) {
+	bucket := "sow-test-cf-provider-logs"
+	for _, test := range []struct {
+		destination string
+		match       bool
+	}{
+		{"r2://sow-test-cf-provider-logs/raw?account-id=test", true},
+		{"r2://SOW-TEST-CF-PROVIDER-LOGS/raw?account-id=test", true},
+		{"s3://other-bucket/sow-test-cf-provider-logs/raw", true},
+		{"https://logs.example.invalid/sink?bucket=sow-test-cf-provider-logs", true},
+		{"https://logs.example.invalid/unrelated", false},
+		{"not a destination", true},
+	} {
+		job := &logpush.LogpushJob{DestinationConf: test.destination}
+		if got := realCloudCloudflareLogpushJobMayWriteBucket(job, bucket); got != test.match {
+			t.Fatalf("destination %q overlap=%t want=%t", test.destination, got, test.match)
 		}
 	}
 }
@@ -2866,24 +3124,23 @@ func realCloudCloudflareDestinationURL(configuration realCloudCloudflareAttestat
 
 func validateRealCloudCloudflareLogpushJob(job *logpush.LogpushJob, environment realCloudEnvironment, configuration realCloudCloudflareAttestationConfig) (string, string, error) {
 	defer func() { *job = logpush.LogpushJob{} }()
-	wantedFilterBody := []byte(realCloudCloudflareHostFilter(environment))
+	wantedFilterBody := []byte(realCloudCloudflareWorkerFilter(configuration))
 	var rawJob struct {
 		Filter string `json:"filter"`
 	}
 	if err := json.Unmarshal([]byte(job.JSON.RawJSON()), &rawJob); err != nil || rawJob.Filter != string(wantedFilterBody) {
-		return "", "", errors.New("Cloudflare Logpush job lacks the exact main-and-beta host filter")
+		return "", "", errors.New("Cloudflare Logpush job lacks the exact auth Worker filter")
 	}
 	//lint:ignore SA1019 LogpullOptions remains part of the pinned provider wire closure and must be asserted empty.
 	logpullOptions := job.LogpullOptions
-	if job.ID != configuration.LogpushJobID || job.Dataset != logpush.LogpushJobDatasetHTTPRequests || !job.Enabled || strings.TrimSpace(job.ErrorMessage) != "" ||
+	if job.ID != configuration.LogpushJobID || job.Dataset != logpush.LogpushJobDatasetWorkersTraceEvents || !job.Enabled || strings.TrimSpace(job.ErrorMessage) != "" ||
 		job.OutputOptions.OutputType != logpush.OutputOptionsOutputTypeNdjson || job.OutputOptions.MergeSubrequests ||
 		job.OutputOptions.SampleRate != 1 || logpullOptions != "" ||
 		job.OutputOptions.BatchPrefix != "" || job.OutputOptions.BatchSuffix != "" || job.OutputOptions.Cve2021_44228 ||
 		job.OutputOptions.FieldDelimiter != "" || job.OutputOptions.RecordDelimiter != "" || job.OutputOptions.RecordPrefix != "" ||
-		job.OutputOptions.RecordSuffix != "" || job.OutputOptions.RecordTemplate != "" ||
-		job.OutputOptions.TimestampFormat != logpush.OutputOptionsTimestampFormatRfc3339 && job.OutputOptions.TimestampFormat != logpush.OutputOptionsTimestampFormatRfc3339ns ||
+		job.OutputOptions.RecordSuffix != "" || job.OutputOptions.RecordTemplate != "" || job.OutputOptions.TimestampFormat != "" ||
 		!sameRealCloudProviderStringSet(job.OutputOptions.FieldNames, realCloudCloudflareRawFields) {
-		return "", "", errors.New("Cloudflare Logpush job is not the enabled full-sample uncustomized http_requests raw NDJSON contract")
+		return "", "", errors.New("Cloudflare Logpush job is not the enabled full-sample Workers Trace Events raw NDJSON contract")
 	}
 	sinkPrefix := realCloudProviderRunSinkPrefix(configuration.RawRoot, strings.TrimSpace(os.Getenv(realCloudRunIDEnv)))
 	destination, err := realCloudCloudflareDestination(job.DestinationConf)
@@ -3014,19 +3271,12 @@ func collectRealCloudEdgeOneControl(ctx context.Context, environment realCloudEn
 	taskRequest.Offset = int64Pointer(0)
 	taskRequest.Limit = uint64Pointer(1000)
 	taskResponse, err := client.DescribeRealtimeLogDeliveryTasksWithContext(ctx, taskRequest)
+	if taskResponse != nil && taskResponse.Response != nil {
+		defer clearRealCloudEdgeOneLogTasks(taskResponse.Response.RealtimeLogDeliveryTasks)
+	}
 	if err != nil || taskResponse == nil || taskResponse.Response == nil {
 		return result, errors.New("EdgeOne realtime log delivery task query failed")
 	}
-	defer func() {
-		for _, task := range taskResponse.Response.RealtimeLogDeliveryTasks {
-			if task != nil {
-				if task.S3 != nil && task.S3.AccessKey != nil {
-					*task.S3.AccessKey = ""
-				}
-				*task = teo.RealtimeLogDeliveryTask{}
-			}
-		}
-	}()
 	if taskResponse.Response.TotalCount == nil || *taskResponse.Response.TotalCount != 1 || len(taskResponse.Response.RealtimeLogDeliveryTasks) != 1 {
 		return result, errors.New("EdgeOne realtime log delivery task query failed or was non-exact")
 	}
@@ -3567,16 +3817,23 @@ func decodeRealCloudProviderRawBytes(raw []byte) ([]byte, error) {
 
 type realCloudExpectedProviderRecord struct {
 	phase, vendor, parent, transaction, cleanSHA, bodySHA string
+	region, cacheStatus                                   string
 	generation                                            uint64
+	cacheAge, cacheMaxAge                                 int64
 	started, observed                                     time.Time
 }
 
-func reconstructRealCloudProviderLogs(environment realCloudEnvironment, stages []realEdgeMultiPoPStageEvidence, cfRaw, teoRaw []byte) ([]realEdgeProviderLog, string, error) {
+func reconstructRealCloudProviderLogs(
+	environment realCloudEnvironment,
+	cloudflareScript, cloudflareVersion string,
+	stages []realEdgeMultiPoPStageEvidence,
+	cfRaw, teoRaw []byte,
+) ([]realEdgeProviderLog, string, error) {
 	expected, err := expectedRealCloudProviderRecords(stages)
 	if err != nil {
 		return nil, "", err
 	}
-	cfLogs, cfRedacted, err := decodeRealCloudCloudflareRawLogs(cfRaw, environment.CFCDNBase, expected["cloudflare"])
+	cfLogs, cfRedacted, err := decodeRealCloudCloudflareRawLogs(cfRaw, cloudflareScript, cloudflareVersion, expected["cloudflare"])
 	if err != nil {
 		return nil, "", err
 	}
@@ -3610,6 +3867,8 @@ func expectedRealCloudProviderRecords(stages []realEdgeMultiPoPStageEvidence) (m
 			result[vendor][observation.RequestID] = realCloudExpectedProviderRecord{
 				phase: phase, vendor: vendor, parent: observation.RequestID, transaction: transaction,
 				cleanSHA: cleanSHA, bodySHA: bodySHA, generation: generation,
+				region: observation.CloudflareColo, cacheStatus: observation.CacheStatus,
+				cacheAge: observation.CacheAgeSeconds, cacheMaxAge: observation.CacheMaxAge,
 				started: observation.RequestStarted, observed: observation.ResponseObserved,
 			}
 		}
@@ -3633,52 +3892,281 @@ func expectedRealCloudProviderRecords(stages []realEdgeMultiPoPStageEvidence) (m
 }
 
 type realCloudCloudflareRawLog struct {
-	CacheCacheStatus   string          `json:"CacheCacheStatus"`
-	ClientRequestURI   string          `json:"ClientRequestURI"`
-	EdgeColoCode       string          `json:"EdgeColoCode"`
-	EdgeColoID         json.Number     `json:"EdgeColoID"`
-	EdgeStartTimestamp json.RawMessage `json:"EdgeStartTimestamp"`
-	ParentRayID        string          `json:"ParentRayID"`
-	RayID              string          `json:"RayID"`
+	EventTimestampMs json.Number     `json:"EventTimestampMs"`
+	Logs             json.RawMessage `json:"Logs"`
+	Outcome          string          `json:"Outcome"`
+	ScriptName       string          `json:"ScriptName"`
+	ScriptVersion    json.RawMessage `json:"ScriptVersion"`
 }
 
-func decodeRealCloudCloudflareRawLogs(raw []byte, baseURL string, expected map[string]realCloudExpectedProviderRecord) ([]realEdgeProviderLog, []string, error) {
-	return decodeRealCloudProviderJSONL(raw, len(realCloudCloudflareRawFields), func(line []byte) (realEdgeProviderLog, string, error) {
+type realCloudCloudflareRawScriptVersion struct {
+	ID      string `json:"id"`
+	Message string `json:"message"`
+	Tag     string `json:"tag"`
+}
+
+type realCloudCloudflareRawConsoleLog struct {
+	Level       string          `json:"Level"`
+	Message     json.RawMessage `json:"Message"`
+	TimestampMs json.Number     `json:"TimestampMs"`
+}
+
+type realCloudCloudflareProviderEvent struct {
+	Schema             string `json:"schema"`
+	ProbeID            string `json:"probe_id"`
+	RequestID          string `json:"request_id"`
+	ProviderRequestID  string `json:"provider_request_id"`
+	Colo               string `json:"colo"`
+	CleanURLSHA256     string `json:"clean_url_sha256"`
+	CacheStatus        string `json:"cache_status"`
+	CacheAgeSeconds    int64  `json:"cache_age_seconds"`
+	CacheMaxAgeSeconds int64  `json:"cache_max_age_seconds"`
+	Status             int64  `json:"status"`
+}
+
+func decodeRealCloudCloudflareRawLogs(
+	raw []byte,
+	expectedScript, expectedVersion string,
+	expected map[string]realCloudExpectedProviderRecord,
+) ([]realEdgeProviderLog, []string, error) {
+	if !validRealCloudProviderIdentifier(expectedScript, 128) || !validRealCloudProviderIdentifier(expectedVersion, 128) {
+		return nil, nil, errors.New("Cloudflare active Worker identity is invalid")
+	}
+	expectedRunID := strings.TrimSpace(os.Getenv(realCloudRunIDEnv))
+	if !validRealCloudRunID(expectedRunID) {
+		return nil, nil, errors.New("Cloudflare provider probe run identity is invalid")
+	}
+	return decodeRealCloudProviderJSONLFiltered(raw, len(realCloudCloudflareRawFields), func(line []byte) (realEdgeProviderLog, string, bool, error) {
+		if !validRealCloudCloudflareExactJSONObject(line, map[string]func(json.RawMessage) bool{
+			"EventTimestampMs": validRealCloudCloudflareJSONInteger,
+			"Logs":             func(value json.RawMessage) bool { return validRealCloudCloudflareJSONArray(value, nil) },
+			"Outcome":          validRealCloudCloudflareJSONString,
+			"ScriptName":       validRealCloudCloudflareJSONString,
+			"ScriptVersion": func(value json.RawMessage) bool {
+				return len(bytes.TrimSpace(value)) > 0 && bytes.TrimSpace(value)[0] == '{'
+			},
+		}) {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare raw export contains an invalid field type or shape")
+		}
 		var record realCloudCloudflareRawLog
 		if err := decodeRealCloudProviderExactObject(line, len(realCloudCloudflareRawFields), &record); err != nil {
-			return realEdgeProviderLog{}, "", err
+			return realEdgeProviderLog{}, "", false, err
 		}
-		wanted, exists := expected[record.ParentRayID]
-		if !exists {
-			return realEdgeProviderLog{}, "", errors.New("Cloudflare raw export contains an extra or unknown parent request")
+		if record.Outcome != "ok" || record.ScriptName != expectedScript {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare raw export has the wrong outcome or auth Worker")
 		}
-		if record.ClientRequestURI != realCloudProviderCleanPath() {
-			return realEdgeProviderLog{}, "", errors.New("Cloudflare raw export contains a token-bearing, queried, or unexpected URL")
-		}
-		cleanSHA, err := realCloudProviderCleanURLSHA(baseURL, record.ClientRequestURI)
-		if err != nil || cleanSHA != wanted.cleanSHA {
-			return realEdgeProviderLog{}, "", errors.New("Cloudflare raw clean URL does not match active evidence")
-		}
-		timestamp, err := parseRealCloudProviderTimestamp(record.EdgeStartTimestamp)
+		eventTimestamp, err := parseRealCloudProviderMillisecondTimestamp(record.EventTimestampMs)
 		if err != nil {
-			return realEdgeProviderLog{}, "", errors.New("Cloudflare raw timestamp is invalid")
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare raw event timestamp is invalid")
 		}
-		nodeID, err := record.EdgeColoID.Int64()
-		if err != nil || nodeID <= 0 {
-			return realEdgeProviderLog{}, "", errors.New("Cloudflare raw edge colo ID is invalid")
+		var version realCloudCloudflareRawScriptVersion
+		if !validRealCloudCloudflareRawScriptVersion(record.ScriptVersion) ||
+			decodeRealCloudProviderExactObject(record.ScriptVersion, 3, &version) != nil ||
+			version.ID != expectedVersion || !validRealCloudCloudflareOptionalMetadata(version.Message, 1000) ||
+			!validRealCloudCloudflareOptionalMetadata(version.Tag, 100) {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare raw export does not bind the active Worker version")
+		}
+		var consoleLog realCloudCloudflareRawConsoleLog
+		logCount, err := decodeRealCloudProviderBoundedJSONArray(record.Logs, 1, func(_ int, item json.RawMessage) error {
+			if !validRealCloudCloudflareExactJSONObject(item, map[string]func(json.RawMessage) bool{
+				"Level": validRealCloudCloudflareJSONString,
+				"Message": func(value json.RawMessage) bool {
+					return validRealCloudCloudflareJSONArray(value, validRealCloudCloudflareJSONString)
+				},
+				"TimestampMs": validRealCloudCloudflareJSONInteger,
+			}) {
+				return errors.New("Cloudflare console log has an invalid field type or shape")
+			}
+			return decodeRealCloudProviderExactObject(item, 3, &consoleLog)
+		})
+		if err != nil {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare raw export contains an invalid console-log envelope")
+		}
+		if logCount == 0 {
+			return realEdgeProviderLog{}, "", false, nil
+		}
+		if consoleLog.Level != "log" {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare raw export does not contain exactly one reviewed console log")
+		}
+		logTimestamp, err := parseRealCloudProviderMillisecondTimestamp(consoleLog.TimestampMs)
+		if err != nil || logTimestamp.Before(eventTimestamp.Add(-time.Second)) || logTimestamp.After(eventTimestamp.Add(realEdgeProviderClockSkew)) {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare console log timestamp is invalid or detached from its event")
+		}
+		var message string
+		if err := decodeRealCloudProviderExactJSONArray(consoleLog.Message, 1, func(_ int, item json.RawMessage) error {
+			decoder := json.NewDecoder(bytes.NewReader(item))
+			if err := decoder.Decode(&message); err != nil || requireRealEdgeJSONEOF(decoder) != nil {
+				return errors.New("Cloudflare console message is not one JSON string")
+			}
+			return nil
+		}); err != nil || len(message) == 0 || len(message) > 4096 || containsRealEdgeURLLeak([]byte(message)) {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare console log contains an invalid or URL-bearing message")
+		}
+		var event realCloudCloudflareProviderEvent
+		if !validRealCloudCloudflareExactJSONObject([]byte(message), map[string]func(json.RawMessage) bool{
+			"schema":                validRealCloudCloudflareJSONString,
+			"probe_id":              validRealCloudCloudflareJSONString,
+			"request_id":            validRealCloudCloudflareJSONString,
+			"provider_request_id":   validRealCloudCloudflareJSONString,
+			"colo":                  validRealCloudCloudflareJSONString,
+			"clean_url_sha256":      validRealCloudCloudflareJSONString,
+			"cache_status":          validRealCloudCloudflareJSONString,
+			"cache_age_seconds":     validRealCloudCloudflareJSONInteger,
+			"cache_max_age_seconds": validRealCloudCloudflareJSONInteger,
+			"status":                validRealCloudCloudflareJSONInteger,
+		}) {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare Worker event contains an invalid field type or shape")
+		}
+		if err := decodeRealCloudProviderExactObject([]byte(message), 10, &event); err != nil {
+			return realEdgeProviderLog{}, "", false, err
+		}
+		if event.Schema != "sow-cloudflare-edge-provider-log/v1" ||
+			!validRealCloudRunID(event.ProbeID) ||
+			!validRealCloudCloudflareRayBase(event.RequestID) || event.ProviderRequestID != "trace-"+event.RequestID ||
+			!validRealCloudCloudflareColo(event.Colo) || !validRealCloudLowerSHA256(event.CleanURLSHA256) ||
+			event.Status != http.StatusOK || !validRealCloudCloudflareCacheFreshness(event.CacheStatus, event.CacheAgeSeconds, event.CacheMaxAgeSeconds) {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare Worker event has an invalid probe, request, clean-cache, or PoP shape")
+		}
+		if event.ProbeID != expectedRunID {
+			return realEdgeProviderLog{}, "", false, nil
+		}
+		wanted, exists := expected[event.RequestID]
+		if !exists {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare raw export contains an extra or unknown current-run parent request")
+		}
+		if event.Colo != wanted.region || event.CleanURLSHA256 != wanted.cleanSHA || event.CacheStatus != wanted.cacheStatus ||
+			event.CacheAgeSeconds != wanted.cacheAge || event.CacheMaxAgeSeconds != wanted.cacheMaxAge {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare Worker event does not match the active request, clean-cache, or PoP evidence")
 		}
 		normalized := realEdgeProviderLog{
-			Schema: "sow-real-edge-provider-joined/v3", RunID: strings.TrimSpace(os.Getenv(realCloudRunIDEnv)), ProbePhase: wanted.phase, Vendor: "cloudflare",
-			RequestID: record.RayID, ParentRequestID: record.ParentRayID, NodeID: strconv.FormatInt(nodeID, 10), Region: strings.ToUpper(record.EdgeColoCode),
-			CacheStatus: strings.ToUpper(record.CacheCacheStatus), CleanURLSHA256: wanted.cleanSHA, BodySHA256: wanted.bodySHA,
-			Generation: wanted.generation, TransactionID: wanted.transaction, ObservedAt: timestamp.Format(time.RFC3339Nano), observedTime: timestamp,
+			Schema: "sow-real-edge-provider-joined/v3", RunID: expectedRunID, ProbePhase: wanted.phase, Vendor: "cloudflare",
+			RequestID: event.ProviderRequestID, ParentRequestID: event.RequestID, NodeID: event.Colo, Region: event.Colo,
+			CacheStatus: event.CacheStatus, CleanURLSHA256: wanted.cleanSHA, BodySHA256: wanted.bodySHA,
+			Generation: wanted.generation, TransactionID: wanted.transaction,
+			ObservedAt: eventTimestamp.Format(time.RFC3339Nano), observedTime: eventTimestamp,
 		}
-		if timestamp.Before(wanted.started.Add(-realEdgeProviderClockSkew)) || timestamp.After(wanted.observed.Add(realEdgeProviderExportLag)) || validateRealEdgeProviderLogShape(normalized) != nil {
-			return realEdgeProviderLog{}, "", errors.New("Cloudflare raw log does not fit the active request window or joined-v3 shape")
+		if eventTimestamp.Before(wanted.started.Add(-realEdgeProviderClockSkew)) || eventTimestamp.After(wanted.observed.Add(realEdgeProviderExportLag)) || validateRealEdgeProviderLogShape(normalized) != nil {
+			return realEdgeProviderLog{}, "", false, errors.New("Cloudflare raw log does not fit the active request window or joined-v3 shape")
 		}
-		delete(expected, record.ParentRayID)
-		return normalized, strings.Join([]string{"cloudflare", normalized.RequestID, normalized.ParentRequestID, normalized.CleanURLSHA256}, "\x00"), nil
+		delete(expected, event.RequestID)
+		return normalized, strings.Join([]string{
+			"cloudflare", expectedScript, expectedVersion, normalized.RequestID, normalized.ParentRequestID, normalized.CleanURLSHA256,
+		}, "\x00"), true, nil
 	})
+}
+
+func validRealCloudCloudflareJSONInteger(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	value, err := strconv.ParseInt(string(trimmed), 10, 64)
+	return err == nil && strconv.FormatInt(value, 10) == string(trimmed)
+}
+
+func validRealCloudCloudflareRawScriptVersion(raw json.RawMessage) bool {
+	return validRealCloudCloudflareExactJSONObject(raw, map[string]func(json.RawMessage) bool{
+		"id":      validRealCloudCloudflareJSONString,
+		"message": validRealCloudCloudflareJSONString,
+		"tag":     validRealCloudCloudflareJSONString,
+	})
+}
+
+func decodeRealCloudProviderExactJSONArray(raw []byte, expectedCount int, decode func(int, json.RawMessage) error) error {
+	count, err := decodeRealCloudProviderBoundedJSONArray(raw, expectedCount, decode)
+	if err != nil {
+		return err
+	}
+	if count != expectedCount {
+		return errors.New("raw provider record has missing or unknown fields")
+	}
+	return nil
+}
+
+func decodeRealCloudProviderBoundedJSONArray(raw []byte, maximum int, decode func(int, json.RawMessage) error) (int, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('[') {
+		return 0, errors.New("raw provider record has missing or unknown fields")
+	}
+	count := 0
+	for decoder.More() {
+		var item json.RawMessage
+		if err := decoder.Decode(&item); err != nil || decode == nil || count >= maximum {
+			return 0, errors.New("raw provider record has missing or unknown fields")
+		}
+		if err := decode(count, item); err != nil {
+			return 0, err
+		}
+		count++
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim(']') {
+		return 0, errors.New("raw provider record has missing or unknown fields")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return 0, errors.New("raw provider record contains trailing data")
+	}
+	return count, nil
+}
+
+func parseRealCloudProviderMillisecondTimestamp(raw json.Number) (time.Time, error) {
+	value, err := raw.Int64()
+	if err != nil || value <= 0 {
+		return time.Time{}, errors.New("timestamp is not a positive integer")
+	}
+	parsed := time.UnixMilli(value).UTC()
+	if parsed.Year() < 2020 || parsed.Year() > 2200 {
+		return time.Time{}, errors.New("timestamp is outside the supported range")
+	}
+	return parsed, nil
+}
+
+func validRealCloudCloudflareRayBase(value string) bool {
+	if len(value) < 16 || len(value) > 32 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' && character < 'a' || character > 'f' {
+			return false
+		}
+	}
+	return true
+}
+
+func validRealCloudCloudflareColo(value string) bool {
+	if len(value) != 3 {
+		return false
+	}
+	for _, character := range value {
+		if character < 'A' || character > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+func validRealCloudCloudflareOptionalMetadata(value string, maximum int) bool {
+	if len(value) > maximum || !utf8.ValidString(value) || strings.TrimSpace(value) != value || containsRealEdgeURLLeak([]byte(value)) {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func validRealCloudCloudflareCacheFreshness(status string, age, maxAge int64) bool {
+	switch status {
+	case "HIT", "MISS", "EXPIRED", "STALE", "UPDATING", "REVALIDATED":
+	default:
+		return false
+	}
+	if age == -1 && maxAge == -1 {
+		return true
+	}
+	return age >= 0 && maxAge > age && maxAge <= 315360000
 }
 
 type realCloudEdgeOneRawLog struct {
@@ -3756,6 +4244,43 @@ func decodeRealCloudProviderJSONL(raw []byte, fieldCount int, decode func([]byte
 	}
 	if scanner.Err() != nil || len(logs) == 0 || fieldCount <= 0 {
 		return nil, nil, errors.New("raw provider JSONL is empty or exceeds its line limit")
+	}
+	return logs, redacted, nil
+}
+
+func decodeRealCloudProviderJSONLFiltered(
+	raw []byte,
+	fieldCount int,
+	decode func([]byte) (realEdgeProviderLog, string, bool, error),
+) ([]realEdgeProviderLog, []string, error) {
+	if len(raw) == 0 || raw[len(raw)-1] != '\n' {
+		return nil, nil, errors.New("raw provider JSONL must end with one complete newline-delimited record")
+	}
+	logs := make([]realEdgeProviderLog, 0, 16)
+	redacted := make([]string, 0, 16)
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 4096), realEdgeMaxProviderLogLine)
+	records := 0
+	for scanner.Scan() {
+		line := append([]byte(nil), scanner.Bytes()...)
+		records++
+		if len(bytes.TrimSpace(line)) == 0 || records > realEdgeMaxProviderLogRecords {
+			clearRealCloudBytes(line)
+			return nil, nil, errors.New("raw provider JSONL has a blank or excessive record set")
+		}
+		log, safe, include, err := decode(line)
+		clearRealCloudBytes(line)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !include {
+			continue
+		}
+		logs = append(logs, log)
+		redacted = append(redacted, safe)
+	}
+	if scanner.Err() != nil || records == 0 || len(logs) == 0 || fieldCount <= 0 {
+		return nil, nil, errors.New("raw provider JSONL is empty, contains no matching probe, or exceeds its line limit")
 	}
 	return logs, redacted, nil
 }
@@ -3995,24 +4520,6 @@ func realCloudProviderCleanURLSHA(baseURL, cleanPath string) (string, error) {
 	return realCloudLowerSHA256([]byte(parsed.String())), nil
 }
 
-func parseRealCloudProviderTimestamp(raw json.RawMessage) (time.Time, error) {
-	var text string
-	if json.Unmarshal(raw, &text) == nil {
-		parsed, err := time.Parse(time.RFC3339Nano, text)
-		if err == nil && parsed.Location() == time.UTC && !parsed.IsZero() {
-			return parsed.UTC(), nil
-		}
-	}
-	var number json.Number
-	if json.Unmarshal(raw, &number) == nil {
-		nanos, err := strconv.ParseInt(number.String(), 10, 64)
-		if err == nil && nanos > 0 {
-			return time.Unix(0, nanos).UTC(), nil
-		}
-	}
-	return time.Time{}, errors.New("invalid timestamp")
-}
-
 func validRealCloudProviderIdentifier(value string, maximum int) bool {
 	return value != "" && len(value) <= maximum && strings.TrimSpace(value) == value && !strings.ContainsAny(value, "\x00\r\n\t /?#")
 }
@@ -4199,7 +4706,7 @@ func TestRealCloudProviderLogIdentitiesArePairwiseIsolated(t *testing.T) {
 
 func TestRealCloudProviderRawExportsReconstructExactOperatorClosure(t *testing.T) {
 	environment, stages, operatorLogs, cfRaw, eoRaw := realCloudProviderRawParserFixture(t)
-	reconstructed, redactedSHA, err := reconstructRealCloudProviderLogs(environment, stages, cfRaw, eoRaw)
+	reconstructed, redactedSHA, err := reconstructRealCloudProviderFixtureLogs(environment, stages, cfRaw, eoRaw)
 	if err != nil {
 		t.Fatalf("reconstruct exact provider raw exports: %v", err)
 	}
@@ -4213,37 +4720,101 @@ func TestRealCloudProviderRawExportsReconstructExactOperatorClosure(t *testing.T
 	t.Run("missing-record", func(t *testing.T) {
 		lines := bytes.Split(bytes.TrimSpace(cfRaw), []byte{'\n'})
 		mutated := append(bytes.Join(lines[:len(lines)-1], []byte{'\n'}), '\n')
-		if _, _, err := reconstructRealCloudProviderLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "omits") {
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "omits") {
 			t.Fatalf("missing raw record err=%v", err)
 		}
 	})
-	t.Run("query-leak", func(t *testing.T) {
-		mutated := bytes.Replace(cfRaw, []byte(`"ClientRequestURI":"`+realCloudProviderCleanPath()+`"`), []byte(`"ClientRequestURI":"`+realCloudProviderCleanPath()+`?token=forbidden"`), 1)
-		if _, _, err := reconstructRealCloudProviderLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "token-bearing") {
-			t.Fatalf("queried Cloudflare raw URL err=%v", err)
+	t.Run("request-event-url-leak", func(t *testing.T) {
+		mutated := bytes.Replace(cfRaw, []byte(`{"EventTimestampMs":`), []byte(`{"Event":{"request":{"url":"https://test.invalid/pro/v1/forbidden"}},"EventTimestampMs":`), 1)
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "invalid field type or shape") {
+			t.Fatalf("unrequested Cloudflare Event URL field err=%v", err)
 		}
 	})
 	t.Run("unknown-field", func(t *testing.T) {
 		mutated := bytes.Replace(eoRaw, []byte(`{"EdgeCacheStatus"`), []byte(`{"Unexpected":true,"EdgeCacheStatus"`), 1)
-		if _, _, err := reconstructRealCloudProviderLogs(environment, stages, cfRaw, mutated); err == nil || !strings.Contains(err.Error(), "unknown fields") {
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, cfRaw, mutated); err == nil || !strings.Contains(err.Error(), "unknown fields") {
 			t.Fatalf("unknown EdgeOne field err=%v", err)
 		}
 	})
 	t.Run("duplicate-cloudflare-field", func(t *testing.T) {
-		mutated := bytes.Replace(cfRaw, []byte(`{"CacheCacheStatus":`), []byte(`{"CacheCacheStatus":"HIT","CacheCacheStatus":`), 1)
-		if _, _, err := reconstructRealCloudProviderLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "repeats a JSON field") {
+		mutated := bytes.Replace(cfRaw, []byte(`{"EventTimestampMs":`), []byte(`{"EventTimestampMs":1,"EventTimestampMs":`), 1)
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "invalid field type or shape") {
 			t.Fatalf("duplicate Cloudflare JSON key err=%v", err)
+		}
+	})
+	t.Run("duplicate-cloudflare-script-version-field", func(t *testing.T) {
+		mutated := bytes.Replace(cfRaw,
+			[]byte(`"ScriptVersion":{"id":"`+realCloudProviderFixtureCFVersion+`"`),
+			[]byte(`"ScriptVersion":{"id":"duplicate","id":"`+realCloudProviderFixtureCFVersion+`"`), 1)
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "active Worker version") {
+			t.Fatalf("duplicate Cloudflare ScriptVersion key err=%v", err)
+		}
+	})
+	t.Run("duplicate-cloudflare-worker-event-field", func(t *testing.T) {
+		mutated := bytes.Replace(cfRaw,
+			[]byte(`\"schema\":\"sow-cloudflare-edge-provider-log/v1\"`),
+			[]byte(`\"schema\":\"bad\",\"schema\":\"sow-cloudflare-edge-provider-log/v1\"`), 1)
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "invalid field type or shape") {
+			t.Fatalf("duplicate Cloudflare Worker event key err=%v", err)
+		}
+	})
+	t.Run("unknown-cloudflare-console-field", func(t *testing.T) {
+		mutated := bytes.Replace(cfRaw, []byte(`"Logs":[{"Level":`), []byte(`"Logs":[{"Unexpected":true,"Level":`), 1)
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "invalid console-log envelope") {
+			t.Fatalf("unknown Cloudflare console key err=%v", err)
+		}
+	})
+	t.Run("cloudflare-script-version-mismatch", func(t *testing.T) {
+		mutated := bytes.Replace(cfRaw, []byte(realCloudProviderFixtureCFVersion), []byte("unreviewed-version"), 1)
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "active Worker version") {
+			t.Fatalf("wrong Cloudflare ScriptVersion err=%v", err)
+		}
+	})
+	t.Run("cloudflare-script-version-null-metadata", func(t *testing.T) {
+		mutated := bytes.Replace(cfRaw, []byte(`"message":"sow test active version"`), []byte(`"message":null`), 1)
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "active Worker version") {
+			t.Fatalf("null Cloudflare ScriptVersion metadata err=%v", err)
+		}
+	})
+	t.Run("cloudflare-non-ok-outcome", func(t *testing.T) {
+		mutated := bytes.Replace(cfRaw, []byte(`"Outcome":"ok"`), []byte(`"Outcome":"exception"`), 1)
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "wrong outcome") {
+			t.Fatalf("Cloudflare non-ok outcome err=%v", err)
+		}
+	})
+	t.Run("cloudflare-url-bearing-console-message", func(t *testing.T) {
+		cleanSHA, err := realCloudProviderCleanURLSHA(environment.CFCDNBase, realCloudProviderCleanPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		mutated := bytes.Replace(cfRaw,
+			[]byte(`\"clean_url_sha256\":\"`+cleanSHA+`\"`),
+			[]byte(`\"clean_url_sha256\":\"https://test.invalid/pro/v1/forbidden\"`), 1)
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "URL-bearing") {
+			t.Fatalf("URL-bearing Cloudflare console message err=%v", err)
+		}
+	})
+	t.Run("cloudflare-cache-freshness-mismatch", func(t *testing.T) {
+		mutated := bytes.Replace(cfRaw, []byte(`\"cache_max_age_seconds\":-1`), []byte(`\"cache_max_age_seconds\":60`), 1)
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "clean-cache") {
+			t.Fatalf("Cloudflare cache freshness mismatch err=%v", err)
+		}
+	})
+	t.Run("cloudflare-cache-age-string", func(t *testing.T) {
+		mutated := bytes.Replace(cfRaw, []byte(`\"cache_age_seconds\":-1`), []byte(`\"cache_age_seconds\":\"-1\"`), 1)
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "field type") {
+			t.Fatalf("string Cloudflare cache age err=%v", err)
 		}
 	})
 	t.Run("duplicate-edgeone-field", func(t *testing.T) {
 		mutated := bytes.Replace(eoRaw, []byte(`{"EdgeCacheStatus":`), []byte(`{"EdgeCacheStatus":"HIT","EdgeCacheStatus":`), 1)
-		if _, _, err := reconstructRealCloudProviderLogs(environment, stages, cfRaw, mutated); err == nil || !strings.Contains(err.Error(), "repeats a JSON field") {
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, cfRaw, mutated); err == nil || !strings.Contains(err.Error(), "repeats a JSON field") {
 			t.Fatalf("duplicate EdgeOne JSON key err=%v", err)
 		}
 	})
 	t.Run("incomplete-final-line", func(t *testing.T) {
 		mutated := append([]byte(nil), cfRaw[:len(cfRaw)-1]...)
-		if _, _, err := reconstructRealCloudProviderLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "newline-delimited") {
+		if _, _, err := reconstructRealCloudProviderFixtureLogs(environment, stages, mutated, eoRaw); err == nil || !strings.Contains(err.Error(), "newline-delimited") {
 			t.Fatalf("unterminated provider JSONL err=%v", err)
 		}
 	})
@@ -4801,7 +5372,7 @@ func TestRealCloudCloudflareWorkerSettingsRawRejectsSDKProjectionAmbiguity(t *te
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := validRealCloudCloudflareWorkerSettingsRaw(test.raw, emptyBindingsSHA); got != test.want {
+			if got := validRealCloudCloudflareWorkerSettingsRaw(test.raw, emptyBindingsSHA, false); got != test.want {
 				t.Fatalf("raw Worker settings valid=%v want=%v body=%s", got, test.want, test.raw)
 			}
 		})
@@ -4812,12 +5383,17 @@ func TestRealCloudCloudflareWorkerSettingsRawRejectsSDKProjectionAmbiguity(t *te
 		t.Fatal(err)
 	}
 	withBinding := strings.Replace(valid, `"bindings":[]`, `"bindings":`+bindingRaw, 1)
-	if !validRealCloudCloudflareWorkerSettingsRaw(withBinding, bindingSHA) {
+	if !validRealCloudCloudflareWorkerSettingsRaw(withBinding, bindingSHA, false) {
 		t.Fatal("raw Worker settings rejected an exact active-version binding multiset")
 	}
 	reordered := strings.Replace(withBinding, bindingRaw, `[{"name":"ORIGIN","service":"pigsty-origin","type":"service","environment":"production"}]`, 1)
-	if !validRealCloudCloudflareWorkerSettingsRaw(reordered, bindingSHA) {
+	if !validRealCloudCloudflareWorkerSettingsRaw(reordered, bindingSHA, false) {
 		t.Fatal("raw Worker settings binding comparison depended on object key order")
+	}
+	logpushEnabled := strings.Replace(valid, `"logpush":false`, `"logpush":true`, 1)
+	if !validRealCloudCloudflareWorkerSettingsRaw(logpushEnabled, emptyBindingsSHA, true) ||
+		validRealCloudCloudflareWorkerSettingsRaw(logpushEnabled, emptyBindingsSHA, false) {
+		t.Fatal("raw Worker settings did not bind the exact role-specific Workers Trace Events switch")
 	}
 }
 
@@ -5198,6 +5774,21 @@ func TestRealCloudProviderControlKeepsThreeWorkerVerifierContract(t *testing.T) 
 	}
 }
 
+const (
+	realCloudProviderFixtureCFScript  = "sow-test-auth"
+	realCloudProviderFixtureCFVersion = "sow-test-auth-version"
+)
+
+func reconstructRealCloudProviderFixtureLogs(
+	environment realCloudEnvironment,
+	stages []realEdgeMultiPoPStageEvidence,
+	cfRaw, eoRaw []byte,
+) ([]realEdgeProviderLog, string, error) {
+	return reconstructRealCloudProviderLogs(
+		environment, realCloudProviderFixtureCFScript, realCloudProviderFixtureCFVersion, stages, cfRaw, eoRaw,
+	)
+}
+
 func realCloudProviderRawParserFixture(t *testing.T) (realCloudEnvironment, []realEdgeMultiPoPStageEvidence, []realEdgeProviderLog, []byte, []byte) {
 	t.Helper()
 	environment := realCloudSafetyFixtureEnvironment()
@@ -5211,6 +5802,32 @@ func realCloudProviderRawParserFixture(t *testing.T) (realCloudEnvironment, []re
 	before := realEdgeTestEvidence(4, "generation-four", baseTime)
 	after := attachRealEdgeTestPrePurge(before, realEdgeTestEvidence(5, "generation-five", baseTime.Add(10*time.Minute)))
 	stages := []realEdgeMultiPoPStageEvidence{before, after}
+	cloudflareRequestIDs := make(map[string]string)
+	for stageIndex := range stages {
+		stage := stages[stageIndex].Vendors["cloudflare"]
+		rewriteObservation := func(observation *realEdgeMultiPoPObservation) {
+			old := observation.RequestID
+			replacement := realCloudLowerSHA256([]byte(old))[:24]
+			cloudflareRequestIDs[old] = replacement
+			observation.RequestID = replacement
+			if observation.CacheStatus == "HIT" {
+				if observation.CacheAgeSeconds < 0 || observation.CacheMaxAge <= observation.CacheAgeSeconds {
+					observation.CacheAgeSeconds, observation.CacheMaxAge = 7, 60
+				}
+			} else {
+				observation.CacheAgeSeconds, observation.CacheMaxAge = -1, -1
+			}
+		}
+		for index := range stage.Observations {
+			rewriteObservation(&stage.Observations[index])
+		}
+		if stage.PrePurge != nil {
+			for index := range stage.PrePurge.Observations {
+				rewriteObservation(&stage.PrePurge.Observations[index])
+			}
+		}
+		stages[stageIndex].Vendors["cloudflare"] = stage
+	}
 	productBody, _, _, err := realCloudProviderProductContracts(environment, "env://"+realCloudEdgeEntitlementsEnv)
 	if err != nil {
 		t.Fatal(err)
@@ -5245,16 +5862,89 @@ func realCloudProviderRawParserFixture(t *testing.T) (realCloudEnvironment, []re
 			t.Fatal(err)
 		}
 		operatorLogs[index].CleanURLSHA256 = cleanSHA
+		if operatorLogs[index].Vendor == "cloudflare" {
+			parent, exists := cloudflareRequestIDs[operatorLogs[index].ParentRequestID]
+			if !exists {
+				t.Fatalf("missing rewritten Cloudflare parent %q", operatorLogs[index].ParentRequestID)
+			}
+			operatorLogs[index].ParentRequestID = parent
+			operatorLogs[index].RequestID = "trace-" + parent
+			operatorLogs[index].NodeID = operatorLogs[index].Region
+		}
+	}
+	expected, err := expectedRealCloudProviderRecords(stages)
+	if err != nil {
+		t.Fatal(err)
 	}
 	var cfBody, eoBody bytes.Buffer
 	cfEncoder, eoEncoder := json.NewEncoder(&cfBody), json.NewEncoder(&eoBody)
+	versionBody, err := json.Marshal(realCloudCloudflareRawScriptVersion{
+		ID: realCloudProviderFixtureCFVersion, Message: "sow test active version", Tag: "sow-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfEncoder.Encode(realCloudCloudflareRawLog{
+		EventTimestampMs: json.Number(strconv.FormatInt(baseTime.UnixMilli(), 10)),
+		Logs:             json.RawMessage(`[]`), Outcome: "ok",
+		ScriptName: realCloudProviderFixtureCFScript, ScriptVersion: versionBody,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedEventBody, err := json.Marshal(realCloudCloudflareProviderEvent{
+		Schema: "sow-cloudflare-edge-provider-log/v1", ProbeID: "unrelated-provider-run-20260714",
+		RequestID: "0123456789abcdef01234567", ProviderRequestID: "trace-0123456789abcdef01234567",
+		Colo: "NRT", CleanURLSHA256: strings.Repeat("c", 64), CacheStatus: "MISS",
+		CacheAgeSeconds: -1, CacheMaxAgeSeconds: -1, Status: http.StatusOK,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedMessageBody, _ := json.Marshal([]string{string(unrelatedEventBody)})
+	unrelatedLogsBody, err := json.Marshal([]realCloudCloudflareRawConsoleLog{{
+		Level: "log", Message: unrelatedMessageBody, TimestampMs: json.Number(strconv.FormatInt(baseTime.UnixMilli(), 10)),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfEncoder.Encode(realCloudCloudflareRawLog{
+		EventTimestampMs: json.Number(strconv.FormatInt(baseTime.UnixMilli(), 10)),
+		Logs:             unrelatedLogsBody, Outcome: "ok",
+		ScriptName: realCloudProviderFixtureCFScript, ScriptVersion: versionBody,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	for _, record := range operatorLogs {
 		switch record.Vendor {
 		case "cloudflare":
+			wanted, exists := expected["cloudflare"][record.ParentRequestID]
+			if !exists {
+				t.Fatalf("missing expected Cloudflare record %q", record.ParentRequestID)
+			}
+			observedAt, err := time.Parse(time.RFC3339Nano, record.ObservedAt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			eventBody, err := json.Marshal(realCloudCloudflareProviderEvent{
+				Schema: "sow-cloudflare-edge-provider-log/v1", ProbeID: runID, RequestID: record.ParentRequestID,
+				ProviderRequestID: record.RequestID, Colo: record.Region, CleanURLSHA256: record.CleanURLSHA256,
+				CacheStatus: record.CacheStatus, CacheAgeSeconds: wanted.cacheAge, CacheMaxAgeSeconds: wanted.cacheMaxAge,
+				Status: http.StatusOK,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			messageBody, _ := json.Marshal([]string{string(eventBody)})
+			logsBody, err := json.Marshal([]realCloudCloudflareRawConsoleLog{{
+				Level: "log", Message: messageBody, TimestampMs: json.Number(strconv.FormatInt(observedAt.UnixMilli(), 10)),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
 			if err := cfEncoder.Encode(realCloudCloudflareRawLog{
-				CacheCacheStatus: record.CacheStatus, ClientRequestURI: realCloudProviderCleanPath(), EdgeColoCode: record.Region,
-				EdgeColoID: json.Number(record.NodeID), EdgeStartTimestamp: json.RawMessage(strconv.Quote(record.ObservedAt)),
-				ParentRayID: record.ParentRequestID, RayID: record.RequestID,
+				EventTimestampMs: json.Number(strconv.FormatInt(observedAt.UnixMilli(), 10)),
+				Logs:             logsBody, Outcome: "ok",
+				ScriptName: realCloudProviderFixtureCFScript, ScriptVersion: versionBody,
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -5373,6 +6063,36 @@ func TestRealCloudProviderCollectorUsesExactSDKAndSignedObjectContracts(t *testi
 	if afterCF, afterEO := fake.mutationCounts(); afterCF != beforeCFUpdates || afterEO != beforeEOUpdates {
 		t.Fatalf("unsafe Cloudflare zone reached provider mutation: before=%d,%d after=%d,%d", beforeCFUpdates, beforeEOUpdates, afterCF, afterEO)
 	}
+	fake.extraCFLogpushJob = true
+	if err := prepareRealCloudProviderPerRunRawSinksAfterGate(t.Context(), environment, runID, configuration,
+		realCloudStorageSecret{AccessKeyID: "loopback-cf-log-writer", SecretAccessKey: "loopback-cf-log-writer-secret"},
+		realCloudStorageSecret{AccessKeyID: "loopback-eo-log-writer", SecretAccessKey: "loopback-eo-log-writer-secret"}, clients); err == nil || !strings.Contains(err.Error(), "can include the reviewed auth Worker") {
+		t.Fatalf("overlapping account Workers Trace job reached setup: %v", err)
+	}
+	fake.extraCFLogpushJob = false
+	if afterCF, afterEO := fake.mutationCounts(); afterCF != beforeCFUpdates || afterEO != beforeEOUpdates {
+		t.Fatalf("overlapping account Workers Trace job reached provider mutation: before=%d,%d after=%d,%d", beforeCFUpdates, beforeEOUpdates, afterCF, afterEO)
+	}
+	fake.overlappingCFZoneLogpush = true
+	if err := prepareRealCloudProviderPerRunRawSinksAfterGate(t.Context(), environment, runID, configuration,
+		realCloudStorageSecret{AccessKeyID: "loopback-cf-log-writer", SecretAccessKey: "loopback-cf-log-writer-secret"},
+		realCloudStorageSecret{AccessKeyID: "loopback-eo-log-writer", SecretAccessKey: "loopback-eo-log-writer-secret"}, clients); err == nil || !strings.Contains(err.Error(), "zone HTTP Logpush job can include a reviewed host") {
+		t.Fatalf("overlapping zone HTTP Logpush job reached setup: %v", err)
+	}
+	fake.overlappingCFZoneLogpush = false
+	if afterCF, afterEO := fake.mutationCounts(); afterCF != beforeCFUpdates || afterEO != beforeEOUpdates {
+		t.Fatalf("overlapping zone HTTP Logpush job reached provider mutation: before=%d,%d after=%d,%d", beforeCFUpdates, beforeEOUpdates, afterCF, afterEO)
+	}
+	fake.extraEdgeTask = true
+	if err := prepareRealCloudProviderPerRunRawSinksAfterGate(t.Context(), environment, runID, configuration,
+		realCloudStorageSecret{AccessKeyID: "loopback-cf-log-writer", SecretAccessKey: "loopback-cf-log-writer-secret"},
+		realCloudStorageSecret{AccessKeyID: "loopback-eo-log-writer", SecretAccessKey: "loopback-eo-log-writer-secret"}, clients); err == nil || !strings.Contains(err.Error(), "preflight EdgeOne") {
+		t.Fatalf("extra EdgeOne realtime-log task reached setup: %v", err)
+	}
+	fake.extraEdgeTask = false
+	if afterCF, afterEO := fake.mutationCounts(); afterCF != beforeCFUpdates || afterEO != beforeEOUpdates {
+		t.Fatalf("extra EdgeOne realtime-log task reached provider mutation: before=%d,%d after=%d,%d", beforeCFUpdates, beforeEOUpdates, afterCF, afterEO)
+	}
 	fake.mu.Lock()
 	cfObjectRequest := "GET /" + configuration.Cloudflare.RawBucket + "/" + fake.cfRawObjectKey()
 	fake.mutateCFRawAtRequest = fake.requests[cfObjectRequest] + 2
@@ -5403,7 +6123,7 @@ func TestRealCloudProviderCollectorUsesExactSDKAndSignedObjectContracts(t *testi
 	}
 	fake.incompleteCFCustomDomain = false
 	fake.extraCFLogpushJob = true
-	if _, err := collectRealCloudCloudflareControl(t.Context(), environment, configuration, clients.cloudflare); err == nil || !strings.Contains(err.Error(), "can include a reviewed host") {
+	if _, err := collectRealCloudCloudflareControl(t.Context(), environment, configuration, clients.cloudflare); err == nil || !strings.Contains(err.Error(), "can include the reviewed auth Worker") {
 		t.Fatalf("overlapping Cloudflare Logpush job was accepted: %v", err)
 	}
 	fake.extraCFLogpushJob = false
@@ -5418,10 +6138,20 @@ func TestRealCloudProviderCollectorUsesExactSDKAndSignedObjectContracts(t *testi
 	}
 	fake.conflictingCFLogpushDestination = false
 	fake.badCFLogpushFilter = true
-	if _, err := collectRealCloudCloudflareControl(t.Context(), environment, configuration, clients.cloudflare); err == nil || !strings.Contains(err.Error(), "exact main-and-beta host filter") {
-		t.Fatalf("non-exact Cloudflare Logpush host filter was accepted: %v", err)
+	if _, err := collectRealCloudCloudflareControl(t.Context(), environment, configuration, clients.cloudflare); err == nil || !strings.Contains(err.Error(), "exact auth Worker filter") {
+		t.Fatalf("non-exact Cloudflare Workers Trace filter was accepted: %v", err)
 	}
 	fake.badCFLogpushFilter = false
+	fake.overlappingCFZoneLogpush = true
+	if _, err := collectRealCloudCloudflareControl(t.Context(), environment, configuration, clients.cloudflare); err == nil || !strings.Contains(err.Error(), "zone HTTP Logpush job can include a reviewed host") {
+		t.Fatalf("overlapping zone HTTP Logpush job was accepted: %v", err)
+	}
+	fake.overlappingCFZoneLogpush = false
+	fake.conflictingCFZoneDestination = true
+	if _, err := collectRealCloudCloudflareControl(t.Context(), environment, configuration, clients.cloudflare); err == nil || !strings.Contains(err.Error(), "zone Logpush job can write the SOW raw bucket") {
+		t.Fatalf("zone Logpush job could reuse the SOW raw bucket: %v", err)
+	}
+	fake.conflictingCFZoneDestination = false
 	fake.extraCFSchedule = true
 	if _, err := collectRealCloudCloudflareControl(t.Context(), environment, configuration, clients.cloudflare); err == nil || !strings.Contains(err.Error(), "schedule") {
 		t.Fatalf("Cloudflare Worker schedule bypass was accepted: %v", err)
@@ -5616,6 +6346,7 @@ type realCloudProviderFakeAPI struct {
 	extraCFTailConsumer, extraCFSchedule, unsafeCFSettings  bool
 	extraCFLogpushJob, unrelatedCFLogpushJob                bool
 	conflictingCFLogpushDestination, badCFLogpushFilter     bool
+	overlappingCFZoneLogpush, conflictingCFZoneDestination  bool
 	unsafeCFZone                                            bool
 	extraEdgeRuntimeSecret, unsafeEdgeZone, extraEdgeDomain bool
 	failEOLogTaskUpdate                                     bool
@@ -5651,15 +6382,15 @@ func (fake *realCloudProviderFakeAPI) cloudflareLogJob() map[string]any {
 	destination := realCloudCloudflareDestinationURL(configuration, strings.TrimSpace(os.Getenv(realCloudRunIDEnv)), realCloudStorageSecret{
 		AccessKeyID: "loopback-cf-log-writer", SecretAccessKey: "loopback-cf-log-writer-secret",
 	})
-	filter := realCloudCloudflareHostFilter(fake.environment)
+	filter := realCloudCloudflareWorkerFilter(configuration)
 	if fake.badCFLogpushFilter {
-		body, _ := json.Marshal(map[string]any{"where": map[string]any{"key": "ClientRequestHost", "operator": "eq", "value": hostOnly(fake.environment.CFCDNBase)}})
+		body, _ := json.Marshal(map[string]any{"where": map[string]any{"key": "ScriptName", "operator": "eq", "value": "other-worker"}})
 		filter = string(body)
 	}
 	return map[string]any{
-		"id": configuration.LogpushJobID, "dataset": "http_requests", "destination_conf": destination, "filter": filter,
+		"id": configuration.LogpushJobID, "dataset": "workers_trace_events", "destination_conf": destination, "filter": filter,
 		"enabled": true, "error_message": "", "output_options": map[string]any{
-			"field_names": realCloudCloudflareRawFields, "merge_subrequests": false, "output_type": "ndjson", "sample_rate": 1, "timestamp_format": "rfc3339ns",
+			"field_names": realCloudCloudflareRawFields, "output_type": "ndjson", "sample_rate": 1,
 		},
 	}
 }
@@ -5671,14 +6402,33 @@ func (fake *realCloudProviderFakeAPI) cloudflareUnrelatedLogJob() map[string]any
 	}
 	filterBody, _ := json.Marshal(map[string]any{
 		"where": map[string]any{
-			"key": "ClientRequestHost", "operator": "eq", "value": "unrelated.test.invalid",
+			"key": "ScriptName", "operator": "eq", "value": "unrelated-worker",
 		},
 	})
 	return map[string]any{
-		"id": fake.configuration.Cloudflare.LogpushJobID + 2, "dataset": "http_requests",
+		"id": fake.configuration.Cloudflare.LogpushJobID + 2, "dataset": "workers_trace_events",
 		"destination_conf": destination, "filter": string(filterBody),
 		"enabled": true, "error_message": "", "output_options": map[string]any{
-			"field_names": realCloudCloudflareRawFields, "merge_subrequests": false, "output_type": "ndjson", "sample_rate": 1, "timestamp_format": "rfc3339ns",
+			"field_names": realCloudCloudflareRawFields, "output_type": "ndjson", "sample_rate": 1,
+		},
+	}
+}
+
+func (fake *realCloudProviderFakeAPI) cloudflareZoneLogJob() map[string]any {
+	destination := "https://logs.example.invalid/zone"
+	filter := realCloudCloudflareHostFilter(fake.environment)
+	if fake.conflictingCFZoneDestination {
+		destination = "r2://" + fake.configuration.Cloudflare.RawBucket + "/zone-overlap"
+		filterBody, _ := json.Marshal(map[string]any{
+			"where": map[string]any{"key": "ClientRequestHost", "operator": "eq", "value": "unrelated.test.invalid"},
+		})
+		filter = string(filterBody)
+	}
+	return map[string]any{
+		"id": fake.configuration.Cloudflare.LogpushJobID + 100, "dataset": "http_requests",
+		"destination_conf": destination, "filter": filter, "enabled": true, "error_message": "",
+		"output_options": map[string]any{
+			"field_names": []string{"RayID"}, "merge_subrequests": false, "output_type": "ndjson", "sample_rate": 1, "timestamp_format": "rfc3339ns",
 		},
 	}
 }
@@ -5770,7 +6520,7 @@ func (fake *realCloudProviderFakeAPI) serveCloudflare(writer http.ResponseWriter
 			zoneName = "production.example.invalid"
 		}
 		writeEnvelope(map[string]any{"id": configuration.ZoneID, "name": zoneName, "status": "active", "paused": false, "type": "full", "account": map[string]any{"id": configuration.AccountID, "name": "sow test"}})
-	case fmt.Sprintf("/zones/%s/logpush/jobs", configuration.ZoneID):
+	case fmt.Sprintf("/accounts/%s/logpush/jobs", configuration.AccountID):
 		jobs := []map[string]any{fake.cloudflareLogJob()}
 		if fake.extraCFLogpushJob {
 			extra := fake.cloudflareLogJob()
@@ -5782,11 +6532,11 @@ func (fake *realCloudProviderFakeAPI) serveCloudflare(writer http.ResponseWriter
 			jobs = append(jobs, fake.cloudflareUnrelatedLogJob())
 		}
 		writeEnvelope(jobs)
-	case fmt.Sprintf("/zones/%s/logpush/jobs/%d", configuration.ZoneID, configuration.LogpushJobID):
+	case fmt.Sprintf("/accounts/%s/logpush/jobs/%d", configuration.AccountID, configuration.LogpushJobID):
 		if request.Method != http.MethodPut || validateRealCloudProviderFakeJSONRequest(request, map[string]any{
 			"destination_conf": realCloudCloudflareDestinationURL(configuration, strings.TrimSpace(os.Getenv(realCloudRunIDEnv)), realCloudStorageSecret{AccessKeyID: "loopback-cf-log-writer", SecretAccessKey: "loopback-cf-log-writer-secret"}),
-			"enabled":          true, "filter": realCloudCloudflareHostFilter(fake.environment),
-			"output_options": map[string]any{"field_names": realCloudCloudflareRawFields, "merge_subrequests": false, "output_type": "ndjson", "sample_rate": 1, "timestamp_format": "rfc3339ns"},
+			"enabled":          true, "filter": realCloudCloudflareWorkerFilter(configuration),
+			"output_options": map[string]any{"field_names": realCloudCloudflareRawFields, "output_type": "ndjson", "sample_rate": 1},
 		}) != nil {
 			http.Error(writer, "invalid Cloudflare per-run Logpush setup", http.StatusBadRequest)
 			return
@@ -5795,6 +6545,12 @@ func (fake *realCloudProviderFakeAPI) serveCloudflare(writer http.ResponseWriter
 		fake.cfLogpushUpdates++
 		fake.mu.Unlock()
 		writeEnvelope(fake.cloudflareLogJob())
+	case fmt.Sprintf("/zones/%s/logpush/jobs", configuration.ZoneID):
+		jobs := []map[string]any{}
+		if fake.overlappingCFZoneLogpush || fake.conflictingCFZoneDestination {
+			jobs = append(jobs, fake.cloudflareZoneLogJob())
+		}
+		writeEnvelope(jobs)
 	case fmt.Sprintf("/zones/%s/workers/routes", configuration.ZoneID):
 		routes := []map[string]any{
 			{"id": "main-route", "pattern": hostOnly(fake.environment.CFCDNBase) + "/*", "script": configuration.WorkerScript},
@@ -5895,7 +6651,7 @@ func (fake *realCloudProviderFakeAPI) serveCloudflare(writer http.ResponseWriter
 				writeEnvelope(map[string]any{
 					"annotations": map[string]any{}, "bindings": bindings, "cache_options": map[string]any{"enabled": false, "cross_version_cache": false},
 					"compatibility_date": runtimeContract.CompatibilityDate, "compatibility_flags": runtimeContract.CompatibilityFlags,
-					"limits": map[string]any{"cpu_ms": 0, "subrequests": 0}, "logpush": false,
+					"limits": map[string]any{"cpu_ms": 0, "subrequests": 0}, "logpush": script == configuration.WorkerScript,
 					"observability": map[string]any{"enabled": false, "head_sampling_rate": 0,
 						"logs":   map[string]any{"enabled": false, "invocation_logs": false, "destinations": []any{}, "head_sampling_rate": 0, "persist": false},
 						"traces": map[string]any{"enabled": false, "destinations": []any{}, "head_sampling_rate": 0, "persist": false, "propagation_policy": ""}},
@@ -6242,8 +6998,9 @@ func (fake *realCloudProviderFakeAPI) assertRequests(t *testing.T) {
 	defer fake.mu.Unlock()
 	want := map[string]int{
 		"GET /client/v4/zones/" + fake.configuration.Cloudflare.ZoneID:                            3,
-		"GET /client/v4/zones/" + fake.configuration.Cloudflare.ZoneID + "/logpush/jobs":          3,
-		"PUT /client/v4/zones/" + fake.configuration.Cloudflare.ZoneID + "/logpush/jobs/17":       1,
+		"GET /client/v4/zones/" + fake.configuration.Cloudflare.ZoneID + "/logpush/jobs":          4,
+		"GET /client/v4/accounts/" + fake.configuration.Cloudflare.AccountID + "/logpush/jobs":    4,
+		"PUT /client/v4/accounts/" + fake.configuration.Cloudflare.AccountID + "/logpush/jobs/17": 1,
 		"GET /client/v4/accounts/" + fake.configuration.Cloudflare.AccountID + "/workers/scripts": 4,
 		"GET /client/v4/zones/" + fake.configuration.Cloudflare.ZoneID + "/workers/routes":        4,
 		"GET /client/v4/accounts/" + fake.configuration.Cloudflare.AccountID + "/workers/domains": 4,
@@ -6252,7 +7009,7 @@ func (fake *realCloudProviderFakeAPI) assertRequests(t *testing.T) {
 		"GET /" + fake.configuration.Cloudflare.RawBucket + "/" + fake.cfRawObjectKey():           2,
 		"GET /" + fake.configuration.EdgeOne.RawBucket + "/" + fake.eoRawObjectKey():              2,
 		"GET /.sow/provider-attestation-deny":                                                     2,
-		"POST /":                                                                                  20,
+		"POST /":                                                                                  21,
 	}
 	scripts := []string{fake.configuration.Cloudflare.WorkerScript, fake.configuration.Cloudflare.OriginWorkerScript}
 	if fake.configuration.Cloudflare.TokenVerifierService != "" {

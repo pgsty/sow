@@ -485,6 +485,83 @@ test("Cloudflare and EdgeOne strip credentials onto the same clean origin URL wi
   }
 });
 
+test("Cloudflare emits one secret-free Workers Trace Event join record for observable clean-cache requests", async () => {
+	const logs = [];
+	const probeID = "real-edge-test-run-20260714";
+	const environment = {
+		...runtimeVariables(),
+		SOW_ORIGIN_MODE: "https-bearer",
+		SOW_ORIGIN_BEARER: "origin-bearer-contract-secret",
+		SOW_TOKEN_ENTITLEMENTS: JSON.stringify([entitlement(await sha256Hex(tokenA))]),
+		SOW_BASIC_ENTITLEMENTS: "[]",
+	};
+	const platform = {
+		console: { log(value) { logs.push(value); } },
+		async fetch(request) {
+			assert.equal(request.headers.get("Authorization"), "Bearer origin-bearer-contract-secret");
+			assert.equal(request.headers.get("X-SOW-Provider-Probe"), null);
+			assert.doesNotMatch(request.url, new RegExp(tokenA));
+			return new Response("payload", {
+				status: 200,
+				headers: {
+					"CF-Cache-Status": "HIT",
+					Age: "7",
+					"Cache-Control": "public, s-maxage=60",
+				},
+			});
+		},
+	};
+	const handler = createCloudflareHandler(environment, platform);
+	const request = new Request(`https://repo.example/pro/v1/${tokenA}/pkg/pig/latest`, {
+		headers: { "CF-Ray": "0123456789abcdef01234567-SJC", "X-SOW-Provider-Probe": probeID },
+	});
+	Object.defineProperty(request, "cf", { value: { colo: "SJC" } });
+	const response = await handler(request);
+	assert.equal(response.status, 200);
+	assert.equal(logs.length, 1);
+	const event = JSON.parse(logs[0]);
+	assert.deepEqual(Object.keys(event), [
+		"schema", "probe_id", "request_id", "provider_request_id", "colo", "clean_url_sha256", "cache_status",
+		"cache_age_seconds", "cache_max_age_seconds", "status",
+	]);
+	assert.equal(event.schema, "sow-cloudflare-edge-provider-log/v1");
+	assert.equal(event.probe_id, probeID);
+	assert.equal(event.request_id, "0123456789abcdef01234567");
+	assert.equal(event.provider_request_id, "trace-0123456789abcdef01234567");
+	assert.equal(event.colo, "SJC");
+	assert.equal(event.clean_url_sha256, response.headers.get("X-SOW-Clean-URL-SHA256"));
+	assert.equal(event.cache_status, "HIT");
+	assert.equal(event.cache_age_seconds, 7);
+	assert.equal(event.cache_max_age_seconds, 60);
+	assert.equal(event.status, 200);
+	assert.doesNotMatch(logs[0], new RegExp(tokenA));
+	assert.doesNotMatch(logs[0], /origin-bearer-contract-secret|repo\.example|\/pkg\//);
+
+	const unjoined = new Request(`https://repo.example/pro/v1/${tokenA}/pkg/pig/latest`, {
+		headers: { "CF-Ray": "0123456789abcdef01234567-IAD", "X-SOW-Provider-Probe": probeID },
+	});
+	Object.defineProperty(unjoined, "cf", { value: { colo: "SJC" } });
+	assert.equal((await handler(unjoined)).status, 200);
+	assert.equal(logs.length, 1, "a mismatched platform colo emitted an unjoinable provider record");
+
+	const uppercaseRay = new Request(`https://repo.example/pro/v1/${tokenA}/pkg/pig/latest`, {
+		headers: { "CF-Ray": "ABCDEF0123456789ABCDEF01-LHR", "X-SOW-Provider-Probe": probeID },
+	});
+	Object.defineProperty(uppercaseRay, "cf", { value: { colo: "LHR" } });
+	assert.equal((await handler(uppercaseRay)).status, 200);
+	assert.equal(logs.length, 2);
+	const uppercaseEvent = JSON.parse(logs[1]);
+	assert.equal(uppercaseEvent.request_id, "abcdef0123456789abcdef01");
+	assert.equal(uppercaseEvent.provider_request_id, "trace-abcdef0123456789abcdef01");
+
+	const ordinary = new Request(`https://repo.example/pro/v1/${tokenA}/pkg/pig/latest`, {
+		headers: { "CF-Ray": "1123456789abcdef01234567-SJC" },
+	});
+	Object.defineProperty(ordinary, "cf", { value: { colo: "SJC" } });
+	assert.equal((await handler(ordinary)).status, 200);
+	assert.equal(logs.length, 2, "ordinary customer traffic emitted an attestation console event");
+});
+
 test("both vendors route RPM caret bytes through one canonical URL spelling", async () => {
 	const admission = routeAdmission({ asset_roots: ["pkg", "pkg^next"] });
 	const runtime = {

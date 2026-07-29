@@ -4,6 +4,14 @@
 Cloudflare/R2、COS/EdgeOne 未执行，POC-06 仍为受阻。没有读取云凭据，也没有写入
 `pro` 或任何 CO/COS/Cloudflare 生产资源。
 
+> 2026-07-29 修订：当前 v5 合同不再使用 Enterprise-only zone
+> `http_requests`。它改用 Workers Paid 可用的 account
+> `workers_trace_events`；auth Worker 精确要求 `logpush=true`，origin/verifier
+> 要求 `false`，并以 provider-owned Trace envelope + 受限十字段 event 关联
+> `CF-Ray`。当前代码、测试、权限和剩余 live gate 见
+> [Workers Paid follow-up](2026-07-29-cloudflare-workers-paid-provider-attestation.md)；
+> 本文其余 v3 结果只保留为当日历史证据。
+
 ## 本轮闭包
 
 - provider config/deployment identity 升级为 v3，逐 auth/origin/verifier 钉住

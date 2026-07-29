@@ -77,10 +77,12 @@ auth route 仍必须各一条，其他 route 只有在按 Cloudflare 官方 lead
 malformed overlap 或 auth Worker 额外暴露均 fail closed。聚焦 ordinary/race SDK collector
 为 1.132s/2.211s；无关 route 正例与覆盖 `.sow/*` 负例均通过，仍无网络请求。
 
-共享 Zone 的 Logpush inventory 同样按相关闭包审计，而不再假设整区只有一个 job：配置中钉住的
-SOW job 仍必须唯一、启用、100% `http_requests`、精确过滤 main+beta 并写入专用 raw-log bucket；
-其他禁用 job 可共存。其他启用 job 只有在不复用 SOW raw bucket，且其 `http_requests` filter
-可证明排除两个 reviewed host 时才允许。未知、畸形或不支持的 filter 均按“可能重叠”失败关闭。
+2026-07-29 的当前合同把 SOW job 改为 account-scoped、唯一、启用、100%
+`workers_trace_events`，精确过滤 auth `ScriptName` 与 `Outcome=ok` 并写入专用 raw-log
+bucket。其他启用 account job 只有在不会包含 auth Worker 且不复用 raw bucket 时才允许。
+共享 Zone inventory 仍独立审计：其他启用 zone job 只有在不复用 raw bucket，且其 HTTP
+filter 可证明排除两个 reviewed host 时才允许。未知、畸形或不支持的 filter 均按“可能重叠”
+失败关闭。
 新增无关 job 正例、reviewed-host 重叠负例和 raw-bucket 复用负例后，focused ordinary/race 为
 1.338s/2.307s；四个联网 opt-in 全部显式关闭的完整 `RealCloud` ordinary/race 为
 7.549s/11.065s。全过程未加载凭据、未构造真实云客户端、未发起网络请求。

@@ -16,8 +16,13 @@ bootstrap registry 仍保持关闭。
 adopt/materialize/verify/fsck、publish race、disposable MinIO S3、四平台 CGO-free
 build 与 bootstrap/readiness 离线套件均通过；Cloudflare plan/registry 从当前源码
 重建后逐字节相同。该轮清空所有云凭据，没有生产或云写入。真实 Worker/route/purge/cache
-与回滚仍等待 scoped test token；HTTP Requests Logpush 另受 Cloudflare Enterprise
-计划与 `Logs Write` 权限约束，COS/EdgeOne 与生产迁移也仍是独立外部证据层。
+与回滚仍等待 scoped test token。随后完成的
+[Workers Paid provider-attestation correction](2026-07-29-cloudflare-workers-paid-provider-attestation.md)
+已用 account `workers_trace_events` 取代 Enterprise-only HTTP Requests：
+Workers Paid 足够，配置真实任务仍需 account `Logs Edit` 和专用 R2 log
+writer/reader/control identities。修正后的 edge 48/48、focused compat
+ordinary/race 均通过，但没有真实 Cloudflare mutation 或 provider-log 读取，POC-06
+仍不升级；COS/EdgeOne 与生产迁移也仍是独立外部证据层。
 2026-07-19 的 V-25 又把 bootstrap 与 provider log-sink 的 reusable lease key
 从 plan/deployment 版本身份中分离：同一资源/专用 raw bucket 始终只有一个稳定 key，历史
 idle/expired 版本可 CAS 重放而 live holder 仍阻塞；readiness receipt/seal 的本地半对中断也可
@@ -195,6 +200,7 @@ SOW_RUN_PERF=1 go test ./internal/aptrepo \
   expired-lease recovery 的官方 SDK/协议夹具 ordinary/race 均通过。bootstrap registry 仍为空，
   本报告没有联网或写入 R2/Worker/Zone，也不冒充 POC-06。
 - `2026-07-17-cloudflare-provider-attestation-offline-validation.md`：provider attestation v3
+  历史证据（当前 v5 Workers Paid 合同见 2026-07-29 follow-up），
   把 auth/origin/verifier 的兼容日期、flags、active runtime/settings/schedule/exposure 与完整
   route/domain/Worker inventory 纳入连续双读摘要，并钉住 EdgeOne realtime-log 的不可变 area；R2 custom domain 强制 TLS 1.2+ 与冻结的
   Modern cipher 集，双供应商日志配置用独立 R2 CAS lease 串行。官方 SDK loopback、fake-store

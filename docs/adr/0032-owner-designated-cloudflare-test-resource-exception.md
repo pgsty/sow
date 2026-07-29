@@ -48,14 +48,15 @@ tuple would discard an explicitly provisioned test surface.
    wildcard-host, path-specific, malformed, negating, or extra auth-Worker
    route that can overlap either host fails closed. Unrelated production route
    bytes are not included in the SOW deployment identity.
-6. Provider attestation also audits the whole shared-zone Logpush inventory.
-   The configured SOW `http_requests` job remains an exact, enabled,
-   full-sample contract for the two reviewed hosts. Other disabled jobs are
-   harmless. Another enabled job is allowed only when it cannot write the SOW
-   raw-log bucket and, for `http_requests`, its filter proves that neither
-   reviewed host can be included. Unknown, malformed, or unsupported filter
-   forms are treated as overlapping and fail closed. Unrelated job bytes are
-   not included in the SOW deployment identity.
+6. Provider attestation selects one exact, enabled, full-sample account
+   `workers_trace_events` job filtered to the auth `ScriptName` and
+   `Outcome=ok`. Other enabled account jobs may coexist only when they cannot
+   include that Worker and cannot write the SOW raw-log bucket. It also audits
+   the whole shared-zone Logpush inventory: another enabled zone job is allowed
+   only when it cannot write the raw bucket and, for HTTP datasets, its filter
+   proves that neither reviewed host can be included. Unknown, malformed, or
+   unsupported filter forms are treated as overlapping and fail closed.
+   Unrelated job bytes are not included in the SOW deployment identity.
 7. Write credentials must be scoped to the exact bucket; Cloudflare API tokens
    must be scoped to the exact zone and URL-list purge operations. Purge-all,
    wildcard host admission, other buckets, other Pigsty hosts, CO/COS production
