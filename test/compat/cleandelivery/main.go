@@ -307,6 +307,7 @@ func build(root, out string) (buildResult, error) {
 		{"bash", "third_party/cavaliergopher-rpm/verify-upstream.sh"},
 		{"go", "test", "-count=1", "./test/compat/cleandelivery"},
 		{"go", "test", "-count=1", "./internal/config", "-run", "TestExampleConfigMatchesSchema|TestShippedPGDGUpstreamExampleMatchesSchema"},
+		{"go", "test", "-count=1", "./test/compat", "-run", "^TestShippedExampleSupportsCleanRoomLocalMVP$"},
 		{"go", "build", "-trimpath", "-o", filepath.Join(work, "sow"), "./cmd/sow"},
 	}
 	for _, command := range commands {
@@ -876,7 +877,7 @@ func isolatedGoEnvironment(work string) ([]string, error) {
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"GOENV=off", "GOWORK=off", "GOTOOLCHAIN=local", "GOFLAGS=-mod=readonly",
-		"CGO_ENABLED=0", "GOSUMDB=sum.golang.org", "GOPRIVATE=", "GONOPROXY=", "GONOSUMDB=",
+		"CGO_ENABLED=0", "GOPRIVATE=", "GONOPROXY=", "GONOSUMDB=",
 	}
 	goProxy := strings.TrimSpace(os.Getenv("SOW_CLEAN_GOPROXY"))
 	if goProxy == "" {
@@ -886,6 +887,17 @@ func isolatedGoEnvironment(work string) ([]string, error) {
 		return nil, errors.New("SOW_CLEAN_GOPROXY contains a control character")
 	}
 	env = append(env, "GOPROXY="+goProxy)
+	goSumDB := strings.TrimSpace(os.Getenv("SOW_CLEAN_GOSUMDB"))
+	if goSumDB == "" {
+		goSumDB = "sum.golang.org"
+	}
+	if strings.ContainsAny(goSumDB, "\x00\r\n") {
+		return nil, errors.New("SOW_CLEAN_GOSUMDB contains a control character")
+	}
+	if strings.EqualFold(goSumDB, "off") {
+		return nil, errors.New("SOW_CLEAN_GOSUMDB cannot disable checksum verification")
+	}
+	env = append(env, "GOSUMDB="+goSumDB)
 	keys := make([]string, 0, len(directories))
 	for key := range directories {
 		keys = append(keys, key)

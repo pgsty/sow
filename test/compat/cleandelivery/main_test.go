@@ -347,8 +347,9 @@ func TestManifestBytesAreStable(t *testing.T) {
 	}
 }
 
-func TestIsolatedGoEnvironmentPinsVerificationAndAllowsExplicitProxy(t *testing.T) {
+func TestIsolatedGoEnvironmentPinsVerificationAndAllowsExplicitMirrors(t *testing.T) {
 	t.Setenv("SOW_CLEAN_GOPROXY", "https://goproxy.example,direct")
+	t.Setenv("SOW_CLEAN_GOSUMDB", "sum.golang.google.cn")
 	env, err := isolatedGoEnvironment(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -356,7 +357,7 @@ func TestIsolatedGoEnvironmentPinsVerificationAndAllowsExplicitProxy(t *testing.
 	joined := "\n" + strings.Join(env, "\n") + "\n"
 	for _, wanted := range []string{
 		"\nGOPROXY=https://goproxy.example,direct\n",
-		"\nGOSUMDB=sum.golang.org\n",
+		"\nGOSUMDB=sum.golang.google.cn\n",
 		"\nGOPRIVATE=\n",
 		"\nGONOPROXY=\n",
 		"\nGONOSUMDB=\n",
@@ -367,7 +368,16 @@ func TestIsolatedGoEnvironmentPinsVerificationAndAllowsExplicitProxy(t *testing.
 	}
 	t.Setenv("SOW_CLEAN_GOPROXY", "https://proxy.invalid\nGOSUMDB=off")
 	if _, err := isolatedGoEnvironment(t.TempDir()); err == nil {
-		t.Fatal("isolatedGoEnvironment accepted an injected environment line")
+		t.Fatal("isolatedGoEnvironment accepted an injected proxy environment line")
+	}
+	t.Setenv("SOW_CLEAN_GOPROXY", "https://proxy.example,direct")
+	t.Setenv("SOW_CLEAN_GOSUMDB", "sum.golang.org\nGOPRIVATE=example.invalid")
+	if _, err := isolatedGoEnvironment(t.TempDir()); err == nil {
+		t.Fatal("isolatedGoEnvironment accepted an injected checksum environment line")
+	}
+	t.Setenv("SOW_CLEAN_GOSUMDB", "off")
+	if _, err := isolatedGoEnvironment(t.TempDir()); err == nil {
+		t.Fatal("isolatedGoEnvironment allowed checksum verification to be disabled")
 	}
 }
 

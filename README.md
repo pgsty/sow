@@ -26,8 +26,8 @@ CGO_ENABLED=0 go build -trimpath -o sow ./cmd/sow
 
 # 发布、校验、恢复和离线物化
 ./sow publish --config sow.yaml --view latest --target cf,cos
-./sow verify --config sow.yaml --layer L1,L2
-./sow verify --config sow.yaml --layer L3,L4 --view stable --target cf --pro-token-file ./pro-token
+./sow verify --config sow.yaml --layer L1
+./sow verify --config sow.yaml --layer L2,L3,L4 --view stable --target cf --pro-token-file ./pro-token
 ./sow fsck --config sow.yaml
 ./sow fsck --config sow.yaml --recover        # 仅恢复严格的本地事务/随机残留
 ./sow fsck --config sow.yaml --target cf --adopt-remote-inventory
@@ -40,6 +40,45 @@ CGO_ENABLED=0 go build -trimpath -o sow ./cmd/sow
 ./sow gc --config sow.yaml                 # dry-run
 ./sow gc --config sow.yaml --apply --confirm <exact-plan-hash>
 ```
+
+### 无云凭据的最小可用闭环
+
+下面的 `sow` 生命周期只使用本地文件系统和 `sow.example.yaml`，不会访问上游或
+云，也不需要 GPG 私钥或云凭据；若 Go module cache 为空，第一行 `go build`
+仍会按 Go 工具链配置下载源码依赖。示例配置声明了三个服务目录；全新根目录必须
+先创建它们。显式 materialize 的目标可由 Nginx 直接托管，因此仓库根及其真实祖先必须允许
+Nginx worker 穿越（目录至少有 other-execute），且路径不能经过 symlink。
+
+```bash
+CGO_ENABLED=0 go build -trimpath -o sow ./cmd/sow
+
+DEMO_ROOT="$(pwd)/sow-demo-root"
+DEMO_CONFIG="$(pwd)/sow.demo.yaml"
+DEMO_INPUT="$(pwd)/sow-demo.bin"
+cp sow.example.yaml "$DEMO_CONFIG"
+mkdir -p "$DEMO_ROOT/bin" \
+  "$DEMO_ROOT/yum/pgsql/el9.x86_64" \
+  "$DEMO_ROOT/apt/pgsql/trixie"
+# 仅对尚为空的 demo 目录执行；不要递归 chmod 已初始化的 .sow 私有状态。
+chmod -R 0755 "$DEMO_ROOT"
+printf 'sow local MVP\n' >"$DEMO_INPUT"
+
+./sow init --config "$DEMO_CONFIG" --root "$DEMO_ROOT"
+./sow add "$DEMO_INPUT" --config "$DEMO_CONFIG" --root "$DEMO_ROOT" \
+  --repo assets-bin
+./sow verify --config "$DEMO_CONFIG" --root "$DEMO_ROOT" \
+  --layer L1 --view beta --repo assets-bin
+./sow promote beta latest --config "$DEMO_CONFIG" --root "$DEMO_ROOT" \
+  --repo assets-bin
+./sow materialize latest --config "$DEMO_CONFIG" --root "$DEMO_ROOT" \
+  --repo assets-bin --target export/latest
+./sow fsck --config "$DEMO_CONFIG" --root "$DEMO_ROOT"
+test -f "$DEMO_ROOT/export/latest/bin/sow-demo.bin"
+```
+
+`L1` 是纯本地字节、索引、签名与机密性闭包；`L2`–`L4` 需要匹配的已配置
+publication target。没有 target 的本地配置执行 `--layer L2` 会以覆盖不完整失败，
+这是 fail-closed 行为，不是本地 smoke test 的失败。
 
 旧 `yum/infra/{arch}` 的 mixed-EL 树不是普通 EL9/10 repo，不能用普通
 `add`、`sync` 或 selector 重新归类。配置显式的 inactive compatibility carrier 后，

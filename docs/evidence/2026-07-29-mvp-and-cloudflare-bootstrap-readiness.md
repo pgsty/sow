@@ -169,3 +169,49 @@ yet been created, so the following claims remain open:
 EL8 is not a blocker: its freeze point is `v5.0.0`, while apt older than 1.2 is
 outside the compatibility floor. Those decisions are already frozen in the
 product contracts and compatibility tests.
+
+## Follow-up: shipped clean-room local MVP closure
+
+The first literal clean-room replay of the README found three documentation
+gaps rather than a CLI implementation failure:
+
+1. `sow.example.yaml` declares three service directories, so an empty root must
+   create those directories before `init`;
+2. `L2` is remote-target coverage and must fail closed when `targets: {}` is
+   used; the credential-free local smoke path is `L1`;
+3. an explicit materialization target is directly hostable, so its real
+   ancestor chain must be symlink-free and Nginx-worker traversable.
+
+The README now contains an exact no-cloud/no-credential asset lifecycle whose
+CLI phase performs no network operation, and
+`TestShippedExampleSupportsCleanRoomLocalMVP` builds the production binary,
+copies the shipped example, initializes an empty tree, adds an asset, executes
+L1, promotes beta to latest, materializes a directly hostable export, runs
+`fsck`, and byte-compares the exported asset. The clean-delivery builder runs
+that test again from the extracted source archive rather than merely compiling
+the archive.
+
+Current-source results before this evidence edit:
+
+| Check | Result |
+|---|---|
+| focused clean-room ordinary | PASS, package `8.011s` |
+| focused clean-room race | PASS, package `7.999s` |
+| full compat ordinary | PASS, package `17.852s` |
+| full compat race | PASS, package `22.931s` |
+| clean-delivery policy race | PASS, package `37.193s` |
+| extracted-tree clean delivery, empty module/cache roots | PASS |
+
+The default Go module endpoints were unreachable from this host. Clean delivery
+therefore gained explicit `SOW_CLEAN_GOSUMDB` alongside the existing
+`SOW_CLEAN_GOPROXY`; it still rejects `off`, clears private/no-sum bypasses, and
+verifies every module. The successful isolated run used
+`https://goproxy.cn,direct` plus `sum.golang.google.cn`. Its archive identity was
+a pre-evidence observation and is intentionally not recorded as the final
+delivery identity; V-14 still requires the post-document identities outside the
+self-referential delivery root.
+
+All repository mutations in this follow-up were below disposable
+`/private/tmp/sow-compat-hostable-*` roots. Cloud credentials and real-cloud
+opt-ins were absent. No Cloudflare API, R2 object, COS/CO resource, production
+repository, or `/Users/vonng/pgsty/repo` write path was used.

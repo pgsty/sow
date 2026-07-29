@@ -2296,3 +2296,51 @@ records. The Goal remains active because a scoped Cloudflare control token,
 real Worker/purge/cache-log proof, COS/EdgeOne non-production resources, and
 production migration evidence are still absent; production resources remain
 forbidden test targets.
+
+## 2026-07-29 V-88 shipped clean-room MVP delivery
+
+V-88 supersedes V-85 after the shipped README/example path was executed
+literally and converted into an archive-enforced actual-binary E2E. The frozen
+delivery now creates the example's three empty service trees, keeps local L1
+separate from target-bound L2-L4, and states the symlink-free
+Nginx-worker-traversability contract before materialization. The production
+binary completes init, asset add, L1, beta-to-latest promote, materialize,
+full local fsck, and an exact exported-byte comparison.
+
+The clean-delivery environment still clears every private/no-sum bypass and
+rejects `GOSUMDB=off`. Because the default Go endpoints were unreachable from
+this host, both independent fresh HOME/GOPATH/GOMODCACHE/GOCACHE roots used a
+reachable checksum-verifying mirror pair:
+
+```text
+SOW_CLEAN_GOPROXY=https://goproxy.cn,direct \
+  SOW_CLEAN_GOSUMDB=sum.golang.google.cn \
+  test/compat/test-clean-delivery.sh /private/tmp/sow-clean-delivery-v88-final-a
+SOW_CLEAN_GOPROXY=https://goproxy.cn,direct \
+  SOW_CLEAN_GOSUMDB=sum.golang.google.cn \
+  test/compat/test-clean-delivery.sh /private/tmp/sow-clean-delivery-v88-final-b
+
+PRODUCT_SOURCE_SHA256=7cc076a693ac28176abfea82a7160a197d41dfa34a1acb67bcaec5ddaa08a7b3
+PRODUCT_SOURCE_FILES=595
+DELIVERY_CONTENT_SHA256=66202f15ef03bd21d392fb434425fbd3e9ed64bd13e7d8c2ce7e168e79b0d743
+DELIVERY_FILES=802
+ARCHIVE_SHA256=933316f244f2f8737ba481a6f785383f0bac3fa179770e9905f91818c4b4afd0
+```
+
+Archives:
+
+- `/private/tmp/sow-clean-delivery-v88-final-a/sow-delivery-66202f15ef03bd21.tgz`
+- `/private/tmp/sow-clean-delivery-v88-final-b/sow-delivery-66202f15ef03bd21.tgz`
+
+Independent `cmp` returned 0 and both `shasum -a 256` values matched the
+archive digest above. This ledger is outside both manifests, so this entry does
+not perturb the recorded identity. The business E2E wrote only disposable
+`/private/tmp/sow-compat-hostable-*` roots. Module downloads were the only
+external network traffic; no cloud credential or real-cloud opt-in was
+available, and no Cloudflare API/R2 object, CO/COS/EdgeOne resource,
+production repository, or `/Users/vonng/pgsty/repo` write path was used.
+
+V-88 closes the reproducible shipped local MVP and current delivery identity,
+not the long-term Goal. Real Cloudflare Worker/route/purge/cache-log, an
+isolated provider-log bucket and identities, COS/EdgeOne, and production
+migration evidence remain open.

@@ -507,6 +507,7 @@ internal/yumrepo/xml.go
 sow.example.yaml
 staticcheck.conf
 test/compat/apt_legacy_alias_test.go
+test/compat/clean_room_mvp_test.go
 test/compat/cleandelivery/delivery-extra-files.txt
 test/compat/cleandelivery/main.go
 test/compat/cleandelivery/main_test.go

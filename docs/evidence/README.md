@@ -8,8 +8,9 @@ Cloudflare 生产仓库、bucket、Zone、domain。既有生产只读基线仅�
 的专用、可丢弃、明显非生产资源。2026-07-18 provider-readiness registry 已且仅已钉住
 `pro`/`pro.pigsty.io`/`beta.pro.pigsty.io` 这一个 Cloudflare tuple。它开放单供应商只读
 readiness；owner 另行明确授权了仅命中空 `pro` 桶、带 exact bucket 确认与 run-owned digest
-allowlist 的 storage-only 协议测试。destructive/full-POC、Worker/CDN、provider-deployment 与
-bootstrap registry 仍保持关闭。
+allowlist 的 storage-only 协议测试。destructive/full-POC、Worker/CDN 与真实
+provider deployment 仍保持关闭；bootstrap registry 只钉住 owner-authorized 的
+create-only exact plan。
 2026-07-29 的
 [current-source MVP/readiness 复验](2026-07-29-mvp-and-cloudflare-bootstrap-readiness.md)
 确认干净 `22d3bd7` 已具备可运行的本地 MVP：真实 CLI APT+YUM
@@ -23,6 +24,12 @@ Workers Paid 足够，配置真实任务仍需 account `Logs Edit` 和专用 R2 
 writer/reader/control identities。修正后的 edge 48/48、focused compat
 ordinary/race 均通过，但没有真实 Cloudflare mutation 或 provider-log 读取，POC-06
 仍不升级；COS/EdgeOne 与生产迁移也仍是独立外部证据层。
+其后 owner-authorized 的 exact Cloudflare bootstrap plan 已进入 create-only registry；
+provider-deployment registry 仍为空，因此这只开放精确 bootstrap 入口，不构成
+Worker/route/purge/cache-log 或 full-POC 已通过。同一 MVP 报告的
+clean-room follow-up 还把 README 的无凭据本地闭环变成真实归档内 E2E：
+shipped example 的 init→asset add→L1→promote→materialize→fsck 普通/race 与完整
+compat 普通/race 均通过；所有写入只在 `/private/tmp`，未触云或生产仓库。
 2026-07-19 的 V-25 又把 bootstrap 与 provider log-sink 的 reusable lease key
 从 plan/deployment 版本身份中分离：同一资源/专用 raw bucket 始终只有一个稳定 key，历史
 idle/expired 版本可 CAS 重放而 live holder 仍阻塞；readiness receipt/seal 的本地半对中断也可
