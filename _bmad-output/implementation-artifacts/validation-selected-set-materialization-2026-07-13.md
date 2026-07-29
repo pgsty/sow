@@ -2344,3 +2344,49 @@ V-88 closes the reproducible shipped local MVP and current delivery identity,
 not the long-term Goal. Real Cloudflare Worker/route/purge/cache-log, an
 isolated provider-log bucket and identities, COS/EdgeOne, and production
 migration evidence remain open.
+
+## 2026-07-29 V-89 actual-process recovery delivery
+
+V-89 supersedes V-88 after the archive-enforced shipped-example E2E gained a
+real process-interruption path. The production CLI adds 1,024 unique assets;
+the harness watches only its durable `.sow` fences, sends `SIGSTOP` and
+`SIGKILL`, confirms plain fsck diagnoses recovery, deletes every original
+input, and invokes inputless `sow add --recover`. L1, full fsck, an exact
+recovered sample, and absence of both durable residues must all pass. No
+in-process fault hook participates.
+
+After the recovery evidence and V-89 traceability row were frozen, two
+independent fresh HOME/GOPATH/GOMODCACHE/GOCACHE roots ran the complete
+extracted-tree delivery gate with checksum verification:
+
+```text
+SOW_CLEAN_GOPROXY=https://goproxy.cn,direct \
+  SOW_CLEAN_GOSUMDB=sum.golang.google.cn \
+  test/compat/test-clean-delivery.sh /private/tmp/sow-clean-delivery-v89-final-a
+SOW_CLEAN_GOPROXY=https://goproxy.cn,direct \
+  SOW_CLEAN_GOSUMDB=sum.golang.google.cn \
+  test/compat/test-clean-delivery.sh /private/tmp/sow-clean-delivery-v89-final-b
+
+PRODUCT_SOURCE_SHA256=00e7e6fbac39298f21df1d105e10b0f6dc28a5a63e54a5a0e3fdb173400bc772
+PRODUCT_SOURCE_FILES=595
+DELIVERY_CONTENT_SHA256=52dfd3bb1d38c874391c4225e261517b540bbc720b1a16f276966896f9bf729d
+DELIVERY_FILES=802
+ARCHIVE_SHA256=6bd03e6a32894486b40456e03c7673756bc0f390247ee93dc1b12aa20f66aefa
+```
+
+Archives:
+
+- `/private/tmp/sow-clean-delivery-v89-final-a/sow-delivery-52dfd3bb1d38c874.tgz`
+- `/private/tmp/sow-clean-delivery-v89-final-b/sow-delivery-52dfd3bb1d38c874.tgz`
+
+Independent `cmp` returned 0 and both archive hashes matched. This ledger is
+outside both manifests and does not perturb the identity it records. Module
+downloads were the only external network traffic. All repository writes and
+child processes stayed below disposable `/private/tmp` roots; cloud
+credentials and provider opt-ins were absent. No Cloudflare API/R2 object,
+CO/COS/EdgeOne resource, production repository, or
+`/Users/vonng/pgsty/repo` write path was used.
+
+V-89 closes the shipped local actual-process recovery and current delivery
+identity only. The long-term Goal remains active for the same real edge,
+double-cloud, and production-migration evidence gaps.

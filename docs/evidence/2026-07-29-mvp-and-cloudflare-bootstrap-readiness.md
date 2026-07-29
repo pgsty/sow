@@ -215,3 +215,34 @@ All repository mutations in this follow-up were below disposable
 `/private/tmp/sow-compat-hostable-*` roots. Cloud credentials and real-cloud
 opt-ins were absent. No Cloudflare API, R2 object, COS/CO resource, production
 repository, or `/Users/vonng/pgsty/repo` write path was used.
+
+## Follow-up: actual-process interruption recovery
+
+The archive-enforced clean-room test now also proves the operator recovery
+claim with the production executable. It starts one actual CLI add containing
+1,024 unique assets, watches only the durable on-disk projection/selection
+fences, sends `SIGSTOP` followed by `SIGKILL` as soon as a fence becomes
+visible, and waits for the child to die. It does not install or call an
+in-process fault hook.
+
+The test then:
+
+1. runs plain `fsck` and requires a nonzero diagnostic containing the recovery
+   action;
+2. deletes the entire original input directory;
+3. executes the documented inputless
+   `sow add --recover --config ... --root ...`;
+4. requires a durable recovery receipt, L1 pass, full clean `fsck`, exact
+   recovered sample bytes, and absence of both durable residue files.
+
+The final 1,024-file fixture passed three consecutive ordinary runs in
+`55.409s` total and two consecutive race-harness runs in `39.042s` total. Full
+compat then passed ordinary/race in `40.601s`/`46.151s`; clean-delivery policy
+race passed in `40.364s`; vet, Staticcheck, and diff checks were clean. The
+recovered beta view contains the original smoke asset plus all 1,024
+interrupted assets. This evidence strengthens FR-28/NFR-09 and clean-environment
+operability; it does not upgrade any real-cloud or production-migration row.
+
+All child processes and repository writes stayed below disposable
+`/private/tmp/sow-compat-hostable-*`. Cloud credentials and all real-provider
+opt-ins were absent, and no production or cloud resource was accessed.

@@ -30,6 +30,9 @@ Worker/route/purge/cache-log 或 full-POC 已通过。同一 MVP 报告的
 clean-room follow-up 还把 README 的无凭据本地闭环变成真实归档内 E2E：
 shipped example 的 init→asset add→L1→promote→materialize→fsck 普通/race 与完整
 compat 普通/race 均通过；所有写入只在 `/private/tmp`，未触云或生产仓库。
+同一归档内 E2E 随后增加 actual-process `SIGKILL`：观察到 durable fence 后终止
+1,024-file asset add，删除全部原输入，再由无输入 `sow add --recover` 恢复，
+并以 L1、full fsck、逐字节 sample 与零 residue 闭合；没有测试 hook 或云访问。
 2026-07-19 的 V-25 又把 bootstrap 与 provider log-sink 的 reusable lease key
 从 plan/deployment 版本身份中分离：同一资源/专用 raw bucket 始终只有一个稳定 key，历史
 idle/expired 版本可 CAS 重放而 live holder 仍阻塞；readiness receipt/seal 的本地半对中断也可
