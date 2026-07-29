@@ -542,6 +542,7 @@ test/compat/testdata/real_cloud_nonproduction_cloudflare_bootstrap_registry.json
 test/compat/testdata/real_cloud_nonproduction_provider_deployment_registry.json
 test/compat/testdata/real_cloud_nonproduction_provider_readiness_registry.json
 test/compat/testdata/real_cloud_nonproduction_resource_registry.json
+test/compat/traceability_contract_test.go
 test/compat/yum_signature_bridge_test.go
 test/perf/legacy_adoption_50k_test.go
 test/perf/manifest_large_test.go
