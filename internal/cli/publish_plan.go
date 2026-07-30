@@ -2169,6 +2169,13 @@ func isDerivedStateTemporaryName(name, canonical string) bool {
 		if !exactLowerHex(suffix[index+len(".tmp-remove-"):], 32) {
 			return false
 		}
+		// Removing a published derived-state file quarantines the final name
+		// directly. A process stop can therefore leave
+		// <canonical>.tmp-remove-<nonce> without an earlier write/install
+		// suffix. It is a valid recoverable residue, not malformed input.
+		if index == 0 {
+			return true
+		}
 		suffix = suffix[:index]
 	}
 	if value, ok := strings.CutPrefix(suffix, ".tmp-install-"); ok {
@@ -2178,6 +2185,16 @@ func isDerivedStateTemporaryName(name, canonical string) bool {
 		return exactLowerHex(value, 16, 32)
 	}
 	return false
+}
+
+// isPureDerivedStateRemovalName recognizes only the quarantine created when a
+// final derived-state coordinate is removed. It is recoverable filesystem
+// residue, but it is never a valid replacement-transaction source: replacement
+// intents may consume only writer/install temporaries whose bytes and identity
+// were bound before the intent was published.
+func isPureDerivedStateRemovalName(name, canonical string) bool {
+	suffix, ok := strings.CutPrefix(name, canonical+".tmp-remove-")
+	return ok && exactLowerHex(suffix, 32)
 }
 
 func exactLowerHex(value string, lengths ...int) bool {

@@ -1,5 +1,6 @@
 README.md
 _bmad-output/brainstorming/brainstorm-sow-repo-cli-2026-07-11/brainstorm-intent.md
+_bmad-output/implementation-artifacts/spec-clean-room-lifecycle-mvp.md
 _bmad-output/implementation-artifacts/spec-cloudflare-static-entitlement-bootstrap.md
 _bmad-output/implementation-artifacts/spec-cloudflare-workers-paid-provider-attestation.md
 _bmad-output/implementation-artifacts/spec-config-cardinality-complexity-bounds.md

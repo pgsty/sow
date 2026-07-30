@@ -30,6 +30,12 @@ type blockingCFCheckpointTransport struct {
 	release     chan struct{}
 }
 
+// These integration tests execute complete dual-target CLI publications under
+// the race detector. Progress is synchronized by explicit transport and
+// checkpoint events; the timeout is only a deadlock guard and must tolerate
+// race-instrumented filesystem and cryptographic work on a loaded runner.
+const publishConcurrencyProgressTimeout = 30 * time.Second
+
 func (transport *blockingCFCheckpointTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	checkpointRead := request.Method == http.MethodGet && strings.TrimPrefix(request.URL.Path, "/") == publish.CheckpointKey
 	if checkpointRead && request.URL.Host == "repo-bucket.storage.test" {
@@ -491,11 +497,11 @@ func TestPublishCLIChangedCOSCommitsWhileCFPipelineIsBlocked(t *testing.T) {
 	}()
 	select {
 	case <-blocking.started:
-	case <-time.After(3 * time.Second):
+	case <-time.After(publishConcurrencyProgressTimeout):
 		t.Fatal("CF pipeline did not reach the blocked checkpoint read")
 	}
 
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(publishConcurrencyProgressTimeout)
 	for {
 		protocol.mutex.Lock()
 		cosBody := append([]byte(nil), protocol.cosObjects[publish.CheckpointKey].body...)
@@ -523,7 +529,7 @@ func TestPublishCLIChangedCOSCommitsWhileCFPipelineIsBlocked(t *testing.T) {
 		if result.code != ExitOK || strings.Count(result.stdout, "status=published") != 2 {
 			t.Fatalf("dual publish after CF release code=%d stdout=%s stderr=%s", result.code, result.stdout, result.stderr)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(publishConcurrencyProgressTimeout):
 		t.Fatal("dual publish did not finish after CF checkpoint read was released")
 	}
 }
@@ -592,11 +598,11 @@ func TestPublishCLICOSAdvancesBetaLatestStableWhileCFInspectionIsBlocked(t *test
 	}()
 	select {
 	case <-blocking.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(publishConcurrencyProgressTimeout):
 		t.Fatal("CF sequence did not reach its blocked recovery inspection")
 	}
 
-	deadline := time.After(8 * time.Second)
+	deadline := time.After(publishConcurrencyProgressTimeout)
 	for {
 		protocol.mutex.Lock()
 		cosBody := append([]byte(nil), protocol.cosObjects[publish.CheckpointKey].body...)
@@ -624,7 +630,7 @@ func TestPublishCLICOSAdvancesBetaLatestStableWhileCFInspectionIsBlocked(t *test
 		if result.code != ExitOK || strings.Count(result.stdout, "status=published") != 6 {
 			t.Fatalf("multi-view publish after CF release code=%d stdout=%s stderr=%s", result.code, result.stdout, result.stderr)
 		}
-	case <-time.After(8 * time.Second):
+	case <-time.After(publishConcurrencyProgressTimeout):
 		t.Fatal("multi-view publish did not finish after CF release")
 	}
 }
@@ -733,11 +739,11 @@ func TestPublishCLICOSAdvancesAcrossSnapshotsWhileCFInspectionIsBlocked(t *testi
 	}()
 	select {
 	case <-blocking.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(publishConcurrencyProgressTimeout):
 		t.Fatal("CF snapshot sequence did not reach its blocked recovery inspection")
 	}
 
-	deadline := time.After(10 * time.Second)
+	deadline := time.After(publishConcurrencyProgressTimeout)
 	for {
 		protocol.mutex.Lock()
 		cosBody := append([]byte(nil), protocol.cosObjects[publish.CheckpointKey].body...)
@@ -764,7 +770,7 @@ func TestPublishCLICOSAdvancesAcrossSnapshotsWhileCFInspectionIsBlocked(t *testi
 		if result.code != ExitOK || strings.Count(result.stdout, "status=published") != 4 {
 			t.Fatalf("multi-snapshot publish after CF release code=%d stdout=%s stderr=%s", result.code, result.stdout, result.stderr)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(publishConcurrencyProgressTimeout):
 		t.Fatal("multi-snapshot publish did not finish after CF release")
 	}
 }
@@ -827,11 +833,11 @@ func TestPublishCLIDefaultCOSAdvancesThroughRetainedSnapshotWhileCFInspectionIsB
 	}()
 	select {
 	case <-blocking.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(publishConcurrencyProgressTimeout):
 		t.Fatal("CF default sequence did not reach its blocked recovery inspection")
 	}
 
-	deadline := time.After(10 * time.Second)
+	deadline := time.After(publishConcurrencyProgressTimeout)
 	for {
 		protocol.mutex.Lock()
 		cosBody := append([]byte(nil), protocol.cosObjects[publish.CheckpointKey].body...)
@@ -858,7 +864,7 @@ func TestPublishCLIDefaultCOSAdvancesThroughRetainedSnapshotWhileCFInspectionIsB
 		if result.code != ExitOK || strings.Count(result.stdout, "status=published") != 8 {
 			t.Fatalf("default publish after CF release code=%d stdout=%s stderr=%s", result.code, result.stdout, result.stderr)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(publishConcurrencyProgressTimeout):
 		t.Fatal("default publish did not finish after CF release")
 	}
 }
@@ -994,11 +1000,11 @@ func TestPublishCLIDefaultRecoversExpiredCFIntentWithoutBlockingCOSViews(t *test
 	}()
 	select {
 	case <-blocking.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(publishConcurrencyProgressTimeout):
 		t.Fatal("CF expired-snapshot inspection did not block")
 	}
 
-	deadline := time.After(10 * time.Second)
+	deadline := time.After(publishConcurrencyProgressTimeout)
 	for {
 		protocol.mutex.Lock()
 		cosBody := append([]byte(nil), protocol.cosObjects[publish.CheckpointKey].body...)
@@ -1030,7 +1036,7 @@ func TestPublishCLIDefaultRecoversExpiredCFIntentWithoutBlockingCOSViews(t *test
 			strings.Contains(result.stdout, "target=cos view=snapshot snapshot="+expiredSnapshot) {
 			t.Fatalf("expired snapshot recovery after CF release code=%d stdout=%s stderr=%s", result.code, result.stdout, result.stderr)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(publishConcurrencyProgressTimeout):
 		t.Fatal("default publish did not finish expired CF recovery after release")
 	}
 	protocol.mutex.Lock()

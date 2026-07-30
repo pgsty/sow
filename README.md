@@ -29,7 +29,7 @@ CGO_ENABLED=0 go build -trimpath -o sow ./cmd/sow
 ./sow verify --config sow.yaml --layer L1
 ./sow verify --config sow.yaml --layer L2,L3,L4 --view stable --target cf --pro-token-file ./pro-token
 ./sow fsck --config sow.yaml
-./sow fsck --config sow.yaml --recover        # 仅恢复严格的本地事务/随机残留
+./sow fsck --config sow.yaml --recover        # 恢复本地事务/残留并从正典重建 SQLite
 ./sow fsck --config sow.yaml --target cf --adopt-remote-inventory
 ./sow fsck --config sow.yaml --target cf --repair-purge-ledger
 # fsck 报告 preserved projection audit 后，一次只退休一个当前 inode
@@ -74,11 +74,61 @@ printf 'sow local MVP\n' >"$DEMO_INPUT"
   --repo assets-bin --target export/latest
 ./sow fsck --config "$DEMO_CONFIG" --root "$DEMO_ROOT"
 test -f "$DEMO_ROOT/export/latest/bin/sow-demo.bin"
+
+# SQLite 只是派生缓存；显式恢复从 canonical Git 全量重建并继续审计。
+rm "$DEMO_ROOT/.sow/cache/state.db"
+./sow fsck --recover --config "$DEMO_CONFIG" --root "$DEMO_ROOT"
+./sow verify --config "$DEMO_CONFIG" --root "$DEMO_ROOT" \
+  --layer L1 --view beta,latest --repo assets-bin
+
+# 从两个可变视图减包；GC 先只读列出精确集合，再用当次摘要确认。
+./sow rm sow-demo.bin --view latest --config "$DEMO_CONFIG" \
+  --root "$DEMO_ROOT" --repo assets-bin
+./sow rm sow-demo.bin --view beta --config "$DEMO_CONFIG" \
+  --root "$DEMO_ROOT" --repo assets-bin
+# 显式物化是 exact reconcile；视图删除后重放会清掉 Nginx 可见旧文件。
+./sow materialize latest --config "$DEMO_CONFIG" --root "$DEMO_ROOT" \
+  --repo assets-bin --target export/latest
+test ! -e "$DEMO_ROOT/export/latest/bin/sow-demo.bin"
+./sow gc --config "$DEMO_CONFIG" --root "$DEMO_ROOT"
+```
+
+上面的正式默认值保留最近 32 个 commit，因此刚删除的对象仍是回滚根，dry-run
+不会立即给出可删除对象。若要在隔离目录完整演示破坏性的确认阶段，先把另一个
+一次性配置的保留窗缩到 1，再初始化；不要对已有仓库临时改这个策略：
+
+```bash
+GC_ROOT="$(pwd)/sow-gc-demo-root"
+GC_CONFIG="$(pwd)/sow.gc-demo.yaml"
+GC_INPUT="$(pwd)/sow-gc-demo.bin"
+sed 's/cas_history_commits: 32/cas_history_commits: 1/' \
+  sow.example.yaml >"$GC_CONFIG"
+mkdir -p "$GC_ROOT/bin" "$GC_ROOT/yum/pgsql/el9.x86_64" \
+  "$GC_ROOT/apt/pgsql/trixie"
+chmod -R 0755 "$GC_ROOT"
+printf 'collectible demo object\n' >"$GC_INPUT"
+./sow init --config "$GC_CONFIG" --root "$GC_ROOT"
+./sow add "$GC_INPUT" --config "$GC_CONFIG" --root "$GC_ROOT" \
+  --repo assets-bin
+./sow rm sow-gc-demo.bin --view beta --config "$GC_CONFIG" \
+  --root "$GC_ROOT" --repo assets-bin
+GC_DRY="$(./sow gc --config "$GC_CONFIG" --root "$GC_ROOT")"
+printf '%s\n' "$GC_DRY"
+GC_PLAN="$(printf '%s\n' "$GC_DRY" |
+  sed -n 's/.*gc_set_sha256=\([0-9a-f]\{64\}\).*/\1/p')"
+test -n "$GC_PLAN"
+./sow gc --config "$GC_CONFIG" --root "$GC_ROOT" \
+  --apply --confirm "$GC_PLAN"
 ```
 
 `L1` 是纯本地字节、索引、签名与机密性闭包；`L2`–`L4` 需要匹配的已配置
 publication target。没有 target 的本地配置执行 `--layer L2` 会以覆盖不完整失败，
 这是 fail-closed 行为，不是本地 smoke test 的失败。
+
+普通命令不会静默掩盖无标记的 cache 漂移；`--recover` 是操作者显式选择的昂贵恢复
+路径，会在持有本地状态锁时以 manifest/ref/CAS 为输入原子替换
+`.sow/cache/state.db`。`gc --apply` 只接受同一当前 CAS+serving 集合算出的
+`gc_set_sha256`；集合变化或已成功重放后，旧摘要以冲突退出且不会删除新对象。
 
 旧 `yum/infra/{arch}` 的 mixed-EL 树不是普通 EL9/10 repo，不能用普通
 `add`、`sync` 或 selector 重新归类。配置显式的 inactive compatibility carrier 后，

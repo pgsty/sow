@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/pgsty/sow/internal/catalog"
 	"github.com/pgsty/sow/internal/config"
 	"github.com/pgsty/sow/internal/state"
 )
@@ -273,6 +274,34 @@ func TestSyncMaterializationScopeSeparatesSameRepoUpstreams(t *testing.T) {
 	}
 	if current, exists, err := readMaterializationSelectionJournal(fixture.cfg.StatePath()); err != nil || !exists || current.ID != journalA.ID {
 		t.Fatalf("wrong upstream changed durable sync journal=%+v exists=%t err=%v", current, exists, err)
+	}
+}
+
+func TestAutomaticSyncJournalRecoveryDoesNotAuthorizeUnmarkedCatalogRepair(t *testing.T) {
+	fixture := setupMaterializationSelectionFixture(t)
+	selectionSHA := strings.Repeat("5", 64)
+	fixture.snapshot.operationScope = syncMaterializationScope("upstream-a", selectionSHA)
+	owner, err := beginMaterializationSelectedSet(fixture.cfg, fixture.canonical, fixture.snapshot, "sync", false, fixture.units)
+	if err != nil || !owner {
+		t.Fatalf("begin scoped sync selection owner=%t err=%v", owner, err)
+	}
+	fixture.snapshot.resetMaterializationSelection()
+	cachePath := catalog.Path(fixture.cfg.StatePath())
+	if err := os.Remove(cachePath); err != nil {
+		t.Fatal(err)
+	}
+
+	upstream := config.Upstream{ID: "upstream-a", Repo: "deb-test", Type: "apt", Arches: []string{"arm64"}, Suite: "jammy"}
+	var output bytes.Buffer
+	recovered, err := checkSyncRecovery(t.Context(), fixture.cfg, fixture.canonical, false, []config.Upstream{upstream}, &output, &bytes.Buffer{})
+	if err != nil || !recovered {
+		t.Fatalf("exact sync journal recovery recovered=%t err=%v output=%s", recovered, err, output.String())
+	}
+	if strings.Contains(output.String(), "cache rebuilt") {
+		t.Fatalf("automatic sync journal recovery healed unrelated unmarked cache drift: %s", output.String())
+	}
+	if _, err := os.Lstat(cachePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("automatic sync journal recovery recreated missing cache: %v", err)
 	}
 }
 

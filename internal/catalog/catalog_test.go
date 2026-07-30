@@ -72,6 +72,28 @@ func TestRebuildIsDisposableAndEquivalent(t *testing.T) {
 	}
 }
 
+func TestInterruptedRebuildInventoryRejectsNonRegularResidue(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), ".sow")
+	cacheDir := filepath.Join(stateDir, "cache")
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("must remain"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(cacheDir, "state-attack.db")); err != nil {
+		t.Fatal(err)
+	}
+	if residues, err := InterruptedRebuildResidues(stateDir); err == nil || len(residues) != 0 ||
+		!strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("symlink rebuild residue was admitted: residues=%v err=%v", residues, err)
+	}
+	if body, err := os.ReadFile(outside); err != nil || string(body) != "must remain" {
+		t.Fatalf("rebuild residue inventory changed symlink target: body=%q err=%v", body, err)
+	}
+}
+
 func TestLegacyProvenanceProjectionStreamsExactCanonicalRows(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), ".sow")
 	stageDir := t.TempDir()

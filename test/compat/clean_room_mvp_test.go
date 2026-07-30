@@ -3,6 +3,7 @@ package compat_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -55,6 +56,12 @@ func TestShippedExampleSupportsCleanRoomLocalMVP(t *testing.T) {
 	runCLI(ctx, t, moduleRoot, cliPath,
 		"add", inputPath, "--config", configPath, "--root", repositoryRoot,
 		"--repo", "assets-bin")
+	addReplayOutput := runCLI(ctx, t, moduleRoot, cliPath,
+		"add", inputPath, "--config", configPath, "--root", repositoryRoot,
+		"--repo", "assets-bin")
+	if !strings.Contains(addReplayOutput, "add unchanged repo=assets-bin view=beta") {
+		t.Fatalf("asset add replay was not idempotent:\n%s", addReplayOutput)
+	}
 	verifyOutput := runCLI(ctx, t, moduleRoot, cliPath,
 		"verify", "--config", configPath, "--root", repositoryRoot,
 		"--layer", "L1", "--view", "beta", "--repo", "assets-bin")
@@ -64,9 +71,22 @@ func TestShippedExampleSupportsCleanRoomLocalMVP(t *testing.T) {
 	runCLI(ctx, t, moduleRoot, cliPath,
 		"promote", "beta", "latest", "--config", configPath, "--root", repositoryRoot,
 		"--repo", "assets-bin")
+	promoteReplayOutput := runCLI(ctx, t, moduleRoot, cliPath,
+		"promote", "beta", "latest", "--config", configPath, "--root", repositoryRoot,
+		"--repo", "assets-bin")
+	if !strings.Contains(promoteReplayOutput, "promote unchanged source=beta destination=latest") {
+		t.Fatalf("promote replay was not idempotent:\n%s", promoteReplayOutput)
+	}
 	runCLI(ctx, t, moduleRoot, cliPath,
 		"materialize", "latest", "--config", configPath, "--root", repositoryRoot,
 		"--repo", "assets-bin", "--target", "export/latest")
+	materializeReplayOutput := runCLI(ctx, t, moduleRoot, cliPath,
+		"materialize", "latest", "--config", configPath, "--root", repositoryRoot,
+		"--repo", "assets-bin", "--target", "export/latest")
+	if !strings.Contains(materializeReplayOutput, "route_receipt_changed=false") ||
+		!strings.Contains(materializeReplayOutput, "existing=1") {
+		t.Fatalf("materialize replay was not idempotent:\n%s", materializeReplayOutput)
+	}
 	fsckOutput := runCLI(ctx, t, moduleRoot, cliPath,
 		"fsck", "--config", configPath, "--root", repositoryRoot)
 	if !strings.Contains(fsckOutput, "fsck clean repos=3 targets=0") {
@@ -81,6 +101,134 @@ func TestShippedExampleSupportsCleanRoomLocalMVP(t *testing.T) {
 		t.Fatalf("materialized asset=%q want=%q", materialized, inputBody)
 	}
 
+	// Close the asset removal and two-phase GC lifecycle without weakening the
+	// shipped rollback default. This disposable copy uses one retained commit
+	// only to make one unexported asset deterministically collectible.
+	const defaultHistory = "cas_history_commits: 32"
+	const testHistory = "cas_history_commits: 1"
+	if bytes.Count(example, []byte(defaultHistory)) != 1 {
+		t.Fatalf("shipped example must contain exactly one %q", defaultHistory)
+	}
+	writeFile(t, configPath, bytes.Replace(example, []byte(defaultHistory), []byte(testHistory), 1), 0o600)
+	gcInputBody := []byte("sow local GC lifecycle\n")
+	gcInputPath := filepath.Join(work, "sow-gc-demo.bin")
+	writeFile(t, gcInputPath, gcInputBody, 0o644)
+	runCLI(ctx, t, moduleRoot, cliPath,
+		"add", gcInputPath, "--config", configPath, "--root", repositoryRoot,
+		"--repo", "assets-bin")
+	runCLI(ctx, t, moduleRoot, cliPath,
+		"rm", filepath.Base(gcInputPath), "--view", "beta",
+		"--config", configPath, "--root", repositoryRoot, "--repo", "assets-bin")
+
+	gcDigest := fmt.Sprintf("%x", sha256.Sum256(gcInputBody))
+	gcObjectPath := filepath.Join(repositoryRoot, ".pool", "sha256", gcDigest[:2], gcDigest)
+	if _, err := os.Stat(gcObjectPath); err != nil {
+		t.Fatalf("collectible CAS object missing before GC: %v", err)
+	}
+	gcDryRun := runCLI(ctx, t, moduleRoot, cliPath,
+		"gc", "--config", configPath, "--root", repositoryRoot, "--limit", "20")
+	if cleanRoomSummaryField(t, gcDryRun, "dry_run") != "true" ||
+		cleanRoomSummaryField(t, gcDryRun, "orphans") != "1" {
+		t.Fatalf("GC dry run did not identify exactly one orphan:\n%s", gcDryRun)
+	}
+	gcPlan := cleanRoomSummaryField(t, gcDryRun, "gc_set_sha256")
+	gcApply := runCLI(ctx, t, moduleRoot, cliPath,
+		"gc", "--config", configPath, "--root", repositoryRoot,
+		"--apply", "--confirm", gcPlan, "--limit", "20")
+	if cleanRoomSummaryField(t, gcApply, "dry_run") != "false" ||
+		cleanRoomSummaryField(t, gcApply, "deleted") != "1" {
+		t.Fatalf("confirmed GC did not delete the exact orphan:\n%s", gcApply)
+	}
+	if _, err := os.Stat(gcObjectPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("confirmed GC retained orphan %s: %v", gcObjectPath, err)
+	}
+
+	// Change the current non-empty deletion set after confirmation. Reusing the
+	// old digest must preserve the newly orphaned object, not merely reject an
+	// already-empty replay.
+	changedGCBody := []byte("sow GC set changed after confirmation\n")
+	changedGCInput := filepath.Join(work, "sow-gc-changed.bin")
+	writeFile(t, changedGCInput, changedGCBody, 0o644)
+	runCLI(ctx, t, moduleRoot, cliPath,
+		"add", changedGCInput, "--config", configPath, "--root", repositoryRoot,
+		"--repo", "assets-bin")
+	runCLI(ctx, t, moduleRoot, cliPath,
+		"rm", filepath.Base(changedGCInput), "--view", "beta",
+		"--config", configPath, "--root", repositoryRoot, "--repo", "assets-bin")
+	changedGCDigest := fmt.Sprintf("%x", sha256.Sum256(changedGCBody))
+	changedGCObjectPath := filepath.Join(repositoryRoot, ".pool", "sha256", changedGCDigest[:2], changedGCDigest)
+
+	staleGC := exec.CommandContext(ctx, cliPath,
+		"gc", "--config", configPath, "--root", repositoryRoot,
+		"--apply", "--confirm", gcPlan, "--limit", "20")
+	staleGC.Dir = moduleRoot
+	staleGCOutput, staleGCErr := staleGC.CombinedOutput()
+	var staleGCExit *exec.ExitError
+	if !errors.As(staleGCErr, &staleGCExit) || staleGCExit.ExitCode() != 6 ||
+		!strings.Contains(string(staleGCOutput), "confirmation differs from current") {
+		t.Fatalf("stale GC confirmation did not fail closed: err=%v\n%s", staleGCErr, staleGCOutput)
+	}
+	if _, err := os.Stat(changedGCObjectPath); err != nil {
+		t.Fatalf("stale GC confirmation deleted a newly orphaned object: %v", err)
+	}
+	changedGCDryRun := runCLI(ctx, t, moduleRoot, cliPath,
+		"gc", "--config", configPath, "--root", repositoryRoot, "--limit", "20")
+	if cleanRoomSummaryField(t, changedGCDryRun, "orphans") != "1" {
+		t.Fatalf("changed GC set did not retain exactly one orphan:\n%s", changedGCDryRun)
+	}
+	changedGCPlan := cleanRoomSummaryField(t, changedGCDryRun, "gc_set_sha256")
+	runCLI(ctx, t, moduleRoot, cliPath,
+		"gc", "--config", configPath, "--root", repositoryRoot,
+		"--apply", "--confirm", changedGCPlan, "--limit", "20")
+	if _, err := os.Stat(changedGCObjectPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh GC confirmation retained changed orphan: %v", err)
+	}
+	gcReplay := runCLI(ctx, t, moduleRoot, cliPath,
+		"gc", "--config", configPath, "--root", repositoryRoot, "--limit", "20")
+	if cleanRoomSummaryField(t, gcReplay, "orphans") != "0" ||
+		cleanRoomSummaryField(t, gcReplay, "deleted") != "0" {
+		t.Fatalf("GC replay did not converge:\n%s", gcReplay)
+	}
+
+	runCLI(ctx, t, moduleRoot, cliPath,
+		"rm", filepath.Base(inputPath), "--view", "latest",
+		"--config", configPath, "--root", repositoryRoot, "--repo", "assets-bin")
+	rmReplayOutput := runCLI(ctx, t, moduleRoot, cliPath,
+		"rm", filepath.Base(inputPath), "--view", "latest",
+		"--config", configPath, "--root", repositoryRoot, "--repo", "assets-bin")
+	if !strings.Contains(rmReplayOutput, "rm unchanged view=latest") {
+		t.Fatalf("asset rm replay was not idempotent:\n%s", rmReplayOutput)
+	}
+	runCLI(ctx, t, moduleRoot, cliPath,
+		"rm", filepath.Base(inputPath), "--view", "beta",
+		"--config", configPath, "--root", repositoryRoot, "--repo", "assets-bin")
+	materializeRemoval := runCLI(ctx, t, moduleRoot, cliPath,
+		"materialize", "latest", "--config", configPath, "--root", repositoryRoot,
+		"--repo", "assets-bin", "--target", "export/latest")
+	if !strings.Contains(materializeRemoval, "pruned=1") {
+		t.Fatalf("materialized export did not report deleted asset pruning:\n%s", materializeRemoval)
+	}
+	if _, err := os.Stat(filepath.Join(repositoryRoot, "export", "latest", "bin", filepath.Base(inputPath))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted asset remains in Nginx-hostable export: %v", err)
+	}
+
+	cachePath := filepath.Join(repositoryRoot, ".sow", "cache", "state.db")
+	if err := os.Remove(cachePath); err != nil {
+		t.Fatal(err)
+	}
+	cacheRecoveryOutput := runCLI(ctx, t, moduleRoot, cliPath,
+		"fsck", "--recover", "--config", configPath, "--root", repositoryRoot)
+	if !strings.Contains(cacheRecoveryOutput, "cache rebuilt after recovery") ||
+		!strings.Contains(cacheRecoveryOutput, "fsck clean repos=3 targets=0") {
+		t.Fatalf("explicit cache recovery did not rebuild and audit canonical state:\n%s", cacheRecoveryOutput)
+	}
+	if info, err := os.Stat(cachePath); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		t.Fatalf("recovered SQLite cache is not a non-empty regular file: info=%v err=%v", info, err)
+	}
+	runCLI(ctx, t, moduleRoot, cliPath,
+		"verify", "--config", configPath, "--root", repositoryRoot,
+		"--layer", "L1", "--view", "beta,latest", "--repo", "assets-bin")
+
 	readme, err := os.ReadFile(filepath.Join(moduleRoot, "README.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -90,6 +238,8 @@ func TestShippedExampleSupportsCleanRoomLocalMVP(t *testing.T) {
 		`mkdir -p "$DEMO_ROOT/bin"`,
 		"--layer L1 --view beta --repo assets-bin",
 		"--repo assets-bin --target export/latest",
+		"fsck --recover",
+		"gc --config",
 		"`L2`–`L4` 需要匹配的已配置",
 	} {
 		if !bytes.Contains(readme, []byte(required)) {
@@ -206,4 +356,20 @@ func TestShippedExampleSupportsCleanRoomLocalMVP(t *testing.T) {
 			t.Fatalf("recovery residue remains at %s: %v", residue, err)
 		}
 	}
+}
+
+func cleanRoomSummaryField(t *testing.T, output, key string) string {
+	t.Helper()
+	prefix := key + "="
+	for _, field := range strings.Fields(output) {
+		if strings.HasPrefix(field, prefix) {
+			value := strings.TrimPrefix(field, prefix)
+			if value == "" {
+				t.Fatalf("summary field %s is empty in:\n%s", key, output)
+			}
+			return value
+		}
+	}
+	t.Fatalf("summary field %s is missing from:\n%s", key, output)
+	return ""
 }

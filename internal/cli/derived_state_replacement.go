@@ -110,6 +110,7 @@ func (intent derivedStateReplacementIntent) validate() error {
 		intent.Destination == "" || intent.Destination == "." ||
 		isDerivedStateReplacementReservedName(intent.Destination) ||
 		!isDerivedStateTemporaryName(intent.Source, intent.Destination) ||
+		isPureDerivedStateRemovalName(intent.Source, intent.Destination) ||
 		intent.SourceTrash != derivedStateReplacementSourceTrashName(intent.TransactionID) ||
 		intent.Candidate != derivedStateReplacementIsolationName(intent.TransactionID) ||
 		intent.CandidateTrash != intent.Candidate+".remove" ||

@@ -92,9 +92,16 @@ func classifyStrictDerivedStateTemporaryName(name string) (canonical, kind strin
 			}
 			index += offset
 			current := name[:index]
-			if current != "" && isDerivedStateTemporaryName(name, current) {
+			suffix := strings.TrimPrefix(name, current)
+			// A pure removal suffix belongs to the final managed coordinate.
+			// When the candidate prefix is itself temporary-shaped, the same
+			// name is either the already-recognized write/install+removal
+			// grammar or a malformed nested removal. Do not admit that inner
+			// split as a second (or attacker-chosen) canonical coordinate.
+			nestedPureRemoval := strings.HasPrefix(suffix, ".tmp-remove-") &&
+				strings.Contains(current, ".tmp-")
+			if current != "" && !nestedPureRemoval && isDerivedStateTemporaryName(name, current) {
 				currentKind := "write"
-				suffix := strings.TrimPrefix(name, current)
 				hasRemoval := strings.Contains(suffix, ".tmp-remove-")
 				if strings.HasPrefix(suffix, ".tmp-install-") {
 					currentKind = "install"

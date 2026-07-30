@@ -47,6 +47,28 @@ func TestValidateMaterializedRouteRootAcceptsExactMetadataAndCanonicalPayload(t 
 	}
 }
 
+func TestValidateMaterializedRouteRootAcceptsMissingPrefixOnlyForEmptyRoute(t *testing.T) {
+	fixture := newMaterializedRouteValidationFixture(t)
+	if err := os.RemoveAll(fixture.routeRoot); err != nil {
+		t.Fatal(err)
+	}
+	writeManifestEntries(t, fixture.exactManifest, nil)
+	writeManifestEntries(t, fixture.payloadManifest, nil)
+	fixture.route = deriveMaterializedRouteFixtureReceipt(t, fixture, []MaterializedRouteClaim{{
+		Kind: MaterializedRouteClaimPrefix, RelativeRoot: fixture.relative,
+	}})
+	validateMaterializedRouteFixture(t, context.Background(), fixture)
+
+	if err := os.MkdirAll(fixture.routeRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeModeFile(t, filepath.Join(fixture.routeRoot, "unexpected"), []byte("leak\n"), 0o444)
+	if err := validateMaterializedRouteFixtureError(t, context.Background(), fixture); err == nil ||
+		!strings.Contains(err.Error(), "manifest drift") {
+		t.Fatalf("empty route receipt accepted a newly visible file: %v", err)
+	}
+}
+
 func TestValidateMaterializedRouteRootRejectsAddedChangedAndUnhostableFiles(t *testing.T) {
 	tests := map[string]func(*testing.T, materializedRouteValidationFixture){
 		"added": func(t *testing.T, fixture materializedRouteValidationFixture) {

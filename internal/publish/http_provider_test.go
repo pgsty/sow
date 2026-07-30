@@ -684,11 +684,11 @@ func TestEdgeOnePurgeEvidenceMarksRepeatedMissingAcceptedJobIndeterminate(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider.purgePollInterval = time.Millisecond
-	// Leave enough wall-clock budget for the signed SDK request and the race
-	// detector; the contract under test is the cross-call persistence boundary,
-	// not a scheduler-dependent six-millisecond deadline.
-	provider.purgeWaitTimeout = 75 * time.Millisecond
+	// Make each completion call issue exactly one signed status request before
+	// its local deadlock guard expires. The contract under test is persistence
+	// across two operator calls, not scheduler-dependent sub-100ms polling.
+	provider.purgePollInterval = time.Minute
+	provider.purgeWaitTimeout = 2 * time.Second
 	provider.purgeMissingGrace = 0
 	accepted, err := provider.EdgeOneAcceptPurgeBatch(context.Background(), []string{"https://cdn.example/pointer"})
 	if err != nil {
@@ -705,7 +705,7 @@ func TestEdgeOnePurgeEvidenceMarksRepeatedMissingAcceptedJobIndeterminate(t *tes
 		second.IndeterminateObservedAt != second.LastNotFoundObservedAt {
 		t.Fatalf("second missing query receipt=%#v err=%v", second, err)
 	}
-	if createCalls.Load() != 1 || describeCalls.Load() < 2 {
+	if createCalls.Load() != 1 || describeCalls.Load() != 2 {
 		t.Fatalf("missing-job polling recreated before persistence boundary create=%d describe=%d", createCalls.Load(), describeCalls.Load())
 	}
 }

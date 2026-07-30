@@ -2390,3 +2390,110 @@ CO/COS/EdgeOne resource, production repository, or
 V-89 closes the shipped local actual-process recovery and current delivery
 identity only. The long-term Goal remains active for the same real edge,
 double-cloud, and production-migration evidence gaps.
+
+## 2026-07-30 V-90 complete local lifecycle and cache-rebuild delivery
+
+V-90 supersedes V-89 after the archive-enforced shipped-example E2E gained the
+full local asset lifecycle: idempotent add/promote/materialize, beta/latest rm,
+two-phase exact-digest GC with stale-confirmation rejection, deliberate SQLite
+deletion, canonical `fsck --recover` rebuild, L1/full fsck, and the existing
+1,024-asset actual-process `SIGSTOP`+`SIGKILL` inputless recovery. Focused
+tests also cover unmarked missing, metadata-drifted, and row-drifted caches.
+
+The complete ordinary/race regression caught and closed a legitimate
+final-file `.tmp-remove-<128-bit>` quarantine grammar plus same-process
+directory-writer serialization window. Loaded race runs also exposed two
+scheduler-dependent test guards; event-order assertions were retained while
+their deadlock budgets were separated from product timing. Six CLI ordinary
+and six CLI race shards, all non-CLI ordinary/race packages, full compat,
+patched RPM, vet, Staticcheck, module/diff checks, four platform CLI and compat
+test builds, command help, and the traceability/allowlist gates passed.
+
+The first final-delivery attempt failed closed because the new one-shot spec
+was not yet in the explicit delivery allowlist. After adding only that exact
+path and rerunning the policy gates, two independent fresh
+HOME/GOPATH/GOMODCACHE/GOCACHE roots executed the complete extracted-tree
+delivery gate with checksum verification:
+
+```text
+SOW_CLEAN_GOPROXY=https://goproxy.cn,direct \
+  SOW_CLEAN_GOSUMDB=sum.golang.google.cn \
+  test/compat/test-clean-delivery.sh \
+  /private/tmp/sow-clean-delivery-v90-final-a-20260730-2
+SOW_CLEAN_GOPROXY=https://goproxy.cn,direct \
+  SOW_CLEAN_GOSUMDB=sum.golang.google.cn \
+  test/compat/test-clean-delivery.sh \
+  /private/tmp/sow-clean-delivery-v90-final-b-20260730-1
+
+PRODUCT_SOURCE_SHA256=5988a3ac9e6550e506c851dd45754c44017aaec126f0633e217c7d44a1f01ce9
+PRODUCT_SOURCE_FILES=595
+DELIVERY_CONTENT_SHA256=b2798f937d4707f70f5dfe529969b3410c228184962492be3113cd00a354f403
+DELIVERY_FILES=803
+ARCHIVE_SHA256=39cb1e4dee6738b106e193359658197d9d003ba4ca236d740e026dc6cca63390
+```
+
+Archives:
+
+- `/private/tmp/sow-clean-delivery-v90-final-a-20260730-2/sow-delivery-b2798f937d4707f7.tgz`
+- `/private/tmp/sow-clean-delivery-v90-final-b-20260730-1/sow-delivery-b2798f937d4707f7.tgz`
+
+Independent `cmp` returned 0, both archive hashes matched, and archive listing
+confirmed that this validation ledger is absent. The ledger update therefore
+does not perturb the identity it records.
+
+All test and repository writes stayed below disposable `/tmp` or
+`/private/tmp` roots. Cloud credentials and real-provider opt-ins were
+explicitly absent. No Cloudflare API/R2 object, CO/COS/EdgeOne resource,
+production repository, or `/Users/vonng/pgsty/repo` write path was accessed.
+V-90 closes the reproducible, runnable local MVP and current delivery identity,
+not the long-term Goal. Real Cloudflare Worker/route/purge/cache-log, isolated
+provider-log resources, COS/EdgeOne, and production migration/cutover evidence
+remain open.
+
+## 2026-07-30 V-90 review-final lifecycle and recovery delivery
+
+The two required adversarial follow-up reviews both returned `resolved` after
+the patch closed stale Nginx export after `rm`, over-broad automatic SQLite
+repair, interrupted cache-rebuild residue handling, empty-route
+materialization, stale-GC evidence, pure final-removal intent admission, and
+bounded concurrency-test draining. Focused and full affected-package
+ordinary/race tests passed, followed by all six full CLI ordinary shards:
+
+```text
+A-F      967.972s
+G-M     1158.894s
+N-O      410.389s
+P-Q     1345.198s
+R-V      829.995s
+rest     328.519s
+```
+
+`go vet ./...`, `staticcheck ./...`, `go mod verify`, `go mod tidy -diff`,
+`git diff --check`, four CGO-free CLI builds, four compat-test cross-builds,
+all required command help, and the expanded production-binary clean-room
+lifecycle also passed. Two further independent fresh delivery roots then
+produced byte-identical archives:
+
+```text
+PRODUCT_SOURCE_SHA256=a22cf7add4e410741b75a82078ab54d1d3639051df35f35436f01bce3e4d57e1
+PRODUCT_SOURCE_FILES=595
+DELIVERY_CONTENT_SHA256=2ee899e29073a29c84644daf3036f81c5ea28aa31f9d5e466d1121f9b681983e
+DELIVERY_FILES=803
+ARCHIVE_SHA256=8e6edba0a017f1e580e502ef14e0b121cba5740a25f4b8b5cf998d6c2e98c006
+```
+
+Archives:
+
+- `/private/tmp/sow-clean-delivery-v90-review-final-a-20260730-1/sow-delivery-2ee899e29073a29c.tgz`
+- `/private/tmp/sow-clean-delivery-v90-review-final-b-20260730-1/sow-delivery-2ee899e29073a29c.tgz`
+
+Independent `cmp` returned 0, both archive hashes matched, and archive listing
+confirmed that this external validation ledger is absent. Cloud credentials
+and every real-provider opt-in were explicitly cleared. No Cloudflare API/R2
+object, CO/COS/EdgeOne resource, production repository, or
+`/Users/vonng/pgsty/repo` write path was accessed.
+
+This review-final evidence establishes the runnable local MVP and its current
+reproducible delivery identity. It does not close the long-term Goal: real
+Cloudflare Worker/route/purge/cache-log, isolated provider-log resources,
+COS/EdgeOne, and production migration/cutover evidence remain open.

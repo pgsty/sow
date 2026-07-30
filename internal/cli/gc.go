@@ -31,7 +31,7 @@ func runGC(ctx context.Context, args []string, stdout, stderr io.Writer) (result
 	limit := fs.Int("limit", 100, "maximum orphan/missing objects printed (0 prints none)")
 	workers := fs.Int("workers", min(runtime.NumCPU(), maxCLIWorkers), "bounded workers for generation-directory validation (1-64)")
 	chunk := fs.Int("chunk-entries", 4096, "entries per generation-directory manifest run")
-	recover := fs.Bool("recover", false, "recover an incomplete canonical transaction before auditing")
+	recover := fs.Bool("recover", false, "recover local state and rebuild the SQLite cache before auditing")
 	fs.Usage = func() {
 		printSubcommandUsage(fs, "sow gc [--config sow.yaml] [--apply --confirm SHA256] [--limit N] [--workers N] [--chunk-entries N] [--recover]")
 	}

@@ -283,8 +283,18 @@ func validateMaterializedRouteExactClaims(ctx context.Context, targetRoot *os.Ro
 		case MaterializedRouteClaimPrefix:
 			if _, err := manifest.ScanRoot(ctx, targetRoot, manifest.Scope{Path: claim.RelativeRoot}, name, manifest.ScanOptions{
 				Workers: options.Workers, ChunkEntries: options.ChunkEntries, TempDir: options.TempDir,
-			}); err != nil {
+			}); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("scan materialized route prefix claim: %w", err)
+			}
+			// Exact reconciliation removes empty directories. A missing prefix
+			// therefore represents an empty route and is admitted only if the
+			// receipt's exact manifest is also empty for this claim; the merged
+			// manifest diff below enforces that equality. Any existing prefix
+			// must still satisfy the full Nginx hostability contract.
+			if _, err := targetRoot.Lstat(filepath.FromSlash(claim.RelativeRoot)); errors.Is(err, os.ErrNotExist) {
+				break
+			} else if err != nil {
+				return fmt.Errorf("inspect materialized route prefix hostability: %w", err)
 			}
 			if err := ValidateHostableTreeRoot(targetRoot, claim.RelativeRoot); err != nil {
 				return fmt.Errorf("validate materialized route prefix hostability: %w", err)

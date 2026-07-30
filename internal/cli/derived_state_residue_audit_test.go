@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDerivedStateResidueInventoryAndRecovery(t *testing.T) {
@@ -551,6 +553,139 @@ func TestDerivedStateRemovalQuarantineCrashRemainsRecoverable(t *testing.T) {
 	}
 	if _, err := recoverDerivedStateResidues(stateRoot, audit); err != nil {
 		t.Fatalf("recover crash-stable removal quarantine: %v", err)
+	}
+}
+
+func TestDerivedStateFinalRemovalQuarantineIsRecoverable(t *testing.T) {
+	stateRoot := t.TempDir()
+	generated := filepath.Join(stateRoot, "generated")
+	if err := os.Mkdir(generated, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := "state.json.tmp-remove-" + strings.Repeat("3", 32)
+	path := filepath.Join(generated, name)
+	if err := os.WriteFile(path, []byte("final removal quarantine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	audit, err := inspectDerivedStateResidues(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audit.temporaries) != 1 ||
+		audit.temporaries[0].Canonical != "state.json" ||
+		audit.temporaries[0].Kind != "removal" {
+		t.Fatalf("final removal inventory=%+v", audit.temporaries)
+	}
+	stats, err := recoverDerivedStateResidues(stateRoot, audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Temporaries != 1 {
+		t.Fatalf("recovered temporary count=%d want=1", stats.Temporaries)
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("final removal quarantine remains: %v", err)
+	}
+}
+
+func TestDerivedStateFinalRemovalSerializesDirectoryWriter(t *testing.T) {
+	stateRoot := t.TempDir()
+	const removedName = "removed.json"
+	removedPath := filepath.Join(stateRoot, removedName)
+	removedBody := []byte("remove exact derived state\n")
+	if err := os.WriteFile(removedPath, removedBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	previousHook := projectionStateBeforeUnlinkHook
+	projectionStateBeforeUnlinkHook = func(string) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	defer func() { projectionStateBeforeUnlinkHook = previousHook }()
+
+	removeDone := make(chan error, 1)
+	go func() {
+		removeDone <- removeExactProjectionIntent(stateRoot, removedName, 1024, func(body []byte) error {
+			if !bytes.Equal(body, removedBody) {
+				return errors.New("derived state removal body changed")
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for final removal quarantine")
+	}
+
+	type writeResult struct {
+		outcome derivedStateReplacementResult
+		err     error
+	}
+	writeDone := make(chan writeResult, 1)
+	go func() {
+		outcome, err := writeDerivedStateFileOutcome(stateRoot, "next.json", []byte("next derived state\n"))
+		writeDone <- writeResult{outcome: outcome, err: err}
+	}()
+	waiterDeadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case result := <-writeDone:
+			close(release)
+			select {
+			case <-removeDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("final removal stayed blocked after an early writer result")
+			}
+			t.Fatalf("directory writer observed in-flight final removal: outcome=%+v err=%v", result.outcome, result.err)
+		default:
+		}
+		derivedStateDirectoryWriterLocks.Lock()
+		entry := derivedStateDirectoryWriterLocks.entries[stateRoot]
+		waiters := 0
+		if entry != nil {
+			waiters = entry.refs
+		}
+		derivedStateDirectoryWriterLocks.Unlock()
+		if waiters == 2 {
+			break
+		}
+		if time.Now().After(waiterDeadline) {
+			close(release)
+			select {
+			case <-removeDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("final removal stayed blocked after waiter timeout")
+			}
+			select {
+			case <-writeDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("directory writer stayed blocked after waiter timeout")
+			}
+			t.Fatalf("directory writer did not queue behind final removal: waiters=%d", waiters)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	select {
+	case err := <-removeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serialized final removal did not resume")
+	}
+	select {
+	case result := <-writeDone:
+		if result.err != nil || result.outcome.Outcome != derivedStateReplacementCommitted {
+			t.Fatalf("serialized directory writer outcome=%+v err=%v", result.outcome, result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("serialized directory writer did not resume")
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -31,6 +32,117 @@ import (
 const SchemaVersion = 3
 
 func Path(stateDir string) string { return filepath.Join(stateDir, "cache", "state.db") }
+
+const interruptedRebuildInventoryLimit = 4096
+
+// InterruptedRebuildResidues inventories only private SQLite files created by
+// RebuildContext. The canonical state lock serializes callers; this inventory
+// makes a SIGKILL-visible state-*.db file explicit instead of allowing it to
+// accumulate forever or silently treating it as canonical data.
+func InterruptedRebuildResidues(stateDir string) ([]string, error) {
+	return handleInterruptedRebuildResidues(stateDir, false)
+}
+
+// RemoveInterruptedRebuildResidues removes the exact bounded inventory and
+// fsyncs the cache directory. Callers must hold the canonical state lock and
+// must expose this as an explicit or marker-backed recovery action.
+func RemoveInterruptedRebuildResidues(stateDir string) ([]string, error) {
+	return handleInterruptedRebuildResidues(stateDir, true)
+}
+
+func handleInterruptedRebuildResidues(stateDir string, remove bool) (result []string, resultErr error) {
+	cacheDir := filepath.Join(stateDir, "cache")
+	before, err := os.Lstat(cacheDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil || before == nil || before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
+		return nil, errors.Join(err, errors.New("catalog: cache path is not a real directory"))
+	}
+	root, err := os.OpenRoot(cacheDir)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: bind cache directory: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, root.Close()) }()
+	opened, err := root.Stat(".")
+	if err != nil || opened == nil || !os.SameFile(before, opened) || opened.Mode()&os.ModeSymlink != 0 || !opened.IsDir() {
+		return nil, errors.Join(err, errors.New("catalog: cache directory changed while binding"))
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return nil, fmt.Errorf("catalog: open cache inventory: %w", err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, directory.Close()) }()
+	seen := 0
+	for {
+		entries, readErr := directory.ReadDir(128)
+		seen += len(entries)
+		if seen > interruptedRebuildInventoryLimit {
+			return nil, errors.New("catalog: cache inventory exceeds its bounded recovery limit")
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if !isInterruptedRebuildName(name) {
+				continue
+			}
+			info, statErr := root.Lstat(name)
+			if statErr != nil || info == nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+				return nil, errors.Join(statErr, fmt.Errorf("catalog: interrupted rebuild residue %s is not a regular file", name))
+			}
+			result = append(result, name)
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("catalog: read cache inventory: %w", readErr)
+		}
+	}
+	sort.Strings(result)
+	if !remove || len(result) == 0 {
+		return result, nil
+	}
+	for _, name := range result {
+		info, err := root.Lstat(name)
+		if err != nil || info == nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return nil, errors.Join(err, fmt.Errorf("catalog: interrupted rebuild residue %s changed before removal", name))
+		}
+		if err := root.Remove(name); err != nil {
+			return nil, fmt.Errorf("catalog: remove interrupted rebuild residue %s: %w", name, err)
+		}
+	}
+	if err := directory.Sync(); err != nil {
+		return nil, fmt.Errorf("catalog: sync recovered cache directory: %w", err)
+	}
+	return result, nil
+}
+
+func isInterruptedRebuildName(name string) bool {
+	base := name
+	matchedSuffix := false
+	for _, suffix := range []string{".db-journal", ".db-wal", ".db-shm", ".db"} {
+		if value, ok := strings.CutSuffix(name, suffix); ok {
+			base = value
+			matchedSuffix = true
+			break
+		}
+	}
+	if !matchedSuffix {
+		return false
+	}
+	nonce, ok := strings.CutPrefix(base, "state-")
+	if !ok || len(nonce) == 0 || len(nonce) > 64 {
+		return false
+	}
+	for _, current := range []byte(nonce) {
+		if (current < '0' || current > '9') &&
+			(current < 'a' || current > 'z') &&
+			(current < 'A' || current > 'Z') {
+			return false
+		}
+	}
+	return true
+}
 
 // Stats reports projection row counts without treating any SQLite row as
 // canonical state.

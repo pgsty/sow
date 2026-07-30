@@ -25,6 +25,32 @@ func TestDerivedStateReplacementZeroValueFailsClosed(t *testing.T) {
 	}
 }
 
+func TestDerivedStateReplacementIntentRejectsFinalRemovalAsSource(t *testing.T) {
+	transactionID := strings.Repeat("1", 32)
+	destination := "state.json"
+	intent := derivedStateReplacementIntent{
+		Schema:         derivedStateReplacementIntentSchema,
+		TransactionID:  transactionID,
+		Phase:          derivedStateReplacementPrepared,
+		Destination:    destination,
+		Source:         destination + ".tmp-remove-" + strings.Repeat("2", 32),
+		SourceTrash:    derivedStateReplacementSourceTrashName(transactionID),
+		Candidate:      derivedStateReplacementIsolationName(transactionID),
+		CandidateTrash: derivedStateReplacementIsolationName(transactionID) + ".remove",
+		CandidateID: derivedStateReplacementIdentity{
+			Size: 0, SHA256: strings.Repeat("3", 64), Mode: uint32(0o600),
+			Device: 1, Inode: 1,
+		},
+	}
+	if err := intent.validate(); err == nil || !strings.Contains(err.Error(), "invalid derived state replacement intent") {
+		t.Fatalf("pure final-removal coordinate was accepted as a replacement source: %v", err)
+	}
+	intent.Source = destination + ".tmp-" + strings.Repeat("4", 32)
+	if err := intent.validate(); err != nil {
+		t.Fatalf("ordinary bound write temporary was rejected: %v", err)
+	}
+}
+
 func TestPublishedDerivedStateSourceRequiresExplicitRecovery(t *testing.T) {
 	cfg := &config.Config{Root: t.TempDir()}
 	if err := os.Mkdir(cfg.StatePath(), 0o700); err != nil {

@@ -292,7 +292,7 @@ func addCommonFlags(fs *flag.FlagSet, values *commonFlags) {
 	fs.Var(&values.arches, "arch", "select configured architecture (repeatable or comma-separated)")
 	fs.IntVar(&values.workers, "workers", min(runtime.NumCPU(), maxCLIWorkers), "bounded worker count per operation/remote target (1-64)")
 	fs.IntVar(&values.chunk, "chunk-entries", 4096, "entries per in-memory sorted run")
-	fs.BoolVar(&values.recover, "recover", false, "preserve and replace a stale local operation lock")
+	fs.BoolVar(&values.recover, "recover", false, "recover local state and rebuild the SQLite cache from canonical Git")
 }
 
 func runInit(ctx context.Context, args []string, stdout, stderr io.Writer) (resultErr error) {
@@ -972,7 +972,18 @@ func runFSCK(ctx context.Context, args []string, stdout, stderr io.Writer) (resu
 }
 
 func prepareCanonicalState(ctx context.Context, store *state.Store, recover bool, stdout io.Writer) error {
-	if err := prepareCanonicalStateCore(ctx, store, recover, stdout); err != nil {
+	return prepareCanonicalStateWithRecoveryMode(ctx, store, recover, recover, stdout)
+}
+
+// prepareCanonicalStateForAutomaticRecovery resumes an exact durable
+// operation journal without turning that journal into operator authorization
+// to heal unrelated, unmarked SQLite drift.
+func prepareCanonicalStateForAutomaticRecovery(ctx context.Context, store *state.Store, stdout io.Writer) error {
+	return prepareCanonicalStateWithRecoveryMode(ctx, store, true, false, stdout)
+}
+
+func prepareCanonicalStateWithRecoveryMode(ctx context.Context, store *state.Store, recoverState, explicitCacheRecovery bool, stdout io.Writer) error {
+	if err := prepareCanonicalStateCoreWithRecoveryMode(ctx, store, recoverState, explicitCacheRecovery, stdout); err != nil {
 		return err
 	}
 	if err := requireNoLocalServingTransactions(store.StateDir()); err != nil {
@@ -985,10 +996,14 @@ func prepareCanonicalState(ctx context.Context, store *state.Store, recover bool
 }
 
 func prepareCanonicalStateCore(ctx context.Context, store *state.Store, recover bool, stdout io.Writer) error {
+	return prepareCanonicalStateCoreWithRecoveryMode(ctx, store, recover, recover, stdout)
+}
+
+func prepareCanonicalStateCoreWithRecoveryMode(ctx context.Context, store *state.Store, recoverState, explicitCacheRecovery bool, stdout io.Writer) error {
 	if err := requireNoPendingYUMCompatibilityCutoverJournals(store.StateDir()); err != nil {
 		return withExitCode(ExitConflict, "%v", err)
 	}
-	return prepareCanonicalStateCoreUnchecked(ctx, store, recover, stdout)
+	return prepareCanonicalStateCoreUnchecked(ctx, store, recoverState, explicitCacheRecovery, stdout)
 }
 
 // prepareCanonicalStateCoreForYUMCompatibilityRecovery is the sole bypass for
@@ -999,11 +1014,11 @@ func prepareCanonicalStateCoreForYUMCompatibilityRecovery(ctx context.Context, s
 	if err := requireNoPendingYUMCompatibilityCutoverJournalsExcept(store.StateDir(), id); err != nil {
 		return withExitCode(ExitConflict, "%v", err)
 	}
-	return prepareCanonicalStateCoreUnchecked(ctx, store, recover, stdout)
+	return prepareCanonicalStateCoreUnchecked(ctx, store, recover, recover, stdout)
 }
 
-func prepareCanonicalStateCoreUnchecked(ctx context.Context, store *state.Store, recover bool, stdout io.Writer) error {
-	if recover {
+func prepareCanonicalStateCoreUnchecked(ctx context.Context, store *state.Store, recoverState, explicitCacheRecovery bool, stdout io.Writer) error {
+	if recoverState {
 		audit, err := inspectDerivedStateResidues(store.StateDir())
 		if err != nil {
 			return withExitCode(ExitConflict, "inspect derived state recovery residue: %v", err)
@@ -1023,7 +1038,7 @@ func prepareCanonicalStateCoreUnchecked(ctx context.Context, store *state.Store,
 		}
 	}
 	var recovered int
-	if recover {
+	if recoverState {
 		results, err := store.Recover(ctx)
 		if err != nil {
 			return withExitCode(ExitConflict, "recover canonical state: %v", err)
@@ -1039,7 +1054,26 @@ func prepareCanonicalStateCoreUnchecked(ctx context.Context, store *state.Store,
 	if err != nil {
 		return withExitCode(ExitConflict, "inspect pending SQLite catalog projection: %v", err)
 	}
-	if recovered == 0 && !pendingProjection {
+	residues, err := catalog.InterruptedRebuildResidues(store.StateDir())
+	if err != nil {
+		return withExitCode(ExitConflict, "inspect interrupted SQLite cache rebuilds: %v", err)
+	}
+	if len(residues) != 0 {
+		if !pendingProjection && !explicitCacheRecovery {
+			return withExitCode(ExitConflict, "interrupted SQLite cache rebuild residue requires explicit --recover: %s", strings.Join(residues, ","))
+		}
+		removed, err := catalog.RemoveInterruptedRebuildResidues(store.StateDir())
+		if err != nil {
+			return withExitCode(ExitConflict, "remove interrupted SQLite cache rebuilds: %v", err)
+		}
+		fmt.Fprintf(stdout, "recovered cache_rebuild_residues=%d\n", len(removed))
+	}
+	// --recover is also the explicit operator path for rebuilding the
+	// disposable SQLite projection from canonical Git. Do this even without a
+	// journal marker: an unmarked missing, stale, or row-corrupt cache must not
+	// survive a command that explicitly requested recovery. Ordinary commands
+	// still report arbitrary cache drift instead of silently healing it.
+	if recovered == 0 && !pendingProjection && !explicitCacheRecovery {
 		return nil
 	}
 	head, err := store.HeadHash()
@@ -1067,7 +1101,7 @@ func prepareCanonicalStateCoreUnchecked(ctx context.Context, store *state.Store,
 		if err != nil {
 			return withExitCode(ExitInternal, "verify SQLite cache after canonical recovery: %v", err)
 		}
-		if recover {
+		if explicitCacheRecovery || recovered != 0 {
 			fmt.Fprintf(stdout, "cache rebuilt after recovery entries=%d\n", entries)
 		} else {
 			fmt.Fprintf(stdout, "cache rebuilt after pending projection entries=%d\n", entries)

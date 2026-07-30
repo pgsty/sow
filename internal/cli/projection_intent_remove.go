@@ -319,6 +319,13 @@ func removeExactProjectionIntent(stateRoot, relative string, maximum int64, vali
 	if filepath.Base(relative) != relative || relative == "." || relative == "" || maximum <= 0 || validate == nil {
 		return errors.New("projection intent removal capability is invalid")
 	}
+	absolute, err := filepath.Abs(stateRoot)
+	if err != nil {
+		return err
+	}
+	stateRoot = absolute
+	unlockDirectoryWriter := lockDerivedStateDirectoryWriter(stateRoot)
+	defer unlockDirectoryWriter()
 	stateRoot, root, rootIdentity, err := bindAdmittedDerivedStateDirectory(stateRoot, "projection intent state root")
 	if err != nil {
 		return err
@@ -356,6 +363,13 @@ func removeExactProjectionStage(stateRoot, relative string, expectedSize int64, 
 		expectedSize < 0 || expectedSize == math.MaxInt64 || !validMaterializationTrustSHA256(expectedSHA256) {
 		return false, errors.New("projection stage cleanup capability is invalid")
 	}
+	absolute, err := filepath.Abs(stateRoot)
+	if err != nil {
+		return false, err
+	}
+	stateRoot = absolute
+	unlockDirectoryWriter := lockDerivedStateDirectoryWriter(stateRoot)
+	defer unlockDirectoryWriter()
 	stateRoot, root, rootIdentity, err := bindAdmittedDerivedStateDirectory(stateRoot, "projection stage state root")
 	if err != nil {
 		return false, err
@@ -414,6 +428,8 @@ func removeExactProjectionResidueBounded(stateRoot, relative string, maximum int
 	if err != nil {
 		return false, err
 	}
+	unlockDirectoryWriter := lockDerivedStateDirectoryWriter(stateRoot)
+	defer unlockDirectoryWriter()
 	rootBefore, err := os.Lstat(stateRoot)
 	if err != nil || rootBefore == nil || rootBefore.Mode()&os.ModeSymlink != 0 || !rootBefore.IsDir() {
 		return false, errors.Join(err, errors.New("projection residue root is not a real directory"))

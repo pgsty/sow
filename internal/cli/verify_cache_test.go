@@ -315,6 +315,174 @@ func TestPendingCatalogProjectionRebuildsEvenWhenMetadataHeadMatches(t *testing.
 	}
 }
 
+func TestExplicitRecoveryRebuildsMissingCatalogWithoutPendingMarker(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sow.yaml")
+	if err := os.WriteFile(configPath, []byte(testConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initializeRepoBaselineForTest(t, root, configPath, "asset")
+	stateDir := filepath.Join(root, ".sow")
+	canonical := state.New(stateDir)
+	head, err := canonical.HeadHash()
+	if err != nil || head.IsZero() {
+		t.Fatalf("canonical head=%s err=%v", head, err)
+	}
+	if err := os.Remove(catalog.Path(stateDir)); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	if err := prepareCanonicalStateCore(t.Context(), canonical, true, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "cache rebuilt after recovery") {
+		t.Fatalf("explicit cache recovery omitted evidence: %s", output.String())
+	}
+	cacheHead, err := catalog.CanonicalHead(t.Context(), stateDir)
+	if err != nil || cacheHead != head {
+		t.Fatalf("recovered cache head=%s want=%s err=%v", cacheHead, head, err)
+	}
+	if version, err := catalog.Version(t.Context(), stateDir); err != nil || version != catalog.SchemaVersion {
+		t.Fatalf("recovered cache schema=%d want=%d err=%v", version, catalog.SchemaVersion, err)
+	}
+}
+
+func TestExplicitRecoveryRebuildsUnmarkedCatalogMetadataDrift(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sow.yaml")
+	if err := os.WriteFile(configPath, []byte(testConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initializeRepoBaselineForTest(t, root, configPath, "asset")
+	stateDir := filepath.Join(root, ".sow")
+	canonical := state.New(stateDir)
+	head, err := canonical.HeadHash()
+	if err != nil || head.IsZero() {
+		t.Fatalf("canonical head=%s err=%v", head, err)
+	}
+	if err := os.Chmod(catalog.Path(stateDir), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", catalog.Path(stateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, updateErr := db.Exec(`UPDATE meta SET value=CASE key WHEN 'schema_version' THEN '999' WHEN 'canonical_head' THEN '0000000000000000000000000000000000000000' ELSE value END WHERE key IN ('schema_version','canonical_head')`)
+	closeErr := db.Close()
+	if updateErr != nil || closeErr != nil {
+		t.Fatalf("inject unmarked metadata drift: %v / %v", updateErr, closeErr)
+	}
+
+	var output bytes.Buffer
+	if err := prepareCanonicalStateCore(t.Context(), canonical, true, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "cache rebuilt after recovery") {
+		t.Fatalf("explicit metadata recovery omitted evidence: %s", output.String())
+	}
+	cacheHead, err := catalog.CanonicalHead(t.Context(), stateDir)
+	if err != nil || cacheHead != head {
+		t.Fatalf("recovered cache head=%s want=%s err=%v", cacheHead, head, err)
+	}
+	if version, err := catalog.Version(t.Context(), stateDir); err != nil || version != catalog.SchemaVersion {
+		t.Fatalf("recovered cache schema=%d want=%d err=%v", version, catalog.SchemaVersion, err)
+	}
+}
+
+func TestExplicitRecoveryRebuildsUnmarkedCatalogRowDrift(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sow.yaml")
+	if err := os.WriteFile(configPath, []byte(testConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "asset"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "asset", "tool.bin"), []byte("explicit catalog recovery fixture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	initializeRepoBaselineForTest(t, root, configPath, "asset")
+	stateDir := filepath.Join(root, ".sow")
+	canonical := state.New(stateDir)
+	head, err := canonical.HeadHash()
+	if err != nil || head.IsZero() {
+		t.Fatalf("canonical head=%s err=%v", head, err)
+	}
+	if err := os.Chmod(catalog.Path(stateDir), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", catalog.Path(stateDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, deleteErr := db.Exec(`DELETE FROM files`)
+	closeErr := db.Close()
+	if deleteErr != nil || closeErr != nil {
+		t.Fatalf("inject unmarked row drift: %v / %v", deleteErr, closeErr)
+	}
+	if count, err := catalog.Count(stateDir); err != nil || count != 0 {
+		t.Fatalf("drifted cache count=%d err=%v", count, err)
+	}
+
+	var output bytes.Buffer
+	if err := prepareCanonicalStateCore(t.Context(), canonical, true, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "cache rebuilt after recovery") {
+		t.Fatalf("explicit row recovery omitted evidence: %s", output.String())
+	}
+	if count, err := catalog.Count(stateDir); err != nil || count != 1 {
+		t.Fatalf("recovered cache count=%d want=1 err=%v", count, err)
+	}
+	cacheHead, err := catalog.CanonicalHead(t.Context(), stateDir)
+	if err != nil || cacheHead != head {
+		t.Fatalf("recovered cache head=%s want=%s err=%v", cacheHead, head, err)
+	}
+}
+
+func TestInterruptedCatalogRebuildResidueRequiresExplicitRecovery(t *testing.T) {
+	root := t.TempDir()
+	configPath := filepath.Join(root, "sow.yaml")
+	if err := os.WriteFile(configPath, []byte(testConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initializeRepoBaselineForTest(t, root, configPath, "asset")
+	stateDir := filepath.Join(root, ".sow")
+	canonical := state.New(stateDir)
+	cacheDir := filepath.Join(stateDir, "cache")
+	for _, name := range []string{"state-crash.db", "state-crash.db-journal"} {
+		if err := os.WriteFile(filepath.Join(cacheDir, name), []byte("interrupted"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := prepareCanonicalStateCore(t.Context(), canonical, false, &bytes.Buffer{}); err == nil ||
+		!strings.Contains(err.Error(), "requires explicit --recover") {
+		t.Fatalf("ordinary restart accepted interrupted cache rebuild residue: %v", err)
+	}
+	for _, name := range []string{"state-crash.db", "state-crash.db-journal"} {
+		if _, err := os.Lstat(filepath.Join(cacheDir, name)); err != nil {
+			t.Fatalf("ordinary restart changed %s: %v", name, err)
+		}
+	}
+
+	var output bytes.Buffer
+	if err := prepareCanonicalStateCore(t.Context(), canonical, true, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "recovered cache_rebuild_residues=2") ||
+		!strings.Contains(output.String(), "cache rebuilt after recovery") {
+		t.Fatalf("explicit recovery omitted cache residue evidence: %s", output.String())
+	}
+	if residues, err := catalog.InterruptedRebuildResidues(stateDir); err != nil || len(residues) != 0 {
+		t.Fatalf("explicit recovery retained rebuild residues=%v err=%v", residues, err)
+	}
+	if info, err := os.Stat(catalog.Path(stateDir)); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		t.Fatalf("explicit recovery did not leave a usable cache: info=%v err=%v", info, err)
+	}
+}
+
 func TestCatalogProjectionMarkerCoversCommitFailureUntilExplicitRecovery(t *testing.T) {
 	root := t.TempDir()
 	configPath := filepath.Join(root, "sow.yaml")

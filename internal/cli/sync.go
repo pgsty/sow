@@ -711,8 +711,14 @@ func checkSyncRecovery(ctx context.Context, cfg *config.Config, canonical *state
 		autoRecover = true
 		fmt.Fprintf(stdout, "sync recovery upstream=%s materialization_selected_set=true\n", upstreamID)
 	}
-	if err := prepareCanonicalState(ctx, canonical, recover || autoRecover, stdout); err != nil {
-		return false, err
+	var prepareErr error
+	if autoRecover && !recover {
+		prepareErr = prepareCanonicalStateForAutomaticRecovery(ctx, canonical, stdout)
+	} else {
+		prepareErr = prepareCanonicalState(ctx, canonical, recover, stdout)
+	}
+	if prepareErr != nil {
+		return false, prepareErr
 	}
 	if err := validateCanonicalHistoryContracts(cfg); err != nil {
 		return false, withExitCode(ExitConflict, "repository history contract changed while sync was waiting for the state lock: %v", err)
