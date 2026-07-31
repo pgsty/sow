@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -182,6 +183,190 @@ func preserveLocalServingRoutes(ctx context.Context, cfg *config.Config, targetR
 	}
 	merged := filepath.Join(txDir, "desired-with-local-serving.tsv")
 	if err := mergeManifestFiles(desiredPath, routes, merged); err != nil {
+		return "", err
+	}
+	return merged, nil
+}
+
+// preserveCanonicalLocalServingRoutes extends an explicit export's exact
+// manifest with only the immutable generations, mirrorlists, and compatibility
+// trust anchors positively owned by canonical lifecycle records for this exact
+// target/view/leaf set. Unlike fixed product roots, explicit targets must not
+// retain arbitrary or foreign bytes merely because they already live below
+// the reserved _sow namespace.
+func preserveCanonicalLocalServingRoutes(
+	ctx context.Context,
+	cfg *config.Config,
+	canonical *state.Store,
+	pool *repository.Store,
+	targetRoot, view, desiredPath, txDir string,
+	desiredLeaves []localYUMServingLeaf,
+	compatibilityPrepared preparedPublication,
+	values commonFlags,
+) (string, error) {
+	if cfg == nil || canonical == nil || pool == nil {
+		return "", errors.New("canonical local serving preservation dependencies are unavailable")
+	}
+	targetRelative, err := localServingTargetRelative(cfg, targetRoot)
+	if err != nil {
+		return "", err
+	}
+	lifecycle, err := loadCanonicalServingLifecycle(canonical)
+	if err != nil {
+		return "", err
+	}
+	desired := make(map[string]struct{}, len(desiredLeaves))
+	for _, leaf := range desiredLeaves {
+		desired[servingLeafKey(leaf.repo.ID, leaf.os, leaf.arch)] = struct{}{}
+	}
+	projections, err := selectedPreparedYUMCompatibilityProjections(cfg, compatibilityPrepared)
+	if err != nil {
+		return "", err
+	}
+	selectedCompatibility := make(map[string]struct{}, len(projections))
+	for _, projection := range projections {
+		selectedCompatibility[projection.ID] = struct{}{}
+	}
+	stage := filepath.Join(txDir, "preserve-canonical-serving")
+	if err := os.Mkdir(stage, 0o700); err != nil {
+		return "", err
+	}
+	parts := []string{desiredPath}
+	partIndex := 0
+	nextPart := func(label string) string {
+		partIndex++
+		return filepath.Join(stage, fmt.Sprintf("%03d-%s.tsv", partIndex, label))
+	}
+	matchedLeaves := make(map[string]string, len(desired))
+	matchedCompatibility := make(map[string]struct{})
+	preservedGenerations := make(map[string]serving.Generation)
+	installOptions := serving.InstallOptions{
+		Workers: values.workers, ChunkEntries: values.chunk, TempDir: filepath.Join(cfg.StatePath(), "tmp"),
+	}
+	for _, record := range lifecycle.Channels {
+		channel := record.Channel
+		if channel.TargetRoot != targetRelative || channel.View != view {
+			continue
+		}
+		leafKey := servingLeafKey(channel.Repo, channel.OS, channel.Arch)
+		if _, wanted := desired[leafKey]; !wanted {
+			continue
+		}
+		if prior, duplicate := matchedLeaves[leafKey]; duplicate {
+			return "", fmt.Errorf("canonical channels %s and %s both own explicit serving leaf %s", prior, record.Path, leafKey)
+		}
+		matchedLeaves[leafKey] = record.Path
+
+		pointerBody, exists, err := serving.ReadMirrorlist(targetRoot, channel.MirrorlistPath)
+		if err != nil {
+			return "", err
+		}
+		if exists {
+			wanted, err := channel.MirrorlistBody()
+			if err != nil {
+				return "", err
+			}
+			if !bytes.Equal(pointerBody, wanted) {
+				return "", fmt.Errorf("explicit target mirrorlist %s differs from canonical lifecycle", channel.MirrorlistPath)
+			}
+			if err := serving.ValidateMirrorlistPermissions(targetRoot, channel.MirrorlistPath); err != nil {
+				return "", err
+			}
+			pointerManifest := nextPart("mirrorlist")
+			if err := writeManifestEntryForBytes(pointerManifest, channel.MirrorlistPath, wanted); err != nil {
+				return "", err
+			}
+			parts = append(parts, pointerManifest)
+		}
+
+		manifestPaths, err := serving.RetainedGenerationManifestPaths(channel)
+		if err != nil {
+			return "", err
+		}
+		for _, manifestPath := range manifestPaths {
+			generationRecord, exists := lifecycle.Generations[manifestPath]
+			if !exists {
+				return "", fmt.Errorf("canonical channel %s retains missing generation %s", record.Path, manifestPath)
+			}
+			generation := generationRecord.Generation
+			if prior, duplicate := preservedGenerations[generation.ID]; duplicate {
+				if prior != generation {
+					return "", fmt.Errorf("canonical generation ID %s has conflicting identities", generation.ID)
+				}
+				continue
+			}
+			generationRoot := filepath.Join(targetRoot, "_sow", "v1", "g", generation.ID)
+			info, err := os.Lstat(generationRoot)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return "", errors.Join(err, fmt.Errorf("explicit target generation %s is not a real directory", generation.ID))
+			}
+			canonicalManifest := nextPart("generation-canonical")
+			staged, err := stageCanonicalServingManifest(canonical, generation, canonicalManifest)
+			if err != nil || !staged {
+				return "", errors.Join(err, fmt.Errorf("canonical manifest for retained generation %s is unavailable", generation.ID))
+			}
+			if err := serving.ValidateInstalledGenerationCanonicalSubset(ctx, pool, targetRoot, generation, canonicalManifest, installOptions); err != nil {
+				return "", fmt.Errorf("validate retained explicit generation %s: %w", generation.ID, err)
+			}
+			prefixed := nextPart("generation-prefixed")
+			if err := prefixManifestPaths(canonicalManifest, prefixed, path.Join("_sow/v1/g", generation.ID)); err != nil {
+				return "", err
+			}
+			parts = append(parts, prefixed)
+			preservedGenerations[generation.ID] = generation
+		}
+		if _, compatibility := selectedCompatibility[channel.Repo]; compatibility {
+			matchedCompatibility[channel.Repo] = struct{}{}
+		}
+	}
+
+	for _, projection := range projections {
+		if _, matched := matchedCompatibility[projection.ID]; !matched {
+			continue
+		}
+		evidence, err := loadFrozenYUMCompatibilityServingEvidence(cfg, canonical, projection)
+		if err != nil {
+			return "", err
+		}
+		trust := []struct {
+			route string
+			body  []byte
+		}{
+			{route: config.YUMCompatibilityPackageTrustRoute(projection.ID), body: evidence.packageTrust},
+			{route: config.YUMCompatibilityRepositoryTrustRoute(projection.ID), body: evidence.repositoryTrust},
+		}
+		for _, item := range trust {
+			filename := filepath.Join(targetRoot, filepath.FromSlash(item.route))
+			if _, err := os.Lstat(filename); errors.Is(err, os.ErrNotExist) {
+				continue
+			} else if err != nil {
+				return "", err
+			}
+			current, err := readStableRegularLimited(filename, maxSecretBytes)
+			if err != nil {
+				return "", err
+			}
+			if !bytes.Equal(current, item.body) {
+				return "", fmt.Errorf("explicit target trust route %s differs from frozen evidence", item.route)
+			}
+			if err := serving.ValidateHostableFile(targetRoot, item.route); err != nil {
+				return "", fmt.Errorf("explicit target trust route %s is not directly hostable: %w", item.route, err)
+			}
+			trustManifest := nextPart("compatibility-trust")
+			if err := writeManifestEntryForBytes(trustManifest, item.route, item.body); err != nil {
+				return "", err
+			}
+			parts = append(parts, trustManifest)
+		}
+	}
+	if len(parts) == 1 {
+		return desiredPath, nil
+	}
+	merged := filepath.Join(stage, "desired-with-canonical-serving.tsv")
+	if err := mergePublicationManifests(parts, merged, stage); err != nil {
 		return "", err
 	}
 	return merged, nil

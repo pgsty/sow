@@ -8,6 +8,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path"
@@ -28,6 +29,23 @@ const yumCommonNamespace = "http://linux.duke.edu/metadata/common"
 var yumIdentitySegment = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9+._~-]*$`)
 
 var errYUMPackageSignature = errors.New("YUM package signature verification failed")
+
+type yumCheckHook func(phase string) error
+type yumCheckHookContextKey struct{}
+
+const yumCheckAfterMetadataValidation = "after-metadata-validation"
+
+func withYUMCheckHook(ctx context.Context, hook yumCheckHook) context.Context {
+	return context.WithValue(ctx, yumCheckHookContextKey{}, hook)
+}
+
+func runYUMCheckHook(ctx context.Context, phase string) error {
+	hook, _ := ctx.Value(yumCheckHookContextKey{}).(yumCheckHook)
+	if hook == nil {
+		return nil
+	}
+	return hook(phase)
+}
 
 // PayloadReadSeekCloser is the narrow retained-file capability required for
 // embedded RPM signature verification.
@@ -82,11 +100,19 @@ func (c YUMCheck) Verify(ctx context.Context, recorder *Recorder) (resultErr err
 	if (c.ActualPayload == nil) != (c.OpenPayload == nil) {
 		return errors.New("YUM capability payload manifest and opener must be supplied together")
 	}
-	if err := realDirectory(c.Root); err != nil {
+	root, err := bindVerificationRoot(c.Root)
+	if err != nil {
 		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "YUM_ROOT_UNSAFE", Subject: c.CheckID, Message: "YUM repository root is absent, symlinked, or not a directory"})
 		return nil
 	}
-	generation, err := yumrepo.ValidateDirectory(ctx, filepath.Join(c.Root, "repodata"), c.Compression, c.Verifier)
+	defer joinVerificationCleanup(&resultErr, root.Close)
+	repodata, err := bindVerificationSubroot(root, "repodata")
+	if err != nil {
+		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "YUM_METADATA_INVALID", Subject: c.CheckID, Message: "YUM repodata directory is absent, symlinked, or changed while binding"})
+		return nil
+	}
+	defer joinVerificationCleanup(&resultErr, repodata.Close)
+	generation, metadataProof, err := yumrepo.ValidateRootWithProof(ctx, repodata.root, "repodata", c.Compression, c.Verifier)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
@@ -96,6 +122,17 @@ func (c YUMCheck) Verify(ctx context.Context, recorder *Recorder) (resultErr err
 			code = "YUM_SIGNATURE_INVALID"
 		}
 		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: code, Subject: c.CheckID, Message: "YUM repodata structure, checksums, compression, or detached signature is invalid"})
+		return nil
+	}
+	if err := runYUMCheckHook(ctx, yumCheckAfterMetadataValidation); err != nil {
+		return err
+	}
+	proofErr := metadataProof.Check(ctx)
+	if errors.Is(proofErr, context.Canceled) || errors.Is(proofErr, context.DeadlineExceeded) {
+		return proofErr
+	}
+	if err := errors.Join(proofErr, repodata.Check()); err != nil {
+		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "YUM_METADATA_INVALID", Subject: c.CheckID, Message: "YUM repodata directory changed after signed generation validation"})
 		return nil
 	}
 	primary := generation.Artifacts[0]
@@ -113,16 +150,7 @@ func (c YUMCheck) Verify(ctx context.Context, recorder *Recorder) (resultErr err
 	if c.ActualPayload == nil && scratchVisibleToScope(c.Root, "Packages", tempRoot) {
 		return errors.New("YUM verification scratch directory is inside Packages")
 	}
-	if c.ActualPayload == nil {
-		if err := auditTreeShape(ctx, filepath.Join(c.Root, "Packages"), false); err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
-			}
-			recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "YUM_PACKAGE_TREE_UNSAFE", Subject: c.CheckID, Message: "YUM Packages tree contains a symlink, special file, or reserved shadow point"})
-			return nil
-		}
-	}
-	expected, identities, canonicalIdentities, err := c.primaryManifests(ctx, tempRoot, primary)
+	expected, identities, canonicalIdentities, err := c.primaryManifests(ctx, repodata, tempRoot, primary)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return err
@@ -139,7 +167,7 @@ func (c YUMCheck) Verify(ctx context.Context, recorder *Recorder) (resultErr err
 		return nil
 	}
 	for _, artifact := range generation.Artifacts[1:] {
-		identity, err := c.secondaryIdentityManifest(ctx, tempRoot, artifact)
+		identity, err := c.secondaryIdentityManifest(ctx, repodata, tempRoot, artifact)
 		if err != nil {
 			recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "YUM_METADATA_IDENTITY_INVALID", Subject: c.CheckID, Message: "filelists or other metadata has invalid package identities"})
 			return nil
@@ -195,18 +223,45 @@ func (c YUMCheck) Verify(ctx context.Context, recorder *Recorder) (resultErr err
 	actualPayload := c.ActualPayload
 	if actualPayload == nil {
 		actualPath := filepath.Join(tempRoot, "actual-packages.tsv")
-		_, err = manifest.Scan(ctx, c.Root, manifest.Scope{Path: "Packages"}, actualPath, manifest.ScanOptions{Workers: c.Workers, ChunkEntries: c.ChunkEntries, TempDir: tempRoot})
+		witness, present, auditErr := bindOptionalTreeAbsence(root, "Packages")
+		if auditErr != nil {
+			err = auditErr
+		} else if !present {
+			actualPayload = absentTreeStream(witness)
+		} else {
+			if err = auditTreeShape(ctx, filepath.Join(c.Root, "Packages"), false); err == nil {
+				_, err = manifest.ScanRoot(ctx, root.root, manifest.Scope{Path: "Packages"}, actualPath, manifest.ScanOptions{Workers: c.Workers, ChunkEntries: c.ChunkEntries, TempDir: tempRoot})
+			}
+			if err == nil {
+				actualPayload = FileStream(actualPath)
+			}
+		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
-			recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "YUM_PACKAGE_TREE_UNSAFE", Subject: c.CheckID, Message: "YUM Packages tree is absent, symlinked, special, or changed while hashing"})
+			recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "YUM_PACKAGE_TREE_UNSAFE", Subject: c.CheckID, Message: "YUM Packages tree is symlinked, special, or changed while hashing"})
 			return nil
 		}
-		actualPayload = FileStream(actualPath)
 	}
 	comparison := ManifestComparisonCheck{CheckID: c.CheckID + "/packages", AtLayer: LayerL1, Subject: c.CheckID, Desired: FileStream(expectedPath), Actual: actualPayload, CodePrefix: "YUM_PACKAGE"}
-	return comparison.Verify(ctx, recorder)
+	if err := comparison.Verify(ctx, recorder); err != nil {
+		return err
+	}
+	proofErr = metadataProof.Check(ctx)
+	if errors.Is(proofErr, context.Canceled) || errors.Is(proofErr, context.DeadlineExceeded) {
+		return proofErr
+	}
+	if err := errors.Join(proofErr, repodata.Check()); err != nil {
+		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "YUM_METADATA_INVALID", Subject: c.CheckID, Message: "YUM signed metadata entries changed during verification"})
+	}
+	if err := root.Check(); err != nil {
+		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "YUM_ROOT_UNSAFE", Subject: c.CheckID, Message: "YUM repository root changed during verification"})
+	}
+	if err := repodata.Check(); err != nil {
+		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "YUM_METADATA_INVALID", Subject: c.CheckID, Message: "YUM repodata directory changed during verification"})
+	}
+	return nil
 }
 
 func (c YUMCheck) packageBodyIdentities(ctx context.Context, tempRoot, manifestPath string) (string, func() error, error) {
@@ -244,8 +299,8 @@ func (c YUMCheck) packageBodyIdentities(ctx context.Context, tempRoot, manifestP
 	})
 }
 
-func (c YUMCheck) primaryManifests(ctx context.Context, tempRoot string, artifact yumrepo.Artifact) (*manifestSpool, *manifestSpool, *manifestSpool, error) {
-	reader, closeArtifact, err := c.openArtifact(artifact)
+func (c YUMCheck) primaryManifests(ctx context.Context, repodata *verificationSubrootBinding, tempRoot string, artifact yumrepo.Artifact) (*manifestSpool, *manifestSpool, *manifestSpool, error) {
+	reader, closeArtifact, err := c.openArtifact(ctx, repodata, artifact)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -278,8 +333,8 @@ func (c YUMCheck) primaryManifests(ctx context.Context, tempRoot string, artifac
 	return spool, identities, canonicalIdentities, nil
 }
 
-func (c YUMCheck) secondaryIdentityManifest(ctx context.Context, tempRoot string, artifact yumrepo.Artifact) (*manifestSpool, error) {
-	reader, closeArtifact, err := c.openArtifact(artifact)
+func (c YUMCheck) secondaryIdentityManifest(ctx context.Context, repodata *verificationSubrootBinding, tempRoot string, artifact yumrepo.Artifact) (*manifestSpool, error) {
+	reader, closeArtifact, err := c.openArtifact(ctx, repodata, artifact)
 	if err != nil {
 		return nil, err
 	}
@@ -297,23 +352,39 @@ func (c YUMCheck) secondaryIdentityManifest(ctx context.Context, tempRoot string
 	return spool, nil
 }
 
-func (c YUMCheck) openArtifact(artifact yumrepo.Artifact) (io.Reader, func() error, error) {
-	f, _, err := openRegularBelow(c.Root, artifact.Path, artifact.Size)
+func (c YUMCheck) openArtifact(ctx context.Context, repodata *verificationSubrootBinding, artifact yumrepo.Artifact) (io.Reader, func() error, error) {
+	const prefix = "repodata/"
+	name := strings.TrimPrefix(artifact.Path, prefix)
+	if ctx == nil || repodata == nil || !strings.HasPrefix(artifact.Path, prefix) ||
+		name == "" || path.Base(name) != name || !safeSegment(name) ||
+		artifact.Size < 0 || artifact.OpenSize < 0 ||
+		len(artifact.SHA256) != sha256.Size*2 || len(artifact.OpenSHA256) != sha256.Size*2 {
+		return nil, nil, errors.New("invalid retained YUM artifact contract")
+	}
+	if _, err := hex.DecodeString(artifact.SHA256); err != nil {
+		return nil, nil, errors.New("invalid compressed YUM artifact checksum")
+	}
+	if _, err := hex.DecodeString(artifact.OpenSHA256); err != nil {
+		return nil, nil, errors.New("invalid open YUM artifact checksum")
+	}
+	f, err := openVerificationRegularFile(repodata, name, artifact.Size)
 	if err != nil {
 		return nil, nil, err
 	}
+	compressed := &yumArtifactHashCounter{hash: sha256.New()}
+	compressedSource := io.TeeReader(&contextReader{ctx: ctx, reader: f.file}, compressed)
 	var reader io.Reader
 	var closer io.Closer
 	switch c.Compression {
 	case yumrepo.CompressionGzip:
-		gz, err := gzip.NewReader(f)
+		gz, err := gzip.NewReader(compressedSource)
 		if err != nil {
 			_ = f.Close()
 			return nil, nil, err
 		}
 		reader, closer = gz, gz
 	case yumrepo.CompressionZstd:
-		zr, err := zstd.NewReader(f, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(64<<20))
+		zr, err := zstd.NewReader(compressedSource, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(64<<20))
 		if err != nil {
 			_ = f.Close()
 			return nil, nil, err
@@ -323,7 +394,35 @@ func (c YUMCheck) openArtifact(artifact yumrepo.Artifact) (io.Reader, func() err
 		_ = f.Close()
 		return nil, nil, errors.New("unsupported YUM compression")
 	}
-	return reader, func() error { return errors.Join(closer.Close(), f.Close()) }, nil
+	opened := &yumArtifactHashCounter{hash: sha256.New()}
+	closed := false
+	return io.TeeReader(reader, opened), func() error {
+		if closed {
+			return nil
+		}
+		closed = true
+		decompressErr := closer.Close()
+		_, drainErr := io.Copy(io.Discard, compressedSource)
+		var proofErr error
+		if compressed.bytes != artifact.Size || hex.EncodeToString(compressed.hash.Sum(nil)) != artifact.SHA256 {
+			proofErr = errors.Join(proofErr, errors.New("compressed YUM artifact differs from signed generation"))
+		}
+		if opened.bytes != artifact.OpenSize || hex.EncodeToString(opened.hash.Sum(nil)) != artifact.OpenSHA256 {
+			proofErr = errors.Join(proofErr, errors.New("open YUM artifact differs from signed generation"))
+		}
+		return errors.Join(decompressErr, drainErr, proofErr, f.Close(), repodata.Check())
+	}, nil
+}
+
+type yumArtifactHashCounter struct {
+	hash  hash.Hash
+	bytes int64
+}
+
+func (counter *yumArtifactHashCounter) Write(body []byte) (int, error) {
+	written, err := counter.hash.Write(body)
+	counter.bytes += int64(written)
+	return written, err
 }
 
 type yumPrimaryPackage struct {

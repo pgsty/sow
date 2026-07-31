@@ -17,6 +17,80 @@ func TestValidateInstalledGenerationRootRejectsNilDependencies(t *testing.T) {
 	}
 }
 
+func TestValidateInstalledGenerationCanonicalSubsetAllowsOnlyPrunableExtras(t *testing.T) {
+	t.Run("extra regular file", func(t *testing.T) {
+		root, manifestPath, generation, pool, options := installedServingFixture(t)
+		extra := filepath.Join(root, "_sow", "v1", "g", generation.ID, "unowned-private.bin")
+		if err := os.WriteFile(extra, []byte("prune me\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateInstalledGenerationCanonicalSubset(t.Context(), pool, root, generation, manifestPath, options); err != nil {
+			t.Fatalf("prunable extra regular file rejected: %v", err)
+		}
+		if err := ValidateInstalledGeneration(t.Context(), pool, root, generation, manifestPath, options); err == nil || !strings.Contains(err.Error(), "added=1") {
+			t.Fatalf("ordinary exact validator accepted extra file: %v", err)
+		}
+	})
+
+	t.Run("shadow-point extra regular file", func(t *testing.T) {
+		root, manifestPath, generation, pool, options := installedServingFixture(t)
+		extra := filepath.Join(root, "_sow", "v1", "g", generation.ID, ".sow", "private.bin")
+		if err := os.MkdirAll(filepath.Dir(extra), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(extra, []byte("prune me\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateInstalledGenerationCanonicalSubset(t.Context(), pool, root, generation, manifestPath, options); err != nil {
+			t.Fatalf("prunable shadow-point regular file rejected: %v", err)
+		}
+		if err := ValidateInstalledGeneration(t.Context(), pool, root, generation, manifestPath, options); err == nil || !strings.Contains(err.Error(), "added=1") {
+			t.Fatalf("ordinary exact validator accepted shadow-point extra file: %v", err)
+		}
+	})
+
+	t.Run("changed canonical file", func(t *testing.T) {
+		root, manifestPath, generation, pool, options := installedServingFixture(t)
+		target := filepath.Join(root, "_sow", "v1", "g", generation.ID, "yum", "test", "x86_64", "repodata", "repomd.xml")
+		body, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body[0] ^= 0x7f
+		if err := os.Remove(target); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, body, 0o444); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateInstalledGenerationCanonicalSubset(t.Context(), pool, root, generation, manifestPath, options); err == nil || !strings.Contains(err.Error(), "changed=1") {
+			t.Fatalf("changed canonical generation file accepted: %v", err)
+		}
+	})
+
+	t.Run("unsafe extra symlink", func(t *testing.T) {
+		root, manifestPath, generation, pool, options := installedServingFixture(t)
+		extra := filepath.Join(root, "_sow", "v1", "g", generation.ID, "unowned-link")
+		if err := os.Symlink(t.TempDir(), extra); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateInstalledGenerationCanonicalSubset(t.Context(), pool, root, generation, manifestPath, options); err == nil {
+			t.Fatal("unsafe extra symlink accepted")
+		}
+	})
+
+	t.Run("unsafe shadow-point symlink", func(t *testing.T) {
+		root, manifestPath, generation, pool, options := installedServingFixture(t)
+		extra := filepath.Join(root, "_sow", "v1", "g", generation.ID, ".sow")
+		if err := os.Symlink(t.TempDir(), extra); err != nil {
+			t.Fatal(err)
+		}
+		if err := ValidateInstalledGenerationCanonicalSubset(t.Context(), pool, root, generation, manifestPath, options); err == nil {
+			t.Fatal("unsafe shadow-point symlink accepted")
+		}
+	})
+}
+
 func TestValidateInstalledGenerationPathAndBoundRejectPermissionDrift(t *testing.T) {
 	validators := []struct {
 		name     string

@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,10 +21,108 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"github.com/pgsty/sow/internal/aptrepo"
 	"github.com/pgsty/sow/internal/repository"
+	"github.com/pgsty/sow/internal/state"
 	"github.com/pgsty/sow/internal/verify"
 	"github.com/pgsty/sow/internal/views"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
+
+func TestSnapshotL1AcceptsAbsentEmptyPackagePayloadTrees(t *testing.T) {
+	for _, fixture := range []struct {
+		name        string
+		config      string
+		repo        string
+		os          string
+		arch        string
+		repoPath    string
+		payloadPath string
+	}{
+		{
+			name: "apt", config: snapshotAPTConfig, repo: "deb-test", os: "jammy", arch: "arm64",
+			repoPath: "apt/test", payloadPath: "apt/test/pool",
+		},
+		{
+			name: "yum", config: snapshotYUMConfig, repo: "rpm-test", os: "el10", arch: "x86_64",
+			repoPath: "yum/test/x86_64", payloadPath: "yum/test/x86_64/Packages",
+		},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			root := nginxWorkerTempDir(t)
+			configPath := filepath.Join(root, "sow.yaml")
+			if err := os.WriteFile(configPath, []byte(fixture.config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(fixture.repoPath)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			_, keyPath := writeMaterializeSigningKey(t, root)
+			publicKeyPath := writeVerifyPublicKey(t, keyPath)
+			run := func(arguments ...string) (int, string, string) {
+				t.Helper()
+				var stdout, stderr bytes.Buffer
+				code := Main(arguments, &stdout, &stderr)
+				return code, stdout.String(), stderr.String()
+			}
+			if code, stdout, stderr := run("init", "--config", configPath, "--workers", "1", "--chunk-entries", "1"); code != ExitOK {
+				t.Fatalf("init code=%d stdout=%s stderr=%s", code, stdout, stderr)
+			}
+
+			stageDir := filepath.Join(root, ".sow", "staging", "test-empty-snapshot")
+			if err := os.MkdirAll(stageDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			empty := filepath.Join(stageDir, "empty-stable.tsv")
+			if err := os.WriteFile(empty, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			viewPath, err := state.ViewPath("stable", fixture.repo, fixture.os, fixture.arch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			viewRef, err := state.ViewRef("stable", fixture.repo, fixture.os, fixture.arch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonical := state.New(filepath.Join(root, ".sow"))
+			if _, changed, err := applyCanonicalState(
+				t.Context(), canonical, "test-empty-stable", "test: seed empty stable package view",
+				map[string]string{viewPath: empty}, []state.RefUpdate{{Name: viewRef}}, state.ApplyOptions{},
+			); err != nil || !changed {
+				t.Fatalf("seed empty stable changed=%v err=%v", changed, err)
+			}
+
+			snapshotID, err := views.SnapshotID(fixture.os, time.Now().UTC())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if code, stdout, stderr := run("promote", "stable", snapshotID, "--config", configPath, "--repo", fixture.repo); code != ExitOK {
+				t.Fatalf("snapshot code=%d stdout=%s stderr=%s", code, stdout, stderr)
+			}
+			if code, stdout, stderr := run(
+				"materialize", snapshotID, "--config", configPath, "--repo", fixture.repo,
+				"--gpg-private-key-file", keyPath, "--workers", "1", "--chunk-entries", "1",
+			); code != ExitOK {
+				t.Fatalf("materialize code=%d stdout=%s stderr=%s", code, stdout, stderr)
+			}
+
+			payload := filepath.Join(
+				root, ".sow", "materialized", "snapshots", snapshotID,
+				filepath.FromSlash(fixture.payloadPath),
+			)
+			if _, err := os.Lstat(payload); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("empty snapshot payload scope exists at %s: %v", payload, err)
+			}
+			code, stdout, stderr := run(
+				"verify", "--layer", "L1", "--snapshot", snapshotID,
+				"--config", configPath, "--repo", fixture.repo,
+				"--gpg-public-key-file", publicKeyPath, "--workers", "1", "--chunk-entries", "1",
+			)
+			if code != ExitOK || !strings.Contains(stdout, "verify outcome=passed") {
+				t.Fatalf("empty snapshot L1 code=%d stdout=%s stderr=%s", code, stdout, stderr)
+			}
+		})
+	}
+}
 
 func TestMaterializeAPTSnapshotBuildsConsumableRepositoryAndRebuildsAfterRetention(t *testing.T) {
 	root := nginxWorkerTempDir(t)
@@ -346,6 +445,32 @@ func assertArchiveNames(t *testing.T, encoded []byte, names ...string) {
 	for _, name := range names {
 		if !found[name] {
 			t.Fatalf("complete offline archive omitted %s; entries=%v", name, found)
+		}
+	}
+}
+
+func assertArchiveOmitsNames(t *testing.T, encoded []byte, names ...string) {
+	t.Helper()
+	gzipReader, err := gzip.NewReader(bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gzipReader.Close()
+	forbidden := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		forbidden[name] = struct{}{}
+	}
+	tarReader := tar.NewReader(gzipReader)
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, denied := forbidden[header.Name]; denied {
+			t.Fatalf("offline archive retained forbidden path %s", header.Name)
 		}
 	}
 }

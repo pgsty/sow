@@ -74,6 +74,314 @@ func auditTreeShape(ctx context.Context, base string, allowRootShadows bool) err
 	})
 }
 
+type verificationRootBinding struct {
+	path     string
+	root     *os.Root
+	identity os.FileInfo
+}
+
+type verificationSubrootBinding struct {
+	parent   *verificationRootBinding
+	path     string
+	root     *os.Root
+	identity os.FileInfo
+}
+
+func bindVerificationRoot(name string) (*verificationRootBinding, error) {
+	if name == "" {
+		return nil, errors.New("empty directory")
+	}
+	absolute, err := filepath.Abs(name)
+	if err != nil {
+		return nil, err
+	}
+	before, err := os.Lstat(absolute)
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
+		return nil, errors.Join(err, errors.New("not a real directory"))
+	}
+	root, err := os.OpenRoot(absolute)
+	if err != nil {
+		return nil, err
+	}
+	opened, openErr := root.Stat(".")
+	current, pathErr := os.Lstat(absolute)
+	if openErr != nil || pathErr != nil || !opened.IsDir() ||
+		current.Mode()&os.ModeSymlink != 0 || !current.IsDir() ||
+		!os.SameFile(before, opened) || !os.SameFile(before, current) {
+		_ = root.Close()
+		return nil, errors.Join(openErr, pathErr, errors.New("directory changed while binding"))
+	}
+	return &verificationRootBinding{path: absolute, root: root, identity: opened}, nil
+}
+
+func (binding *verificationRootBinding) Check() error {
+	if binding == nil || binding.root == nil {
+		return errors.New("verification root is unavailable")
+	}
+	opened, openErr := binding.root.Stat(".")
+	current, pathErr := os.Lstat(binding.path)
+	if openErr != nil || pathErr != nil || !opened.IsDir() ||
+		current.Mode()&os.ModeSymlink != 0 || !current.IsDir() ||
+		!os.SameFile(binding.identity, opened) || !os.SameFile(binding.identity, current) {
+		return errors.Join(openErr, pathErr, errors.New("verification root identity changed"))
+	}
+	return nil
+}
+
+func (binding *verificationRootBinding) Close() error {
+	if binding == nil || binding.root == nil {
+		return nil
+	}
+	err := binding.root.Close()
+	binding.root = nil
+	return err
+}
+
+func bindVerificationSubroot(parent *verificationRootBinding, relative string) (*verificationSubrootBinding, error) {
+	if parent == nil || parent.root == nil || !safeRelative(relative) {
+		return nil, errors.New("verification subroot coordinate is unsafe")
+	}
+	if err := parent.Check(); err != nil {
+		return nil, err
+	}
+	name := filepath.FromSlash(relative)
+	before, err := parent.root.Lstat(name)
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
+		return nil, errors.Join(err, errors.New("verification subroot is absent, symlinked, or not a directory"))
+	}
+	root, err := parent.root.OpenRoot(name)
+	if err != nil {
+		return nil, err
+	}
+	opened, openErr := root.Stat(".")
+	current, pathErr := parent.root.Lstat(name)
+	if openErr != nil || pathErr != nil || !opened.IsDir() ||
+		current.Mode()&os.ModeSymlink != 0 || !current.IsDir() ||
+		!os.SameFile(before, opened) || !os.SameFile(before, current) {
+		_ = root.Close()
+		return nil, errors.Join(openErr, pathErr, errors.New("verification subroot changed while binding"))
+	}
+	return &verificationSubrootBinding{parent: parent, path: name, root: root, identity: opened}, nil
+}
+
+func (binding *verificationSubrootBinding) Check() error {
+	if binding == nil || binding.parent == nil || binding.root == nil {
+		return errors.New("verification subroot is unavailable")
+	}
+	if err := binding.parent.Check(); err != nil {
+		return err
+	}
+	opened, openErr := binding.root.Stat(".")
+	current, pathErr := binding.parent.root.Lstat(binding.path)
+	if openErr != nil || pathErr != nil || !opened.IsDir() ||
+		current.Mode()&os.ModeSymlink != 0 || !current.IsDir() ||
+		!os.SameFile(binding.identity, opened) || !os.SameFile(binding.identity, current) {
+		return errors.Join(openErr, pathErr, errors.New("verification subroot identity changed"))
+	}
+	return nil
+}
+
+func (binding *verificationSubrootBinding) Close() error {
+	if binding == nil || binding.root == nil {
+		return nil
+	}
+	checkErr := binding.Check()
+	closeErr := binding.root.Close()
+	binding.root = nil
+	return errors.Join(checkErr, closeErr)
+}
+
+type verificationRegularFile struct {
+	root     *verificationSubrootBinding
+	name     string
+	file     *os.File
+	identity os.FileInfo
+	closed   bool
+}
+
+func openVerificationRegularFile(root *verificationSubrootBinding, name string, exactSize int64) (*verificationRegularFile, error) {
+	if root == nil || root.root == nil || !safeSegment(name) || exactSize < 0 {
+		return nil, errors.New("verification regular-file request is unsafe")
+	}
+	if err := root.Check(); err != nil {
+		return nil, err
+	}
+	before, err := root.root.Lstat(name)
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() || before.Size() != exactSize {
+		return nil, errors.Join(err, errors.New("verification artifact is not the expected regular file"))
+	}
+	file, err := root.root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	opened, openErr := file.Stat()
+	current, pathErr := root.root.Lstat(name)
+	if openErr != nil || pathErr != nil || !opened.Mode().IsRegular() ||
+		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
+		!os.SameFile(before, opened) || !os.SameFile(before, current) {
+		_ = file.Close()
+		return nil, errors.Join(openErr, pathErr, errors.New("verification artifact changed while opening"))
+	}
+	return &verificationRegularFile{root: root, name: name, file: file, identity: opened}, nil
+}
+
+func (file *verificationRegularFile) Check() error {
+	if file == nil || file.root == nil || file.file == nil || file.closed {
+		return errors.New("verification regular file is unavailable")
+	}
+	if err := file.root.Check(); err != nil {
+		return err
+	}
+	opened, openErr := file.file.Stat()
+	current, pathErr := file.root.root.Lstat(file.name)
+	if openErr != nil || pathErr != nil || !opened.Mode().IsRegular() ||
+		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
+		!os.SameFile(file.identity, opened) || !os.SameFile(file.identity, current) ||
+		opened.Size() != file.identity.Size() || current.Size() != file.identity.Size() ||
+		opened.Mode() != file.identity.Mode() || current.Mode() != file.identity.Mode() ||
+		!opened.ModTime().Equal(file.identity.ModTime()) || !current.ModTime().Equal(file.identity.ModTime()) {
+		return errors.Join(openErr, pathErr, errors.New("verification artifact changed while reading"))
+	}
+	return nil
+}
+
+func (file *verificationRegularFile) Close() error {
+	if file == nil || file.closed {
+		return nil
+	}
+	checkErr := file.Check()
+	file.closed = true
+	closeErr := file.file.Close()
+	file.file = nil
+	return errors.Join(checkErr, closeErr)
+}
+
+type optionalTreeParent struct {
+	path     string
+	identity os.FileInfo
+}
+
+type optionalTreeAbsenceWitness struct {
+	root    *verificationRootBinding
+	path    string
+	parents []optionalTreeParent
+}
+
+// bindOptionalTreeAbsence distinguishes one absent payload leaf from a
+// missing/replaced repository root or parent. The returned witness retains the
+// root capability and every parent inode for all later stream boundaries.
+func bindOptionalTreeAbsence(root *verificationRootBinding, scopePath string) (*optionalTreeAbsenceWitness, bool, error) {
+	if root == nil || root.root == nil {
+		return nil, false, errors.New("optional tree root is unavailable")
+	}
+	if scopePath == "" {
+		scopePath = "."
+	}
+	if strings.ContainsAny(scopePath, "\\\x00\t\r\n") || path.IsAbs(scopePath) ||
+		path.Clean(scopePath) != scopePath || scopePath == ".." || strings.HasPrefix(scopePath, "../") {
+		return nil, false, errors.New("optional tree scope is unsafe")
+	}
+	if err := root.Check(); err != nil {
+		return nil, false, err
+	}
+	if scopePath == "." {
+		return nil, true, nil
+	}
+	parts := strings.Split(scopePath, "/")
+	witness := &optionalTreeAbsenceWitness{root: root, path: scopePath}
+	for index := 1; index < len(parts); index++ {
+		parentPath := strings.Join(parts[:index], "/")
+		info, err := root.root.Lstat(filepath.FromSlash(parentPath))
+		if err != nil {
+			return nil, false, fmt.Errorf("inspect optional tree parent %s: %w", parentPath, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return nil, false, fmt.Errorf("optional tree parent %s is not a real directory", parentPath)
+		}
+		witness.parents = append(witness.parents, optionalTreeParent{path: parentPath, identity: info})
+	}
+	info, err := root.root.Lstat(filepath.FromSlash(scopePath))
+	if errors.Is(err, fs.ErrNotExist) {
+		if err := witness.Check(); err != nil {
+			return nil, false, err
+		}
+		return witness, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("inspect optional tree %s: %w", scopePath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return nil, false, errors.New("optional tree is not a real directory")
+	}
+	return nil, true, nil
+}
+
+func (witness *optionalTreeAbsenceWitness) Check() error {
+	if witness == nil || witness.root == nil {
+		return errors.New("optional tree absence witness is unavailable")
+	}
+	if err := witness.root.Check(); err != nil {
+		return err
+	}
+	for _, parent := range witness.parents {
+		info, err := witness.root.root.Lstat(filepath.FromSlash(parent.path))
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || !os.SameFile(parent.identity, info) {
+			return errors.Join(err, fmt.Errorf("optional tree parent %s changed", parent.path))
+		}
+	}
+	_, err := witness.root.root.Lstat(filepath.FromSlash(witness.path))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect optional tree %s: %w", witness.path, err)
+	}
+	return fmt.Errorf("optional tree %s appeared during verification", witness.path)
+}
+
+// absentTreeStream binds an empty manifest to a root-capability absence
+// witness. Open, every read, and close all recheck root/parent identity and the
+// missing leaf, so replacement cannot be accepted as an empty repository.
+func absentTreeStream(witness *optionalTreeAbsenceWitness) Stream {
+	return func() (io.ReadCloser, error) {
+		reader := &absentTreeReader{witness: witness}
+		if err := reader.requireAbsent(); err != nil {
+			return nil, err
+		}
+		return reader, nil
+	}
+}
+
+type absentTreeReader struct {
+	witness *optionalTreeAbsenceWitness
+	closed  bool
+}
+
+func (r *absentTreeReader) Read([]byte) (int, error) {
+	if r.closed {
+		return 0, os.ErrClosed
+	}
+	if err := r.requireAbsent(); err != nil {
+		return 0, err
+	}
+	return 0, io.EOF
+}
+
+func (r *absentTreeReader) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	return r.requireAbsent()
+}
+
+func (r *absentTreeReader) requireAbsent() error {
+	if r.witness == nil {
+		return errors.New("optional tree absence witness is unavailable")
+	}
+	return r.witness.Check()
+}
+
 func openRegularBelow(root, relative string, maxSize int64) (*os.File, os.FileInfo, error) {
 	if err := realDirectory(root); err != nil {
 		return nil, nil, err

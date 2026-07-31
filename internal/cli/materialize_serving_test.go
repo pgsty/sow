@@ -484,8 +484,64 @@ func TestMaterializeDedicatedAndStableYUMRoutesAreCompleteAndExplicit(t *testing
 		"_sow/v1/g/"+generation+"/yum/test/x86_64/repodata/repomd.xml",
 		"_sow/v1/g/"+generation+"/yum/test/x86_64/repodata/repomd.xml.asc",
 	)
+	mirrorPath := filepath.Join(exportRoot, filepath.FromSlash(mirror))
+	repomdPath := filepath.Join(exportRoot, "_sow", "v1", "g", generation, "yum", "test", "x86_64", "repodata", "repomd.xml")
+	mirrorInfo, err := os.Lstat(mirrorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repomdInfo, err := os.Lstat(repomdPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rogue := filepath.Join(exportRoot, "_sow", "unowned-private.bin")
+	if err := os.WriteFile(rogue, []byte("must not survive exact export\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	generationRogue := filepath.Join(exportRoot, "_sow", "v1", "g", generation, ".sow", "unowned-private.bin")
+	if err := os.MkdirAll(filepath.Dir(generationRogue), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(generationRogue, []byte("must not survive retained generation\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if code, stdout, stderr = runServingCLI(t, arguments...); code != ExitOK {
 		t.Fatalf("dedicated replay code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "created=false pointer=unchanged") ||
+		!strings.Contains(stdout, " linked=0 ") ||
+		!strings.Contains(stdout, " relinked=0 ") ||
+		!strings.Contains(stdout, " pruned=2 ") ||
+		!strings.Contains(stdout, " route_receipt_changed=false ") ||
+		!strings.Contains(stdout, "serving_created=0 serving_pointers=0") {
+		t.Fatalf("dedicated exact replay was not a canonical-route physical no-op:\n%s", stdout)
+	}
+	if _, err := os.Lstat(rogue); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dedicated exact replay retained unowned _sow content: %v", err)
+	}
+	if _, err := os.Lstat(generationRogue); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dedicated exact replay retained unowned generation content: %v", err)
+	}
+	currentMirror, mirrorErr := os.Lstat(mirrorPath)
+	currentRepomd, repomdErr := os.Lstat(repomdPath)
+	if mirrorErr != nil || repomdErr != nil || !os.SameFile(mirrorInfo, currentMirror) || !os.SameFile(repomdInfo, currentRepomd) {
+		t.Fatalf("dedicated exact replay replaced canonical route inodes: mirror=%v repomd=%v", mirrorErr, repomdErr)
+	}
+	archive, err = os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertArchiveOmitsNames(
+		t,
+		archive,
+		"_sow/unowned-private.bin",
+		"_sow/v1/g/"+generation+"/.sow/unowned-private.bin",
+	)
+	if code, stdout, stderr = runServingCLI(t, arguments...); code != ExitOK ||
+		!strings.Contains(stdout, " pruned=0 ") ||
+		!strings.Contains(stdout, "created=false pointer=unchanged") ||
+		!strings.Contains(stdout, "serving_created=0 serving_pointers=0") {
+		t.Fatalf("dedicated clean replay code=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}
 	if _, err := os.Stat(filepath.Join(exportRoot, "_sow", "v1", "g", generation)); err != nil {
 		t.Fatalf("dedicated reconcile removed generation: %v", err)

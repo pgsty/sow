@@ -643,7 +643,7 @@ func buildSnapshotL1Checks(ctx context.Context, cfg *config.Config, canonical *s
 			if err != nil {
 				return nil, err
 			}
-			checks = append(checks, verify.FilesystemCheck{CheckID: "apt/snapshot/" + snapshotID + "/" + repo.ID + "/payload", Root: root, Scope: manifest.Scope{Path: "pool"}, Expected: verify.FileStream(expected), Workers: values.workers, ChunkEntries: values.chunk, TempDir: txDir})
+			checks = append(checks, verify.FilesystemCheck{CheckID: "apt/snapshot/" + snapshotID + "/" + repo.ID + "/payload", Root: root, Scope: manifest.Scope{Path: "pool"}, Expected: verify.FileStream(expected), Workers: values.workers, ChunkEntries: values.chunk, TempDir: txDir, AllowAbsentEmptyScope: true})
 			checks = append(checks, verify.APTCheck{
 				CheckID: "apt/snapshot/" + snapshotID + "/" + repo.ID, Root: root,
 				ExpectedSuites: []string{snapshotID}, ExpectedSuiteComponents: map[string][]string{snapshotID: repo.APT.ComponentsForSuite(sourceSuite)},
@@ -673,7 +673,7 @@ func buildSnapshotL1Checks(ctx context.Context, cfg *config.Config, canonical *s
 				if err != nil {
 					return nil, err
 				}
-				checks = append(checks, verify.FilesystemCheck{CheckID: "yum/snapshot/" + snapshotID + "/" + repo.ID + "/" + leaf.arch + "/payload", Root: root, Scope: manifest.Scope{Path: "Packages"}, Expected: verify.FileStream(expected), Workers: values.workers, ChunkEntries: values.chunk, TempDir: txDir})
+				checks = append(checks, verify.FilesystemCheck{CheckID: "yum/snapshot/" + snapshotID + "/" + repo.ID + "/" + leaf.arch + "/payload", Root: root, Scope: manifest.Scope{Path: "Packages"}, Expected: verify.FileStream(expected), Workers: values.workers, ChunkEntries: values.chunk, TempDir: txDir, AllowAbsentEmptyScope: true})
 				checks = append(checks, verify.YUMCheck{CheckID: "yum/snapshot/" + snapshotID + "/" + repo.ID + "/" + leaf.arch, Root: root, Compression: compression, Verifier: yumVerifier, PackageKeyring: packageKeyring, VerifyAt: time.Now().UTC(), Workers: values.workers, ChunkEntries: values.chunk, TempDir: txDir})
 			}
 		}

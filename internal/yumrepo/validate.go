@@ -2,6 +2,7 @@ package yumrepo
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"container/heap"
 	"context"
@@ -59,6 +60,56 @@ func ValidateDirectory(ctx context.Context, dir string, compression Compression,
 	return validateDirectory(ctx, dir, compression, verifier, false)
 }
 
+// ValidateRoot validates an already-retained repodata directory capability.
+// The caller owns root and must keep it open while consuming the returned
+// artifact paths. This prevents a public pathname swap between signed
+// generation validation and higher-layer metadata parsing.
+func ValidateRoot(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier) (*Generation, error) {
+	generation, _, err := validateRootWithProof(ctx, root, diagnostic, compression, verifier, false)
+	return generation, err
+}
+
+// ValidatedRootProof retains the identities and content hashes of the complete
+// signed generation (repomd, detached signature, and all three artifacts).
+// The caller must keep the os.Root supplied to ValidateRootWithProof open.
+type ValidatedRootProof struct {
+	root       *os.Root
+	identity   os.FileInfo
+	generation Generation
+	entries    []validatedRegularEntry
+}
+
+// ValidateRootWithProof is ValidateRoot plus a proof that higher verification
+// layers can recheck after consuming metadata. This closes the gap where the
+// directory inode remains stable but repomd.xml or its signature is replaced.
+func ValidateRootWithProof(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier) (*Generation, *ValidatedRootProof, error) {
+	return validateRootWithProof(ctx, root, diagnostic, compression, verifier, false)
+}
+
+func (proof *ValidatedRootProof) Check(ctx context.Context) error {
+	if ctx == nil || proof == nil || proof.root == nil || proof.identity == nil || len(proof.entries) == 0 {
+		return fmt.Errorf("%w: validated root proof is unavailable", ErrInvalidRepodata)
+	}
+	current, err := proof.root.Stat(".")
+	if err != nil || !current.IsDir() || !os.SameFile(proof.identity, current) {
+		return fmt.Errorf("%w: retained repodata root changed after validation: %v", ErrInvalidRepodata, err)
+	}
+	if err := rejectExtraGenerationFilesRoot(proof.root, &proof.generation); err != nil {
+		return err
+	}
+	if err := verifyValidatedGenerationEntriesRoot(ctx, proof.root, proof.entries); err != nil {
+		return err
+	}
+	if err := rejectExtraGenerationFilesRoot(proof.root, &proof.generation); err != nil {
+		return err
+	}
+	current, err = proof.root.Stat(".")
+	if err != nil || !current.IsDir() || !os.SameFile(proof.identity, current) {
+		return fmt.Errorf("%w: retained repodata root changed during proof check: %v", ErrInvalidRepodata, err)
+	}
+	return nil
+}
+
 // ValidateFlatCompatibilityDirectory applies the same signed, exact-generation
 // validation as ValidateDirectory, but requires every primary location href to
 // be a single flat RPM basename. This mode exists only for admitting the frozen
@@ -69,66 +120,102 @@ func ValidateFlatCompatibilityDirectory(ctx context.Context, dir string, compres
 }
 
 func validateDirectory(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, flatCompatibility bool) (*Generation, error) {
-	if ctx == nil {
-		return nil, fmt.Errorf("%w: nil context", ErrInvalidRepodata)
-	}
-	if verifier == nil {
-		return nil, fmt.Errorf("%w: detached verifier is required", ErrInvalidRepodata)
-	}
-	if compression != CompressionGzip && compression != CompressionZstd {
-		return nil, fmt.Errorf("%w: unsupported compression %q", ErrInvalidRepodata, compression)
-	}
 	dir = filepath.Clean(dir)
-	info, err := os.Lstat(dir)
+	absolute, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve %q: %v", ErrInvalidRepodata, dir, err)
+	}
+	info, err := os.Lstat(absolute)
 	if err != nil {
 		return nil, fmt.Errorf("%w: stat %q: %v", ErrInvalidRepodata, dir, err)
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("%w: %q is not a real directory", ErrInvalidRepodata, dir)
 	}
-	if err := verifyRepomdSignature(ctx, dir, verifier); err != nil {
-		return nil, err
+	root, err := os.OpenRoot(absolute)
+	if err != nil {
+		return nil, fmt.Errorf("%w: open %q: %v", ErrInvalidRepodata, dir, err)
 	}
-	repomdBytes, err := readRegularFileLimited(filepath.Join(dir, "repomd.xml"), maxRepomdBytes)
+	defer root.Close()
+	opened, openErr := root.Stat(".")
+	current, pathErr := os.Lstat(absolute)
+	if openErr != nil || pathErr != nil || !opened.IsDir() || current.Mode()&os.ModeSymlink != 0 ||
+		!current.IsDir() || !os.SameFile(info, opened) || !os.SameFile(info, current) {
+		return nil, fmt.Errorf("%w: generation directory changed while binding: %v", ErrInvalidRepodata, errors.Join(openErr, pathErr))
+	}
+	generation, _, err := validateRootWithProof(ctx, root, dir, compression, verifier, flatCompatibility)
 	if err != nil {
 		return nil, err
 	}
+	opened, openErr = root.Stat(".")
+	current, pathErr = os.Lstat(absolute)
+	if openErr != nil || pathErr != nil || !opened.IsDir() || current.Mode()&os.ModeSymlink != 0 || !current.IsDir() ||
+		!os.SameFile(info, opened) || !os.SameFile(info, current) {
+		return nil, fmt.Errorf("%w: generation directory changed during validation: %v", ErrInvalidRepodata, errors.Join(openErr, pathErr))
+	}
+	return generation, nil
+}
+
+func validateRootWithProof(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier, flatCompatibility bool) (*Generation, *ValidatedRootProof, error) {
+	if ctx == nil {
+		return nil, nil, fmt.Errorf("%w: nil context", ErrInvalidRepodata)
+	}
+	if root == nil {
+		return nil, nil, fmt.Errorf("%w: nil repodata root", ErrInvalidRepodata)
+	}
+	if verifier == nil {
+		return nil, nil, fmt.Errorf("%w: detached verifier is required", ErrInvalidRepodata)
+	}
+	if compression != CompressionGzip && compression != CompressionZstd {
+		return nil, nil, fmt.Errorf("%w: unsupported compression %q", ErrInvalidRepodata, compression)
+	}
+	if diagnostic == "" {
+		diagnostic = "."
+	}
+	boundIdentity, err := root.Stat(".")
+	if err != nil || !boundIdentity.IsDir() {
+		return nil, nil, fmt.Errorf("%w: retained repodata root is not a directory: %v", ErrInvalidRepodata, err)
+	}
+	repomdBytes, validatedEntries, err := verifyRepomdSignatureRoot(ctx, root, verifier)
+	if err != nil {
+		return nil, nil, err
+	}
 	if bytesContainsDirective(repomdBytes) {
-		return nil, fmt.Errorf("%w: XML directives are forbidden", ErrInvalidRepodata)
+		return nil, nil, fmt.Errorf("%w: XML directives are forbidden", ErrInvalidRepodata)
 	}
 	var document repomdDocument
 	decoder := xml.NewDecoder(strings.NewReader(string(repomdBytes)))
 	decoder.Strict = true
 	if err := decoder.Decode(&document); err != nil {
-		return nil, fmt.Errorf("%w: decode repomd.xml: %v", ErrInvalidRepodata, err)
+		return nil, nil, fmt.Errorf("%w: decode repomd.xml: %v", ErrInvalidRepodata, err)
 	}
 	if document.XMLName.Space != repoNS || document.XMLName.Local != "repomd" {
-		return nil, fmt.Errorf("%w: repomd root is {%s}%s", ErrInvalidRepodata, document.XMLName.Space, document.XMLName.Local)
+		return nil, nil, fmt.Errorf("%w: repomd root is {%s}%s", ErrInvalidRepodata, document.XMLName.Space, document.XMLName.Local)
 	}
 	revision, err := strconv.ParseInt(strings.TrimSpace(document.Revision), 10, 64)
 	if err != nil || revision < 0 {
-		return nil, fmt.Errorf("%w: invalid revision %q", ErrInvalidRepodata, document.Revision)
+		return nil, nil, fmt.Errorf("%w: invalid revision %q", ErrInvalidRepodata, document.Revision)
 	}
 	if len(document.Data) != 3 {
-		return nil, fmt.Errorf("%w: expected exactly primary, filelists, and other; got %d records", ErrInvalidRepodata, len(document.Data))
+		return nil, nil, fmt.Errorf("%w: expected exactly primary, filelists, and other; got %d records", ErrInvalidRepodata, len(document.Data))
 	}
 
 	wantedOrder := []string{"primary", "filelists", "other"}
 	byType := make(map[string]repomdRecord, 3)
 	for _, record := range document.Data {
 		if _, exists := byType[record.Type]; exists {
-			return nil, fmt.Errorf("%w: duplicate %q record", ErrInvalidRepodata, record.Type)
+			return nil, nil, fmt.Errorf("%w: duplicate %q record", ErrInvalidRepodata, record.Type)
 		}
 		byType[record.Type] = record
 	}
 	repomdSum := sha256.Sum256(repomdBytes)
-	generation := &Generation{Dir: dir, Revision: revision, RepomdSHA256: hex.EncodeToString(repomdSum[:])}
+	generation := &Generation{Dir: diagnostic, Revision: revision, RepomdSHA256: hex.EncodeToString(repomdSum[:])}
 	// Validation must never create scratch below a directly hosted repository
 	// leaf. A private mode-0700 system temp directory keeps concurrent clients
 	// from observing identity runs and allows read-only repository mounts.
 	identityTemp, err := os.MkdirTemp("", "sow-yum-identity-")
 	if err != nil {
-		return nil, fmt.Errorf("%w: create package identity scratch: %v", ErrInvalidRepodata, err)
+		return nil, nil, fmt.Errorf("%w: create package identity scratch: %v", ErrInvalidRepodata, err)
 	}
 	defer os.RemoveAll(identityTemp)
 	var packageCount int64 = -1
@@ -136,64 +223,87 @@ func validateDirectory(ctx context.Context, dir string, compression Compression,
 	for i, kind := range wantedOrder {
 		record, ok := byType[kind]
 		if !ok {
-			return nil, fmt.Errorf("%w: missing %q record", ErrInvalidRepodata, kind)
+			return nil, nil, fmt.Errorf("%w: missing %q record", ErrInvalidRepodata, kind)
 		}
-		artifact, count, identities, err := validateArtifact(ctx, dir, kind, record, compression, flatCompatibility, identityTemp)
+		artifact, count, identities, validatedEntry, err := validateArtifactRoot(ctx, root, kind, record, compression, flatCompatibility, identityTemp)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		validatedEntries = append(validatedEntries, validatedEntry)
 		currentIdentitySHA, err := hashFileContext(ctx, identities)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if identitySHA == "" {
 			identitySHA = currentIdentitySHA
 		} else if currentIdentitySHA != identitySHA {
-			return nil, fmt.Errorf("%w: %s package identity set differs from primary", ErrInvalidRepodata, kind)
+			return nil, nil, fmt.Errorf("%w: %s package identity set differs from primary", ErrInvalidRepodata, kind)
 		}
 		if packageCount == -1 {
 			packageCount = count
 		} else if count != packageCount {
-			return nil, fmt.Errorf("%w: %s package count %d differs from %d", ErrInvalidRepodata, kind, count, packageCount)
+			return nil, nil, fmt.Errorf("%w: %s package count %d differs from %d", ErrInvalidRepodata, kind, count, packageCount)
 		}
 		generation.Artifacts[i] = artifact
 	}
 	generation.Packages = packageCount
-	if err := rejectExtraGenerationFiles(dir, generation); err != nil {
-		return nil, err
+	if err := rejectExtraGenerationFilesRoot(root, generation); err != nil {
+		return nil, nil, err
 	}
-	return generation, nil
+	if err := verifyValidatedGenerationEntriesRoot(ctx, root, validatedEntries); err != nil {
+		return nil, nil, err
+	}
+	// Re-list after the final content/identity proofs so an entry added while
+	// those proofs were running cannot hide behind a previously exact listing.
+	if err := rejectExtraGenerationFilesRoot(root, generation); err != nil {
+		return nil, nil, err
+	}
+	currentIdentity, err := root.Stat(".")
+	if err != nil || !currentIdentity.IsDir() || !os.SameFile(boundIdentity, currentIdentity) {
+		return nil, nil, fmt.Errorf("%w: retained repodata root changed during validation: %v", ErrInvalidRepodata, err)
+	}
+	proof := &ValidatedRootProof{
+		root: root, identity: boundIdentity, generation: *generation,
+		entries: append([]validatedRegularEntry(nil), validatedEntries...),
+	}
+	return generation, proof, nil
 }
 
-func verifyRepomdSignature(ctx context.Context, dir string, verifier DetachedVerifier) error {
-	messageInfo, err := os.Lstat(filepath.Join(dir, "repomd.xml"))
-	if err != nil || !messageInfo.Mode().IsRegular() || messageInfo.Size() <= 0 || messageInfo.Size() > maxRepomdBytes {
-		return fmt.Errorf("%w: invalid repomd.xml", ErrInvalidRepodata)
-	}
-	message, err := os.Open(filepath.Join(dir, "repomd.xml"))
+func verifyRepomdSignatureRoot(ctx context.Context, root *os.Root, verifier DetachedVerifier) ([]byte, []validatedRegularEntry, error) {
+	message, err := openBoundRegularFile(root, "repomd.xml", 1, maxRepomdBytes)
 	if err != nil {
-		return fmt.Errorf("%w: open repomd.xml: %v", ErrInvalidRepodata, err)
+		return nil, nil, fmt.Errorf("%w: invalid repomd.xml: %v", ErrInvalidRepodata, err)
 	}
-	defer message.Close()
-	sigInfo, err := os.Lstat(filepath.Join(dir, "repomd.xml.asc"))
-	if err != nil || !sigInfo.Mode().IsRegular() || sigInfo.Size() <= 0 || sigInfo.Size() > maxSignatureBytes {
-		return fmt.Errorf("%w: invalid repomd.xml.asc", ErrInvalidRepodata)
+	messageBytes, messageErr := message.ReadAll(maxRepomdBytes)
+	messageEntry := validatedRegularEntry{
+		name: "repomd.xml", identity: message.identity, sha256: digestBytes(messageBytes),
 	}
-	signature, err := os.Open(filepath.Join(dir, "repomd.xml.asc"))
+	messageCloseErr := message.Close()
+	if messageErr != nil || messageCloseErr != nil {
+		return nil, nil, errors.Join(messageErr, messageCloseErr)
+	}
+	signature, err := openBoundRegularFile(root, "repomd.xml.asc", 1, maxSignatureBytes)
 	if err != nil {
-		return fmt.Errorf("%w: open repomd.xml.asc: %v", ErrInvalidRepodata, err)
+		return nil, nil, fmt.Errorf("%w: invalid repomd.xml.asc: %v", ErrInvalidRepodata, err)
 	}
-	defer signature.Close()
-	if err := verifier.Verify(ctx, io.LimitReader(message, maxRepomdBytes+1), io.LimitReader(signature, maxSignatureBytes+1)); err != nil {
-		return fmt.Errorf("%w: %v", ErrSignatureValidation, err)
+	signatureBytes, signatureErr := signature.ReadAll(maxSignatureBytes)
+	signatureEntry := validatedRegularEntry{
+		name: "repomd.xml.asc", identity: signature.identity, sha256: digestBytes(signatureBytes),
 	}
-	return nil
+	signatureCloseErr := signature.Close()
+	if signatureErr != nil || signatureCloseErr != nil {
+		return nil, nil, errors.Join(signatureErr, signatureCloseErr)
+	}
+	if err := verifier.Verify(ctx, bytes.NewReader(messageBytes), bytes.NewReader(signatureBytes)); err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrSignatureValidation, err)
+	}
+	return messageBytes, []validatedRegularEntry{messageEntry, signatureEntry}, nil
 }
 
-func validateArtifact(ctx context.Context, dir, kind string, record repomdRecord, compression Compression, flatCompatibility bool, identityTemp string) (Artifact, int64, string, error) {
+func validateArtifactRoot(ctx context.Context, root *os.Root, kind string, record repomdRecord, compression Compression, flatCompatibility bool, identityTemp string) (Artifact, int64, string, validatedRegularEntry, error) {
 	if record.Checksum.Type != "sha256" || record.OpenChecksum.Type != "sha256" ||
 		!validSHA256(record.Checksum.Value) || !validSHA256(record.OpenChecksum.Value) {
-		return Artifact{}, 0, "", fmt.Errorf("%w: %s requires SHA256 checksums", ErrInvalidRepodata, kind)
+		return Artifact{}, 0, "", validatedRegularEntry{}, fmt.Errorf("%w: %s requires SHA256 checksums", ErrInvalidRepodata, kind)
 	}
 	extension := ".gz"
 	if compression == CompressionZstd {
@@ -203,54 +313,59 @@ func validateArtifact(ctx context.Context, dir, kind string, record repomdRecord
 	wantHref := "repodata/" + wantBase
 	if record.Location.Href != wantHref || path.Clean(record.Location.Href) != record.Location.Href ||
 		strings.Contains(record.Location.Href, "\\") {
-		return Artifact{}, 0, "", fmt.Errorf("%w: unsafe or non-canonical %s href %q", ErrInvalidRepodata, kind, record.Location.Href)
+		return Artifact{}, 0, "", validatedRegularEntry{}, fmt.Errorf("%w: unsafe or non-canonical %s href %q", ErrInvalidRepodata, kind, record.Location.Href)
 	}
-	filename := filepath.Join(dir, wantBase)
-	info, err := os.Lstat(filename)
-	if err != nil || !info.Mode().IsRegular() {
-		return Artifact{}, 0, "", fmt.Errorf("%w: missing regular artifact %q", ErrInvalidRepodata, wantBase)
-	}
-	if info.Size() != record.Size || record.Size < 0 || record.OpenSize < 0 || record.Timestamp < 0 {
-		return Artifact{}, 0, "", fmt.Errorf("%w: invalid %s size/timestamp", ErrInvalidRepodata, kind)
-	}
-	compressedSHA, err := hashFileContext(ctx, filename)
+	file, err := openBoundRegularFile(root, wantBase, 0, record.Size)
 	if err != nil {
-		return Artifact{}, 0, "", err
+		return Artifact{}, 0, "", validatedRegularEntry{}, fmt.Errorf("%w: missing regular artifact %q", ErrInvalidRepodata, wantBase)
+	}
+	defer file.Close()
+	if file.identity.Size() != record.Size || record.Size < 0 || record.OpenSize < 0 || record.Timestamp < 0 {
+		return Artifact{}, 0, "", validatedRegularEntry{}, fmt.Errorf("%w: invalid %s size/timestamp", ErrInvalidRepodata, kind)
+	}
+	compressedSHA, err := hashReaderContext(ctx, file.file)
+	if err != nil {
+		return Artifact{}, 0, "", validatedRegularEntry{}, err
 	}
 	if compressedSHA != record.Checksum.Value {
-		return Artifact{}, 0, "", fmt.Errorf("%w: %s compressed checksum mismatch", ErrInvalidRepodata, kind)
+		return Artifact{}, 0, "", validatedRegularEntry{}, fmt.Errorf("%w: %s compressed checksum mismatch", ErrInvalidRepodata, kind)
 	}
-	openSHA, openSize, count, identities, err := validateOpenXML(ctx, filename, kind, compression, flatCompatibility, identityTemp)
+	if err := file.Reset(); err != nil {
+		return Artifact{}, 0, "", validatedRegularEntry{}, err
+	}
+	openSHA, openSize, count, identities, err := validateOpenXML(ctx, file.file, kind, compression, flatCompatibility, identityTemp)
 	if err != nil {
-		return Artifact{}, 0, "", err
+		return Artifact{}, 0, "", validatedRegularEntry{}, err
+	}
+	if err := file.Check(); err != nil {
+		return Artifact{}, 0, "", validatedRegularEntry{}, err
 	}
 	if openSHA != record.OpenChecksum.Value || openSize != record.OpenSize {
-		return Artifact{}, 0, "", fmt.Errorf("%w: %s open checksum/size mismatch", ErrInvalidRepodata, kind)
+		return Artifact{}, 0, "", validatedRegularEntry{}, fmt.Errorf("%w: %s open checksum/size mismatch", ErrInvalidRepodata, kind)
+	}
+	validatedEntry := validatedRegularEntry{name: wantBase, identity: file.identity, sha256: compressedSHA}
+	if err := file.Close(); err != nil {
+		return Artifact{}, 0, "", validatedRegularEntry{}, err
 	}
 	return Artifact{
 		Type: kind, Path: wantHref, SHA256: record.Checksum.Value,
 		OpenSHA256: record.OpenChecksum.Value, Size: record.Size, OpenSize: record.OpenSize,
 		Timestamp: record.Timestamp, Packages: count, Compression: compression,
-	}, count, identities, nil
+	}, count, identities, validatedEntry, nil
 }
 
-func validateOpenXML(ctx context.Context, filename, kind string, compression Compression, flatCompatibility bool, identityTemp string) (string, int64, int64, string, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return "", 0, 0, "", err
-	}
-	defer f.Close()
+func validateOpenXML(ctx context.Context, source io.Reader, kind string, compression Compression, flatCompatibility bool, identityTemp string) (string, int64, int64, string, error) {
 	var reader io.Reader
 	var closer io.Closer
 	switch compression {
 	case CompressionGzip:
-		gz, err := gzip.NewReader(f)
+		gz, err := gzip.NewReader(source)
 		if err != nil {
 			return "", 0, 0, "", fmt.Errorf("%w: open gzip %s: %v", ErrInvalidRepodata, kind, err)
 		}
 		reader, closer = gz, gz
 	case CompressionZstd:
-		zr, err := zstd.NewReader(f, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(64<<20))
+		zr, err := zstd.NewReader(source, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(64<<20))
 		if err != nil {
 			return "", 0, 0, "", fmt.Errorf("%w: open zstd %s: %v", ErrInvalidRepodata, kind, err)
 		}
@@ -621,20 +736,170 @@ func closeMetadataIdentityCursors(cursors metadataIdentityHeap) {
 	}
 }
 
-func rejectExtraGenerationFiles(dir string, generation *Generation) error {
+type boundRegularFile struct {
+	root     *os.Root
+	name     string
+	file     *os.File
+	identity os.FileInfo
+	closed   bool
+}
+
+type validatedRegularEntry struct {
+	name     string
+	identity os.FileInfo
+	sha256   string
+}
+
+func digestBytes(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
+}
+
+func verifyValidatedGenerationEntriesRoot(ctx context.Context, root *os.Root, entries []validatedRegularEntry) error {
+	if ctx == nil || root == nil || len(entries) == 0 {
+		return fmt.Errorf("%w: validated generation entry proofs are unavailable", ErrInvalidRepodata)
+	}
+	seen := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		if entry.name == "" || entry.identity == nil || !validSHA256(entry.sha256) {
+			return fmt.Errorf("%w: invalid validated generation entry proof", ErrInvalidRepodata)
+		}
+		if _, exists := seen[entry.name]; exists {
+			return fmt.Errorf("%w: duplicate validated generation entry proof %q", ErrInvalidRepodata, entry.name)
+		}
+		seen[entry.name] = struct{}{}
+		file, err := openBoundRegularFile(root, entry.name, entry.identity.Size(), entry.identity.Size())
+		if err != nil {
+			return fmt.Errorf("%w: validated entry %q changed after inspection: %v", ErrInvalidRepodata, entry.name, err)
+		}
+		sameIdentity := os.SameFile(entry.identity, file.identity) &&
+			entry.identity.Mode() == file.identity.Mode() &&
+			entry.identity.Size() == file.identity.Size() &&
+			entry.identity.ModTime().Equal(file.identity.ModTime())
+		if !sameIdentity {
+			_ = file.Close()
+			return fmt.Errorf("%w: validated entry %q changed after inspection", ErrInvalidRepodata, entry.name)
+		}
+		digest, hashErr := hashReaderContext(ctx, file.file)
+		closeErr := file.Close()
+		if hashErr != nil || closeErr != nil {
+			return errors.Join(
+				fmt.Errorf("%w: revalidate entry %q", ErrInvalidRepodata, entry.name),
+				hashErr,
+				closeErr,
+			)
+		}
+		if digest != entry.sha256 {
+			return fmt.Errorf("%w: validated entry %q content changed after inspection", ErrInvalidRepodata, entry.name)
+		}
+	}
+	return nil
+}
+
+func openBoundRegularFile(root *os.Root, name string, minimum, maximum int64) (*boundRegularFile, error) {
+	if root == nil || name == "" || filepath.IsAbs(name) || filepath.Clean(name) != name ||
+		name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) ||
+		minimum < 0 || maximum < minimum {
+		return nil, errors.New("unsafe bounded regular file request")
+	}
+	before, err := root.Lstat(name)
+	if err != nil || before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() ||
+		before.Size() < minimum || before.Size() > maximum {
+		return nil, errors.Join(err, fmt.Errorf("%s is not a bounded regular file", name))
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	opened, openErr := file.Stat()
+	current, pathErr := root.Lstat(name)
+	if openErr != nil || pathErr != nil || !opened.Mode().IsRegular() ||
+		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
+		!os.SameFile(before, opened) || !os.SameFile(before, current) {
+		_ = file.Close()
+		return nil, errors.Join(openErr, pathErr, fmt.Errorf("%s changed while opening", name))
+	}
+	return &boundRegularFile{root: root, name: name, file: file, identity: opened}, nil
+}
+
+func (file *boundRegularFile) Check() error {
+	if file == nil || file.root == nil || file.file == nil || file.closed {
+		return errors.New("bounded regular file is unavailable")
+	}
+	opened, openErr := file.file.Stat()
+	current, pathErr := file.root.Lstat(file.name)
+	if openErr != nil || pathErr != nil || !opened.Mode().IsRegular() ||
+		current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() ||
+		!os.SameFile(file.identity, opened) || !os.SameFile(file.identity, current) ||
+		opened.Size() != file.identity.Size() || current.Size() != file.identity.Size() ||
+		opened.Mode() != file.identity.Mode() || current.Mode() != file.identity.Mode() ||
+		!opened.ModTime().Equal(file.identity.ModTime()) || !current.ModTime().Equal(file.identity.ModTime()) {
+		return errors.Join(openErr, pathErr, fmt.Errorf("%s changed while reading", file.name))
+	}
+	return nil
+}
+
+func (file *boundRegularFile) Reset() error {
+	if err := file.Check(); err != nil {
+		return err
+	}
+	if _, err := file.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return file.Check()
+}
+
+func (file *boundRegularFile) ReadAll(maximum int64) ([]byte, error) {
+	if file == nil || maximum < 0 {
+		return nil, errors.New("invalid bounded regular file read")
+	}
+	if err := file.Check(); err != nil {
+		return nil, err
+	}
+	body, err := io.ReadAll(io.LimitReader(file.file, maximum+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > maximum || int64(len(body)) != file.identity.Size() {
+		return nil, fmt.Errorf("%s exceeded its bound or changed size", file.name)
+	}
+	if err := file.Check(); err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+func (file *boundRegularFile) Close() error {
+	if file == nil || file.closed {
+		return nil
+	}
+	checkErr := file.Check()
+	file.closed = true
+	closeErr := file.file.Close()
+	file.file = nil
+	return errors.Join(checkErr, closeErr)
+}
+
+func rejectExtraGenerationFilesRoot(root *os.Root, generation *Generation) error {
 	wanted := map[string]struct{}{"repomd.xml": {}, "repomd.xml.asc": {}}
 	for _, artifact := range generation.Artifacts {
 		wanted[strings.TrimPrefix(artifact.Path, "repodata/")] = struct{}{}
 	}
-	entries, err := os.ReadDir(dir)
+	directory, err := root.Open(".")
 	if err != nil {
 		return err
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if readErr != nil || closeErr != nil {
+		return errors.Join(readErr, closeErr)
 	}
 	if len(entries) != len(wanted) {
 		return fmt.Errorf("%w: generation contains extra or missing files", ErrInvalidRepodata)
 	}
 	for _, entry := range entries {
-		if _, ok := wanted[entry.Name()]; !ok || entry.IsDir() {
+		info, err := root.Lstat(entry.Name())
+		if _, ok := wanted[entry.Name()]; err != nil || !ok || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return fmt.Errorf("%w: unexpected generation entry %q", ErrInvalidRepodata, entry.Name())
 		}
 	}
@@ -654,24 +919,12 @@ func hashFileContext(ctx context.Context, filename string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func readRegularFileLimited(filename string, limit int64) ([]byte, error) {
-	info, err := os.Lstat(filename)
-	if err != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > limit {
-		return nil, fmt.Errorf("%w: invalid regular file %q", ErrInvalidRepodata, filepath.Base(filename))
+func hashReaderContext(ctx context.Context, reader io.Reader) (string, error) {
+	h := sha256.New()
+	if _, err := io.CopyBuffer(h, &contextReader{ctx: ctx, r: reader}, make([]byte, copyBufferSize)); err != nil {
+		return "", err
 	}
-	f, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > limit {
-		return nil, fmt.Errorf("%w: file %q exceeds size limit", ErrInvalidRepodata, filepath.Base(filename))
-	}
-	return data, nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func validSHA256(value string) bool {

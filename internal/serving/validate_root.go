@@ -81,6 +81,76 @@ func ValidateInstalledGenerationRoot(ctx context.Context, pool *repository.Store
 	return validateHostableDirectoryParentsRoot(targetRoot, relative)
 }
 
+// ValidateInstalledGenerationCanonicalSubset validates every canonical
+// generation entry and hardlink while allowing additional regular files to be
+// present temporarily. This is only for an exact-reconcile preflight: callers
+// must immediately reconcile against the same canonical manifest so all
+// additional entries are removed. Missing or changed canonical bytes,
+// symlinks, special files, unsafe parents, or non-hostable canonical entries
+// still fail closed.
+func ValidateInstalledGenerationCanonicalSubset(ctx context.Context, pool *repository.Store, targetRoot string, generation Generation, manifestPath string, options InstallOptions) (resultErr error) {
+	if pool == nil {
+		return errors.New("nil CAS store")
+	}
+	if err := generation.Validate(); err != nil {
+		return err
+	}
+	if err := validateGenerationManifest(generation, manifestPath); err != nil {
+		return err
+	}
+	confinedRoot, err := validateTargetRoot(pool.Root(), targetRoot)
+	if err != nil {
+		return err
+	}
+	if _, err := installedGenerationRoot(confinedRoot, generation.ID); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(confinedRoot)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, root.Close()) }()
+	return validateInstalledGenerationCanonicalSubsetRoot(ctx, pool, root, generation, manifestPath, options)
+}
+
+func validateInstalledGenerationCanonicalSubsetRoot(ctx context.Context, pool *repository.Store, targetRoot *os.Root, generation Generation, manifestPath string, options InstallOptions) error {
+	if ctx == nil || pool == nil || targetRoot == nil {
+		return errors.New("bound installed-generation subset validation dependencies are unavailable")
+	}
+	if err := generation.Validate(); err != nil {
+		return err
+	}
+	if err := validateGenerationManifest(generation, manifestPath); err != nil {
+		return err
+	}
+	relative := filepath.Join("_sow", "v1", "g", generation.ID)
+	if err := validateHostableDirectoryParentsRoot(targetRoot, relative); err != nil {
+		return err
+	}
+	generationRoot, identity, err := openServingDirectoryRoot(targetRoot, relative)
+	if err != nil {
+		return err
+	}
+	defer generationRoot.Close()
+	if err := validateTreeContainsManifestRoot(ctx, generationRoot, manifestPath, options); err != nil {
+		return err
+	}
+	if err := runGenerationValidationHook(ctx, generationValidationAfterManifestScan, ""); err != nil {
+		return err
+	}
+	if err := validateManifestHostableFilesRoot(generationRoot, manifestPath); err != nil {
+		return err
+	}
+	if err := validateTreeHardlinksRoot(ctx, pool, generationRoot, manifestPath); err != nil {
+		return err
+	}
+	current, err := targetRoot.Lstat(relative)
+	if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.IsDir() || current.Mode().Perm() != 0o755 || !os.SameFile(identity, current) {
+		return errors.Join(err, errors.New("installed generation coordinate was replaced during subset validation"))
+	}
+	return validateHostableDirectoryParentsRoot(targetRoot, relative)
+}
+
 func openServingDirectoryRoot(root *os.Root, relative string) (*os.Root, os.FileInfo, error) {
 	if root == nil || relative == "" || relative == "." || filepath.IsAbs(relative) || filepath.Clean(relative) != relative || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return nil, nil, errors.New("unsafe bound serving directory")
@@ -101,6 +171,66 @@ func openServingDirectoryRoot(root *os.Root, relative string) (*os.Root, os.File
 	return opened, bound, nil
 }
 
+func validateTreeContainsManifestRoot(ctx context.Context, root *os.Root, manifestPath string, options InstallOptions) error {
+	if options.Workers < 1 || options.ChunkEntries < 1 || options.TempDir == "" {
+		return errors.New("bound generation subset validation requires positive workers/chunk entries and a temp directory")
+	}
+	actual, err := os.CreateTemp(options.TempDir, "serving-generation-subset-*.tsv")
+	if err != nil {
+		return err
+	}
+	actualPath := actual.Name()
+	if err := actual.Close(); err != nil {
+		return err
+	}
+	defer os.Remove(actualPath)
+	if _, err := manifest.ScanRoot(ctx, root, manifest.Scope{Path: "."}, actualPath, manifest.ScanOptions{
+		Workers: options.Workers, ChunkEntries: options.ChunkEntries, TempDir: options.TempDir,
+		ShadowPolicy: manifest.ShadowIncludeAll,
+	}); err != nil {
+		return err
+	}
+	wanted, err := os.Open(manifestPath)
+	if err != nil {
+		return err
+	}
+	observed, err := os.Open(actualPath)
+	if err != nil {
+		_ = wanted.Close()
+		return err
+	}
+	diff, diffErr := manifest.Diff(wanted, observed, nil)
+	closeErr := errors.Join(wanted.Close(), observed.Close())
+	if diffErr != nil || closeErr != nil {
+		return errors.Join(diffErr, closeErr)
+	}
+	if diff.Removed != 0 || diff.Changed != 0 {
+		return fmt.Errorf("generation canonical subset drift: added=%d removed=%d changed=%d", diff.Added, diff.Removed, diff.Changed)
+	}
+	return nil
+}
+
+func validateManifestHostableFilesRoot(root *os.Root, manifestPath string) error {
+	file, err := os.Open(manifestPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	reader := manifest.NewReader(file)
+	for {
+		entry, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := ValidateHostableFileRoot(root, filepath.FromSlash(entry.Path)); err != nil {
+			return fmt.Errorf("canonical generation path %s is not directly hostable: %w", entry.Path, err)
+		}
+	}
+}
+
 func validateTreeAgainstManifestRoot(ctx context.Context, root *os.Root, manifestPath string, options InstallOptions) error {
 	if options.Workers < 1 || options.ChunkEntries < 1 || options.TempDir == "" {
 		return errors.New("bound generation validation requires positive workers/chunk entries and a temp directory")
@@ -116,6 +246,7 @@ func validateTreeAgainstManifestRoot(ctx context.Context, root *os.Root, manifes
 	defer os.Remove(actualPath)
 	if _, err := manifest.ScanRoot(ctx, root, manifest.Scope{Path: "."}, actualPath, manifest.ScanOptions{
 		Workers: options.Workers, ChunkEntries: options.ChunkEntries, TempDir: options.TempDir,
+		ShadowPolicy: manifest.ShadowIncludeAll,
 	}); err != nil {
 		return err
 	}

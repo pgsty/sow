@@ -65,6 +65,31 @@ func TestScanRejectsUnrepresentablePathAndSymlink(t *testing.T) {
 	}
 }
 
+func TestValidateScopeRejectsUnsafeAbsentCoordinatesAndPatterns(t *testing.T) {
+	for _, scope := range []Scope{
+		{Path: "../outside"},
+		{Path: "/absolute"},
+		{Path: "nested/../outside"},
+		{Path: "nested\\outside"},
+		{Path: "repo", Include: []string{"["}},
+		{Path: "repo", Exclude: []string{"**["}},
+	} {
+		if err := ValidateScope(scope); err == nil {
+			t.Fatalf("unsafe scope was accepted: %+v", scope)
+		}
+	}
+	for _, scope := range []Scope{
+		{},
+		{Path: "."},
+		{Path: "repo"},
+		{Path: "nested/repo", Include: []string{"**/*.rpm"}, Exclude: []string{"debug/**"}},
+	} {
+		if err := ValidateScope(scope); err != nil {
+			t.Fatalf("safe scope rejected %+v: %v", scope, err)
+		}
+	}
+}
+
 func scanError(root string) error {
 	_, err := Scan(context.Background(), root, Scope{Path: "repo"}, filepath.Join(root, "manifest.tsv"), ScanOptions{Workers: 2, ChunkEntries: 1, TempDir: filepath.Join(root, ".sow", "tmp")})
 	return err

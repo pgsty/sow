@@ -44,8 +44,14 @@ func (s *Store) ReconcileExact(ctx context.Context, desiredManifest, targetRoot 
 		return result, err
 	}
 	defer os.Remove(currentPath)
+	shadowPolicy := manifest.ShadowIncludeAll
+	if target == s.root {
+		// The repository root owns these three operator directories. A
+		// sub-target is an exact export and has no such exemption.
+		shadowPolicy = manifest.ShadowExcludeScopeRoot
+	}
 	if _, err := manifest.Scan(ctx, target, manifest.Scope{Path: "."}, currentPath, manifest.ScanOptions{
-		Workers: workers, ChunkEntries: chunkEntries, TempDir: s.tempRoot,
+		Workers: workers, ChunkEntries: chunkEntries, TempDir: s.tempRoot, ShadowPolicy: shadowPolicy,
 	}); err != nil {
 		return result, fmt.Errorf("scan materialized target: %w", err)
 	}
@@ -61,7 +67,7 @@ func (s *Store) ReconcileExact(ctx context.Context, desiredManifest, targetRoot 
 	diff, compareErr := manifest.Diff(desired, actual, func(change manifest.Change) error {
 		switch change.Kind {
 		case manifest.Added:
-			if err := removeMaterializedPath(target, change.New.Path); err != nil {
+			if err := removeExactMaterializedPath(target, change.New.Path, target != s.root); err != nil {
 				return err
 			}
 			result.RemovedFiles++
@@ -86,18 +92,22 @@ func (s *Store) ReconcileExact(ctx context.Context, desiredManifest, targetRoot 
 			return result, err
 		}
 	}
-	if err := verifyMaterializedExact(ctx, target, desiredManifest, currentPath, s.tempRoot, workers, chunkEntries); err != nil {
+	if err := verifyMaterializedExact(ctx, target, desiredManifest, currentPath, s.tempRoot, workers, chunkEntries, shadowPolicy); err != nil {
 		return result, err
 	}
 	return result, nil
 }
 
-func removeMaterializedPath(root, relative string) error {
-	return removeMaterializedPathWithHook(root, relative, nil)
+func removeMaterializedPathWithHook(root, relative string, beforeRemove func(string) error) (resultErr error) {
+	return removeExactMaterializedPathWithHook(root, relative, false, beforeRemove)
 }
 
-func removeMaterializedPathWithHook(root, relative string, beforeRemove func(string) error) (resultErr error) {
-	if err := validateMaterializedPath(relative); err != nil {
+func removeExactMaterializedPath(root, relative string, allowReservedPrefix bool) error {
+	return removeExactMaterializedPathWithHook(root, relative, allowReservedPrefix, nil)
+}
+
+func removeExactMaterializedPathWithHook(root, relative string, allowReservedPrefix bool, beforeRemove func(string) error) (resultErr error) {
+	if err := validateMaterializedPathPolicy(relative, allowReservedPrefix); err != nil {
 		return err
 	}
 	fullPath := filepath.Join(root, filepath.FromSlash(relative))
@@ -177,9 +187,9 @@ func removeEmptyDirectories(root string) error {
 	return syncDirectory(root)
 }
 
-func verifyMaterializedExact(ctx context.Context, target, desiredManifest, scratch, tempDir string, workers, chunkEntries int) error {
+func verifyMaterializedExact(ctx context.Context, target, desiredManifest, scratch, tempDir string, workers, chunkEntries int, shadowPolicy manifest.ShadowPolicy) error {
 	if _, err := manifest.Scan(ctx, target, manifest.Scope{Path: "."}, scratch, manifest.ScanOptions{
-		Workers: workers, ChunkEntries: chunkEntries, TempDir: tempDir,
+		Workers: workers, ChunkEntries: chunkEntries, TempDir: tempDir, ShadowPolicy: shadowPolicy,
 	}); err != nil {
 		return fmt.Errorf("verify materialized target: %w", err)
 	}

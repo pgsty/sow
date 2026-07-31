@@ -92,10 +92,12 @@ func (c APTCheck) Verify(ctx context.Context, recorder *Recorder) (resultErr err
 	if (c.ActualPayload == nil) != (c.OpenPayload == nil) {
 		return errors.New("APT capability payload manifest and opener must be supplied together")
 	}
-	if err := realDirectory(c.Root); err != nil {
+	root, err := bindVerificationRoot(c.Root)
+	if err != nil {
 		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "APT_ROOT_UNSAFE", Subject: c.CheckID, Message: "APT archive root is absent, symlinked, or not a directory"})
 		return nil
 	}
+	defer joinVerificationCleanup(&resultErr, root.Close)
 	tempRoot, removeTemp, err := verificationTemp(c.TempDir, "sow-verify-apt-")
 	if err != nil {
 		return err
@@ -105,15 +107,6 @@ func (c APTCheck) Verify(ctx context.Context, recorder *Recorder) (resultErr err
 	}
 	if c.ActualPayload == nil && scratchVisibleToScope(c.Root, "pool", tempRoot) {
 		return errors.New("APT verification scratch directory is inside the pool")
-	}
-	if c.ActualPayload == nil {
-		if err := auditTreeShape(ctx, filepath.Join(c.Root, "pool"), false); err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
-			}
-			recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "APT_POOL_UNSAFE", Subject: c.CheckID, Message: "APT pool contains a symlink, special file, or reserved shadow point"})
-			return nil
-		}
 	}
 	global, err := newManifestSpool(tempRoot, c.ChunkEntries)
 	if err != nil {
@@ -219,15 +212,26 @@ func (c APTCheck) Verify(ctx context.Context, recorder *Recorder) (resultErr err
 	actualPayload := c.ActualPayload
 	if actualPayload == nil {
 		actualPool := filepath.Join(tempRoot, "actual-pool.tsv")
-		_, err = manifest.Scan(ctx, c.Root, manifest.Scope{Path: "pool"}, actualPool, manifest.ScanOptions{Workers: c.Workers, ChunkEntries: c.ChunkEntries, TempDir: tempRoot})
+		witness, present, auditErr := bindOptionalTreeAbsence(root, "pool")
+		if auditErr != nil {
+			err = auditErr
+		} else if !present {
+			actualPayload = absentTreeStream(witness)
+		} else {
+			if err = auditTreeShape(ctx, filepath.Join(c.Root, "pool"), false); err == nil {
+				_, err = manifest.ScanRoot(ctx, root.root, manifest.Scope{Path: "pool"}, actualPool, manifest.ScanOptions{Workers: c.Workers, ChunkEntries: c.ChunkEntries, TempDir: tempRoot})
+			}
+			if err == nil {
+				actualPayload = FileStream(actualPool)
+			}
+		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return err
 			}
-			recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "APT_POOL_UNSAFE", Subject: c.CheckID, Message: "APT pool is absent, contains a symlink or special file, or changed while hashing"})
+			recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "APT_POOL_UNSAFE", Subject: c.CheckID, Message: "APT pool contains a symlink or special file, or changed while hashing"})
 			return nil
 		}
-		actualPayload = FileStream(actualPool)
 	}
 	if len(c.SelectedSuites) != 0 {
 		actual, openErr := actualPayload()
@@ -240,10 +244,22 @@ func (c APTCheck) Verify(ctx context.Context, recorder *Recorder) (resultErr err
 		if copyErr != nil || closeErr != nil {
 			return errors.Join(copyErr, closeErr)
 		}
-		return verifyAPTManifestSubset(ctx, recorder, c.CheckID, expectedPool, actualPath)
+		if err := verifyAPTManifestSubset(ctx, recorder, c.CheckID, expectedPool, actualPath); err != nil {
+			return err
+		}
+		if err := root.Check(); err != nil {
+			recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "APT_ROOT_UNSAFE", Subject: c.CheckID, Message: "APT archive root changed during verification"})
+		}
+		return nil
 	}
 	comparison := ManifestComparisonCheck{CheckID: c.CheckID + "/pool", AtLayer: LayerL1, Subject: c.CheckID, Desired: FileStream(expectedPool), Actual: actualPayload, CodePrefix: "APT_POOL"}
-	return comparison.Verify(ctx, recorder)
+	if err := comparison.Verify(ctx, recorder); err != nil {
+		return err
+	}
+	if err := root.Check(); err != nil {
+		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "APT_ROOT_UNSAFE", Subject: c.CheckID, Message: "APT archive root changed during verification"})
+	}
+	return nil
 }
 
 func (c APTCheck) verifyPackageBodyIdentities(ctx context.Context, recorder *Recorder, tempRoot, payloadPath, signedIdentities string) (resultErr error) {

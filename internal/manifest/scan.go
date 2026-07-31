@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -25,10 +26,46 @@ type Scope struct {
 	Exclude []string
 }
 
+// ValidateScope validates the lexical scope contract independently of
+// filesystem existence. Optional-tree verifiers must call this before
+// deciding that a missing path represents a valid empty repository.
+func ValidateScope(scope Scope) error {
+	scopePath := scope.Path
+	if scopePath == "" {
+		scopePath = "."
+	}
+	if strings.ContainsAny(scopePath, "\\\x00\t\r\n") ||
+		filepath.IsAbs(scopePath) || path.IsAbs(scopePath) ||
+		path.Clean(scopePath) != scopePath ||
+		scopePath == ".." || strings.HasPrefix(scopePath, "../") {
+		return errors.New("manifest scope must be a safe root-relative path")
+	}
+	return validatePatterns(append(append([]string{}, scope.Include...), scope.Exclude...))
+}
+
 type ScanOptions struct {
 	Workers      int
 	ChunkEntries int
 	TempDir      string
+	// ShadowPolicy controls how reserved operator directory names are treated.
+	// The zero value preserves the ordinary repository-scan contract: any path
+	// containing .sow, .pool, or .git is excluded. Exact export reconciliation
+	// may exclude only those names at the scan-scope root, while isolated
+	// immutable-generation validation must include them so a nested secret or
+	// symlink cannot hide from exactness checks.
+	ShadowPolicy ShadowPolicy
+}
+
+type ShadowPolicy uint8
+
+const (
+	ShadowExcludeAll ShadowPolicy = iota
+	ShadowExcludeScopeRoot
+	ShadowIncludeAll
+)
+
+func (policy ShadowPolicy) valid() bool {
+	return policy <= ShadowIncludeAll
 }
 
 type ScanStats struct {
@@ -66,11 +103,14 @@ func Scan(ctx context.Context, root string, scope Scope, dst string, options Sca
 	if options.Workers < 1 || options.ChunkEntries < 1 {
 		return ScanStats{}, errors.New("workers and chunk entries must be positive")
 	}
-	rootAbs, baseAbs, err := resolveScope(root, scope.Path)
-	if err != nil {
+	if !options.ShadowPolicy.valid() {
+		return ScanStats{}, errors.New("invalid manifest shadow-point policy")
+	}
+	if err := ValidateScope(scope); err != nil {
 		return ScanStats{}, err
 	}
-	if err := validatePatterns(append(append([]string{}, scope.Include...), scope.Exclude...)); err != nil {
+	rootAbs, baseAbs, err := resolveScope(root, scope.Path)
+	if err != nil {
 		return ScanStats{}, err
 	}
 	if err := os.MkdirAll(options.TempDir, 0o700); err != nil {
@@ -85,7 +125,7 @@ func Scan(ctx context.Context, root string, scope Scope, dst string, options Sca
 
 	go func() {
 		defer close(jobs)
-		walkErrors <- walkScope(ctx, rootAbs, baseAbs, scope, jobs)
+		walkErrors <- walkScope(ctx, rootAbs, baseAbs, scope, options.ShadowPolicy, jobs)
 	}()
 
 	var workers sync.WaitGroup
@@ -190,7 +230,7 @@ func resolveScope(root, scopePath string) (string, string, error) {
 	return rootReal, baseReal, nil
 }
 
-func walkScope(ctx context.Context, root, base string, scope Scope, jobs chan<- fileJob) error {
+func walkScope(ctx context.Context, root, base string, scope Scope, shadowPolicy ShadowPolicy, jobs chan<- fileJob) error {
 	return filepath.WalkDir(base, func(current string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -208,7 +248,7 @@ func walkScope(ctx context.Context, root, base string, scope Scope, jobs chan<- 
 		if relBase == "." {
 			return nil
 		}
-		if containsShadowPoint(relBase) {
+		if skipShadowPoint(relBase, shadowPolicy) {
 			if entry.IsDir() {
 				return filepath.SkipDir
 			}
@@ -319,6 +359,22 @@ func containsShadowPoint(rel string) bool {
 		}
 	}
 	return false
+}
+
+func skipShadowPoint(rel string, policy ShadowPolicy) bool {
+	switch policy {
+	case ShadowExcludeAll:
+		return containsShadowPoint(rel)
+	case ShadowExcludeScopeRoot:
+		return !strings.Contains(rel, "/") && containsShadowPoint(rel)
+	case ShadowIncludeAll:
+		return false
+	default:
+		// Public entry points reject invalid policies before walking. Failing
+		// closed here keeps direct in-package calls from silently weakening a
+		// scan if a future policy is added incompletely.
+		return true
+	}
 }
 
 func flushRun(tempDir string, entries []Entry) (string, error) {

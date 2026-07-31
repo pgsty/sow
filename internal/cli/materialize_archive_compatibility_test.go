@@ -53,6 +53,33 @@ func TestLatestWorkingTreeArchiveCarriesFrozenYUMCompatibility(t *testing.T) {
 	freezeOutput := runOK("compatibility", "yum-freeze", "--id", "infra-legacy-x86-64", "--candidate", candidate, "--confirm", nginxTestOutputValue(t, candidateOutput, "freeze_confirm"), "--config", configPath, "--workers", "1", "--chunk-entries", "2")
 	runOK("compatibility", "yum-cutover", "--id", "infra-legacy-x86-64", "--confirm", nginxTestOutputValue(t, freezeOutput, "cutover_confirm"), "--config", configPath, "--workers", "1", "--chunk-entries", "2")
 
+	explicitTarget := "export/frozen-compatibility"
+	explicitArguments := []string{
+		"materialize", "latest", "--repo", "infra-el9", "--config", configPath,
+		"--target", explicitTarget, "--serving-base-url", "https://repo.example.invalid",
+		"--gpg-private-key-file", privateKey, "--workers", "2", "--chunk-entries", "2",
+	}
+	explicitOutput := runOK(explicitArguments...)
+	if !strings.Contains(explicitOutput, "compatibility_generations=1") || !strings.Contains(explicitOutput, "compatibility_created=1") {
+		t.Fatalf("explicit target omitted active compatibility route: %s", explicitOutput)
+	}
+	explicitRoot := filepath.Join(workspace, filepath.FromSlash(explicitTarget))
+	for _, relative := range []string{
+		serving.MirrorlistPath("latest", "infra-legacy-x86-64", "cross-el", "x86_64"),
+		config.YUMCompatibilityPackageTrustRoute("infra-legacy-x86-64"),
+		config.YUMCompatibilityRepositoryTrustRoute("infra-legacy-x86-64"),
+	} {
+		if info, err := os.Stat(filepath.Join(explicitRoot, filepath.FromSlash(relative))); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+			t.Fatalf("explicit compatibility route %s is absent or empty: info=%v err=%v", relative, info, err)
+		}
+	}
+	explicitReplay := runOK(explicitArguments...)
+	if !strings.Contains(explicitReplay, "compatibility_created=0") ||
+		!strings.Contains(explicitReplay, "compatibility_pointers=0") ||
+		!strings.Contains(explicitReplay, "route_receipt_changed=false") {
+		t.Fatalf("explicit compatibility replay was not idempotent: %s", explicitReplay)
+	}
+
 	canonical := state.New(filepath.Join(workspace, config.StateDirectory))
 	frozen, err := loadYUMCompatibilityFrozenStateAt(canonical, plumbing.ZeroHash, "infra-legacy-x86-64")
 	if err != nil {

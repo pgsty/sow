@@ -277,46 +277,52 @@ func build(root, out string) (buildResult, error) {
 		return buildResult{}, fmt.Errorf("archive reproducibility: %w", err)
 	}
 
-	extract := filepath.Join(work, "extract")
-	if err := extractAndValidate(first, extract, p.delivery, virtual); err != nil {
-		return buildResult{}, err
-	}
-	verifyExtract := func() error {
-		if err := auditExtracted(extract, p.delivery, virtual); err != nil {
-			return err
+	for index, archive := range []string{first, second} {
+		extract := filepath.Join(work, fmt.Sprintf("extract-%d", index+1))
+		if err := extractAndValidate(archive, extract, p.delivery, virtual); err != nil {
+			return buildResult{}, fmt.Errorf("extract delivery %d: %w", index+1, err)
 		}
-		if err := auditAllowedContent(extract, p.delivery); err != nil {
-			return fmt.Errorf("extracted delivery content: %w", err)
+		verifyExtract := func() error {
+			if err := auditExtracted(extract, p.delivery, virtual); err != nil {
+				return err
+			}
+			if err := auditAllowedContent(extract, p.delivery); err != nil {
+				return fmt.Errorf("extracted delivery content: %w", err)
+			}
+			if err := verifyManifest(extract, productBytes); err != nil {
+				return fmt.Errorf("product manifest: %w", err)
+			}
+			if err := verifyManifest(extract, deliveryBytes); err != nil {
+				return fmt.Errorf("delivery manifest: %w", err)
+			}
+			return checkMarkdownLinks(extract, p.delivery)
 		}
-		if err := verifyManifest(extract, productBytes); err != nil {
-			return fmt.Errorf("product manifest: %w", err)
+		if err := verifyExtract(); err != nil {
+			return buildResult{}, fmt.Errorf("verify delivery %d: %w", index+1, err)
 		}
-		if err := verifyManifest(extract, deliveryBytes); err != nil {
-			return fmt.Errorf("delivery manifest: %w", err)
-		}
-		return checkMarkdownLinks(extract, p.delivery)
-	}
-	if err := verifyExtract(); err != nil {
-		return buildResult{}, err
-	}
 
-	commands := [][]string{
-		{"go", "mod", "tidy", "-diff"},
-		{"go", "mod", "download"},
-		{"go", "mod", "verify"},
-		{"bash", "third_party/cavaliergopher-rpm/verify-upstream.sh"},
-		{"go", "test", "-count=1", "./test/compat/cleandelivery"},
-		{"go", "test", "-count=1", "./internal/config", "-run", "TestExampleConfigMatchesSchema|TestShippedPGDGUpstreamExampleMatchesSchema"},
-		{"go", "test", "-count=1", "./test/compat", "-run", "^TestShippedExampleSupportsCleanRoomLocalMVP$"},
-		{"go", "build", "-trimpath", "-o", filepath.Join(work, "sow"), "./cmd/sow"},
-	}
-	for _, command := range commands {
-		if err := runCheckedCommand(extract, env, verifyExtract, command[0], command[1:]...); err != nil {
-			return buildResult{}, err
+		binary := filepath.Join(work, fmt.Sprintf("sow-%d", index+1))
+		commands := [][]string{
+			{"go", "mod", "tidy", "-diff"},
+			{"go", "mod", "download"},
+			{"go", "mod", "verify"},
+			{"bash", "third_party/cavaliergopher-rpm/verify-upstream.sh"},
+			{"go", "test", "-count=1", "./test/compat/cleandelivery"},
+			{"go", "test", "-count=1", "./internal/config", "-run", "TestExampleConfigMatchesSchema|TestShippedPGDGUpstreamExampleMatchesSchema"},
+			{"go", "test", "-timeout", "15m", "-count=1", "./test/compat", "-run", "^TestShippedExampleSupportsCleanRoomLocalMVP$"},
+			{"go", "build", "-trimpath", "-o", binary, "./cmd/sow"},
 		}
-	}
-	for _, arguments := range [][]string{{"--help"}, {"version"}} {
-		if err := runCheckedCommand(extract, env, verifyExtract, filepath.Join(work, "sow"), arguments...); err != nil {
+		for _, command := range commands {
+			if err := runCheckedCommand(extract, env, verifyExtract, command[0], command[1:]...); err != nil {
+				return buildResult{}, fmt.Errorf("delivery %d: %w", index+1, err)
+			}
+		}
+		for _, arguments := range [][]string{{"--help"}, {"version"}} {
+			if err := runCheckedCommand(extract, env, verifyExtract, binary, arguments...); err != nil {
+				return buildResult{}, fmt.Errorf("delivery %d: %w", index+1, err)
+			}
+		}
+		if err := verifyExtract(); err != nil {
 			return buildResult{}, err
 		}
 	}

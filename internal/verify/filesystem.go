@@ -15,29 +15,36 @@ import (
 // canonical manifest. Scanning hashes real bytes, rejects symlinks and special
 // files, and uses external sorted runs through manifest.Scan.
 type FilesystemCheck struct {
-	CheckID      string
-	Root         string
-	Scope        manifest.Scope
-	Expected     Stream
-	Workers      int
-	ChunkEntries int
-	TempDir      string
+	CheckID               string
+	Root                  string
+	Scope                 manifest.Scope
+	Expected              Stream
+	Workers               int
+	ChunkEntries          int
+	TempDir               string
+	AllowAbsentEmptyScope bool
 }
 
 func (c FilesystemCheck) ID() string   { return c.CheckID }
 func (c FilesystemCheck) Layer() Layer { return LayerL1 }
 
-func (c FilesystemCheck) Verify(ctx context.Context, recorder *Recorder) error {
+func (c FilesystemCheck) Verify(ctx context.Context, recorder *Recorder) (resultErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if c.Expected == nil {
 		return errors.New("filesystem check requires a canonical manifest stream")
 	}
-	if err := realDirectory(c.Root); err != nil {
+	if err := manifest.ValidateScope(c.Scope); err != nil {
+		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "FS_SCOPE_INVALID", Subject: c.CheckID, Message: "repository verification scope or path patterns are unsafe"})
+		return nil
+	}
+	root, err := bindVerificationRoot(c.Root)
+	if err != nil {
 		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "FS_ROOT_UNSAFE", Subject: c.CheckID, Message: "repository root is absent, symlinked, or not a directory"})
 		return nil
 	}
+	defer joinVerificationCleanup(&resultErr, root.Close)
 	tempRoot, removeTemp, err := verificationTemp(c.TempDir, "sow-verify-fs-")
 	if err != nil {
 		return fmt.Errorf("create filesystem verification temp directory: %w", err)
@@ -50,29 +57,51 @@ func (c FilesystemCheck) Verify(ctx context.Context, recorder *Recorder) error {
 	}
 	scopePath := filepath.Join(c.Root, filepath.FromSlash(c.Scope.Path))
 	allowRootShadows := c.Scope.Path == "" || c.Scope.Path == "."
-	if err := auditTreeShape(ctx, scopePath, allowRootShadows); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
+	var actual Stream
+	var auditErr error
+	if c.AllowAbsentEmptyScope {
+		witness, present, witnessErr := bindOptionalTreeAbsence(root, c.Scope.Path)
+		auditErr = witnessErr
+		if auditErr == nil && !present {
+			actual = absentTreeStream(witness)
+		} else if auditErr == nil {
+			auditErr = auditTreeShape(ctx, scopePath, allowRootShadows)
+		}
+	} else {
+		auditErr = auditTreeShape(ctx, scopePath, allowRootShadows)
+	}
+	if auditErr != nil {
+		if errors.Is(auditErr, context.Canceled) || errors.Is(auditErr, context.DeadlineExceeded) {
+			return auditErr
 		}
 		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "FS_TREE_UNSAFE", Subject: c.CheckID, Message: "repository tree contains a symlink, special file, or nested shadow point"})
 		return nil
 	}
-	actualPath := filepath.Join(tempRoot, "actual.tsv")
-	_, err = manifest.Scan(ctx, c.Root, c.Scope, actualPath, manifest.ScanOptions{
-		Workers: c.Workers, ChunkEntries: c.ChunkEntries, TempDir: tempRoot,
-	})
-	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
+	if actual == nil {
+		actualPath := filepath.Join(tempRoot, "actual.tsv")
+		_, err = manifest.ScanRoot(ctx, root.root, c.Scope, actualPath, manifest.ScanOptions{
+			Workers: c.Workers, ChunkEntries: c.ChunkEntries, TempDir: tempRoot,
+		})
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "FS_SCAN_FAILED", Subject: c.CheckID, Message: "repository tree could not be safely scanned"})
+			return nil
 		}
-		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "FS_SCAN_FAILED", Subject: c.CheckID, Message: "repository tree could not be safely scanned"})
-		return nil
+		actual = FileStream(actualPath)
 	}
 	comparison := ManifestComparisonCheck{
 		CheckID: c.CheckID + "/manifest", AtLayer: LayerL1, Subject: c.CheckID,
-		Desired: c.Expected, Actual: FileStream(actualPath), CodePrefix: "FS",
+		Desired: c.Expected, Actual: actual, CodePrefix: "FS",
 	}
-	return comparison.Verify(ctx, recorder)
+	if err := comparison.Verify(ctx, recorder); err != nil {
+		return err
+	}
+	if err := root.Check(); err != nil {
+		recorder.Add(Finding{Layer: LayerL1, Severity: SeverityCritical, Category: CategoryIntegrity, Code: "FS_ROOT_UNSAFE", Subject: c.CheckID, Message: "repository root changed during verification"})
+	}
+	return nil
 }
 
 func scratchVisibleToScope(root, scope, scratch string) bool {

@@ -135,6 +135,10 @@ func openRegular(name string) (*os.File, os.FileInfo, error) {
 }
 
 func validateMaterializedPath(name string) error {
+	return validateMaterializedPathPolicy(name, false)
+}
+
+func validateMaterializedPathPolicy(name string, allowReservedPrefix bool) error {
 	if name == "" || strings.ContainsAny(name, "\\\x00\t\r\n") || strings.HasPrefix(name, "/") {
 		return fmt.Errorf("%w: invalid root-relative path %q", ErrUnsafePath, name)
 	}
@@ -145,7 +149,9 @@ func validateMaterializedPath(name string) error {
 	first := strings.SplitN(name, "/", 2)[0]
 	switch first {
 	case ".sow", ".pool", ".git":
-		return fmt.Errorf("%w: reserved materialization prefix %q", ErrUnsafePath, first)
+		if !allowReservedPrefix {
+			return fmt.Errorf("%w: reserved materialization prefix %q", ErrUnsafePath, first)
+		}
 	}
 	return nil
 }

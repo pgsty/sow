@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,6 +65,194 @@ func TestFilesystemManifestAndStateComparisonsUseRealBytes(t *testing.T) {
 	if !hasCode(cache, "CACHE_SCHEMA_DRIFT") || !hasCode(cache, "CACHE_HEAD_DRIFT") {
 		t.Fatalf("cache schema drift not found: %+v", cache)
 	}
+}
+
+func TestFilesystemOptionalEmptyScopeFailsClosed(t *testing.T) {
+	t.Run("absent empty scope passes", func(t *testing.T) {
+		root := t.TempDir()
+		report := Run(context.Background(), Request{Layers: []Layer{LayerL1}, Checks: []Check{FilesystemCheck{
+			CheckID: "optional-empty", Root: root, Scope: manifest.Scope{Path: "pool"},
+			Expected: ReaderStream(""), Workers: 1, ChunkEntries: 1, AllowAbsentEmptyScope: true,
+		}}})
+		if report.Outcome != OutcomePassed {
+			t.Fatalf("absent empty scope rejected: %+v", report)
+		}
+	})
+
+	t.Run("absent nonempty scope is missing", func(t *testing.T) {
+		root := t.TempDir()
+		expected := manifestText(t, manifestFor("pool/package.bin", "payload"))
+		report := Run(context.Background(), Request{Layers: []Layer{LayerL1}, Checks: []Check{FilesystemCheck{
+			CheckID: "optional-missing", Root: root, Scope: manifest.Scope{Path: "pool"},
+			Expected: ReaderStream(expected), Workers: 1, ChunkEntries: 1, AllowAbsentEmptyScope: true,
+		}}})
+		if report.Exit != ExitVerification || !hasCode(report, "FS_MISSING") {
+			t.Fatalf("absent nonempty scope did not fail as missing: %+v", report)
+		}
+	})
+
+	for _, fixture := range []struct {
+		name  string
+		scope manifest.Scope
+	}{
+		{name: "escaping path", scope: manifest.Scope{Path: "../outside"}},
+		{name: "absolute path", scope: manifest.Scope{Path: "/tmp/outside"}},
+		{name: "malformed include", scope: manifest.Scope{Path: "pool", Include: []string{"["}}},
+		{name: "malformed exclude", scope: manifest.Scope{Path: "pool", Exclude: []string{"**["}}},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			root := t.TempDir()
+			report := Run(context.Background(), Request{Layers: []Layer{LayerL1}, Checks: []Check{FilesystemCheck{
+				CheckID: "optional-invalid-scope", Root: root, Scope: fixture.scope,
+				Expected: ReaderStream(""), Workers: 1, ChunkEntries: 1, AllowAbsentEmptyScope: true,
+			}}})
+			if !hasCode(report, "FS_SCOPE_INVALID") {
+				t.Fatalf("invalid optional scope was accepted: %+v", report)
+			}
+		})
+	}
+
+	for _, fixture := range []struct {
+		name string
+		make func(*testing.T, string)
+	}{
+		{name: "regular file", make: func(t *testing.T, name string) {
+			t.Helper()
+			writeFile(t, name, "not a directory")
+		}},
+		{name: "symlink", make: func(t *testing.T, name string) {
+			t.Helper()
+			target := filepath.Join(filepath.Dir(name), "target")
+			if err := os.Mkdir(target, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, name); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			root := t.TempDir()
+			fixture.make(t, filepath.Join(root, "pool"))
+			report := Run(context.Background(), Request{Layers: []Layer{LayerL1}, Checks: []Check{FilesystemCheck{
+				CheckID: "optional-unsafe", Root: root, Scope: manifest.Scope{Path: "pool"},
+				Expected: ReaderStream(""), Workers: 1, ChunkEntries: 1, AllowAbsentEmptyScope: true,
+			}}})
+			if !hasCode(report, "FS_TREE_UNSAFE") {
+				t.Fatalf("unsafe optional scope was accepted: %+v", report)
+			}
+		})
+	}
+}
+
+func TestAbsentTreeStreamDetectsAppearanceAtReadAndCloseBoundaries(t *testing.T) {
+	t.Run("read", func(t *testing.T) {
+		root := t.TempDir()
+		binding, err := bindVerificationRoot(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer binding.Close()
+		witness, present, err := bindOptionalTreeAbsence(binding, "pool")
+		if err != nil || present {
+			t.Fatalf("bind absent pool: present=%t err=%v", present, err)
+		}
+		reader, err := absentTreeStream(witness)()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(root, "pool"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reader.Read(make([]byte, 1)); err == nil || errors.Is(err, io.EOF) {
+			t.Fatalf("tree appearance at read boundary was not detected: %v", err)
+		}
+	})
+
+	t.Run("close", func(t *testing.T) {
+		root := t.TempDir()
+		binding, err := bindVerificationRoot(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer binding.Close()
+		witness, present, err := bindOptionalTreeAbsence(binding, "Packages")
+		if err != nil || present {
+			t.Fatalf("bind absent Packages: present=%t err=%v", present, err)
+		}
+		reader, err := absentTreeStream(witness)()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reader.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Fatalf("empty stream read=%v, want EOF", err)
+		}
+		if err := os.Mkdir(filepath.Join(root, "Packages"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := reader.Close(); err == nil {
+			t.Fatal("tree appearance at close boundary was not detected")
+		}
+	})
+
+	t.Run("root replacement", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "repo")
+		if err := os.Mkdir(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		binding, err := bindVerificationRoot(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer binding.Close()
+		witness, present, err := bindOptionalTreeAbsence(binding, "pool")
+		if err != nil || present {
+			t.Fatalf("bind absent pool: present=%t err=%v", present, err)
+		}
+		reader, err := absentTreeStream(witness)()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(root, filepath.Join(parent, "repo-old")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reader.Read(make([]byte, 1)); err == nil || errors.Is(err, io.EOF) {
+			t.Fatalf("root replacement was accepted: %v", err)
+		}
+	})
+
+	t.Run("parent replacement", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.Mkdir(filepath.Join(root, "nested"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		binding, err := bindVerificationRoot(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer binding.Close()
+		witness, present, err := bindOptionalTreeAbsence(binding, "nested/pool")
+		if err != nil || present {
+			t.Fatalf("bind absent nested pool: present=%t err=%v", present, err)
+		}
+		reader, err := absentTreeStream(witness)()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(filepath.Join(root, "nested"), filepath.Join(root, "nested-old")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(filepath.Join(root, "nested"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := reader.Close(); err == nil {
+			t.Fatal("parent replacement was accepted")
+		}
+	})
 }
 
 func TestCASAuditAndConfidentialityUseProductionParsers(t *testing.T) {

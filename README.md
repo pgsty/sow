@@ -93,6 +93,15 @@ test ! -e "$DEMO_ROOT/export/latest/bin/sow-demo.bin"
 ./sow gc --config "$DEMO_CONFIG" --root "$DEMO_ROOT"
 ```
 
+这段可复制的无凭据示例刻意只操作 asset，因此不需要任何长期或临时签名材料。
+发行归档的强制 clean-room 门禁还会在两个 fresh 抽取树中生成一次性仓库签名身份，
+使用真实可安装 DEB 与已签 RPM（RPM 包签名和仓库 metadata 签名使用不同信任身份），
+让同一个生产 `sow` 二进制完成 APT、YUM、asset 的 add、promote、materialize、
+L1/fsck、rm 和幂等重放；它还会删除 SQLite 派生缓存后重建，并仅对 asset add
+执行真实 SIGSTOP/SIGKILL 与无输入恢复。该门禁不读取云凭据、不访问云或生产仓库；
+验证范围和复现命令见
+[三类仓库 clean-room MVP 证据](docs/evidence/2026-07-30-clean-room-all-repository-types-mvp.md)。
+
 上面的正式默认值保留最近 32 个 commit，因此刚删除的对象仍是回滚根，dry-run
 不会立即给出可删除对象。若要在隔离目录完整演示破坏性的确认阶段，先把另一个
 一次性配置的保留窗缩到 1，再初始化；不要对已有仓库临时改这个策略：

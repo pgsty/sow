@@ -193,6 +193,96 @@ func TestValidateDirectoryUsesPrivateScratchAndLeavesReadOnlyServedTreeUnchanged
 	}
 }
 
+func TestValidateDirectoryRejectsGenerationSwapAfterSignatureVerification(t *testing.T) {
+	signer := testSigner(t)
+	parent := t.TempDir()
+	live := filepath.Join(parent, "live")
+	replacement := filepath.Join(parent, "replacement")
+	held := filepath.Join(parent, "held")
+	for dir, revision := range map[string]int64{live: 1, replacement: 2} {
+		if _, err := Generate(t.Context(), dir, Options{
+			ELMajor:  8,
+			Revision: revision,
+			Signer:   signer,
+		}, &SliceIterator{}); err != nil {
+			t.Fatalf("generate revision %d: %v", revision, err)
+		}
+	}
+
+	swapped := false
+	verifier := detachedVerifierFunc(func(ctx context.Context, message, signature io.Reader) error {
+		if err := signer.Verify(ctx, message, signature); err != nil {
+			return err
+		}
+		if err := os.Rename(live, held); err != nil {
+			return fmt.Errorf("hold signed generation: %w", err)
+		}
+		if err := os.Rename(replacement, live); err != nil {
+			_ = os.Rename(held, live)
+			return fmt.Errorf("activate replacement generation: %w", err)
+		}
+		swapped = true
+		return nil
+	})
+
+	_, err := ValidateDirectory(t.Context(), live, CompressionGzip, verifier)
+	if !swapped {
+		t.Fatal("test verifier did not swap the public generation")
+	}
+	if err == nil || !strings.Contains(err.Error(), "generation directory changed") {
+		t.Fatalf("generation swap error = %v, want bound-directory rejection", err)
+	}
+}
+
+func TestValidateDirectoryRejectsRepomdEntrySwapAfterSignatureVerification(t *testing.T) {
+	signer := testSigner(t)
+	parent := t.TempDir()
+	live := filepath.Join(parent, "live")
+	if _, err := Generate(t.Context(), live, Options{
+		ELMajor: 8, Revision: 1, Signer: signer,
+	}, &SliceIterator{}); err != nil {
+		t.Fatal(err)
+	}
+	repomd := filepath.Join(live, "repomd.xml")
+	original, err := os.ReadFile(repomd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalInfo, err := os.Lstat(repomd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := append([]byte(nil), original...)
+	replacement[len(replacement)-1] ^= 0x01
+	held := filepath.Join(parent, "held-repomd.xml")
+	swapped := false
+	verifier := detachedVerifierFunc(func(ctx context.Context, message, signature io.Reader) error {
+		if err := signer.Verify(ctx, message, signature); err != nil {
+			return err
+		}
+		if err := os.Rename(repomd, held); err != nil {
+			return fmt.Errorf("hold signed repomd: %w", err)
+		}
+		if err := os.WriteFile(repomd, replacement, originalInfo.Mode().Perm()); err != nil {
+			_ = os.Rename(held, repomd)
+			return fmt.Errorf("install unsigned replacement repomd: %w", err)
+		}
+		if err := os.Chtimes(repomd, originalInfo.ModTime(), originalInfo.ModTime()); err != nil {
+			return err
+		}
+		swapped = true
+		return nil
+	})
+
+	_, err = ValidateDirectory(t.Context(), live, CompressionGzip, verifier)
+	if !swapped {
+		t.Fatal("test verifier did not swap repomd.xml")
+	}
+	if err == nil || !strings.Contains(err.Error(), "changed after inspection") {
+		t.Fatalf("same-directory repomd swap error = %v, want final entry-identity rejection", err)
+	}
+}
+
 func TestMetadataIdentitySpoolCancellationIsBounded(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	spool := newMetadataIdentitySpool(ctx, t.TempDir(), "primary")
@@ -206,6 +296,12 @@ func TestMetadataIdentitySpoolCancellationIsBounded(t *testing.T) {
 	if _, err := spool.Finish(); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled identity merge continued: %v", err)
 	}
+}
+
+type detachedVerifierFunc func(context.Context, io.Reader, io.Reader) error
+
+func (verify detachedVerifierFunc) Verify(ctx context.Context, message, signature io.Reader) error {
+	return verify(ctx, message, signature)
 }
 
 func TestGenerateRejectsEL7OutsideFrozenGzipPolicy(t *testing.T) {

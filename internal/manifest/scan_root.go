@@ -58,7 +58,10 @@ func ScanRoot(ctx context.Context, root *os.Root, scope Scope, dst string, optio
 	if options.Workers < 1 || options.ChunkEntries < 1 {
 		return ScanStats{}, errors.New("workers and chunk entries must be positive")
 	}
-	if err := validatePatterns(append(append([]string{}, scope.Include...), scope.Exclude...)); err != nil {
+	if !options.ShadowPolicy.valid() {
+		return ScanStats{}, errors.New("invalid manifest shadow-point policy")
+	}
+	if err := ValidateScope(scope); err != nil {
 		return ScanStats{}, err
 	}
 	binding, err := openBoundScanScope(root, scope.Path)
@@ -79,7 +82,7 @@ func ScanRoot(ctx context.Context, root *os.Root, scope Scope, dst string, optio
 	walkErrors := make(chan error, 1)
 	go func() {
 		defer close(jobs)
-		walkErrors <- walkRootScope(ctx, binding.root, binding.prefix, scope, jobs)
+		walkErrors <- walkRootScope(ctx, binding.root, binding.prefix, scope, options.ShadowPolicy, jobs)
 	}()
 
 	var workers sync.WaitGroup
@@ -271,11 +274,11 @@ func openBoundRootDirectory(parent *os.Root, name string) (*os.Root, os.FileInfo
 	return opened, bound, nil
 }
 
-func walkRootScope(ctx context.Context, root *os.Root, prefix string, scope Scope, jobs chan<- rootFileJob) error {
-	return walkRootDirectory(ctx, root, "", prefix, scope, jobs)
+func walkRootScope(ctx context.Context, root *os.Root, prefix string, scope Scope, shadowPolicy ShadowPolicy, jobs chan<- rootFileJob) error {
+	return walkRootDirectory(ctx, root, "", prefix, scope, shadowPolicy, jobs)
 }
 
-func walkRootDirectory(ctx context.Context, current *os.Root, relative, prefix string, scope Scope, jobs chan<- rootFileJob) error {
+func walkRootDirectory(ctx context.Context, current *os.Root, relative, prefix string, scope Scope, shadowPolicy ShadowPolicy, jobs chan<- rootFileJob) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -300,7 +303,7 @@ func walkRootDirectory(ctx context.Context, current *os.Root, relative, prefix s
 		if relative != "" {
 			relBase = path.Join(relative, name)
 		}
-		if containsShadowPoint(relBase) {
+		if skipShadowPoint(relBase, shadowPolicy) {
 			continue
 		}
 		info, err := current.Lstat(name)
@@ -318,7 +321,7 @@ func walkRootDirectory(ctx context.Context, current *os.Root, relative, prefix s
 			if err != nil {
 				return fmt.Errorf("open repo directory %q: %w", relBase, err)
 			}
-			walkErr := walkRootDirectory(ctx, child, relBase, prefix, scope, jobs)
+			walkErr := walkRootDirectory(ctx, child, relBase, prefix, scope, shadowPolicy, jobs)
 			coordinateErr := verifyBoundRootDirectory(current, name, identity, relBase)
 			if err := errors.Join(walkErr, coordinateErr, child.Close()); err != nil {
 				return err

@@ -612,6 +612,21 @@ func runMaterialize(ctx context.Context, args []string, stdout, stderr io.Writer
 			return withExitCode(ExitVerification, "build requested archive selector manifest for %s: %v", refID, err)
 		}
 	}
+	var servingLeaves []localYUMServingLeaf
+	var compatibilityServingLeaves []localYUMServingLeaf
+	var compatibilityPrepared preparedPublication
+	if isView {
+		servingLeaves = localServingLeavesFromViewLeaves(matchedLeaves)
+		prepared := preparedPublication{view: refID}
+		for _, leaf := range matchedLeaves {
+			prepared.projections = append(prepared.projections, publicationProjection{view: refID, repo: leaf.repo, os: leaf.os, arch: leaf.arch})
+		}
+		compatibilityPrepared, err = activeLocalYUMCompatibilityPrepared(cfg, canonical, prepared)
+		if err != nil {
+			return withExitCode(ExitVerification, "resolve active local YUM compatibility routes: %v", err)
+		}
+		compatibilityServingLeaves = localYUMCompatibilityTopologyLeaves(compatibilityPrepared)
+	}
 	reconcilePath := selectedExactPath
 	if targetIsDefault && !localServingSelectionIsFull(values) {
 		// A selector owns only its exact subtree. Scan after the upsert so old
@@ -634,12 +649,25 @@ func runMaterialize(ctx context.Context, args []string, stdout, stderr io.Writer
 			return withExitCode(ExitVerification, "merge materialization selector ownership: %v", err)
 		}
 	} else if targetIsDefault && isView {
-		// Fixed mutable view roots retain strong-serving generations already
-		// handed to delayed clients. Snapshots and explicit dedicated exports
-		// are exact derived trees and never inherit a foreign _sow namespace.
+		// Mutable view roots retain strong-serving generations already handed
+		// to delayed clients. The fixed product roots are cumulative and retain
+		// the complete existing canonical namespace until topology retention
+		// removes an expired generation.
 		reconcilePath, err = preserveLocalServingRoutes(ctx, cfg, targetAbs, selectedExactPath, txDir, values)
 		if err != nil {
 			return withExitCode(ExitVerification, "preserve delayed-client serving generations: %v", err)
+		}
+	} else if isView {
+		// An explicit target is an exact export. Preserve only route bytes
+		// positively owned by canonical lifecycle records for this exact
+		// target/view/leaf set; arbitrary or foreign _sow content is pruned.
+		preservedServingLeaves := append([]localYUMServingLeaf(nil), servingLeaves...)
+		preservedServingLeaves = append(preservedServingLeaves, compatibilityServingLeaves...)
+		reconcilePath, err = preserveCanonicalLocalServingRoutes(
+			ctx, cfg, canonical, pool, targetAbs, refID, selectedExactPath, txDir, preservedServingLeaves, compatibilityPrepared, values,
+		)
+		if err != nil {
+			return withExitCode(ExitVerification, "preserve exact canonical serving generations: %v", err)
 		}
 	}
 	if err := requireAllMaterializationTrust(values, cfg, privateKey, materializeTrustExactReconcileBefore); err != nil {
@@ -653,10 +681,10 @@ func runMaterialize(ctx context.Context, args []string, stdout, stderr io.Writer
 		return withExitCode(ExitConflict, "%v", err)
 	}
 	var servingResult localServingActivationResult
+	var compatibilityServing localYUMCompatibilityServingResult
 	var topology localServingTopologyResult
 	selectedArchivePath := requestedExactPath
 	if isView {
-		servingLeaves := localServingLeavesFromViewLeaves(matchedLeaves)
 		if err := requireAllMaterializationTrust(values, cfg, privateKey, materializeTrustServingActivateBefore); err != nil {
 			return withExitCode(ExitConflict, "%v", err)
 		}
@@ -665,18 +693,11 @@ func runMaterialize(ctx context.Context, args []string, stdout, stderr io.Writer
 		if err != nil {
 			return withExitCode(ExitVerification, "activate local YUM serving routes: %v", err)
 		}
-		prepared := preparedPublication{view: refID}
-		for _, leaf := range matchedLeaves {
-			prepared.projections = append(prepared.projections, publicationProjection{view: refID, repo: leaf.repo, os: leaf.os, arch: leaf.arch})
-		}
-		compatibilityPrepared, err := activeLocalYUMCompatibilityPrepared(cfg, canonical, prepared)
+		compatibilityServing, err = activateLocalYUMCompatibilityServing(ctx, cfg, canonical, pool, targetAbs, servingBaseURL, txDir, compatibilityPrepared, values, stdout)
 		if err != nil {
-			return withExitCode(ExitVerification, "resolve active local YUM compatibility routes: %v", err)
-		}
-		if _, err := activateLocalYUMCompatibilityServing(ctx, cfg, canonical, pool, targetAbs, servingBaseURL, txDir, compatibilityPrepared, values, stdout); err != nil {
 			return withExitCode(ExitVerification, "activate local YUM compatibility routes: %v", err)
 		}
-		servingLeaves = append(servingLeaves, localYUMCompatibilityTopologyLeaves(compatibilityPrepared)...)
+		servingLeaves = append(servingLeaves, compatibilityServingLeaves...)
 		if err := requireAllMaterializationTrust(values, cfg, privateKey, materializeTrustServingActivateAfter); err != nil {
 			return withExitCode(ExitConflict, "%v", err)
 		}
@@ -761,6 +782,9 @@ func runMaterialize(ctx context.Context, args []string, stdout, stderr io.Writer
 		refID, target, entryCount, byteCount, exact.Files, exact.Bytes, materialized.Linked, materialized.Existing, materialized.Relinked, reconciled.RemovedFiles, metadata.APTSuites, metadata.YUMRepos, routeCommit, routeChanged, routeCount, prunedSnapshots)
 	if servingResult.Generations != 0 || topology.ChannelsRemoved != 0 || topology.PointersRemoved != 0 || topology.LedgersExpired != 0 {
 		fmt.Fprintf(stdout, "materialized serving_generations=%d serving_created=%d serving_pointers=%d serving_channels_removed=%d serving_generation_ledgers_expired=%d\n", servingResult.Generations, servingResult.Created, servingResult.Pointers, topology.ChannelsRemoved, topology.LedgersExpired)
+	}
+	if compatibilityServing.Generations != 0 || compatibilityServing.Created != 0 || compatibilityServing.Pointers != 0 || compatibilityServing.TrustFiles != 0 {
+		fmt.Fprintf(stdout, "materialized compatibility_generations=%d compatibility_created=%d compatibility_pointers=%d compatibility_trust_files=%d\n", compatibilityServing.Generations, compatibilityServing.Created, compatibilityServing.Pointers, compatibilityServing.TrustFiles)
 	}
 	if archivePath != "" {
 		if err := validateArchiveDestination(cfg, values.configPath, targetAbs, archivePath); err != nil {
