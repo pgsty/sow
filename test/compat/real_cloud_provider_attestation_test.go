@@ -1990,39 +1990,41 @@ func validRealCloudCloudflareBindingInventory(resources workers.ScriptVersionGet
 			return json.Unmarshal(trimmed, &bindings) == nil
 		},
 		"script": func(value json.RawMessage) bool {
-			return validRealCloudCloudflareExactJSONObject(value, map[string]func(json.RawMessage) bool{
-				"etag": validRealCloudCloudflareJSONString,
-			})
+			return validRealCloudCloudflareJSONObjectWithRequired(value, map[string]func(json.RawMessage) bool{
+				"etag":               validRealCloudCloudflareJSONString,
+				"handlers":           validRealCloudCloudflareStringArray,
+				"named_handlers":     validRealCloudCloudflareNamedHandlers,
+				"last_deployed_from": validRealCloudCloudflareExactJSONString("api"),
+			}, "etag")
 		},
 		"script_runtime": func(value json.RawMessage) bool {
-			return validRealCloudCloudflareExactJSONObject(value, map[string]func(json.RawMessage) bool{
-				"compatibility_date": validRealCloudCloudflareJSONString,
-				"compatibility_flags": func(flags json.RawMessage) bool {
-					trimmed := bytes.TrimSpace(flags)
-					if len(trimmed) == 0 || trimmed[0] != '[' {
-						return false
-					}
-					var values []json.RawMessage
-					if json.Unmarshal(trimmed, &values) != nil {
-						return false
-					}
-					for _, flag := range values {
-						if !validRealCloudCloudflareJSONString(flag) {
-							return false
-						}
-					}
-					return true
-				},
+			return validRealCloudCloudflareJSONObjectWithRequired(value, map[string]func(json.RawMessage) bool{
+				"compatibility_date":  validRealCloudCloudflareJSONString,
+				"compatibility_flags": validRealCloudCloudflareStringArray,
 				"limits": func(limits json.RawMessage) bool {
-					return validRealCloudCloudflareExactJSONObject(limits, map[string]func(json.RawMessage) bool{
-						"cpu_ms": func(value json.RawMessage) bool { return string(bytes.TrimSpace(value)) == "0" },
-					})
+					return validRealCloudCloudflareJSONObject(limits, map[string]func(json.RawMessage) bool{
+						"cpu_ms":      validRealCloudCloudflareZero,
+						"subrequests": validRealCloudCloudflareZero,
+					}, false)
 				},
-				"migration_tag": validRealCloudCloudflareJSONString,
-				"usage_model":   validRealCloudCloudflareJSONString,
-			})
+				"migration_tag": validRealCloudCloudflareExactJSONString(""),
+				"usage_model":   validRealCloudCloudflareExactJSONString("standard"),
+				"cache_options": func(cache json.RawMessage) bool {
+					return validRealCloudCloudflareJSONObjectWithRequired(cache, map[string]func(json.RawMessage) bool{
+						"enabled":             validRealCloudCloudflareFalse,
+						"cross_version_cache": validRealCloudCloudflareFalse,
+					}, "enabled")
+				},
+			}, "compatibility_date", "usage_model")
 		},
 	})
+}
+
+func validRealCloudCloudflareExactJSONString(wanted string) func(json.RawMessage) bool {
+	return func(raw json.RawMessage) bool {
+		var value string
+		return json.Unmarshal(bytes.TrimSpace(raw), &value) == nil && value == wanted
+	}
 }
 
 func validRealCloudCloudflareJSONString(raw json.RawMessage) bool {
@@ -2034,8 +2036,65 @@ func validRealCloudCloudflareJSONString(raw json.RawMessage) bool {
 	return json.Unmarshal(trimmed, &value) == nil
 }
 
+func validRealCloudCloudflareStringArray(raw json.RawMessage) bool {
+	var values []json.RawMessage
+	if json.Unmarshal(bytes.TrimSpace(raw), &values) != nil {
+		return false
+	}
+	for _, value := range values {
+		if !validRealCloudCloudflareJSONString(value) {
+			return false
+		}
+	}
+	return true
+}
+
+func validRealCloudCloudflareNamedHandlers(raw json.RawMessage) bool {
+	var handlers []json.RawMessage
+	if json.Unmarshal(bytes.TrimSpace(raw), &handlers) != nil {
+		return false
+	}
+	for _, handler := range handlers {
+		if !validRealCloudCloudflareJSONObjectWithRequired(handler, map[string]func(json.RawMessage) bool{
+			"name":     validRealCloudCloudflareJSONString,
+			"handlers": validRealCloudCloudflareStringArray,
+		}, "name", "handlers") {
+			return false
+		}
+	}
+	return true
+}
+
+func validRealCloudCloudflareZero(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "0"
+}
+
+func validRealCloudCloudflareFalse(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "false"
+}
+
 func validRealCloudCloudflareExactJSONObject(raw json.RawMessage, fields map[string]func(json.RawMessage) bool) bool {
 	return validRealCloudCloudflareJSONObject(raw, fields, true)
+}
+
+func validRealCloudCloudflareJSONObjectWithRequired(
+	raw json.RawMessage,
+	fields map[string]func(json.RawMessage) bool,
+	required ...string,
+) bool {
+	if !validRealCloudCloudflareJSONObject(raw, fields, false) {
+		return false
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(bytes.TrimSpace(raw), &object) != nil {
+		return false
+	}
+	for _, name := range required {
+		if _, found := object[name]; !found {
+			return false
+		}
+	}
+	return true
 }
 
 func validRealCloudCloudflareJSONObject(raw json.RawMessage, fields map[string]func(json.RawMessage) bool, requireAll bool) bool {
@@ -5317,6 +5376,7 @@ func TestRealCloudCloudflareBindingInventoryRequiresExplicitArray(t *testing.T) 
 		want bool
 	}{
 		{name: "empty-array", raw: `{"bindings":[],"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`, want: true},
+		{name: "provider-default-omission", raw: `{"bindings":[],"script":{"etag":"worker-etag","handlers":["fetch"],"named_handlers":[{"name":"createHandler","handlers":["class"]}],"last_deployed_from":"api"},"script_runtime":{"compatibility_date":"2026-07-20","usage_model":"standard","cache_options":{"enabled":false,"cross_version_cache":false}}}`, want: true},
 		{name: "missing", raw: `{"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
 		{name: "null", raw: `{"bindings":null,"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
 		{name: "object", raw: `{"bindings":{},"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
@@ -5328,6 +5388,8 @@ func TestRealCloudCloudflareBindingInventoryRequiresExplicitArray(t *testing.T) 
 		{name: "duplicate-runtime-limits", raw: `{"bindings":[],"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":0},"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
 		{name: "string-cpu", raw: `{"bindings":[],"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[],"limits":{"cpu_ms":"0"},"migration_tag":"","usage_model":"standard"}}`},
 		{name: "non-string-flag", raw: `{"bindings":[],"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","compatibility_flags":[1],"limits":{"cpu_ms":0},"migration_tag":"","usage_model":"standard"}}`},
+		{name: "provider-cache-enabled", raw: `{"bindings":[],"script":{"etag":"worker-etag"},"script_runtime":{"compatibility_date":"2026-07-20","usage_model":"standard","cache_options":{"enabled":true,"cross_version_cache":false}}}`},
+		{name: "provider-named-handler-malformed", raw: `{"bindings":[],"script":{"etag":"worker-etag","named_handlers":[{"name":"createHandler","handlers":[1]}]},"script_runtime":{"compatibility_date":"2026-07-20","usage_model":"standard"}}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			var resources workers.ScriptVersionGetResponseResources

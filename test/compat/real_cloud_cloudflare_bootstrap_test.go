@@ -608,7 +608,7 @@ func (control *realCloudCloudflareSDKBootstrapControl) Inspect(ctx context.Conte
 	default:
 		return state, errors.New("unknown Cloudflare bootstrap Worker role")
 	}
-	evidence, err := collectRealCloudCloudflareActiveWorker(ctx, control.client, plan.AccountID, script, repositoryBundle, expectedSHA, runtimeContract, role == "auth", false)
+	evidence, err := collectRealCloudCloudflareActiveWorker(ctx, control.client, plan.AccountID, script, repositoryBundle, expectedSHA, runtimeContract, false, false)
 	if err != nil {
 		return state, err
 	}
@@ -669,7 +669,7 @@ func (control *realCloudCloudflareSDKBootstrapControl) inspectSecurityObservatio
 		}
 		expectedDate, expectedFlags = plan.TokenVerifierCompatibilityDate, plan.TokenVerifierCompatibilityFlags
 	}
-	expectedLogpush := role == "auth"
+	expectedLogpush := false
 	if settings.CompatibilityDate != expectedDate || !equalRealCloudStrings(settings.CompatibilityFlags, expectedFlags) ||
 		settings.Logpush != expectedLogpush || settings.CacheOptions.Enabled || settings.CacheOptions.CrossVersionCache ||
 		settings.Limits.CPUMs != 0 || settings.Limits.Subrequests != 0 ||
@@ -1619,8 +1619,11 @@ func validateRealCloudCloudflareBootstrapAuthBindings(bindings []workers.ScriptV
 			rows = append(rows, strings.Join([]string{binding.Name, string(binding.Type), binding.Text}, "\x00"))
 		case workers.ScriptVersionGetResponseResourcesBindingsTypeService:
 			wanted, found := wantedServices[binding.Name]
-			if !found || binding.Service != wanted || binding.Environment != plan.TokenVerifierEnvironment && binding.Name == "TOKEN_VERIFIER" ||
-				binding.Environment != "" && binding.Name == "ORIGIN" || binding.Entrypoint != "" {
+			wantedEnvironment := realCloudCloudflareBootstrapServiceEnvironment("")
+			if binding.Name == "TOKEN_VERIFIER" {
+				wantedEnvironment = realCloudCloudflareBootstrapServiceEnvironment(plan.TokenVerifierEnvironment)
+			}
+			if !found || binding.Service != wanted || binding.Environment != wantedEnvironment || binding.Entrypoint != "" {
 				return "", errors.New("Cloudflare bootstrap auth Worker service binding differs from the plan")
 			}
 			delete(wantedServices, binding.Name)
@@ -1641,6 +1644,13 @@ func validateRealCloudCloudflareBootstrapAuthBindings(bindings []workers.ScriptV
 	sort.Strings(rows)
 	body, _ := json.Marshal(rows)
 	return realCloudLowerSHA256(body), nil
+}
+
+func realCloudCloudflareBootstrapServiceEnvironment(environment string) string {
+	if environment == "" {
+		return "production"
+	}
+	return environment
 }
 
 func (control *realCloudCloudflareSDKBootstrapControl) Upload(ctx context.Context, plan realCloudCloudflareBootstrapPlan, role, planSHA, runID string) error {
@@ -1675,7 +1685,8 @@ func (control *realCloudCloudflareSDKBootstrapControl) Upload(ctx context.Contex
 		}
 		bindings = append(bindings, workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindService{
 			Name: cloudflareapi.F("ORIGIN"), Service: cloudflareapi.F(plan.OriginScript),
-			Type: cloudflareapi.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindServiceTypeService),
+			Environment: cloudflareapi.F(realCloudCloudflareBootstrapServiceEnvironment("")),
+			Type:        cloudflareapi.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindServiceTypeService),
 		})
 		if realCloudCloudflareBootstrapUsesProvider(plan) {
 			if len(control.secretBindings) != 0 {
@@ -1683,7 +1694,7 @@ func (control *realCloudCloudflareSDKBootstrapControl) Upload(ctx context.Contex
 			}
 			bindings = append(bindings, workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindService{
 				Name: cloudflareapi.F("TOKEN_VERIFIER"), Service: cloudflareapi.F(plan.TokenVerifierService),
-				Environment: cloudflareapi.F(plan.TokenVerifierEnvironment),
+				Environment: cloudflareapi.F(realCloudCloudflareBootstrapServiceEnvironment(plan.TokenVerifierEnvironment)),
 				Type:        cloudflareapi.F(workers.ScriptUpdateParamsMetadataBindingsWorkersBindingKindServiceTypeService),
 			})
 		} else {
@@ -1719,10 +1730,7 @@ func (control *realCloudCloudflareSDKBootstrapControl) Upload(ctx context.Contex
 			CacheOptions: cloudflareapi.F(workers.ScriptUpdateParamsMetadataCacheOptions{
 				Enabled: cloudflareapi.F(false), CrossVersionCache: cloudflareapi.F(false),
 			}),
-			Logpush: cloudflareapi.F(role == "auth"), MainModule: cloudflareapi.F("worker.mjs"),
-			Limits: cloudflareapi.F(workers.ScriptUpdateParamsMetadataLimits{
-				CPUMs: cloudflareapi.F(int64(0)), Subrequests: cloudflareapi.F(int64(0)),
-			}),
+			Logpush: cloudflareapi.F(false), MainModule: cloudflareapi.F("worker.mjs"),
 			Observability: cloudflareapi.F(workers.ScriptUpdateParamsMetadataObservability{
 				Enabled: cloudflareapi.F(false),
 			}),
@@ -1731,7 +1739,10 @@ func (control *realCloudCloudflareSDKBootstrapControl) Upload(ctx context.Contex
 		}),
 		Files: cloudflareapi.F([]io.Reader{file}),
 	}, option.WithHeader("If-None-Match", "*"))
-	if err != nil || response == nil || response.ID != "" && response.ID != script {
+	if err != nil {
+		return fmt.Errorf("upload exact Cloudflare bootstrap Worker: %w", err)
+	}
+	if response == nil || response.ID != "" && response.ID != script {
 		return errors.New("upload exact Cloudflare bootstrap Worker")
 	}
 	return nil
@@ -1939,10 +1950,10 @@ func realCloudCloudflareBootstrapExpectedAuthBindingsSHA(plan realCloudCloudflar
 		rows = append(rows, strings.Join([]string{name, string(workers.ScriptVersionGetResponseResourcesBindingsTypePlainText), value}, "\x00"))
 	}
 	rows = append(rows,
-		strings.Join([]string{"ORIGIN", string(workers.ScriptVersionGetResponseResourcesBindingsTypeService), plan.OriginScript, ""}, "\x00"),
+		strings.Join([]string{"ORIGIN", string(workers.ScriptVersionGetResponseResourcesBindingsTypeService), plan.OriginScript, realCloudCloudflareBootstrapServiceEnvironment("")}, "\x00"),
 	)
 	if realCloudCloudflareBootstrapUsesProvider(plan) {
-		rows = append(rows, strings.Join([]string{"TOKEN_VERIFIER", string(workers.ScriptVersionGetResponseResourcesBindingsTypeService), plan.TokenVerifierService, plan.TokenVerifierEnvironment}, "\x00"))
+		rows = append(rows, strings.Join([]string{"TOKEN_VERIFIER", string(workers.ScriptVersionGetResponseResourcesBindingsTypeService), plan.TokenVerifierService, realCloudCloudflareBootstrapServiceEnvironment(plan.TokenVerifierEnvironment)}, "\x00"))
 	} else {
 		rows = append(rows, strings.Join([]string{plan.TokenVerifierSecret, string(workers.ScriptVersionGetResponseResourcesBindingsTypeSecretText)}, "\x00"))
 	}
@@ -2131,8 +2142,11 @@ func applyRealCloudCloudflareBootstrap(ctx context.Context, control realCloudClo
 			}
 		}
 		state, err = control.Inspect(ctx, plan, role)
-		if err != nil || validateRealCloudCloudflareBootstrapWorkerState(role, state, plan, runID, true) != nil {
-			return receipt, fmt.Errorf("verify Cloudflare bootstrap %s Worker after reconciliation", role)
+		if err != nil {
+			return receipt, fmt.Errorf("inspect Cloudflare bootstrap %s Worker after reconciliation: %w", role, err)
+		}
+		if err := validateRealCloudCloudflareBootstrapWorkerState(role, state, plan, runID, true); err != nil {
+			return receipt, fmt.Errorf("verify Cloudflare bootstrap %s Worker after reconciliation: %w", role, err)
 		}
 		states[role] = state
 	}
@@ -4522,8 +4536,8 @@ func TestRealCloudCloudflareBootstrapOfficialSDKMutationContract(t *testing.T) {
 						for name, value := range plan.EdgeContract.Variables {
 							wanted[name] = "plain_text\x00" + value
 						}
-						wanted["ORIGIN"] = "service\x00" + plan.OriginScript + "\x00"
-						wanted["TOKEN_VERIFIER"] = "service\x00" + plan.TokenVerifierService + "\x00" + plan.TokenVerifierEnvironment
+						wanted["ORIGIN"] = "service\x00" + plan.OriginScript + "\x00" + realCloudCloudflareBootstrapServiceEnvironment("")
+						wanted["TOKEN_VERIFIER"] = "service\x00" + plan.TokenVerifierService + "\x00" + realCloudCloudflareBootstrapServiceEnvironment(plan.TokenVerifierEnvironment)
 						for _, binding := range metadata.Bindings {
 							observed := binding.Type + "\x00" + binding.Text
 							if binding.Type == "service" {
@@ -4541,7 +4555,8 @@ func TestRealCloudCloudflareBootstrapOfficialSDKMutationContract(t *testing.T) {
 						metadata.Annotations.Message == message && metadata.Annotations.Tag == tag &&
 						!metadata.CacheOptions.Enabled && !metadata.CacheOptions.CrossVersionCache && !metadata.Observability.Enabled &&
 						metadata.Limits.CPUMs == 0 && metadata.Limits.Subrequests == 0 && metadata.UsageModel == "standard" &&
-						metadata.Logpush == (script == plan.AuthScript) && metadata.Tags != nil && len(metadata.Tags) == 0 && metadata.TailConsumers != nil && len(metadata.TailConsumers) == 0 &&
+						!metadata.Logpush && metadata.Tags != nil && len(metadata.Tags) == 0 && metadata.TailConsumers != nil && len(metadata.TailConsumers) == 0 &&
+						!bytes.Contains(partBody, []byte(`"limits"`)) && bytes.Contains(partBody, []byte(`"logpush":false`)) &&
 						!bytes.Contains(partBody, []byte("secret"))
 				case "files":
 					seenFile = part.FileName() == "worker.mjs" && part.Header.Get("Content-Type") == "application/javascript+module" && bytes.Equal(partBody, wantedBundle)
@@ -4663,7 +4678,7 @@ func TestRealCloudCloudflareStaticBootstrapOfficialSDKSecretBindingContract(t *t
 				for name, value := range plan.EdgeContract.Variables {
 					wanted[name] = "plain_text\x00" + value
 				}
-				wanted["ORIGIN"] = "service\x00" + plan.OriginScript + "\x00"
+				wanted["ORIGIN"] = "service\x00" + plan.OriginScript + "\x00" + realCloudCloudflareBootstrapServiceEnvironment("")
 				wanted[plan.TokenVerifierSecret] = "secret_text\x00" + secret
 				for _, binding := range metadata.Bindings {
 					observed := binding.Type + "\x00" + binding.Text
@@ -4896,8 +4911,8 @@ func TestRealCloudCloudflareBootstrapOfficialSDKInspectContract(t *testing.T) {
 		bindings = append(bindings, map[string]any{"name": name, "type": "plain_text", "text": value})
 	}
 	bindings = append(bindings,
-		map[string]any{"name": "ORIGIN", "type": "service", "service": plan.OriginScript, "environment": ""},
-		map[string]any{"name": "TOKEN_VERIFIER", "type": "service", "service": plan.TokenVerifierService, "environment": plan.TokenVerifierEnvironment},
+		map[string]any{"name": "ORIGIN", "type": "service", "service": plan.OriginScript, "environment": realCloudCloudflareBootstrapServiceEnvironment("")},
+		map[string]any{"name": "TOKEN_VERIFIER", "type": "service", "service": plan.TokenVerifierService, "environment": realCloudCloudflareBootstrapServiceEnvironment(plan.TokenVerifierEnvironment)},
 	)
 	message, tag := realCloudCloudflareBootstrapOwnershipAnnotations(plan, runID)
 	for _, test := range []struct {
@@ -4983,7 +4998,7 @@ func TestRealCloudCloudflareBootstrapOfficialSDKInspectContract(t *testing.T) {
 						"bindings":    bindings, "cache_options": map[string]any{"enabled": false, "cross_version_cache": false},
 						"compatibility_date": plan.CompatibilityDate, "compatibility_flags": plan.CompatibilityFlags,
 						"limits": map[string]any{"cpu_ms": 0, "subrequests": 0}, "placement": map[string]any{}, "usage_model": "standard",
-						"logpush": true, "observability": map[string]any{"enabled": test.observabilityEnabled,
+						"logpush": false, "observability": map[string]any{"enabled": test.observabilityEnabled,
 							"logs":   map[string]any{"enabled": false, "invocation_logs": false, "destinations": []any{}, "persist": false},
 							"traces": map[string]any{"enabled": false, "destinations": []any{}, "persist": false}},
 						"tags": []any{}, "tail_consumers": []any{},

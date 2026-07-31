@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-07-17
-- Amended: 2026-07-29
+- Amended: 2026-07-29, 2026-07-31
 - Scope: dedicated non-production provider evidence only
 
 ## Context
@@ -41,6 +41,17 @@ observations:
   `logpush=false`;
 - schedule inventory is explicitly present and empty;
 - workers.dev and preview exposure are explicitly disabled.
+
+The first-deployment bootstrap is deliberately one capability boundary earlier:
+it uploads both auth and origin Workers with `logpush=false`. Authentication,
+private-origin routing, cache normalization and purge do not depend on Workers
+Logpush, and ordinary Workers accounts reject `logpush=true` at upload time
+with provider error 10023. The separate provider-log setup and attestation
+remain Workers Paid gates: they may require the auth Worker to have
+`logpush=true` only after the reviewed account has that capability and the
+isolated raw sink is protected by its own lease. Origin and verifier Workers
+remain `logpush=false`. A bootstrap receipt therefore proves a usable edge
+deployment, not the later provider-log evidence closure.
 
 The discriminator is not allowed to define its own expected product. Decode
 receives the actual generated `sow.yaml` bytes from outside the attestation,

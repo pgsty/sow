@@ -90,6 +90,9 @@ class FakeR2Bucket {
     const value = this.objects.get(key);
     if (!value) return null;
     const object = fakeR2Object(value);
+    if (value.fullRangeMetadata) {
+      object.range = { offset: 0, length: value.body.length };
+    }
 		if (fakeR2ConditionFails(object, options.onlyIf)) {
 			delete object.body;
 			return object;
@@ -142,7 +145,11 @@ function fakeR2Object(value) {
 test("Cloudflare service-only R2 origin provides GET, HEAD, range, conditional, and private errors", async () => {
   const key = ".sow/gated/yum/infra/Packages/p/pkg.rpm";
   const body = new TextEncoder().encode("0123456789");
-  const bucket = new FakeR2Bucket(new Map([[key, { body, cacheControl: "public, max-age=60" }]]));
+  const bucket = new FakeR2Bucket(new Map([[key, {
+    body,
+    cacheControl: "public, max-age=60",
+    fullRangeMetadata: true,
+  }]]));
   const handler = createCloudflareR2OriginHandler({ REPOSITORY: bucket });
 
   const get = await handler(new Request(`https://sow-private-origin.invalid/${key}`));
@@ -151,6 +158,7 @@ test("Cloudflare service-only R2 origin provides GET, HEAD, range, conditional, 
   assert.equal(get.headers.get("ETag"), '"r2-fixture"');
   assert.equal(get.headers.get("Accept-Ranges"), "bytes");
   assert.equal(get.headers.get("Cache-Control"), "public, max-age=60");
+  assert.equal(get.headers.get("Content-Range"), null, "provider full-range metadata must not turn an ordinary GET into 206");
 
   const head = await handler(new Request(`https://sow-private-origin.invalid/${key}`, { method: "HEAD" }));
   assert.equal(head.status, 200);

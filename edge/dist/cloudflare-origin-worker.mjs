@@ -157,7 +157,12 @@ function r2ObjectResponse(object, method, requestHeaders, conditional) {
   } else if (typeof object.etag === "string" && object.etag !== "") {
     headers.set("ETag", `"${object.etag.replace(/^"|"$/g, "")}"`);
   }
-  const range = normalizeR2Range(object.range, object.size);
+  // Real R2 objects may expose a full-object range descriptor even when the
+  // client did not send Range. Only a GET that actually requested a range may
+  // turn that provider metadata into a 206 response.
+  const range = method === "GET" && requestHeaders.has("Range")
+    ? normalizeR2Range(object.range, object.size)
+    : null;
   const length = range ? range.length : object.size;
   if (Number.isSafeInteger(length) && length >= 0) headers.set("Content-Length", String(length));
   if (object.uploaded instanceof Date && !Number.isNaN(object.uploaded.valueOf())) headers.set("Last-Modified", object.uploaded.toUTCString());
