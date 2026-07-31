@@ -9,6 +9,10 @@ const PROVIDER_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 const EDGE_RUNTIME_SCHEMA = "sow-edge-runtime/v2";
 const EDGE_PRO_PREFIX = "/pro/v1/{token}/";
 
+function edgeRuntimeFailureResponse() {
+	return privateError(503, "temporarily_unavailable");
+}
+
 class SnapshotRouteAbsentError extends Error {
 	constructor(status) {
 		super("snapshot route is absent");
@@ -1391,10 +1395,7 @@ export default {
     try {
       return await createCloudflareHandler(environment)(request);
     } catch {
-      return new Response("temporarily_unavailable\n", {
-        status: 503,
-        headers: { "Cache-Control": "private, no-store, max-age=0", "X-SOW-Edge-Contract": "sow-edge-runtime/v1" },
-      });
+      return edgeRuntimeFailureResponse();
     }
   },
 };

@@ -2,6 +2,7 @@ import {
   createConfiguredTokenVerifier,
   createSowEdgeHandler,
   createStaticEnvironmentVerifier,
+	edgeRuntimeFailureResponse,
   readEdgeRuntimeConfiguration,
 	sha256Hex,
 	SnapshotRouteAbsentError,
@@ -227,10 +228,7 @@ export default {
     try {
       return await createCloudflareHandler(environment)(request);
     } catch {
-      return new Response("temporarily_unavailable\n", {
-        status: 503,
-        headers: { "Cache-Control": "private, no-store, max-age=0", "X-SOW-Edge-Contract": "sow-edge-runtime/v1" },
-      });
+      return edgeRuntimeFailureResponse();
     }
   },
 };

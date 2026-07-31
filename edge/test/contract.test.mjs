@@ -4,9 +4,9 @@ import { readFileSync } from "node:fs";
 import { webcrypto } from "node:crypto";
 import { Buffer } from "node:buffer";
 
-import { createSowEdgeHandler, sha256Hex } from "../shared/contract.mjs";
+import { createSowEdgeHandler, EDGE_RUNTIME_SCHEMA, sha256Hex } from "../shared/contract.mjs";
 import { createCloudflareR2OriginHandler } from "../cloudflare/origin.mjs";
-import { createCloudflareHandler } from "../cloudflare/worker.mjs";
+import cloudflareWorker, { createCloudflareHandler } from "../cloudflare/worker.mjs";
 import { createEdgeOneHandler } from "../edgeone/function.mjs";
 
 const tokenA = "A".repeat(22);
@@ -332,24 +332,75 @@ test("all generated deployment bundles load without source-tree imports", async 
   const originBundle = await import("../dist/cloudflare-origin-worker.mjs");
   assert.equal(typeof authBundle.createCloudflareHandler, "function");
   assert.equal(typeof originBundle.createCloudflareR2OriginHandler, "function");
-  const priorListener = globalThis.addEventListener;
-  let listener;
-  globalThis.addEventListener = (name, candidate) => {
-    assert.equal(name, "fetch");
-    listener = candidate;
-  };
-  try {
-    await import(`../dist/edgeone.js?bundle-smoke=${Date.now()}`);
-  } finally {
-    if (priorListener === undefined) delete globalThis.addEventListener;
-    else globalThis.addEventListener = priorListener;
-  }
+  const listener = await importEdgeOneListener(`../dist/edgeone.js?bundle-smoke=${Date.now()}`);
   assert.equal(typeof listener, "function");
   for (const relative of ["../dist/cloudflare-worker.mjs", "../dist/cloudflare-origin-worker.mjs", "../dist/edgeone.js"]) {
     const body = readFileSync(new URL(relative, import.meta.url), "utf8");
     assert.doesNotMatch(body, /^import\s/m, relative);
   }
 });
+
+test("source and generated provider entrypoints expose the current hardened fallback contract", async () => {
+	const request = new Request("https://repo.example/pkg");
+	const observations = [];
+	observations.push(await assertRuntimeFailureResponse(await cloudflareWorker.fetch(request, {})));
+
+	const sourceEdgeOne = await importEdgeOneListener(`../edgeone/index.js?fallback=${Date.now()}`);
+	observations.push(await assertRuntimeFailureResponse(await dispatchEdgeOne(sourceEdgeOne, request, {})));
+
+	const cloudflareBundle = await import(`../dist/cloudflare-worker.mjs?fallback=${Date.now()}`);
+	observations.push(await assertRuntimeFailureResponse(await cloudflareBundle.default.fetch(request, {})));
+
+	const bundledEdgeOne = await importEdgeOneListener(`../dist/edgeone.js?fallback=${Date.now()}`);
+	observations.push(await assertRuntimeFailureResponse(await dispatchEdgeOne(bundledEdgeOne, request, {})));
+	for (const observation of observations.slice(1)) assert.deepEqual(observation, observations[0]);
+});
+
+async function importEdgeOneListener(relative) {
+	const priorListener = globalThis.addEventListener;
+	let listener;
+	globalThis.addEventListener = (name, candidate) => {
+		assert.equal(name, "fetch");
+		listener = candidate;
+	};
+	try {
+		await import(relative);
+	} finally {
+		if (priorListener === undefined) delete globalThis.addEventListener;
+		else globalThis.addEventListener = priorListener;
+	}
+	return listener;
+}
+
+async function dispatchEdgeOne(listener, request, environment) {
+	const hadEnvironment = Object.hasOwn(globalThis, "env");
+	const priorEnvironment = globalThis.env;
+	globalThis.env = environment;
+	try {
+		let responsePromise;
+		listener({
+			request,
+			respondWith(value) {
+				responsePromise = value;
+			},
+		});
+		return await responsePromise;
+	} finally {
+		if (hadEnvironment) globalThis.env = priorEnvironment;
+		else delete globalThis.env;
+	}
+}
+
+async function assertRuntimeFailureResponse(response) {
+	assert.equal(response.status, 503);
+	const body = await response.text();
+	assert.equal(body, "temporarily_unavailable\n");
+	assert.equal(response.headers.get("X-SOW-Edge-Contract"), EDGE_RUNTIME_SCHEMA);
+	assert.equal(response.headers.get("Cache-Control"), "private, no-store, max-age=0");
+	assert.equal(response.headers.get("Content-Type"), "text/plain; charset=utf-8");
+	assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
+	return { status: response.status, body, headers: [...response.headers].sort(([left], [right]) => left.localeCompare(right)) };
+}
 
 async function vendorFixtures(runtimeOverrides = {}, originResponder = originResponseFor, entitlementOverrides = {}) {
   const tokenEntitlements = JSON.stringify([

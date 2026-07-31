@@ -8,6 +8,10 @@ const PROVIDER_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
 export const EDGE_RUNTIME_SCHEMA = "sow-edge-runtime/v2";
 export const EDGE_PRO_PREFIX = "/pro/v1/{token}/";
 
+export function edgeRuntimeFailureResponse() {
+	return privateError(503, "temporarily_unavailable");
+}
+
 export class SnapshotRouteAbsentError extends Error {
 	constructor(status) {
 		super("snapshot route is absent");
