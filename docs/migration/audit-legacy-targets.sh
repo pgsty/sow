@@ -30,8 +30,8 @@ options:
   --emit-tsv FILE    write normalized machine map after every gate passes
   --source-fingerprints FILE
                      expected source hashes; hermetic tests only and requires
-                     SOW_MIGRATION_AUDIT_FIXTURE_MODE=1 (default is the frozen
-                     2026-07-12 production-source baseline)
+                     SOW_MIGRATION_AUDIT_FIXTURE_MODE=1 (default is the reviewed
+                     2026-07-31 production-source baseline)
 EOF
 }
 
@@ -298,14 +298,14 @@ if [ -n "$SOURCE_FINGERPRINTS" ]; then
 	done < "$SOURCE_FINGERPRINTS"
 	SOURCE_FINGERPRINT_BASELINE=hermetic-fixture
 else
-	check_fingerprint Makefile 434851089902ebc3f0ab402c81a3b407a420a4f4ec9c8368a10494f21d4c1a8c
+	check_fingerprint Makefile a3d1f2214b84ebf6bc235a7524068e381dcc9ae4ac046c128cb01888fa3baee8
 	check_fingerprint apt/Makefile 1077efce002f193466351f16424841a9d7eecc4e8ca61382cf4ba7b5635c8945
 	check_fingerprint apt/list/gen d1f89aea35e672c10b0e0e0151035f34f2ed3d2be039d61dee10ad65393a118c
 	check_fingerprint yum/Makefile 32a7800a577213e4b257a4116f75986a95a55e8b8909baa8bc54f475cb4953f3
 	check_fingerprint yum/build e7837003d1498dd80d1ab7aded299c5b577399b37a8257c7e81c5427f795c27a
 	check_fingerprint docker/Makefile 1629076293514cadb1fcaf8b2e734ff1b715bd9af4a086f56c3a4284e38bfd2e
 	check_fingerprint docker/Dockerfile f9d821210669b82132e3232581e3aa69d98256c2e1257b30ed59ddb8f7ba4966
-	SOURCE_FINGERPRINT_BASELINE=frozen-production-2026-07-12
+	SOURCE_FINGERPRINT_BASELINE=reviewed-production-source-2026-07-31
 fi
 
 if grep -Eq '未迁移/未验证|范围缺口/未验证|待退役/未验证|策略禁止/未验证|\|[[:space:]]*unresolved[[:space:]]*\|' "$MAP"; then

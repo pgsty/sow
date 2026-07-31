@@ -1,6 +1,6 @@
 # 旧仓物理拓扑盘点证据
 
-本证据面固定 2026-07-14 时 `/Users/vonng/pgsty/repo` 的**本地物理源盘点**，用于阻止
+本证据面固定 2026-07-31 时 `/Users/vonng/pgsty/repo` 的**本地物理源盘点**，用于阻止
 迁移配置继续建立在 33 repo / 73 leaf 的 synthetic selector fixture 上。它不是零字节纳管
 通过证据，不证明 URL 等价迁移，也没有验证任何对象存储、CDN 或生产资源。
 
@@ -9,7 +9,7 @@
 - `audit-physical-topology.sh` 只接受绝对本地目录，不执行 Make recipe，也没有网络或云调用。
 - 任何情况下都不读取、`stat` 或散列旧仓的 `bin/fileauth.txt`。根 Makefile 中对应 recipe
   只作为文本被显式跳过；公开根脚本则受闭合 allowlist 约束。
-- 这份 2026-07-14 inventory 生成时，只有公开的 APT `Packages`、YUM `repomd.xml`、
+- 这份 2026-07-31 inventory 生成时，只有公开的 APT `Packages`、YUM `repomd.xml`、
   根脚本和 7 个审阅过的构建源文件记录 SHA-256；`pro/` 当时只记录普通文件路径与
   `stat` 字节数。2026-07-17 用户授权只读后，另在精确副本完成 15 个 TGZ 的 SHA-256、
   gzip/tar 和 gated adoption，证据见 `../evidence/2026-07-17-gated-pro-exact-copy-adoption.md`。
@@ -31,7 +31,7 @@ kind  logical_path  physical_path  scope_or_family  bytes  sha256
 
 | 范围 | 总数 | 分布 / 说明 |
 |---|---:|---|
-| APT `binary-*` index | 74 | infra 2、mssql 6、percona 12、pgdg 40、pgsql 14 |
+| APT `binary-*` index | 76 | infra 2、mssql 6、percona 12、pgdg 42（含 resolute-pgdg 2）、pgsql 14 |
 | YUM `repomd.xml` | 131 | gpsql 3、infra 2、mssql 5、percona 9、pgdg 105、pgsql 7 |
 | PGDG nested child | 1 | `yum/pgdg/17/redhat/rhel-10-aarch64/rhel-10.0-aarch64` |
 | 根级 exact key | 7 | `/get`、`/pig`、`/pkg`、`/beta`、`/cc`、`/claude`、`/ray` |
@@ -43,7 +43,7 @@ kind  logical_path  physical_path  scope_or_family  bytes  sha256
 
 | 文件 | SHA-256 |
 |---|---|
-| `Makefile` | `434851089902ebc3f0ab402c81a3b407a420a4f4ec9c8368a10494f21d4c1a8c` |
+| `Makefile` | `a3d1f2214b84ebf6bc235a7524068e381dcc9ae4ac046c128cb01888fa3baee8` |
 | `apt/Makefile` | `1077efce002f193466351f16424841a9d7eecc4e8ca61382cf4ba7b5635c8945` |
 | `apt/list/gen` | `d1f89aea35e672c10b0e0e0151035f34f2ed3d2be039d61dee10ad65393a118c` |
 | `yum/Makefile` | `32a7800a577213e4b257a4116f75986a95a55e8b8909baa8bc54f475cb4953f3` |
@@ -69,11 +69,11 @@ root key/prefix ownership 或 gated pro 路径/字节数/文件类型漂移都�
 漂移、未审阅根源文件和 gated pro 非普通文件；所有负例只修改临时目录。
 
 `--snapshot` 可指向独立 fixture，供 hermetic 测试复用同一审计器；默认 canonical fixture
-仍额外硬门禁 74 / 131 / 1 / 7 / 8 / 16、APT/YUM family 分布、nested child 与 exact
+仍额外硬门禁 76 / 131 / 1 / 7 / 8 / 16、APT/YUM family 分布、nested child 与 exact
 key/prefix 集合，测试 fixture 不能弱化这些本地旧仓事实。
 
 第三条命令只读取上述 machine snapshot、完整 `pigsty-v1.yaml` 和显式 migration ledger，
-以 production config decoder 展开并执行双向 set equality：98 个 repo ID、74 个 APT index、
+以 production config decoder 展开并执行双向 set equality：98 个 repo ID、76 个 APT index、
 130 个普通 YUM leaf、1 个仅供兼容候选生成的 EL9 policy owner、2 个精确 compatibility
 projection、7/8 个根 key/prefix 与 16 个 gated pro 文件必须恰好一次闭合。它还用
 临时突变证明：12-repo 与 33/73 synthetic fixture 不能冒充物理合同，缺 APT index、伪造

@@ -317,7 +317,7 @@ done
 # Custom snapshots are supported for hermetic tests, but cannot weaken these
 # exact production-source inventory facts.
 if [ "$SNAPSHOT" = "$DEFAULT_SNAPSHOT" ]; then
-	[ "$(count_inventory "$TMP/actual" apt-index)" = 74 ] || exit 1
+	[ "$(count_inventory "$TMP/actual" apt-index)" = 76 ] || exit 1
 	[ "$(count_inventory "$TMP/actual" yum-repomd-total)" = 131 ] || exit 1
 	[ "$(count_inventory "$TMP/actual" yum-repomd-nested)" = 1 ] || exit 1
 	[ "$(count_inventory "$TMP/actual" root-exact-key)" = 7 ] || exit 1
@@ -325,7 +325,7 @@ if [ "$SNAPSHOT" = "$DEFAULT_SNAPSHOT" ]; then
 	[ "$(count_inventory "$TMP/actual" pro-file)" = 16 ] || exit 1
 
 	awk -F '\t' '$1 == "apt-index" { print $4 }' "$TMP/actual" | LC_ALL=C sort | uniq -c | awk '{ print $2 "=" $1 }' > "$TMP/apt-family"
-	printf '%s\n' infra=2 mssql=6 percona=12 pgdg=40 pgsql=14 > "$TMP/apt-family.expected"
+	printf '%s\n' infra=2 mssql=6 percona=12 pgdg=42 pgsql=14 > "$TMP/apt-family.expected"
 	LC_ALL=C sort "$TMP/apt-family.expected" -o "$TMP/apt-family.expected"
 	cmp -s "$TMP/apt-family.expected" "$TMP/apt-family" || { echo 'canonical APT family distribution changed' >&2; exit 1; }
 

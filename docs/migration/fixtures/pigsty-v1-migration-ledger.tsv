@@ -21,6 +21,7 @@ apt-suite	apt-pgdg	jammy-pgdg	main	mapped-review-required	active-policy-unverifi
 apt-suite	apt-pgdg	jammy-pgdg-testing	18,19,main	mapped-review-required	active-policy-unverified	release-signature-not-inventory	cf,cos
 apt-suite	apt-pgdg	noble-pgdg	main	mapped-review-required	active-policy-unverified	release-signature-not-inventory	cf,cos
 apt-suite	apt-pgdg	noble-pgdg-testing	18,19,main	mapped-review-required	active-policy-unverified	release-signature-not-inventory	cf,cos
+apt-suite	apt-pgdg	resolute-pgdg	main	mapped-review-required	active-policy-unverified	release-signature-not-inventory	cf,cos
 apt-suite	apt-pgdg	trixie-pgdg	main	mapped-review-required	active-policy-unverified	release-signature-not-inventory	cf,cos
 apt-suite	apt-pgdg	trixie-pgdg-testing	18,19,main	mapped-review-required	active-policy-unverified	release-signature-not-inventory	cf,cos
 apt-suite	apt-pgsql-bookworm	bookworm	main	mapped-review-required	active-policy-unverified	release-signature-not-inventory	cf,cos

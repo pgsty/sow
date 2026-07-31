@@ -380,7 +380,7 @@ func TestCurrentConfigurationFixturesStayBelowComplexityBounds(t *testing.T) {
 	}{
 		{path: "../../sow.example.yaml", wantUnits: 33},
 		{path: "../../docs/examples/sow-pgdg.yaml", wantUnits: 200},
-		{path: "../../docs/migration/fixtures/pigsty-v1.yaml", wantUnits: 1771},
+		{path: "../../docs/migration/fixtures/pigsty-v1.yaml", wantUnits: 1785},
 	}
 	for _, fixture := range fixtures {
 		t.Run(fixture.path, func(t *testing.T) {

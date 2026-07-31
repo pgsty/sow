@@ -24,7 +24,7 @@ gpg: {public_key: keys/migration-unverified-repository-key.asc}
 pools: {public: {}, gated: {}}
 
 repos:
-  # APT: 11 physical archives expand to exactly 74 Packages indices.
+  # APT: 11 physical archives expand to exactly 76 Packages indices.
   # stash is an external-builder handoff, not a served repository pool. The two
   # rustfs a94 bodies are unreferenced reprepro orphans; b8 is the indexed
   # version. Preserve all 22 source bytes in place but quarantine them from the
@@ -40,7 +40,7 @@ repos:
     default_pool: public
     publish_targets: [cf, cos]
     apt:
-      suites: [bookworm-pgdg, bookworm-pgdg-testing, bullseye-pgdg, bullseye-pgdg-testing, jammy-pgdg, jammy-pgdg-testing, noble-pgdg, noble-pgdg-testing, trixie-pgdg, trixie-pgdg-testing]
+      suites: [bookworm-pgdg, bookworm-pgdg-testing, bullseye-pgdg, bullseye-pgdg-testing, jammy-pgdg, jammy-pgdg-testing, noble-pgdg, noble-pgdg-testing, resolute-pgdg, trixie-pgdg, trixie-pgdg-testing]
       components: [main, "18", "19"]
       suite_components:
         bookworm-pgdg: [main]
@@ -51,6 +51,7 @@ repos:
         jammy-pgdg-testing: [main, "18", "19"]
         noble-pgdg: [main]
         noble-pgdg-testing: [main, "18", "19"]
+        resolute-pgdg: [main]
         trixie-pgdg: [main]
         trixie-pgdg-testing: [main, "18", "19"]
       suite_lifecycle:
@@ -62,6 +63,7 @@ repos:
         jammy-pgdg-testing: active
         noble-pgdg: active
         noble-pgdg-testing: active
+        resolute-pgdg: active
         trixie-pgdg: active
         trixie-pgdg-testing: active
   - {id: apt-pgsql-focal, type: apt, path: apt/pgsql/focal, os: {family: ubuntu, major: 20, suite: focal, lifecycle: frozen}, arches: [amd64, arm64], default_pool: public, publish_targets: [cf, cos], apt: {suites: [focal], components: [main], suite_components: {focal: [main]}, suite_lifecycle: {focal: frozen}}}

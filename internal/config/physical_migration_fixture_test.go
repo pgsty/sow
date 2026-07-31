@@ -75,8 +75,8 @@ func TestPigstyV1PhysicalMigrationContract(t *testing.T) {
 		}
 	}
 	assertExactStringSet(t, "98-repo config/ledger ownership closure", ledgerRepoIDs, configuredRepoIDs)
-	if len(configuredRepoIDs) != 98 || len(ledger) != 135 {
-		t.Fatalf("physical migration identities repos=%d ledger_rows=%d want=98/135", len(configuredRepoIDs), len(ledger))
+	if len(configuredRepoIDs) != 98 || len(ledger) != 136 {
+		t.Fatalf("physical migration identities repos=%d ledger_rows=%d want=98/136", len(configuredRepoIDs), len(ledger))
 	}
 
 	assertPhysicalAPTClosure(t, cfg, repos, topology, ledger)
@@ -89,7 +89,7 @@ func TestPigstyV1PhysicalMigrationContract(t *testing.T) {
 	assertQuarantinedCarrierUnitsZero(t, cfg)
 
 	counts := countPhysicalTopologyKinds(topology)
-	if counts["apt-index"] != 74 || counts["yum-repomd"] != 130 || counts["yum-repomd-nested"] != 1 ||
+	if counts["apt-index"] != 76 || counts["yum-repomd"] != 130 || counts["yum-repomd-nested"] != 1 ||
 		counts["pro-file"] != 16 {
 		t.Fatalf("canonical topology counts changed: apt=%d yum=%d nested=%d pro=%d",
 			counts["apt-index"], counts["yum-repomd"], counts["yum-repomd-nested"], counts["pro-file"])
@@ -328,8 +328,8 @@ func assertPhysicalAPTClosure(t *testing.T, cfg *Config, repos map[string]Repo, 
 			}
 		}
 	}
-	if rows != 27 {
-		t.Fatalf("APT suite ledger rows=%d want=27", rows)
+	if rows != 28 {
+		t.Fatalf("APT suite ledger rows=%d want=28", rows)
 	}
 	for _, repo := range cfg.Repos {
 		if repo.Type != "apt" {
@@ -342,8 +342,8 @@ func assertPhysicalAPTClosure(t *testing.T, cfg *Config, repos map[string]Repo, 
 		}
 	}
 	assertExactStringSet(t, "APT physical index closure", got, want)
-	if len(got) != 74 {
-		t.Fatalf("APT expanded indices=%d want=74", len(got))
+	if len(got) != 76 {
+		t.Fatalf("APT expanded indices=%d want=76", len(got))
 	}
 }
 

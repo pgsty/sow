@@ -4,7 +4,7 @@
 > 动词/flag 及表内 repo/os/arch selector 已由脚本和完整物理 Pigsty-v1 配置验证；
 > 本地 Pigsty-v1 布局 adoption/回滚夹具已执行。生产旧树切换、真实 URL、旧 writer 撤权
 > 与双云/CDN 回滚仍未验证。
-> 审计日期：2026-07-14
+> 审计日期：2026-07-31
 > 目的：为 G5“约 40 个旧业务目标全部由 SOW 替代退役”建立逐目标、不可漏项的基线。
 
 ## 1. 审计边界与计数
@@ -107,11 +107,11 @@ docs/migration/test-audit-legacy-targets.sh /Users/vonng/pgsty/repo
 docs/migration/test-family-e2e.sh
 ```
 
-2026-07-12 审计输入为：
+2026-07-31 审计输入为：
 
 | 文件 | SHA-256 |
 |---|---|
-| root `Makefile` | `434851089902ebc3f0ab402c81a3b407a420a4f4ec9c8368a10494f21d4c1a8c` |
+| root `Makefile` | `a3d1f2214b84ebf6bc235a7524068e381dcc9ae4ac046c128cb01888fa3baee8` |
 | `apt/Makefile` | `1077efce002f193466351f16424841a9d7eecc4e8ca61382cf4ba7b5635c8945` |
 | `apt/list/gen` | `d1f89aea35e672c10b0e0e0151035f34f2ed3d2be039d61dee10ad65393a118c` |
 | `yum/Makefile` | `32a7800a577213e4b257a4116f75986a95a55e8b8909baa8bc54f475cb4953f3` |
@@ -125,7 +125,7 @@ docs/migration/test-family-e2e.sh
 
 - [`fixtures/pigsty-v1.yaml`](fixtures/pigsty-v1.yaml) 与
   [`fixtures/pigsty-v1-migration-ledger.tsv`](fixtures/pigsty-v1-migration-ledger.tsv) 共同构成
-  完整本地物理迁移合同：98 repo ID / 135 ledger row 精确展开 74 个 APT index 与
+  完整本地物理迁移合同：98 repo ID / 136 ledger row 精确展开 76 个 APT index 与
   130 个 ordinary YUM leaf，并逐项处置 1 个 EL9 compatibility policy owner、2 个精确
   compatibility projection、1 个 nested child、7 个根 exact key、8 个根 prefix 和 16 个 gated pro
   文件。Pro owner 已在只读生产源精确副本完成本地 stable adoption/checksum replacement，
@@ -506,7 +506,7 @@ G5 当前状态为 **实现中、未通过**。必须同时满足以下条件后
 ## 10. 当前证据边界
 
 本地已执行：旧源固定摘要 + 176/176 target/处置/CLI 审核；33-repo selector universe 与
-12-repo synthetic 子集 ID/path 对账；完整 98-repo/135-row config/ledger 对 74 APT index、130 ordinary
+12-repo synthetic 子集 ID/path 对账；完整 98-repo/136-row config/ledger 对 76 APT index、130 ordinary
 YUM leaf、专用 EL9 policy owner、双架构 compatibility projection、nested quarantine、root assets 和 active gated Pro owner 的双向集合门禁及突变负例；
 44-family E2E/disposition contract 及 5 个突变负例；16 个真实
 CLI/FS/parser/provider-protocol 测试；`sow init --adopt-content` 的 suite-nested APT、flat-RPM

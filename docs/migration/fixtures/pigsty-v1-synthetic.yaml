@@ -1,6 +1,6 @@
 # Synthetic 12-repository Pigsty-v1 subset retained for the legacy adoption
 # and selector-generalization tests. It is not the complete physical topology
-# and must never be cited as 74 APT / 131 YUM migration evidence.
+# and must never be cited as 76 APT / 131 YUM migration evidence.
 schema: sow/v1
 
 state:

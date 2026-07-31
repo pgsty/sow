@@ -60,7 +60,7 @@ go build -trimpath -o "$SOW_BIN" ./cmd/sow
 
 [`fixtures/pigsty-v1.yaml`](fixtures/pigsty-v1.yaml) 是可加载、无秘密的**完整物理迁移
 合同**，不是生产即用配置。它以 98 个 repo ID 表达 11 个 APT archive、74 个 YUM path
-template 和 13 个 asset owner；展开后与固定盘点逐路径闭合为 74 个 APT index、130 个普通
+template 和 13 个 asset owner；展开后与固定盘点逐路径闭合为 76 个 APT index、130 个普通
 YUM leaf、7 个根 exact key、8 个根 prefix 和 16 个 gated pro 文件。APT PGDG 的 sparse
 suite/component 与 per-suite lifecycle、Percona 的独立 noarch repodata、asset target
 affinity 和 repo_groups 均为 machine-gated 合同。
@@ -986,8 +986,8 @@ grep -Fqx 'production_current_host_preflight=pass' "$EVIDENCE/writer-fence-repor
     报告、scheduler/container/ACL 与云 IAM 撤权证据全部闭合。
 
 当前结论：Phase 0–2 有可重复本地路径，其中 44-family 本地 E2E/disposition contract、
-33-repo selector generalization、12-repo synthetic parser/adoption、完整 98-repo/135-row
-config/ledger 对 74 APT + 130 ordinary YUM leaf、专用 EL9 policy owner 与双架构 compatibility
+33-repo selector generalization、12-repo synthetic parser/adoption、完整 98-repo/136-row
+config/ledger 对 76 APT + 130 ordinary YUM leaf、专用 EL9 policy owner 与双架构 compatibility
 projection 的双向集合门禁、零字节 adoption 和本地
 symlink 回退夹具已实测。完整存量树 fresh copy 已完成 PGDG 官方恢复、775 个稳定负证、
 remainder adoption、真 DNF、full fsck/GC；current `yum/infra` exact copy 已完成 216/216
