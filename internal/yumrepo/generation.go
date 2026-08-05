@@ -285,6 +285,11 @@ func assembleXML(dest, kind, body string, packages int64) error {
 	if err != nil {
 		return fmt.Errorf("yumrepo: create %s XML: %w", kind, err)
 	}
+	if err := out.Chmod(0o644); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dest)
+		return fmt.Errorf("yumrepo: chmod %s XML: %w", kind, err)
+	}
 	ok := false
 	defer func() {
 		_ = out.Close()
@@ -359,6 +364,11 @@ func compressXML(ctx context.Context, dir, kind, rawPath string, compression Com
 	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
 		return Artifact{}, fmt.Errorf("yumrepo: create compressed %s: %w", kind, err)
+	}
+	if err := out.Chmod(0o644); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmpPath)
+		return Artifact{}, fmt.Errorf("yumrepo: chmod compressed %s: %w", kind, err)
 	}
 	ok := false
 	defer func() {
@@ -436,6 +446,11 @@ func writeRepomd(filename string, generation *Generation) error {
 	if err != nil {
 		return fmt.Errorf("yumrepo: create repomd.xml: %w", err)
 	}
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		_ = os.Remove(filename)
+		return fmt.Errorf("yumrepo: chmod repomd.xml: %w", err)
+	}
 	ok := false
 	defer func() {
 		_ = f.Close()
@@ -478,6 +493,12 @@ func signRepomd(ctx context.Context, dir string, signer DetachedSigner) error {
 	if err != nil {
 		_ = message.Close()
 		return fmt.Errorf("yumrepo: create repomd.xml.asc: %w", err)
+	}
+	if err := signature.Chmod(0o644); err != nil {
+		_ = message.Close()
+		_ = signature.Close()
+		_ = os.Remove(signaturePath)
+		return fmt.Errorf("yumrepo: chmod repomd.xml.asc: %w", err)
 	}
 	signErr := signer.Sign(ctx, message, signature)
 	var signatureSyncErr error

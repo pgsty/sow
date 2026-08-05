@@ -39,7 +39,7 @@ const (
 
 var (
 	productRoots          = []string{".github", "cmd", "edge", "internal", "test", "third_party"}
-	deliveryRoots         = append(append([]string{}, productRoots...), "docs")
+	deliveryRoots         = append(append([]string{}, productRoots...), "design", "docs")
 	markdownInlineLink    = regexp.MustCompile(`!?\[[^\]]*\]\(([^)]+)\)`)
 	markdownReference     = regexp.MustCompile(`(?m)^\s*\[[^\]]+\]:\s*(\S+)`)
 	highConfidenceSecrets = []struct {

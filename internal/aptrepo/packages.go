@@ -1,9 +1,11 @@
 package aptrepo
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -53,6 +55,21 @@ func NewPackagesWriter(w io.Writer) (*PackagesWriter, error) {
 }
 
 func (w *PackagesWriter) Write(pkg Package) error {
+	return w.writeAt(pkg, pkg.PoolPath)
+}
+
+// WriteManaged emits one parsed package with the frozen componentless managed
+// pool/<prefix>/<source>/<basename> Filename. The parsed control paragraph and
+// package hashes remain unchanged; only the repository-relative location is
+// projected differently from a conventional component-bearing APT archive.
+func (w *PackagesWriter) WriteManaged(pkg Package, filename string) error {
+	if err := validateManagedPoolPath(pkg.Source, pathBase(filename), filename); err != nil {
+		return err
+	}
+	return w.writeAt(pkg, filename)
+}
+
+func (w *PackagesWriter) writeAt(pkg Package, filename string) error {
 	if err := validatePackageMetadata(pkg); err != nil {
 		return err
 	}
@@ -63,11 +80,31 @@ func (w *PackagesWriter) Write(pkg Package) error {
 		return ErrDuplicatePackageIdentity
 	}
 	paragraph := packageParagraph(pkg)
+	paragraph.Values["Filename"] = filename
 	if err := w.encoder.Encode(encodedParagraph{Paragraph: paragraph}); err != nil {
 		return fmt.Errorf("aptrepo: encode Packages paragraph: %w", err)
 	}
 	copyForOrder := pkg
 	w.last = &copyForOrder
+	return nil
+}
+
+func validateManagedPoolPath(source, basename, filename string) error {
+	if !debianNamePattern.MatchString(source) || !safeDebBasename(basename) || filename == "" || strings.ContainsAny(filename, "\\\x00\r\n\t") {
+		return fmt.Errorf("aptrepo: unsafe managed pool path %q", filename)
+	}
+	prefix := source[:1]
+	if strings.HasPrefix(source, "lib") {
+		if len(source) < 4 {
+			prefix = source
+		} else {
+			prefix = source[:4]
+		}
+	}
+	want := strings.Join([]string{"pool", prefix, source, basename}, "/")
+	if filename != want {
+		return fmt.Errorf("aptrepo: managed pool path %q is not canonical; want %q", filename, want)
+	}
 	return nil
 }
 
@@ -85,6 +122,54 @@ func WritePackages(w io.Writer, packages []Package) error {
 		if err := writer.Write(pkg); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// WriteFlatPackages emits a Packages index for a directory where package
+// files live beside the index. It is intentionally narrower than the managed
+// archive renderer: every Filename is exactly ./<source basename>, while all
+// control metadata and checksums still come from a successfully parsed .deb.
+// Package sources are rehashed before their paragraphs are emitted so callers
+// cannot publish metadata for bytes that changed after inspection.
+func WriteFlatPackages(ctx context.Context, w io.Writer, packages []Package) error {
+	if ctx == nil {
+		return errors.New("aptrepo: nil context")
+	}
+	if w == nil {
+		return errors.New("aptrepo: nil Packages writer")
+	}
+	sorted := append([]Package(nil), packages...)
+	SortPackages(sorted)
+	encoder, err := control.NewEncoder(w)
+	if err != nil {
+		return fmt.Errorf("aptrepo: create flat control encoder: %w", err)
+	}
+	var previous *Package
+	for _, pkg := range sorted {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := validatePackageMetadata(pkg); err != nil {
+			return err
+		}
+		if previous != nil && previous.Name == pkg.Name && version.Compare(previous.debianVersion, pkg.debianVersion) == 0 && previous.Architecture == pkg.Architecture {
+			return ErrDuplicatePackageIdentity
+		}
+		if err := verifyPackageSource(ctx, pkg); err != nil {
+			return err
+		}
+		base := filepath.Base(pkg.SourcePath)
+		if !safeDebBasename(base) || filepath.Join(filepath.Dir(pkg.SourcePath), base) != filepath.Clean(pkg.SourcePath) {
+			return fmt.Errorf("aptrepo: unsafe flat deb source %q", pkg.SourcePath)
+		}
+		paragraph := packageParagraph(pkg)
+		paragraph.Values["Filename"] = "./" + base
+		if err := encoder.Encode(encodedParagraph{Paragraph: paragraph}); err != nil {
+			return fmt.Errorf("aptrepo: encode flat Packages paragraph: %w", err)
+		}
+		copyForOrder := pkg
+		previous = &copyForOrder
 	}
 	return nil
 }
@@ -140,8 +225,14 @@ func validatePackageMetadata(pkg Package) error {
 		}
 		fieldNames[folded] = name
 	}
-	if pkg.paragraph.Values["Package"] != pkg.Name || pkg.paragraph.Values["Version"] != pkg.Version || pkg.paragraph.Values["Architecture"] != pkg.Architecture {
-		return errors.New("aptrepo: package identity does not match parsed deb control metadata")
+	if pkg.paragraph.Values["Package"] != pkg.Name || pkg.paragraph.Values["Architecture"] != pkg.Architecture {
+		return fmt.Errorf("aptrepo: package identity does not match parsed deb control metadata: package=%q/%q architecture=%q/%q",
+			pkg.Name, pkg.paragraph.Values["Package"], pkg.Architecture, pkg.paragraph.Values["Architecture"])
+	}
+	rawVersion, err := version.Parse(pkg.paragraph.Values["Version"])
+	if err != nil || version.Compare(rawVersion, pkg.debianVersion) != 0 {
+		return fmt.Errorf("aptrepo: package version does not match parsed deb control metadata: version=%q/%q",
+			pkg.Version, pkg.paragraph.Values["Version"])
 	}
 	if sourcePackageName(pkg.paragraph.Values["Source"], pkg.Name) != pkg.Source || pkg.debianVersion.String() != pkg.Version {
 		return errors.New("aptrepo: package source or version does not match parsed deb control metadata")
@@ -176,6 +267,15 @@ func packageParagraph(pkg Package) control.Paragraph {
 	for key, value := range pkg.paragraph.Values {
 		if _, derived := derivedIndexFields[strings.ToLower(key)]; derived {
 			continue
+		}
+		if value == "" {
+			continue
+		}
+		if strings.EqualFold(key, "Description") {
+			// The control decoder retains its final continuation newline. The
+			// canonical dpkg-scanpackages paragraph does not emit a synthetic
+			// trailing blank continuation line.
+			value = strings.TrimRight(value, "\n")
 		}
 		values[key] = value
 	}

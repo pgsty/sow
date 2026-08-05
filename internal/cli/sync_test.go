@@ -599,7 +599,7 @@ func TestRepoPathPoolSegmentCannotSpoofAPTComponent(t *testing.T) {
 func TestSyncAPTEndToEndPreservesCanonicalProvenanceAndNeverDeletes(t *testing.T) {
 	ctx := context.Background()
 	created := time.Unix(1_500_000_000, 0).UTC()
-	entity, err := openpgp.NewEntity("SOW Sync Test", "", "sync@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW Sync Test", "", "sync@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -787,7 +787,7 @@ func TestSyncAPTEndToEndPreservesCanonicalProvenanceAndNeverDeletes(t *testing.T
 func TestSyncYUMEndToEndPreservesCanonicalProvenanceAndNeverDeletes(t *testing.T) {
 	ctx := context.Background()
 	created := time.Unix(1_500_000_000, 0).UTC()
-	entity, err := openpgp.NewEntity("SOW YUM Sync Test", "", "yum-sync@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW YUM Sync Test", "", "yum-sync@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}

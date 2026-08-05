@@ -424,6 +424,47 @@ func TestGenerateParseableFixtureEL8(t *testing.T) {
 	}
 }
 
+func TestChangelogsMatchCreaterepoLimitOrderAndTimestampProjection(t *testing.T) {
+	dir := t.TempDir()
+	fixture := filepath.Join(dir, "fixture-1.2.3-4.x86_64.rpm")
+	names := make([]string, 0, 12)
+	texts := make([]string, 0, 12)
+	dates := make([]uint32, 0, 12)
+	for value := 12; value >= 1; value-- {
+		names = append(names, fmt.Sprintf("author-%02d", value))
+		texts = append(texts, fmt.Sprintf("change-%02d", value))
+		date := uint32(value * 10)
+		if value == 3 {
+			date = 40
+		}
+		dates = append(dates, date)
+	}
+	writeRPMFixture(t, fixture, "fixture",
+		stringTag(tagChangelogName, names...),
+		intTag(tagChangelogTime, dates...),
+		stringTag(tagChangelogText, texts...),
+	)
+	metadata, err := readPackage(context.Background(), PackageInput{Path: fixture})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata.Changelogs) != 10 {
+		t.Fatalf("changelog count = %d, want 10", len(metadata.Changelogs))
+	}
+	for index, entry := range metadata.Changelogs {
+		value := index + 3
+		wantDate := int64(value * 10)
+		if value == 3 {
+			wantDate = 40
+		} else if value == 4 {
+			wantDate = 41
+		}
+		if entry.Author != fmt.Sprintf("author-%02d", value) || entry.Text != fmt.Sprintf("change-%02d", value) || entry.Date != wantDate {
+			t.Fatalf("changelog[%d] = %+v, want author/change %02d date %d", index, entry, value, wantDate)
+		}
+	}
+}
+
 func TestGenerateCheckedInExternalRPMEL10(t *testing.T) {
 	encoded, err := os.ReadFile("../cli/testdata/pgdg-redhat-nonfree-repo.rpm.b64")
 	if err != nil {
@@ -953,7 +994,7 @@ func intTag(id uint32, values ...uint32) fixtureTag {
 	return fixtureTag{id: id, typ: 4, count: uint32(len(values)), data: data}
 }
 
-func writeRPMFixture(t *testing.T, filename, name string) {
+func writeRPMFixture(t *testing.T, filename, name string, extraTags ...fixtureTag) {
 	t.Helper()
 	tags := []fixtureTag{
 		stringTag(tagName, name), stringTag(tagVersion, "1.2.3"), stringTag(tagRelease, "4"), intTag(tagEpoch, 0),
@@ -966,6 +1007,20 @@ func writeRPMFixture(t *testing.T, filename, name string) {
 		intTag(tagChangelogTime, 1_600_000_000), stringTag(tagChangelogName, "SOW Test"), stringTag(tagChangelogText, "fixture release"),
 		intTag(tagDirIndexes, 0), stringTag(tagBaseNames, "fixture.conf"), stringTag(tagDirNames, "/etc/"),
 	}
+	if len(extraTags) != 0 {
+		overridden := make(map[uint32]struct{}, len(extraTags))
+		for _, tag := range extraTags {
+			overridden[tag.id] = struct{}{}
+		}
+		filtered := tags[:0]
+		for _, tag := range tags {
+			if _, replace := overridden[tag.id]; !replace {
+				filtered = append(filtered, tag)
+			}
+		}
+		tags = filtered
+	}
+	tags = append(tags, extraTags...)
 	sort.Slice(tags, func(i, j int) bool { return tags[i].id < tags[j].id })
 	var store bytes.Buffer
 	indexes := make([]byte, 16*len(tags))

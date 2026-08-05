@@ -53,8 +53,12 @@ func NewOpenPGPSigner(key io.Reader, passphrase []byte, at time.Time) (*OpenPGPK
 	if at.IsZero() {
 		return nil, errorsSigningTimeRequired()
 	}
-	if signingKey, ok := entity.SigningKey(at); !ok || signingKey.PrivateKey == nil || signingKey.PrivateKey.Encrypted {
+	signingKey, ok := entity.SigningKey(at)
+	if !ok || signingKey.PrivateKey == nil || signingKey.PrivateKey.Encrypted {
 		return nil, errorsPrivateKeyRequired()
+	}
+	if !DeterministicMetadataSignatureAlgorithm(signingKey.PublicKey.PubKeyAlgo) {
+		return nil, fmt.Errorf("yumrepo: metadata signing key algorithm %d is not retry-deterministic", signingKey.PublicKey.PubKeyAlgo)
 	}
 	return &OpenPGPKey{
 		entities: entities,
@@ -131,6 +135,19 @@ func yumSigningConfig(at time.Time) packet.Config {
 		NonDeterministicSignaturesViaNotation: &randomizedNotation,
 		InsecureGenerateNonCriticalKeyFlags:   true,
 		InsecureGenerateNonCriticalSignatureCreationTime: true,
+	}
+}
+
+// DeterministicMetadataSignatureAlgorithm reports algorithms whose OpenPGP
+// signature primitive is deterministic for fixed message bytes and creation
+// time. DSA/ECDSA are intentionally excluded: retrying a preview/build with
+// fresh entropy would change repository file identities.
+func DeterministicMetadataSignatureAlgorithm(algorithm packet.PublicKeyAlgorithm) bool {
+	switch algorithm {
+	case packet.PubKeyAlgoRSA, packet.PubKeyAlgoRSASignOnly, packet.PubKeyAlgoEdDSA, packet.PubKeyAlgoEd25519, packet.PubKeyAlgoEd448:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -48,7 +48,7 @@ func InspectCatalogPackage(ctx context.Context, in PackageInput) (CatalogPackage
 		deps []dependency
 	}{
 		{"provides", metadata.Provides},
-		{"requires", metadata.Requires},
+		{"requires", metadata.CatalogRequires},
 		{"conflicts", metadata.Conflicts},
 		{"obsoletes", metadata.Obsoletes},
 	} {

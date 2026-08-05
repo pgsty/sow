@@ -1,0 +1,25 @@
+schema: sow/v2
+architectures:
+  - x86_64
+  - aarch64
+repos:
+  pgsql:
+    protected: false
+    signing:
+      rpm:
+        packages:
+          mode: never
+    dists:
+      el9:
+        format: rpm
+        architectures:
+          - x86_64
+          - aarch64
+        limit: 0
+        exclude: []
+      noble:
+        format: deb
+        architectures:
+          - aarch64
+        limit: 0
+        exclude: []

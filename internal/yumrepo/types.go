@@ -19,6 +19,7 @@ var (
 	ErrInvalidRepodata     = errors.New("invalid YUM repodata")
 	ErrSignatureValidation = errors.New("repomd signature validation failed")
 	ErrEmbeddedSignature   = errors.New("invalid or missing embedded RPM signature")
+	ErrUnsignedRPMPackage  = errors.New("RPM package has no embedded OpenPGP signature")
 	ErrRPMPackageSignature = errors.New("RPM package signature verification failed")
 )
 
@@ -97,6 +98,10 @@ func CompressionForEL(major int) (Compression, error) {
 type PackageInput struct {
 	Path     string
 	Basename string
+	// Location optionally overrides the canonical Packages/<bucket>/<basename>
+	// href for a managed architecture view. It is restricted to the frozen
+	// pool/<prefix>/<source>/<basename> shape and never changes package identity.
+	Location string
 	FileTime time.Time
 }
 
@@ -104,14 +109,16 @@ type PackageInput struct {
 // inference and canonical-order preparation. InspectPackage obtains it from the
 // same file descriptor and parser used by generation.
 type PackageInfo struct {
-	Name     string
-	Version  string
-	Release  string
-	Epoch    int64
-	Arch     string
-	SHA256   string
-	Size     int64
-	Location string
+	Name      string
+	Source    string
+	SourceRPM string
+	Version   string
+	Release   string
+	Epoch     int64
+	Arch      string
+	SHA256    string
+	Size      int64
+	Location  string
 }
 
 // PackageIterator supplies RPMs without requiring the generator to retain a
@@ -235,10 +242,11 @@ type Artifact struct {
 
 // Generation is a complete immutable repodata directory.
 type Generation struct {
-	Dir          string
-	Artifacts    [3]Artifact
-	Packages     int64
-	Revision     int64
-	RepomdSHA256 string
-	Reused       bool
+	Dir            string
+	Artifacts      [3]Artifact
+	Packages       int64
+	Revision       int64
+	RepomdSHA256   string
+	IdentitySHA256 string
+	Reused         bool
 }

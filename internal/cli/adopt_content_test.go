@@ -2151,7 +2151,7 @@ func writeLegacySigningKey(t *testing.T, root string) (string, string) {
 	t.Helper()
 	writeRPMPackageTrustFixture(t, root)
 	created := time.Unix(1_500_000_000, 0).UTC()
-	entity, err := openpgp.NewEntity("SOW Legacy Adoption", "", "legacy@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW Legacy Adoption", "", "legacy@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2175,7 +2175,7 @@ func writeLegacySigningKey(t *testing.T, root string) (string, string) {
 func writeLegacyMetadataSigningKey(t *testing.T, root string) (string, string) {
 	t.Helper()
 	created := time.Unix(1_500_000_100, 0).UTC()
-	entity, err := openpgp.NewEntity("SOW Historical Metadata", "", "historical-metadata@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW Historical Metadata", "", "historical-metadata@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4044,7 +4044,7 @@ func TestPublishCLIUploadsRealAPTAndYUMGenerationClosures(t *testing.T) {
 	decodeFixture("../aptrepo/testdata/libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64", debPath)
 	decodeFixture("testdata/pgdg-redhat-nonfree-repo.rpm.b64", rpmPath)
 	created := time.Unix(1_500_000_000, 0).UTC()
-	entity, err := openpgp.NewEntity("SOW Publish Test", "", "sow@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW Publish Test", "", "sow@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4645,11 +4645,16 @@ func TestPublishCLIAssetOnlyChangeDoesNotTouchYUMClosures(t *testing.T) {
 	}
 }
 
+// Test fixtures exercise OpenPGP semantics rather than RSA strength. Keeping
+// fixture keys at 1024 bits avoids spending the full-suite budget repeatedly
+// generating short-lived 2048-bit encryption subkeys under Go's FIPS backend.
+const testOpenPGPRSABits = 1024
+
 func writePublishTestPrivateKey(t *testing.T, root string) string {
 	t.Helper()
 	writeRPMPackageTrustFixture(t, root)
 	created := time.Unix(1_500_000_000, 0).UTC()
-	entity, err := openpgp.NewEntity("SOW Publish Test", "", "sow@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW Publish Test", "", "sow@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}

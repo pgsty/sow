@@ -4735,7 +4735,7 @@ func TestRealCloudCloudflareStaticBootstrapBindingInspectionIsExact(t *testing.T
 		})
 	}
 	bindings = append(bindings,
-		workers.ScriptVersionGetResponseResourcesBinding{Name: "ORIGIN", Type: workers.ScriptVersionGetResponseResourcesBindingsTypeService, Service: plan.OriginScript},
+		workers.ScriptVersionGetResponseResourcesBinding{Name: "ORIGIN", Type: workers.ScriptVersionGetResponseResourcesBindingsTypeService, Service: plan.OriginScript, Environment: realCloudCloudflareBootstrapServiceEnvironment("")},
 		workers.ScriptVersionGetResponseResourcesBinding{Name: plan.TokenVerifierSecret, Type: workers.ScriptVersionGetResponseResourcesBindingsTypeSecretText},
 	)
 	got, err := validateRealCloudCloudflareBootstrapAuthBindings(bindings, plan)

@@ -292,7 +292,7 @@ func TestSyncRecoveryRejectsChangedFrozenRepositoryContracts(t *testing.T) {
 				t.Helper()
 				created := time.Unix(1_600_000_000, 0).UTC()
 				rotated, err := openpgp.NewEntity("Rotated SOW Repository Key", "", "rotated@example.invalid", &packet.Config{
-					Time: func() time.Time { return created }, RSABits: 2048,
+					Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits,
 				})
 				if err != nil {
 					t.Fatal(err)
@@ -379,7 +379,7 @@ func TestSyncRecoveryRejectsInPlaceRepositoryKeyRotation(t *testing.T) {
 
 	created := time.Unix(1_600_000_000, 0).UTC()
 	rotated, err := openpgp.NewEntity("Rotated In Place", "", "rotated-in-place@example.invalid", &packet.Config{
-		Time: func() time.Time { return created }, RSABits: 2048,
+		Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -681,7 +681,7 @@ func TestSyncRecoveryRepairsViewCommittedBeforeRealFilesystemFailure(t *testing.
 func TestSyncRecoveryRepairsYUMViewCommittedBeforeRealFilesystemFailure(t *testing.T) {
 	ctx := context.Background()
 	created := time.Unix(1_500_000_000, 0).UTC()
-	entity, err := openpgp.NewEntity("SOW YUM Recovery", "", "yum-recovery@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW YUM Recovery", "", "yum-recovery@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -808,7 +808,7 @@ func newSyncAPTRecoveryFixture(t *testing.T, components []string) syncAPTRecover
 	t.Helper()
 	ctx := context.Background()
 	created := time.Unix(1_500_000_000, 0).UTC()
-	entity, err := openpgp.NewEntity("SOW Sync Recovery", "", "sync-recovery@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW Sync Recovery", "", "sync-recovery@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}

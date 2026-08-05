@@ -26,6 +26,12 @@ type Signer struct {
 	entity *openpgp.Entity
 }
 
+// Verifier is the public-only half used to authenticate a retained Built APT
+// Generation after the Desired signing key has rotated.
+type Verifier struct {
+	entity *openpgp.Entity
+}
+
 // NewSigner accepts an armored or binary private key ring containing exactly
 // one entity. passphrase is used only while unlocking encrypted private keys
 // and is not retained.
@@ -99,6 +105,34 @@ func NewSignerBytes(key, passphrase []byte) (*Signer, error) {
 	return NewSigner(bytes.NewReader(key), passphrase)
 }
 
+// NewVerifier accepts exactly one armored or binary public/private OpenPGP
+// entity. No private material is required or retained by this verification
+// path.
+func NewVerifier(key io.Reader) (*Verifier, error) {
+	if key == nil {
+		return nil, ErrInvalidSigningKey
+	}
+	data, err := io.ReadAll(io.LimitReader(key, maxSigningKeyBytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxSigningKeyBytes {
+		return nil, ErrInvalidSigningKey
+	}
+	defer clear(data)
+	var entities openpgp.EntityList
+	if bytes.HasPrefix(bytes.TrimSpace(data), []byte("-----BEGIN PGP")) {
+		entities, err = openpgp.ReadArmoredKeyRing(bytes.NewReader(data))
+	} else {
+		entities, err = openpgp.ReadKeyRing(bytes.NewReader(data))
+	}
+	if err != nil || len(entities) != 1 || entities[0] == nil || entities[0].PrimaryKey == nil {
+		return nil, ErrInvalidSigningKey
+	}
+	return &Verifier{entity: entities[0]}, nil
+}
+
+func NewVerifierBytes(key []byte) (*Verifier, error) {
+	return NewVerifier(bytes.NewReader(key))
+}
+
 // Validate preflights the single entity's signing key for a publication time
 // without writing any metadata.
 func (s *Signer) Validate(at time.Time) error {
@@ -114,6 +148,9 @@ func (s *Signer) Validate(at time.Time) error {
 	for _, keyID := range keyIDs {
 		key, ok := s.entity.SigningKeyById(at, keyID)
 		if ok && key.PrivateKey != nil && !key.PrivateKey.Encrypted {
+			if !deterministicSignatureAlgorithm(key.PublicKey.PubKeyAlgo) {
+				return ErrSigningFailed
+			}
 			usable++
 		}
 	}
@@ -162,14 +199,28 @@ func (s *Signer) DetachedSign(w io.Writer, message io.Reader, at time.Time) erro
 // Verify checks both APT signature forms against the exact Release bytes and
 // the signer's public entity. Errors are intentionally secret-free.
 func (s *Signer) Verify(release, inRelease, detached []byte, at time.Time) error {
-	if s.Validate(at) != nil {
+	if s == nil {
+		return ErrSigningFailed
+	}
+	return verifyMetadataSignatures(s.entity, release, inRelease, detached, at)
+}
+
+func (v *Verifier) Verify(release, inRelease, detached []byte, at time.Time) error {
+	if v == nil {
+		return ErrSigningFailed
+	}
+	return verifyMetadataSignatures(v.entity, release, inRelease, detached, at)
+}
+
+func verifyMetadataSignatures(entity *openpgp.Entity, release, inRelease, detached []byte, at time.Time) error {
+	if entity == nil || at.IsZero() {
 		return ErrSigningFailed
 	}
 	block, rest := clearsign.Decode(inRelease)
 	if block == nil || len(bytes.TrimSpace(rest)) != 0 || !bytes.Equal(block.Plaintext, release) {
 		return ErrSigningFailed
 	}
-	keyring := openpgp.EntityList{s.entity}
+	keyring := openpgp.EntityList{entity}
 	config := signingConfig(at)
 	if _, err := block.VerifySignature(keyring, config); err != nil {
 		return ErrSigningFailed
@@ -182,8 +233,19 @@ func (s *Signer) Verify(release, inRelease, detached []byte, at time.Time) error
 
 func signingConfig(at time.Time) *packet.Config {
 	at = at.UTC()
+	randomizedNotation := false
 	return &packet.Config{
-		DefaultHash: crypto.SHA256,
-		Time:        func() time.Time { return at },
+		DefaultHash:                           crypto.SHA256,
+		Time:                                  func() time.Time { return at },
+		NonDeterministicSignaturesViaNotation: &randomizedNotation,
+	}
+}
+
+func deterministicSignatureAlgorithm(algorithm packet.PublicKeyAlgorithm) bool {
+	switch algorithm {
+	case packet.PubKeyAlgoRSA, packet.PubKeyAlgoRSASignOnly, packet.PubKeyAlgoEdDSA, packet.PubKeyAlgoEd25519, packet.PubKeyAlgoEd448:
+		return true
+	default:
+		return false
 	}
 }

@@ -28,42 +28,54 @@ var (
 )
 
 const (
-	tagName          = 1000
-	tagVersion       = 1001
-	tagRelease       = 1002
-	tagEpoch         = 1003
-	tagSummary       = 1004
-	tagDescription   = 1005
-	tagBuildTime     = 1006
-	tagBuildHost     = 1007
-	tagVendor        = 1011
-	tagLicense       = 1014
-	tagPackager      = 1015
-	tagGroup         = 1016
-	tagURL           = 1020
-	tagArch          = 1022
-	tagOldFilenames  = 1027
-	tagFileModes     = 1030
-	tagFileFlags     = 1037
-	tagSourceRPM     = 1044
-	tagProvideNames  = 1047
-	tagRequireFlags  = 1048
-	tagRequireNames  = 1049
-	tagRequireEVRs   = 1050
-	tagConflictFlags = 1053
-	tagConflictNames = 1054
-	tagConflictEVRs  = 1055
-	tagChangelogTime = 1080
-	tagChangelogName = 1081
-	tagChangelogText = 1082
-	tagObsoleteNames = 1090
-	tagProvideFlags  = 1112
-	tagProvideEVRs   = 1113
-	tagObsoleteFlags = 1114
-	tagObsoleteEVRs  = 1115
-	tagDirIndexes    = 1116
-	tagBaseNames     = 1117
-	tagDirNames      = 1118
+	tagName            = 1000
+	tagVersion         = 1001
+	tagRelease         = 1002
+	tagEpoch           = 1003
+	tagSummary         = 1004
+	tagDescription     = 1005
+	tagBuildTime       = 1006
+	tagBuildHost       = 1007
+	tagVendor          = 1011
+	tagLicense         = 1014
+	tagPackager        = 1015
+	tagGroup           = 1016
+	tagURL             = 1020
+	tagArch            = 1022
+	tagOldFilenames    = 1027
+	tagFileModes       = 1030
+	tagFileFlags       = 1037
+	tagSourceRPM       = 1044
+	tagProvideNames    = 1047
+	tagRequireFlags    = 1048
+	tagRequireNames    = 1049
+	tagRequireEVRs     = 1050
+	tagConflictFlags   = 1053
+	tagConflictNames   = 1054
+	tagConflictEVRs    = 1055
+	tagChangelogTime   = 1080
+	tagChangelogName   = 1081
+	tagChangelogText   = 1082
+	tagObsoleteNames   = 1090
+	tagProvideFlags    = 1112
+	tagProvideEVRs     = 1113
+	tagObsoleteFlags   = 1114
+	tagObsoleteEVRs    = 1115
+	tagDirIndexes      = 1116
+	tagBaseNames       = 1117
+	tagDirNames        = 1118
+	tagRecommendNames  = 5046
+	tagRecommendEVRs   = 5047
+	tagRecommendFlags  = 5048
+	tagSuggestNames    = 5049
+	tagSuggestEVRs     = 5050
+	tagSuggestFlags    = 5051
+	tagSupplementNames = 5052
+	tagSupplementEVRs  = 5053
+	tagSupplementFlags = 5054
+	tagEnhanceNames    = 5055
+	tagEnhanceEVRs     = 5056
+	tagEnhanceFlags    = 5057
 )
 
 type dependency struct {
@@ -73,6 +85,9 @@ type dependency struct {
 	Version string
 	Release string
 	Pre     bool
+	// MissingOK is the legacy pre-RPM-4.12 weak-require marker. It is an
+	// inspection-only fact and is projected into recommends before rendering.
+	MissingOK bool
 }
 
 type rpmFile struct {
@@ -100,7 +115,10 @@ type packageMetadata struct {
 	BuildHost, SourceRPM         string
 	HeaderStart, HeaderEnd       int
 	Provides, Requires           []dependency
+	CatalogRequires              []dependency
 	Conflicts, Obsoletes         []dependency
+	Suggests, Enhances           []dependency
+	Recommends, Supplements      []dependency
 	Files                        []rpmFile
 	Changelogs                   []changelog
 }
@@ -159,8 +177,9 @@ func InspectPackage(ctx context.Context, in PackageInput) (PackageInfo, error) {
 	if err != nil {
 		return PackageInfo{}, err
 	}
+	source := sourceNameFromRPM(metadata.SourceRPM, metadata.Name, metadata.Version, metadata.Release)
 	return PackageInfo{
-		Name: metadata.Name, Version: metadata.Version, Release: metadata.Release,
+		Name: metadata.Name, Source: source, SourceRPM: metadata.SourceRPM, Version: metadata.Version, Release: metadata.Release,
 		Epoch: metadata.Epoch, Arch: metadata.Arch, SHA256: metadata.Checksum,
 		Size: metadata.PackageSize, Location: metadata.Location,
 	}, nil
@@ -223,6 +242,7 @@ func InspectPackageReader(ctx context.Context, input io.ReadSeeker, originalBase
 		return PackageInfo{}, fmt.Errorf("%w: %v", ErrInvalidPackage, err)
 	}
 	epoch := tagInt(&pkg.Header, tagEpoch)
+	sourceRPM := tagString(&pkg.Header, tagSourceRPM)
 	if name == "" || version == "" || release == "" || architecture == "" ||
 		!validXMLString(name) || !validXMLString(version) || !validXMLString(release) || !validXMLString(architecture) || epoch < 0 {
 		return PackageInfo{}, fmt.Errorf("%w: RPM reader lacks required NEVRA fields", ErrInvalidPackage)
@@ -238,7 +258,7 @@ func InspectPackageReader(ctx context.Context, input io.ReadSeeker, originalBase
 	if firstHash != secondHash || firstSize != secondSize {
 		return PackageInfo{}, fmt.Errorf("%w: RPM reader changed while being inspected", ErrInvalidPackage)
 	}
-	return PackageInfo{Name: name, Version: version, Release: release, Epoch: epoch, Arch: architecture,
+	return PackageInfo{Name: name, Source: sourceNameFromRPM(sourceRPM, name, version, release), SourceRPM: sourceRPM, Version: version, Release: release, Epoch: epoch, Arch: architecture,
 		SHA256: secondHash, Size: secondSize, Location: location}, nil
 }
 
@@ -300,6 +320,12 @@ func readPackage(ctx context.Context, in PackageInput) (*packageMetadata, error)
 	if err != nil {
 		return nil, err
 	}
+	if in.Location != "" {
+		if err := validateManagedPackageLocation(name, basename, in.Location); err != nil {
+			return nil, err
+		}
+		location = in.Location
+	}
 	architecture, err := normalizedRPMArchitecture(&pkg.Header, basename)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %q: %v", ErrInvalidPackage, in.Path, err)
@@ -333,15 +359,36 @@ func readPackage(ctx context.Context, in PackageInput) (*packageMetadata, error)
 	if m.Requires, err = readDependencies(&pkg.Header, tagRequireNames, tagRequireFlags, tagRequireEVRs, true); err != nil {
 		return nil, fmt.Errorf("%w: %q requires: %v", ErrInvalidPackage, in.Path, err)
 	}
+	// Keep the header-exact requires for the legacy disposable catalog. The
+	// rpm-md renderer deliberately applies createrepo-compatible projection
+	// below (weak MISSINGOK split, rpmlib/self/file filtering and deduplication),
+	// but that lossy view must not change catalog rebuild semantics.
+	m.CatalogRequires = append([]dependency(nil), m.Requires...)
+	var legacyRecommends []dependency
+	m.Requires, legacyRecommends = partitionLegacyWeakRequires(m.Requires)
 	if m.Conflicts, err = readDependencies(&pkg.Header, tagConflictNames, tagConflictFlags, tagConflictEVRs, false); err != nil {
 		return nil, fmt.Errorf("%w: %q conflicts: %v", ErrInvalidPackage, in.Path, err)
 	}
 	if m.Obsoletes, err = readDependencies(&pkg.Header, tagObsoleteNames, tagObsoleteFlags, tagObsoleteEVRs, false); err != nil {
 		return nil, fmt.Errorf("%w: %q obsoletes: %v", ErrInvalidPackage, in.Path, err)
 	}
+	if m.Suggests, err = readDependencies(&pkg.Header, tagSuggestNames, tagSuggestFlags, tagSuggestEVRs, false); err != nil {
+		return nil, fmt.Errorf("%w: %q suggests: %v", ErrInvalidPackage, in.Path, err)
+	}
+	if m.Enhances, err = readDependencies(&pkg.Header, tagEnhanceNames, tagEnhanceFlags, tagEnhanceEVRs, false); err != nil {
+		return nil, fmt.Errorf("%w: %q enhances: %v", ErrInvalidPackage, in.Path, err)
+	}
+	if m.Recommends, err = readDependencies(&pkg.Header, tagRecommendNames, tagRecommendFlags, tagRecommendEVRs, false); err != nil {
+		return nil, fmt.Errorf("%w: %q recommends: %v", ErrInvalidPackage, in.Path, err)
+	}
+	m.Recommends = stableUniqueDependencies(append(m.Recommends, legacyRecommends...), false)
+	if m.Supplements, err = readDependencies(&pkg.Header, tagSupplementNames, tagSupplementFlags, tagSupplementEVRs, false); err != nil {
+		return nil, fmt.Errorf("%w: %q supplements: %v", ErrInvalidPackage, in.Path, err)
+	}
 	if m.Files, err = readFiles(&pkg.Header); err != nil {
 		return nil, fmt.Errorf("%w: %q files: %v", ErrInvalidPackage, in.Path, err)
 	}
+	m.Requires = normalizeRPMRequires(m.Requires, m.Provides, m.Files)
 	if m.Changelogs, err = readChangelogs(&pkg.Header); err != nil {
 		return nil, fmt.Errorf("%w: %q changelogs: %v", ErrInvalidPackage, in.Path, err)
 	}
@@ -359,16 +406,91 @@ func readPackage(ctx context.Context, in PackageInput) (*packageMetadata, error)
 	return m, nil
 }
 
+// CompareEVR applies RPM's native epoch/version/release ordering. It returns a
+// negative value when the left EVR is older, zero when equal, and a positive
+// value when newer.
+func CompareEVR(leftEpoch int64, leftVersion, leftRelease string, rightEpoch int64, rightVersion, rightRelease string) int {
+	if leftEpoch < rightEpoch {
+		return -1
+	}
+	if leftEpoch > rightEpoch {
+		return 1
+	}
+	if compared := crpm.CompareVersions(leftVersion, rightVersion); compared != 0 {
+		return compared
+	}
+	return crpm.CompareVersions(leftRelease, rightRelease)
+}
+
+func sourceNameFromRPM(sourceRPM, fallback, version, release string) string {
+	base := strings.TrimSpace(sourceRPM)
+	for _, suffix := range []string{".src.rpm", ".nosrc.rpm"} {
+		if strings.HasSuffix(base, suffix) {
+			base = strings.TrimSuffix(base, suffix)
+			break
+		}
+	}
+	if tail := "-" + version + "-" + release; version != "" && release != "" && strings.HasSuffix(base, tail) {
+		base = strings.TrimSuffix(base, tail)
+	}
+	if base == "" || !safeManagedPackageComponent(base) {
+		return fallback
+	}
+	return base
+}
+
+func validateManagedPackageLocation(name, basename, location string) error {
+	if location == "" || path.Clean(location) != location || strings.ContainsAny(location, "\\%?#\x00\r\n\t") {
+		return fmt.Errorf("%w: unsafe managed package location %q", ErrUnsafeLocation, location)
+	}
+	parts := strings.Split(location, "/")
+	if len(parts) != 4 || parts[0] != "pool" || path.Base(parts[3]) != basename || !safeRPMBasename(basename) ||
+		!safeManagedPackageComponent(parts[1]) || !safeManagedPackageComponent(parts[2]) {
+		return fmt.Errorf("%w: managed location %q must be pool/<prefix>/<source>/<basename>", ErrUnsafeLocation, location)
+	}
+	source := parts[2]
+	prefix := source[:1]
+	if strings.HasPrefix(source, "lib") {
+		if len(source) < 4 {
+			prefix = source
+		} else {
+			prefix = source[:4]
+		}
+	}
+	prefix = strings.ToLower(prefix)
+	if parts[1] != prefix || name == "" {
+		return fmt.Errorf("%w: managed location %q has a non-canonical source prefix", ErrUnsafeLocation, location)
+	}
+	return nil
+}
+
+func safeManagedPackageComponent(value string) bool {
+	if value == "" || value == "." || value == ".." {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		c := value[index]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+			continue
+		}
+		switch c {
+		case '.', '-', '_', '+', '~', '^':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func normalizedRPMArchitecture(header *crpm.Header, basename string) (string, error) {
-	architecture := tagString(header, tagArch)
-	isSourceBasename := strings.HasSuffix(basename, ".src.rpm") || strings.HasSuffix(basename, ".nosrc.rpm")
-	if !isSourceBasename {
-		return architecture, nil
-	}
-	if sourceRPM := tagString(header, tagSourceRPM); sourceRPM != "" {
-		return "", fmt.Errorf("source-RPM basename carries binary SourceRPM tag %q", sourceRPM)
-	}
-	return "src", nil
+	// Filename is not package identity. Source-package rejection and every
+	// architecture decision must use the parsed RPM header, so a binary RPM
+	// merely renamed to *.src.rpm is still indexed as its real architecture.
+	// Valid source RPMs carry src/nosrc in RPMTAG_ARCH and are rejected by the
+	// P0 caller after inspection.
+	_ = basename
+	return tagString(header, tagArch), nil
 }
 
 func validatePackageSizeTags(pkg *crpm.Package) error {
@@ -431,10 +553,38 @@ func readDependencies(h *crpm.Header, namesID, flagsID, evrsID int, requires boo
 		out = append(out, dependency{
 			Name: name, Flags: dependencyFlags(rawFlags), Epoch: epoch,
 			Version: version, Release: release,
-			Pre: requires && rawFlags&((1<<6)|(1<<9)|(1<<10)|(1<<11)|(1<<12)) != 0,
+			Pre:       requires && rawFlags&((1<<5)|(1<<6)|(1<<7)|(1<<9)|(1<<10)) != 0,
+			MissingOK: requires && rawFlags&(1<<19) != 0,
 		})
 	}
 	return out, nil
+}
+
+func partitionLegacyWeakRequires(requires []dependency) (hard, weak []dependency) {
+	for _, dep := range requires {
+		if dep.MissingOK {
+			dep.MissingOK = false
+			dep.Pre = false
+			weak = append(weak, dep)
+			continue
+		}
+		hard = append(hard, dep)
+	}
+	return hard, weak
+}
+
+func stableUniqueDependencies(dependencies []dependency, includePre bool) []dependency {
+	seen := make(map[dependencyIdentity]struct{}, len(dependencies))
+	result := make([]dependency, 0, len(dependencies))
+	for _, dep := range dependencies {
+		identity := identityOfDependency(dep, includePre)
+		if _, duplicate := seen[identity]; duplicate {
+			continue
+		}
+		seen[identity] = struct{}{}
+		result = append(result, dep)
+	}
+	return result
 }
 
 func dependencyFlags(flags int64) string {
@@ -453,6 +603,109 @@ func dependencyFlags(flags int64) string {
 	default:
 		return ""
 	}
+}
+
+type dependencyIdentity struct {
+	Name, Flags, Epoch, Version, Release string
+	Pre                                  bool
+}
+
+func identityOfDependency(dep dependency, includePre bool) dependencyIdentity {
+	return dependencyIdentity{
+		Name: dep.Name, Flags: dep.Flags, Epoch: dep.Epoch, Version: dep.Version, Release: dep.Release,
+		Pre: includePre && dep.Pre,
+	}
+}
+
+// normalizeRPMRequires follows the projection used by createrepo_c rather
+// than copying every raw RPMTAG_REQUIRE* row into primary.xml. RPM's rpmlib
+// capabilities are internal to RPM, primary files owned by the same package
+// are already represented as files, exact self-provides are redundant, and
+// repeated requirements add no solver information. The historical yum format
+// also retains only the highest libc.so.6 symbol requirement.
+func normalizeRPMRequires(requires, provides []dependency, files []rpmFile) []dependency {
+	provided := make(map[dependencyIdentity]struct{}, len(provides))
+	for _, dep := range provides {
+		provided[identityOfDependency(dep, false)] = struct{}{}
+	}
+	ownedPrimaryFiles := make(map[string]struct{})
+	for _, file := range files {
+		if isPrimaryRPMFile(file.Name) {
+			ownedPrimaryFiles[file.Name] = struct{}{}
+		}
+	}
+
+	lastByName := make(map[string]dependencyIdentity)
+	result := make([]dependency, 0, len(requires))
+	var highestLibc *dependency
+	for _, dep := range requires {
+		if strings.HasPrefix(dep.Name, "rpmlib(") {
+			continue
+		}
+		if strings.HasPrefix(dep.Name, "/") {
+			if _, owned := ownedPrimaryFiles[dep.Name]; owned {
+				continue
+			}
+		}
+		if _, selfProvided := provided[identityOfDependency(dep, false)]; selfProvided {
+			continue
+		}
+		identity := identityOfDependency(dep, true)
+		if previous, seen := lastByName[dep.Name]; seen && previous == identity {
+			continue
+		}
+		if strings.HasPrefix(dep.Name, "libc.so.6") {
+			if highestLibc == nil || compareLibcRequirement(highestLibc.Name, dep.Name) < 0 {
+				candidate := dep
+				highestLibc = &candidate
+			}
+			continue
+		}
+		result = append(result, dep)
+		lastByName[dep.Name] = identity
+	}
+	if highestLibc != nil {
+		result = append(result, *highestLibc)
+	}
+	return result
+}
+
+func isPrimaryRPMFile(name string) bool {
+	return strings.HasPrefix(name, "/etc/") || name == "/usr/lib/sendmail" || strings.Contains(name, "bin/")
+}
+
+// compareLibcRequirement compares the first parenthesized symbol versions in
+// libc.so.6 requirements. It returns a negative number when left is older.
+func compareLibcRequirement(left, right string) int {
+	leftVersion, leftVersioned := libcRequirementVersion(left)
+	rightVersion, rightVersioned := libcRequirementVersion(right)
+	switch {
+	case leftVersioned && !rightVersioned:
+		return 1
+	case !leftVersioned && rightVersioned:
+		return -1
+	case !leftVersioned:
+		return 0
+	default:
+		return crpm.CompareVersions(leftVersion, rightVersion)
+	}
+}
+
+func libcRequirementVersion(name string) (string, bool) {
+	start := strings.IndexByte(name, '(')
+	if start < 0 {
+		return "", false
+	}
+	endRelative := strings.IndexByte(name[start+1:], ')')
+	if endRelative < 0 {
+		return "", false
+	}
+	content := name[start+1 : start+1+endRelative]
+	firstDigit := strings.IndexFunc(content, func(r rune) bool { return r >= '0' && r <= '9' })
+	if firstDigit < 0 {
+		return "", false
+	}
+	return content[firstDigit:], true
 }
 
 func splitEVR(evr string) (epoch, version, release string) {
@@ -513,9 +766,21 @@ func readChangelogs(h *crpm.Header) ([]changelog, error) {
 	if len(names) != len(dates) || len(names) != len(texts) {
 		return nil, fmt.Errorf("misaligned RPM changelog tags: names=%d dates=%d texts=%d", len(names), len(dates), len(texts))
 	}
-	out := make([]changelog, 0, len(names))
-	for i := range names {
-		out = append(out, changelog{Author: names[i], Date: dates[i], Text: texts[i]})
+	// RPM stores changelogs newest first. createrepo_c's current default keeps
+	// the newest ten, emits them oldest first, and makes equal timestamps
+	// strictly increasing so libdnf presents the newest entry first.
+	const createrepoChangelogLimit = 10
+	count := len(names)
+	if count > createrepoChangelogLimit {
+		count = createrepoChangelogLimit
+	}
+	out := make([]changelog, 0, count)
+	for i := count - 1; i >= 0; i-- {
+		date := dates[i]
+		if len(out) != 0 && date <= out[len(out)-1].Date {
+			date = out[len(out)-1].Date + 1
+		}
+		out = append(out, changelog{Author: names[i], Date: date, Text: texts[i]})
 	}
 	return out, nil
 }

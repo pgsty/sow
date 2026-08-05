@@ -16,7 +16,8 @@ type DirectoryExchanger interface {
 }
 
 // NativeDirectoryExchanger uses renameat2(RENAME_EXCHANGE) on Linux and
-// renamex_np(RENAME_SWAP) on macOS. There is no two-rename fallback.
+// renamex_np(RENAME_SWAP) on macOS. The directories may have different real
+// parents on the same filesystem; there is no two-rename fallback.
 type NativeDirectoryExchanger struct{}
 
 // ActivationPhase identifies the two authorization boundaries around the
@@ -288,8 +289,14 @@ func exchangePaths(first, second string) (string, string, error) {
 		return "", "", err
 	}
 	firstAbs, secondAbs = filepath.Clean(firstAbs), filepath.Clean(secondAbs)
-	if firstAbs == secondAbs || filepath.Dir(firstAbs) != filepath.Dir(secondAbs) {
-		return "", "", fmt.Errorf("yumrepo: atomic exchange requires two distinct sibling directories")
+	if firstAbs == secondAbs {
+		return "", "", fmt.Errorf("yumrepo: atomic exchange requires two distinct directories")
+	}
+	for _, parent := range []string{filepath.Dir(firstAbs), filepath.Dir(secondAbs)} {
+		info, err := os.Lstat(parent)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return "", "", fmt.Errorf("yumrepo: exchange parent %q is not a real directory", parent)
+		}
 	}
 	for _, item := range []string{firstAbs, secondAbs} {
 		info, err := os.Lstat(item)

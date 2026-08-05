@@ -114,7 +114,7 @@ func TestRPMAddBuildsSignedZstdRepositoryFromExternalPackage(t *testing.T) {
 		t.Fatal(err)
 	}
 	created := time.Unix(1_500_000_000, 0).UTC()
-	entity, err := openpgp.NewEntity("SOW CLI Test", "", "sow@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW CLI Test", "", "sow@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -77,6 +78,8 @@ type ValidatedRootProof struct {
 	identity   os.FileInfo
 	generation Generation
 	entries    []validatedRegularEntry
+	signed     bool
+	retained   bool
 }
 
 // ValidateRootWithProof is ValidateRoot plus a proof that higher verification
@@ -94,13 +97,13 @@ func (proof *ValidatedRootProof) Check(ctx context.Context) error {
 	if err != nil || !current.IsDir() || !os.SameFile(proof.identity, current) {
 		return fmt.Errorf("%w: retained repodata root changed after validation: %v", ErrInvalidRepodata, err)
 	}
-	if err := rejectExtraGenerationFilesRoot(proof.root, &proof.generation); err != nil {
+	if err := rejectExtraGenerationFilesRootMode(ctx, proof.root, &proof.generation, proof.signed, proof.retained); err != nil {
 		return err
 	}
 	if err := verifyValidatedGenerationEntriesRoot(ctx, proof.root, proof.entries); err != nil {
 		return err
 	}
-	if err := rejectExtraGenerationFilesRoot(proof.root, &proof.generation); err != nil {
+	if err := rejectExtraGenerationFilesRootMode(ctx, proof.root, &proof.generation, proof.signed, proof.retained); err != nil {
 		return err
 	}
 	current, err = proof.root.Stat(".")
@@ -119,7 +122,47 @@ func ValidateFlatCompatibilityDirectory(ctx context.Context, dir string, compres
 	return validateDirectory(ctx, dir, compression, verifier, true)
 }
 
+// ValidateFlatUnsignedDirectory validates the unsigned flat rpm-md shape used
+// by sow create. Package hrefs must be single RPM basenames and no detached
+// repomd signature is accepted or required.
+func ValidateFlatUnsignedDirectory(ctx context.Context, dir string, compression Compression) (*Generation, error) {
+	return validateDirectoryMode(ctx, dir, compression, nil, true, false, false)
+}
+
+// ValidateManagedUnsignedDirectory validates unsigned managed rpm-md. Package
+// hrefs use the root-pool projection shape pool/<prefix>/<source>/<basename>;
+// the managed layer separately proves that each view-local href is a regular
+// hardlink alias of its canonical root Pool object.
+func ValidateManagedUnsignedDirectory(ctx context.Context, dir string, compression Compression) (*Generation, error) {
+	return validateDirectoryModeRetained(ctx, dir, compression, nil, false, false, false, true)
+}
+
+// ValidateManagedDirectory validates signed managed rpm-md while permitting
+// checksum-named artifacts retained from prior generations for in-flight
+// client closure. repomd.xml and its detached signature always describe only
+// the current three metadata artifacts.
+func ValidateManagedDirectory(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier) (*Generation, error) {
+	return validateDirectoryModeRetained(ctx, dir, compression, verifier, false, true, false, true)
+}
+
+// ValidateFlatEmptyUnsignedDirectory validates the empty unsigned rpm-md
+// shape used by the P1 control plane without creating identity scratch files.
+// It is intentionally closed to zero-package generations; non-empty metadata
+// must use the full validator, which may spill bounded identity runs to a
+// private system temporary directory.
+func ValidateFlatEmptyUnsignedDirectory(ctx context.Context, dir string, compression Compression) (*Generation, error) {
+	return validateDirectoryMode(ctx, dir, compression, nil, true, false, true)
+}
+
 func validateDirectory(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, flatCompatibility bool) (*Generation, error) {
+	return validateDirectoryMode(ctx, dir, compression, verifier, flatCompatibility, true, false)
+}
+
+func validateDirectoryMode(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, flatCompatibility, signed, requireEmpty bool) (*Generation, error) {
+	return validateDirectoryModeRetained(ctx, dir, compression, verifier, flatCompatibility, signed, requireEmpty, false)
+}
+
+func validateDirectoryModeRetained(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, flatCompatibility, signed, requireEmpty, retained bool) (*Generation, error) {
 	dir = filepath.Clean(dir)
 	absolute, err := filepath.Abs(dir)
 	if err != nil {
@@ -143,7 +186,7 @@ func validateDirectory(ctx context.Context, dir string, compression Compression,
 		!current.IsDir() || !os.SameFile(info, opened) || !os.SameFile(info, current) {
 		return nil, fmt.Errorf("%w: generation directory changed while binding: %v", ErrInvalidRepodata, errors.Join(openErr, pathErr))
 	}
-	generation, _, err := validateRootWithProof(ctx, root, dir, compression, verifier, flatCompatibility)
+	generation, _, err := validateRootWithProofMode(ctx, root, dir, compression, verifier, flatCompatibility, signed, requireEmpty, retained)
 	if err != nil {
 		return nil, err
 	}
@@ -157,13 +200,17 @@ func validateDirectory(ctx context.Context, dir string, compression Compression,
 }
 
 func validateRootWithProof(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier, flatCompatibility bool) (*Generation, *ValidatedRootProof, error) {
+	return validateRootWithProofMode(ctx, root, diagnostic, compression, verifier, flatCompatibility, true, false, false)
+}
+
+func validateRootWithProofMode(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier, flatCompatibility, signed, requireEmpty, retained bool) (*Generation, *ValidatedRootProof, error) {
 	if ctx == nil {
 		return nil, nil, fmt.Errorf("%w: nil context", ErrInvalidRepodata)
 	}
 	if root == nil {
 		return nil, nil, fmt.Errorf("%w: nil repodata root", ErrInvalidRepodata)
 	}
-	if verifier == nil {
+	if signed && verifier == nil {
 		return nil, nil, fmt.Errorf("%w: detached verifier is required", ErrInvalidRepodata)
 	}
 	if compression != CompressionGzip && compression != CompressionZstd {
@@ -176,7 +223,13 @@ func validateRootWithProof(ctx context.Context, root *os.Root, diagnostic string
 	if err != nil || !boundIdentity.IsDir() {
 		return nil, nil, fmt.Errorf("%w: retained repodata root is not a directory: %v", ErrInvalidRepodata, err)
 	}
-	repomdBytes, validatedEntries, err := verifyRepomdSignatureRoot(ctx, root, verifier)
+	var repomdBytes []byte
+	var validatedEntries []validatedRegularEntry
+	if signed {
+		repomdBytes, validatedEntries, err = verifyRepomdSignatureRoot(ctx, root, verifier)
+	} else {
+		repomdBytes, validatedEntries, err = readUnsignedRepomdRoot(root)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -210,14 +263,10 @@ func validateRootWithProof(ctx context.Context, root *os.Root, diagnostic string
 	}
 	repomdSum := sha256.Sum256(repomdBytes)
 	generation := &Generation{Dir: diagnostic, Revision: revision, RepomdSHA256: hex.EncodeToString(repomdSum[:])}
-	// Validation must never create scratch below a directly hosted repository
-	// leaf. A private mode-0700 system temp directory keeps concurrent clients
-	// from observing identity runs and allows read-only repository mounts.
-	identityTemp, err := os.MkdirTemp("", "sow-yum-identity-")
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: create package identity scratch: %v", ErrInvalidRepodata, err)
-	}
-	defer os.RemoveAll(identityTemp)
+	// Identity validation stays in memory for ordinary repositories. Large
+	// metadata sets lazily create private external-sort runs; empty repositories
+	// and bounded read-only checks never require temporary storage.
+	identityTemp := ""
 	var packageCount int64 = -1
 	var identitySHA string
 	for i, kind := range wantedOrder {
@@ -225,14 +274,18 @@ func validateRootWithProof(ctx context.Context, root *os.Root, diagnostic string
 		if !ok {
 			return nil, nil, fmt.Errorf("%w: missing %q record", ErrInvalidRepodata, kind)
 		}
-		artifact, count, identities, validatedEntry, err := validateArtifactRoot(ctx, root, kind, record, compression, flatCompatibility, identityTemp)
+		artifact, count, identities, validatedEntry, err := validateArtifactRoot(ctx, root, kind, record, compression, flatCompatibility, identityTemp, requireEmpty)
 		if err != nil {
 			return nil, nil, err
 		}
 		validatedEntries = append(validatedEntries, validatedEntry)
-		currentIdentitySHA, err := hashFileContext(ctx, identities)
-		if err != nil {
-			return nil, nil, err
+		currentIdentitySHA := digestBytes(nil)
+		if requireEmpty {
+			if count != 0 {
+				return nil, nil, fmt.Errorf("%w: %s metadata is not empty", ErrInvalidRepodata, kind)
+			}
+		} else {
+			currentIdentitySHA = identities
 		}
 		if identitySHA == "" {
 			identitySHA = currentIdentitySHA
@@ -246,8 +299,9 @@ func validateRootWithProof(ctx context.Context, root *os.Root, diagnostic string
 		}
 		generation.Artifacts[i] = artifact
 	}
+	generation.IdentitySHA256 = identitySHA
 	generation.Packages = packageCount
-	if err := rejectExtraGenerationFilesRoot(root, generation); err != nil {
+	if err := rejectExtraGenerationFilesRootMode(ctx, root, generation, signed, retained); err != nil {
 		return nil, nil, err
 	}
 	if err := verifyValidatedGenerationEntriesRoot(ctx, root, validatedEntries); err != nil {
@@ -255,7 +309,7 @@ func validateRootWithProof(ctx context.Context, root *os.Root, diagnostic string
 	}
 	// Re-list after the final content/identity proofs so an entry added while
 	// those proofs were running cannot hide behind a previously exact listing.
-	if err := rejectExtraGenerationFilesRoot(root, generation); err != nil {
+	if err := rejectExtraGenerationFilesRootMode(ctx, root, generation, signed, retained); err != nil {
 		return nil, nil, err
 	}
 	currentIdentity, err := root.Stat(".")
@@ -264,7 +318,7 @@ func validateRootWithProof(ctx context.Context, root *os.Root, diagnostic string
 	}
 	proof := &ValidatedRootProof{
 		root: root, identity: boundIdentity, generation: *generation,
-		entries: append([]validatedRegularEntry(nil), validatedEntries...),
+		entries: append([]validatedRegularEntry(nil), validatedEntries...), signed: signed, retained: retained,
 	}
 	return generation, proof, nil
 }
@@ -300,7 +354,21 @@ func verifyRepomdSignatureRoot(ctx context.Context, root *os.Root, verifier Deta
 	return messageBytes, []validatedRegularEntry{messageEntry, signatureEntry}, nil
 }
 
-func validateArtifactRoot(ctx context.Context, root *os.Root, kind string, record repomdRecord, compression Compression, flatCompatibility bool, identityTemp string) (Artifact, int64, string, validatedRegularEntry, error) {
+func readUnsignedRepomdRoot(root *os.Root) ([]byte, []validatedRegularEntry, error) {
+	message, err := openBoundRegularFile(root, "repomd.xml", 1, maxRepomdBytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: invalid repomd.xml: %v", ErrInvalidRepodata, err)
+	}
+	messageBytes, readErr := message.ReadAll(maxRepomdBytes)
+	entry := validatedRegularEntry{name: "repomd.xml", identity: message.identity, sha256: digestBytes(messageBytes)}
+	closeErr := message.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, nil, errors.Join(readErr, closeErr)
+	}
+	return messageBytes, []validatedRegularEntry{entry}, nil
+}
+
+func validateArtifactRoot(ctx context.Context, root *os.Root, kind string, record repomdRecord, compression Compression, flatCompatibility bool, identityTemp string, requireEmpty bool) (Artifact, int64, string, validatedRegularEntry, error) {
 	if record.Checksum.Type != "sha256" || record.OpenChecksum.Type != "sha256" ||
 		!validSHA256(record.Checksum.Value) || !validSHA256(record.OpenChecksum.Value) {
 		return Artifact{}, 0, "", validatedRegularEntry{}, fmt.Errorf("%w: %s requires SHA256 checksums", ErrInvalidRepodata, kind)
@@ -333,7 +401,7 @@ func validateArtifactRoot(ctx context.Context, root *os.Root, kind string, recor
 	if err := file.Reset(); err != nil {
 		return Artifact{}, 0, "", validatedRegularEntry{}, err
 	}
-	openSHA, openSize, count, identities, err := validateOpenXML(ctx, file.file, kind, compression, flatCompatibility, identityTemp)
+	openSHA, openSize, count, identities, err := validateOpenXML(ctx, file.file, kind, compression, flatCompatibility, identityTemp, requireEmpty)
 	if err != nil {
 		return Artifact{}, 0, "", validatedRegularEntry{}, err
 	}
@@ -354,7 +422,7 @@ func validateArtifactRoot(ctx context.Context, root *os.Root, kind string, recor
 	}, count, identities, validatedEntry, nil
 }
 
-func validateOpenXML(ctx context.Context, source io.Reader, kind string, compression Compression, flatCompatibility bool, identityTemp string) (string, int64, int64, string, error) {
+func validateOpenXML(ctx context.Context, source io.Reader, kind string, compression Compression, flatCompatibility bool, identityTemp string, requireEmpty bool) (string, int64, int64, string, error) {
 	var reader io.Reader
 	var closer io.Closer
 	switch compression {
@@ -377,15 +445,25 @@ func validateOpenXML(ctx context.Context, source io.Reader, kind string, compres
 	h := sha256.New()
 	counter := &countingWriter{w: h}
 	tee := io.TeeReader(&contextReader{ctx: ctx, r: reader}, counter)
-	spool := newMetadataIdentitySpool(ctx, identityTemp, kind)
+	var spool *metadataIdentitySpool
+	if !requireEmpty {
+		spool = newMetadataIdentitySpool(ctx, identityTemp, kind)
+	}
 	count, err := validateMetadataXMLMode(tee, kind, flatCompatibility, spool)
 	if err != nil {
 		spool.Close()
 		return "", 0, 0, "", err
 	}
-	identities, err := spool.Finish()
-	if err != nil {
-		return "", 0, 0, "", err
+	identities := ""
+	if requireEmpty {
+		if count != 0 {
+			return "", 0, 0, "", fmt.Errorf("%w: %s metadata is not empty", ErrInvalidRepodata, kind)
+		}
+	} else {
+		identities, err = spool.Finish()
+		if err != nil {
+			return "", 0, 0, "", err
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), counter.n, count, identities, nil
 }
@@ -536,6 +614,12 @@ func validatePackageHrefForMode(name, href string, flatCompatibility bool) error
 		return nil
 	}
 	parts := strings.Split(href, "/")
+	if len(parts) == 4 && parts[0] == "pool" {
+		if err := validateManagedPackageLocation(name, parts[3], href); err != nil {
+			return fmt.Errorf("%w: package href %q is not a canonical managed pool location", ErrInvalidRepodata, href)
+		}
+		return nil
+	}
 	if len(parts) != 3 || parts[0] != "Packages" || len(parts[1]) != 1 {
 		return fmt.Errorf("%w: package href %q violates Packages/<bucket>/<basename>", ErrInvalidRepodata, href)
 	}
@@ -554,6 +638,7 @@ type metadataIdentitySpool struct {
 	kind  string
 	chunk []string
 	runs  []string
+	owned bool
 	done  bool
 }
 
@@ -587,6 +672,13 @@ func (s *metadataIdentitySpool) flush() error {
 		if s.chunk[index] == s.chunk[index-1] {
 			return fmt.Errorf("%w: %s metadata contains duplicate pkgid %s", ErrInvalidRepodata, s.kind, s.chunk[index])
 		}
+	}
+	if s.root == "" {
+		root, err := os.MkdirTemp("", "sow-yum-identity-")
+		if err != nil {
+			return fmt.Errorf("%w: create package identity scratch: %v", ErrInvalidRepodata, err)
+		}
+		s.root, s.owned = root, true
 	}
 	name := filepath.Join(s.root, fmt.Sprintf("%s-%08d.ids", s.kind, len(s.runs)))
 	file, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -622,22 +714,27 @@ func (s *metadataIdentitySpool) Finish() (string, error) {
 	if s == nil || s.done {
 		return "", fmt.Errorf("%w: package identity spool is unavailable", ErrInvalidRepodata)
 	}
+	if len(s.runs) == 0 {
+		sort.Strings(s.chunk)
+		hasher := sha256.New()
+		previous := ""
+		for index, identity := range s.chunk {
+			if index > 0 && identity == previous {
+				return "", fmt.Errorf("%w: %s metadata contains duplicate pkgid %s", ErrInvalidRepodata, s.kind, identity)
+			}
+			if _, err := io.WriteString(hasher, identity+"\n"); err != nil {
+				return "", err
+			}
+			previous = identity
+		}
+		s.done = true
+		return hex.EncodeToString(hasher.Sum(nil)), nil
+	}
 	if err := s.flush(); err != nil {
 		return "", err
 	}
 	s.done = true
-	outputName := filepath.Join(s.root, s.kind+".identities")
-	output, err := os.OpenFile(outputName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return "", err
-	}
-	committed := false
-	defer func() {
-		_ = output.Close()
-		if !committed {
-			_ = os.Remove(outputName)
-		}
-	}()
+	defer s.cleanup()
 	var cursors metadataIdentityHeap
 	for _, runName := range s.runs {
 		if err := s.ctx.Err(); err != nil {
@@ -662,7 +759,8 @@ func (s *metadataIdentitySpool) Finish() (string, error) {
 		cursors = append(cursors, &metadataIdentityCursor{value: scanner.Text(), scanner: scanner, file: file})
 	}
 	heap.Init(&cursors)
-	writer := bufio.NewWriterSize(output, 128*1024)
+	hasher := sha256.New()
+	writer := bufio.NewWriterSize(hasher, 128*1024)
 	previous := ""
 	for merged := 0; cursors.Len() != 0; merged++ {
 		if merged%256 == 0 {
@@ -698,16 +796,20 @@ func (s *metadataIdentitySpool) Finish() (string, error) {
 	if err := writer.Flush(); err != nil {
 		return "", err
 	}
-	if err := errors.Join(output.Sync(), output.Close()); err != nil {
-		return "", err
-	}
-	committed = true
-	return outputName, nil
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 func (s *metadataIdentitySpool) Close() {
 	if s != nil {
 		s.done = true
+		s.cleanup()
+	}
+}
+
+func (s *metadataIdentitySpool) cleanup() {
+	if s != nil && s.owned && s.root != "" {
+		_ = os.RemoveAll(s.root)
+		s.root, s.owned = "", false
 	}
 }
 
@@ -880,8 +982,13 @@ func (file *boundRegularFile) Close() error {
 	return errors.Join(checkErr, closeErr)
 }
 
-func rejectExtraGenerationFilesRoot(root *os.Root, generation *Generation) error {
-	wanted := map[string]struct{}{"repomd.xml": {}, "repomd.xml.asc": {}}
+var retainedMetadataName = regexp.MustCompile(`^([0-9a-f]{64})-(?:primary|filelists|other)\.xml\.(?:gz|zst)$`)
+
+func rejectExtraGenerationFilesRootMode(ctx context.Context, root *os.Root, generation *Generation, signed, allowRetained bool) error {
+	wanted := map[string]struct{}{"repomd.xml": {}}
+	if signed {
+		wanted["repomd.xml.asc"] = struct{}{}
+	}
 	for _, artifact := range generation.Artifacts {
 		wanted[strings.TrimPrefix(artifact.Path, "repodata/")] = struct{}{}
 	}
@@ -894,13 +1001,29 @@ func rejectExtraGenerationFilesRoot(root *os.Root, generation *Generation) error
 	if readErr != nil || closeErr != nil {
 		return errors.Join(readErr, closeErr)
 	}
-	if len(entries) != len(wanted) {
+	if len(entries) < len(wanted) || (!allowRetained && len(entries) != len(wanted)) {
 		return fmt.Errorf("%w: generation contains extra or missing files", ErrInvalidRepodata)
 	}
 	for _, entry := range entries {
 		info, err := root.Lstat(entry.Name())
-		if _, ok := wanted[entry.Name()]; err != nil || !ok || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return fmt.Errorf("%w: unexpected generation entry %q", ErrInvalidRepodata, entry.Name())
+		}
+		if _, ok := wanted[entry.Name()]; ok {
+			continue
+		}
+		match := retainedMetadataName.FindStringSubmatch(entry.Name())
+		if !allowRetained || len(match) != 2 {
+			return fmt.Errorf("%w: unexpected generation entry %q", ErrInvalidRepodata, entry.Name())
+		}
+		file, err := root.Open(entry.Name())
+		if err != nil {
+			return fmt.Errorf("%w: open retained generation entry %q", ErrInvalidRepodata, entry.Name())
+		}
+		digest, hashErr := hashReaderContext(ctx, file)
+		closeErr := file.Close()
+		if hashErr != nil || closeErr != nil || digest != match[1] {
+			return fmt.Errorf("%w: retained generation entry %q checksum mismatch", ErrInvalidRepodata, entry.Name())
 		}
 	}
 	return nil

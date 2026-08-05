@@ -354,7 +354,7 @@ func assertAPTSnapshotRepository(t *testing.T, root, suite, poolPath string, pri
 func writeMaterializeSigningKey(t *testing.T, root string) ([]byte, string) {
 	t.Helper()
 	created := time.Now().UTC().Add(-24 * time.Hour)
-	entity, err := openpgp.NewEntity("SOW materialize", "", "materialize@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW materialize", "", "materialize@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}

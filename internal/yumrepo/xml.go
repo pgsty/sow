@@ -85,6 +85,7 @@ func writePrimaryPackage(w io.Writer, m *packageMetadata) error {
 		deps []dependency
 	}{
 		{"rpm:provides", m.Provides}, {"rpm:requires", m.Requires}, {"rpm:conflicts", m.Conflicts}, {"rpm:obsoletes", m.Obsoletes},
+		{"rpm:suggests", m.Suggests}, {"rpm:enhances", m.Enhances}, {"rpm:recommends", m.Recommends}, {"rpm:supplements", m.Supplements},
 	} {
 		if len(group.deps) == 0 {
 			continue
@@ -115,11 +116,14 @@ func writePrimaryPackage(w io.Writer, m *packageMetadata) error {
 		}
 	}
 	for _, f := range m.Files {
-		if f.Mode&0170000 == 0040000 {
+		if !isPrimaryRPMFile(f.Name) {
 			continue
 		}
 		attrs := [][2]string(nil)
-		if f.Flags&(1<<6) != 0 {
+		switch {
+		case f.Mode&0170000 == 0040000:
+			attrs = [][2]string{{"type", "dir"}}
+		case f.Flags&(1<<6) != 0:
 			attrs = [][2]string{{"type", "ghost"}}
 		}
 		if err := textElementAttrs(w, "    ", "file", f.Name, attrs); err != nil {
@@ -146,10 +150,10 @@ func writeFilelistsPackage(w io.Writer, m *packageMetadata) error {
 	for _, f := range m.Files {
 		attrs := [][2]string(nil)
 		switch {
-		case f.Flags&(1<<6) != 0:
-			attrs = [][2]string{{"type", "ghost"}}
 		case f.Mode&0170000 == 0040000:
 			attrs = [][2]string{{"type", "dir"}}
+		case f.Flags&(1<<6) != 0:
+			attrs = [][2]string{{"type", "ghost"}}
 		}
 		if err := textElementAttrs(w, "  ", "file", f.Name, attrs); err != nil {
 			return err

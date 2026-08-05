@@ -1062,7 +1062,7 @@ func writeExpiredPackageProjectionSigningKey(t *testing.T, root, keyPath string)
 	t.Helper()
 	created := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Second)
 	entity, err := openpgp.NewEntity("Expiring SOW package projection", "", "projection-expiry@example.invalid", &packet.Config{
-		Time: func() time.Time { return created }, RSABits: 2048, KeyLifetimeSecs: 60,
+		Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits, KeyLifetimeSecs: 60,
 	})
 	if err != nil {
 		t.Fatal(err)

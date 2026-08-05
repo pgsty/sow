@@ -90,7 +90,7 @@ func TestRepositoryPublicTrustAnchorRejectsExpiredSigningKey(t *testing.T) {
 	created := time.Unix(1_500_000_000, 0).UTC()
 	entity, err := openpgp.NewEntity("SOW expired", "", "expired@example.invalid", &packet.Config{
 		Time:            func() time.Time { return created },
-		RSABits:         2048,
+		RSABits:         testOpenPGPRSABits,
 		KeyLifetimeSecs: 60,
 	})
 	if err != nil {
@@ -116,11 +116,11 @@ func TestRepositoryPublicTrustAnchorRejectsExpiredSigningKey(t *testing.T) {
 func TestRepositoryPublicTrustAnchorRejectsMultipleSigningFingerprints(t *testing.T) {
 	root := t.TempDir()
 	created := time.Now().UTC().Add(-time.Hour)
-	entity, err := openpgp.NewEntity("SOW multi signer", "", "multi-signer@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW multi signer", "", "multi-signer@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := entity.AddSigningSubkey(&packet.Config{Time: func() time.Time { return created.Add(time.Second) }, RSABits: 2048}); err != nil {
+	if err := entity.AddSigningSubkey(&packet.Config{Time: func() time.Time { return created.Add(time.Second) }, RSABits: testOpenPGPRSABits}); err != nil {
 		t.Fatal(err)
 	}
 	var public bytes.Buffer
@@ -221,7 +221,7 @@ func TestRepositoryTrustAnchorDigestBindsPacketStreamOnlyForPackageRefs(t *testi
 func TestRepositoryTrustAnchorDigestIsStableForMultiUIDKey(t *testing.T) {
 	root := t.TempDir()
 	created := time.Unix(1_700_000_000, 0).UTC()
-	entity, err := openpgp.NewEntity("SOW multi uid", "", "first@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: 2048})
+	entity, err := openpgp.NewEntity("SOW multi uid", "", "first@example.invalid", &packet.Config{Time: func() time.Time { return created }, RSABits: testOpenPGPRSABits})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func generateRepositorySigningKey(t *testing.T, identity string) ([]byte, []byte
 	created := time.Unix(1_700_000_000, 0).UTC()
 	entity, err := openpgp.NewEntity("SOW "+identity, "", identity+"@example.invalid", &packet.Config{
 		Time:    func() time.Time { return created },
-		RSABits: 2048,
+		RSABits: testOpenPGPRSABits,
 	})
 	if err != nil {
 		t.Fatal(err)

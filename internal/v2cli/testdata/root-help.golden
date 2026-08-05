@@ -1,0 +1,38 @@
+SOW local package repository manager
+
+Usage:
+  sow [OPTIONS] COMMAND [ARGS]
+
+Options:
+  -h, --help                         Show help
+      --version                      Show version
+
+Commands:
+  create [DIR]                       Generate a flat RPM/DEB repository
+  init [DIR]                         Initialize a workspace
+  config check                       Validate workspace configuration
+  config show [--all]                Show workspace configuration
+  repo ls                            List repositories
+  repo new NAME                      Create a repository
+  repo show [NAME]                   Show a repository
+  repo rm NAME [-f|--force]          Remove a repository
+  dist ls                            List distributions
+  dist new NAME --format rpm|deb     Create a distribution
+  dist show NAME                     Show a distribution
+  dist rm NAME [-f|--force]          Remove a distribution
+  add PATH...                        Add packages to Desired Membership
+  rm PACKAGE...                      Remove Desired Membership
+  ls                                 List Desired packages
+  show PACKAGE                       Show one package object
+  where PACKAGE                      Locate a package across repositories
+  status                             Show cheap repository state
+  build                              Converge Desired to a Built Generation
+  check                              Verify repository integrity end to end
+  changes [BASE_GENERATION]          Show physical delivery changes
+  log [OPERATION]                    Show operation audit records
+  log export [FILE]                  Export operation audit as JSONL
+  log prune BEFORE                   Prune eligible terminal audit records
+  help [COMMAND [SUBCOMMAND]]        Show help
+  version                            Show version
+
+Use "sow help COMMAND" for command help.

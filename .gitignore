@@ -13,3 +13,7 @@
 coverage.out
 .sow/
 .pool/
+
+docs/
+bin/
+dist/

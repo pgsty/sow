@@ -2,8 +2,13 @@ package aptrepo
 
 import (
 	"archive/tar"
+	"bufio"
+	"bytes"
+	"compress/bzip2"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -12,8 +17,12 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
+	"github.com/kjk/lzma"
+	"github.com/klauspost/compress/zstd"
+	"github.com/xi2/xz"
 	"pault.ag/go/debian/control"
 	"pault.ag/go/debian/deb"
 	"pault.ag/go/debian/version"
@@ -23,7 +32,15 @@ var (
 	debianNamePattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
 	componentPattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
 	architecturePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
-	filenamePattern     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9+._:~-]*\.deb$`)
+)
+
+const (
+	maxDebArMembers         = 128
+	maxDebControlCompressed = int64(32 << 20)
+	maxDebControlExpanded   = int64(128 << 20)
+	maxDebControlFile       = int64(16 << 20)
+	maxDebControlMembers    = 4096
+	maxDebDecoderMemory     = uint64(64 << 20)
 )
 
 // Package is the metadata SOW needs from an existing Debian binary package.
@@ -75,6 +92,13 @@ func InspectPackageAs(ctx context.Context, filePath, component, originalBasename
 	if err := validateComponent(component); err != nil {
 		return Package{}, err
 	}
+	pathInfo, err := os.Lstat(filePath)
+	if err != nil {
+		return Package{}, fmt.Errorf("aptrepo: lstat deb: %w", err)
+	}
+	if !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 {
+		return Package{}, errors.New("aptrepo: deb input is not a regular file")
+	}
 
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -90,8 +114,8 @@ func InspectPackageAs(ctx context.Context, filePath, component, originalBasename
 	if err != nil {
 		return Package{}, fmt.Errorf("aptrepo: stat deb: %w", err)
 	}
-	if !info.Mode().IsRegular() {
-		return Package{}, errors.New("aptrepo: deb input is not a regular file")
+	if !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
+		return Package{}, errors.New("aptrepo: deb changed while opening")
 	}
 	pkg, err := InspectPackageReaderAs(ctx, f, component, originalBasename)
 	if err != nil {
@@ -101,7 +125,9 @@ func InspectPackageAs(ctx context.Context, filePath, component, originalBasename
 	if err != nil {
 		return Package{}, fmt.Errorf("aptrepo: stat deb after inspection: %w", err)
 	}
-	if pkg.Size != info.Size() || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
+	pathAfter, pathErr := os.Lstat(filePath)
+	if pkg.Size != info.Size() || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) ||
+		pathErr != nil || !pathAfter.Mode().IsRegular() || pathAfter.Mode()&os.ModeSymlink != 0 || !os.SameFile(pathInfo, pathAfter) {
 		return Package{}, errors.New("aptrepo: deb changed while being inspected")
 	}
 	if err := f.Close(); err != nil {
@@ -140,7 +166,7 @@ func InspectPackageReaderAs(ctx context.Context, reader PackageReader, component
 	}
 
 	base := originalBasename
-	if filepath.Base(base) != base || !filenamePattern.MatchString(base) {
+	if filepath.Base(base) != base || !safeDebBasename(base) {
 		return Package{}, fmt.Errorf("aptrepo: unsafe deb filename %q", base)
 	}
 	if _, err := reader.Seek(0, io.SeekStart); err != nil {
@@ -154,7 +180,7 @@ func InspectPackageReaderAs(ctx context.Context, reader PackageReader, component
 		return Package{}, fmt.Errorf("aptrepo: rewind deb for parsing: %w", err)
 	}
 
-	debianControl, err := loadDebControl(reader)
+	debianControl, err := loadDebControl(ctx, reader, initialSize)
 	if err != nil {
 		return Package{}, fmt.Errorf("aptrepo: parse deb control: %w", err)
 	}
@@ -202,7 +228,10 @@ func InspectPackageReaderAs(ctx context.Context, reader PackageReader, component
 	}, nil
 }
 
-func loadDebControl(reader io.ReaderAt) (deb.Control, error) {
+func loadDebControl(ctx context.Context, reader io.ReaderAt, size int64) (deb.Control, error) {
+	if err := validateDebArLayout(ctx, reader, size); err != nil {
+		return deb.Control{}, err
+	}
 	archive, err := deb.LoadAr(reader)
 	if err != nil {
 		return deb.Control{}, err
@@ -211,6 +240,9 @@ func loadDebControl(reader io.ReaderAt) (deb.Control, error) {
 	var dataSeen bool
 	var controlMember *deb.ArEntry
 	for {
+		if err := ctx.Err(); err != nil {
+			return deb.Control{}, err
+		}
 		member, err := archive.Next()
 		if errors.Is(err, io.EOF) {
 			break
@@ -238,6 +270,9 @@ func loadDebControl(reader io.ReaderAt) (deb.Control, error) {
 			if controlMember != nil {
 				return deb.Control{}, errors.New("duplicate control archive member")
 			}
+			if member.Size <= 0 || member.Size > maxDebControlCompressed {
+				return deb.Control{}, fmt.Errorf("control archive compressed size %d exceeds limit", member.Size)
+			}
 			controlMember = member
 		case member.Name == "data.tar" || strings.HasPrefix(member.Name, "data.tar."):
 			if dataSeen {
@@ -258,19 +293,75 @@ func loadDebControl(reader io.ReaderAt) (deb.Control, error) {
 	if !dataSeen {
 		return deb.Control{}, errors.New("missing data archive member")
 	}
-	return loadDebControlArchive(controlMember)
+	return loadDebControlArchive(ctx, controlMember)
 }
 
-func loadDebControlArchive(member *deb.ArEntry) (parsed deb.Control, resultErr error) {
-	archive, closer, err := member.Tarfile()
+func validateDebArLayout(ctx context.Context, reader io.ReaderAt, size int64) error {
+	if size < 8 {
+		return errors.New("truncated ar archive")
+	}
+	magic := make([]byte, 8)
+	if _, err := reader.ReadAt(magic, 0); err != nil || string(magic) != "!<arch>\n" {
+		return errors.Join(err, errors.New("invalid ar archive header"))
+	}
+	offset := int64(8)
+	for count := 0; offset < size; count++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if count >= maxDebArMembers {
+			return fmt.Errorf("ar archive exceeds %d members", maxDebArMembers)
+		}
+		if size-offset < 60 {
+			return errors.New("truncated ar member header")
+		}
+		header := make([]byte, 60)
+		if _, err := reader.ReadAt(header, offset); err != nil {
+			return err
+		}
+		if header[58] != '`' || header[59] != '\n' {
+			return errors.New("malformed ar member header terminator")
+		}
+		memberSize, err := strconv.ParseInt(strings.TrimSpace(string(header[48:58])), 10, 64)
+		if err != nil || memberSize < 0 {
+			return fmt.Errorf("invalid ar member size %q", strings.TrimSpace(string(header[48:58])))
+		}
+		dataOffset := offset + 60
+		if memberSize > size-dataOffset {
+			return errors.New("ar member extends beyond package")
+		}
+		offset = dataOffset + memberSize
+		if memberSize&1 != 0 {
+			if offset >= size {
+				return errors.New("ar member is missing alignment padding")
+			}
+			offset++
+		}
+	}
+	if offset != size {
+		return errors.New("ar archive length is inconsistent")
+	}
+	return nil
+}
+
+func loadDebControlArchive(ctx context.Context, member *deb.ArEntry) (parsed deb.Control, resultErr error) {
+	stream, err := openDebControlStream(ctx, member)
 	if err != nil {
 		return deb.Control{}, err
 	}
 	defer func() {
-		resultErr = errors.Join(resultErr, closer.Close())
+		resultErr = errors.Join(resultErr, stream.Close())
 	}()
+	archive := tar.NewReader(stream)
 	found := false
-	for {
+	expanded := int64(0)
+	for members := 0; ; members++ {
+		if err := ctx.Err(); err != nil {
+			return deb.Control{}, err
+		}
+		if members >= maxDebControlMembers {
+			return deb.Control{}, fmt.Errorf("control archive exceeds %d members", maxDebControlMembers)
+		}
 		header, err := archive.Next()
 		if errors.Is(err, io.EOF) {
 			break
@@ -278,6 +369,10 @@ func loadDebControlArchive(member *deb.ArEntry) (parsed deb.Control, resultErr e
 		if err != nil {
 			return deb.Control{}, err
 		}
+		if header.Size < 0 || header.Size > maxDebControlExpanded-expanded {
+			return deb.Control{}, fmt.Errorf("control archive expands beyond %d bytes", maxDebControlExpanded)
+		}
+		expanded += header.Size
 		if path.Clean(header.Name) != "control" {
 			continue
 		}
@@ -290,7 +385,21 @@ func loadDebControlArchive(member *deb.ArEntry) (parsed deb.Control, resultErr e
 		if header.Typeflag != tar.TypeReg && header.Typeflag != byte(0) {
 			return deb.Control{}, errors.New("control file in control archive is not regular")
 		}
-		if err := control.Unmarshal(&parsed, archive); err != nil {
+		if header.Size > maxDebControlFile {
+			return deb.Control{}, fmt.Errorf("control file exceeds %d bytes", maxDebControlFile)
+		}
+		limited := &io.LimitedReader{R: archive, N: maxDebControlFile + 1}
+		body, err := io.ReadAll(limited)
+		if err != nil {
+			return deb.Control{}, err
+		}
+		if int64(len(body)) != header.Size || limited.N == 0 {
+			return deb.Control{}, fmt.Errorf("control file exceeds %d bytes or is truncated", maxDebControlFile)
+		}
+		if err := validateBinaryControlDocument(body); err != nil {
+			return deb.Control{}, err
+		}
+		if err := control.Unmarshal(&parsed, bytes.NewReader(body)); err != nil {
 			return deb.Control{}, err
 		}
 		found = true
@@ -299,6 +408,111 @@ func loadDebControlArchive(member *deb.ArEntry) (parsed deb.Control, resultErr e
 		return deb.Control{}, errors.New("missing control file in control archive")
 	}
 	return parsed, nil
+}
+
+func validateBinaryControlDocument(body []byte) error {
+	if len(body) == 0 {
+		return errors.New("empty binary control paragraph")
+	}
+	seen := make(map[string]struct{})
+	haveField, haveCurrentField, paragraphEnded := false, false, false
+	for index, raw := range bytes.Split(body, []byte{'\n'}) {
+		line := raw
+		if len(line) != 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		for _, value := range line {
+			if value == '\r' || value == 0 || value == 0x7f || (value < 0x20 && value != '\t') {
+				return fmt.Errorf("binary control line %d contains a forbidden control byte", index+1)
+			}
+		}
+		if len(line) == 0 {
+			if !haveField {
+				return fmt.Errorf("binary control line %d starts an empty paragraph", index+1)
+			}
+			paragraphEnded = true
+			haveCurrentField = false
+			continue
+		}
+		if paragraphEnded {
+			return fmt.Errorf("binary control contains more than one paragraph at line %d", index+1)
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			if !haveCurrentField {
+				return fmt.Errorf("binary control line %d has an orphan continuation", index+1)
+			}
+			continue
+		}
+		colon := bytes.IndexByte(line, ':')
+		if colon <= 0 || !validBinaryControlFieldName(line[:colon]) {
+			return fmt.Errorf("binary control line %d has an invalid field name", index+1)
+		}
+		name := strings.ToLower(string(line[:colon]))
+		if _, duplicate := seen[name]; duplicate {
+			return fmt.Errorf("binary control line %d repeats field %q", index+1, line[:colon])
+		}
+		seen[name] = struct{}{}
+		haveField, haveCurrentField = true, true
+	}
+	if !haveField {
+		return errors.New("empty binary control paragraph")
+	}
+	return nil
+}
+
+func validBinaryControlFieldName(name []byte) bool {
+	if len(name) == 0 || name[0] == '#' {
+		return false
+	}
+	for _, value := range name {
+		// deb822 field names are printable US-ASCII other than colon and may
+		// not contain whitespace or controls.
+		if value < 0x21 || value > 0x7e || value == ':' {
+			return false
+		}
+	}
+	return true
+}
+
+func openDebControlStream(ctx context.Context, member *deb.ArEntry) (io.ReadCloser, error) {
+	input := io.Reader(&contextReader{ctx: ctx, r: member.Data})
+	switch filepath.Ext(member.Name) {
+	case ".tar":
+		return io.NopCloser(input), nil
+	case ".gz":
+		return gzip.NewReader(input)
+	case ".bz2":
+		return io.NopCloser(bzip2.NewReader(input)), nil
+	case ".xz":
+		reader, err := xz.NewReader(input, uint32(maxDebDecoderMemory))
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(reader), nil
+	case ".lzma":
+		buffered := bufio.NewReader(input)
+		header, err := buffered.Peek(5)
+		if err != nil {
+			return nil, err
+		}
+		if dictionary := uint64(binary.LittleEndian.Uint32(header[1:5])); dictionary > maxDebDecoderMemory {
+			return nil, fmt.Errorf("lzma dictionary %d exceeds limit", dictionary)
+		}
+		return lzma.NewReader(buffered), nil
+	case ".zst":
+		reader, err := zstd.NewReader(input,
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderLowmem(true),
+			zstd.WithDecoderMaxMemory(maxDebDecoderMemory),
+			zstd.WithDecoderMaxWindow(maxDebDecoderMemory),
+		)
+		if err != nil {
+			return nil, err
+		}
+		return reader.IOReadCloser(), nil
+	default:
+		return nil, fmt.Errorf("unsupported control archive compression %q", member.Name)
+	}
 }
 
 // PoolPath returns the human-readable, archive-root-relative pool location
@@ -310,7 +524,7 @@ func PoolPath(component, source, filename string) (string, error) {
 	if !debianNamePattern.MatchString(source) {
 		return "", fmt.Errorf("aptrepo: unsafe source package name %q", source)
 	}
-	if path.Base(filename) != filename || !filenamePattern.MatchString(filename) {
+	if path.Base(filename) != filename || !safeDebBasename(filename) {
 		return "", fmt.Errorf("aptrepo: unsafe deb filename %q", filename)
 	}
 	prefix := source[:1]
@@ -324,6 +538,33 @@ func PoolPath(component, source, filename string) (string, error) {
 	return path.Join("pool", component, prefix, source, filename), nil
 }
 
+// safeDebBasename accepts Debian's common epoch filename spelling while
+// keeping URL and filesystem path interpretation unambiguous. APT archives in
+// the wild encode the version's ':' as %3a (or %3A); no other percent escape
+// is needed for a Debian package basename, so encoded separators, dots,
+// percent signs, NULs, and double-encoding remain rejected.
+func safeDebBasename(value string) bool {
+	if len(value) <= len(".deb") || !strings.HasSuffix(value, ".deb") || !asciiAlphaNumeric(value[0]) {
+		return false
+	}
+	for i := 1; i < len(value); i++ {
+		c := value[i]
+		if asciiAlphaNumeric(c) || strings.ContainsRune("+._:~-", rune(c)) {
+			continue
+		}
+		if c == '%' && i+2 < len(value) && value[i+1] == '3' && (value[i+2] == 'a' || value[i+2] == 'A') {
+			i += 2
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func asciiAlphaNumeric(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
 func sourcePackageName(source, fallback string) string {
 	source = strings.TrimSpace(source)
 	if source == "" {
@@ -333,6 +574,21 @@ func sourcePackageName(source, fallback string) string {
 		source = source[:i]
 	}
 	return source
+}
+
+// CompareVersions applies Debian's native epoch/upstream/revision ordering.
+// It returns a negative value when left is older, zero when equal, and a
+// positive value when newer.
+func CompareVersions(left, right string) (int, error) {
+	leftVersion, err := version.Parse(left)
+	if err != nil {
+		return 0, fmt.Errorf("aptrepo: parse Debian version %q: %w", left, err)
+	}
+	rightVersion, err := version.Parse(right)
+	if err != nil {
+		return 0, fmt.Errorf("aptrepo: parse Debian version %q: %w", right, err)
+	}
+	return version.Compare(leftVersion, rightVersion), nil
 }
 
 func validateComponent(component string) error {

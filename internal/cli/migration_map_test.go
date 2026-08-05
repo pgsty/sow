@@ -120,18 +120,17 @@ func TestOperatorExamplesBindYUMExportsAndConfiguredUpstreams(t *testing.T) {
 		}
 		return string(body)
 	}
-	readme := read("..", "..", "README.md")
-	if !strings.Contains(readme, "materialize stable --config sow.yaml --target export/stable") ||
-		!strings.Contains(readme, "--serving-base-url https://repo.example/pro/v1/basic") {
-		t.Fatal("README explicit stable YUM export does not bind its Basic serving base URL")
-	}
-	if !strings.Contains(readme, "--upstream pgdg-apt,pgdg-yum") ||
-		!strings.Contains(readme, "docs/examples/sow-pgdg.yaml") {
-		t.Fatal("README sync example is not bound to the shipped PGDG upstream configuration")
+	historical := read("..", "..", "design", "v0.2", "product-capabilities-v1.md")
+	if !strings.Contains(historical, "sow sync --upstream pgdg-apt,pgdg-yum") ||
+		!strings.Contains(historical, "docs/examples/sow-pgdg.yaml") {
+		t.Fatal("retained V1 sync example is not bound to the shipped PGDG upstream configuration")
 	}
 	runbook := read("..", "..", "docs", "migration", "runbook.md")
 	if !strings.Contains(runbook, "--target \"$STAGING_ROOT\" \\\n  --serving-base-url \"$STAGING_SERVING_BASE_URL\"") {
 		t.Fatal("migration candidate materialize omits its explicit YUM serving base URL")
+	}
+	if !strings.Contains(runbook, "stable would end in /pro/v1/basic") {
+		t.Fatal("migration candidate guidance does not bind stable YUM to its Basic serving base URL")
 	}
 }
 

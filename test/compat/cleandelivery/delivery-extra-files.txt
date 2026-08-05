@@ -9,6 +9,7 @@ _bmad-output/implementation-artifacts/spec-config-input-and-rpm-provenance-harde
 _bmad-output/implementation-artifacts/spec-current-source-real-r2-revalidation.md
 _bmad-output/implementation-artifacts/spec-dead-code-static-analysis-closure.md
 _bmad-output/implementation-artifacts/spec-derived-state-residue-removal-identity.md
+_bmad-output/implementation-artifacts/spec-edge-fallback-contract-parity.md
 _bmad-output/implementation-artifacts/spec-full-provider-checkpoint-fenced-delete.md
 _bmad-output/implementation-artifacts/spec-gc-provenance-canonical-identity.md
 _bmad-output/implementation-artifacts/spec-local-serving-atomic-parent-rollback.md
@@ -26,6 +27,20 @@ _bmad-output/implementation-artifacts/spec-yum-consumer-preflight-lock-release.m
 _bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/addendum.md
 _bmad-output/planning-artifacts/prds/prd-sow-2026-07-11/prd.md
 _bmad-output/planning-artifacts/research/technical-sow-repo-cli-tech-validation-research-2026-07-11.md
+design/README.md
+design/v0.2/architecture/architecture-spine.md
+design/v0.2/architecture/reviews/review-adversarial.md
+design/v0.2/architecture/reviews/review-rubric.md
+design/v0.2/prd/addendum.md
+design/v0.2/prd/api-contract.md
+design/v0.2/prd/cli-design.md
+design/v0.2/prd/prd.md
+design/v0.2/prd/reviews/review-api-contract.md
+design/v0.2/prd/reviews/review-prd-rubric.md
+design/v0.2/prd/reviews/review-resolution.md
+design/v0.2/product-capabilities-v1.md
+design/v0.2/release-spec.md
+design/v0.2/research/rpm-shared-pool-reposync-compatibility.md
 docs/adr/0001-core-contracts.md
 docs/adr/0002-publication-routes-and-compatibility-gates.md
 docs/adr/0003-snapshot-generation-copy-and-retention.md
@@ -173,6 +188,7 @@ docs/evidence/2026-07-22-upstream-proof-order-determinism.md
 docs/evidence/2026-07-29-cloudflare-workers-paid-provider-attestation.md
 docs/evidence/2026-07-29-mvp-and-cloudflare-bootstrap-readiness.md
 docs/evidence/2026-07-30-clean-room-all-repository-types-mvp.md
+docs/evidence/2026-07-31-legacy-source-resolute-baseline.md
 docs/evidence/README.md
 docs/examples/sow-pgdg.yaml
 docs/migration/audit-legacy-targets.sh

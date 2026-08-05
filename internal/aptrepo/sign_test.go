@@ -46,6 +46,16 @@ func TestSignerProducesVerifiableInReleaseAndDetachedSignature(t *testing.T) {
 	if err := signer.Verify(message, inRelease.Bytes(), detached.Bytes(), signedAt); err != nil {
 		t.Fatalf("Signer.Verify: %v", err)
 	}
+	var replayInRelease, replayDetached bytes.Buffer
+	if err := signer.ClearSign(&replayInRelease, bytes.NewReader(message), signedAt); err != nil {
+		t.Fatalf("replay ClearSign: %v", err)
+	}
+	if err := signer.DetachedSign(&replayDetached, bytes.NewReader(message), signedAt); err != nil {
+		t.Fatalf("replay DetachedSign: %v", err)
+	}
+	if !bytes.Equal(inRelease.Bytes(), replayInRelease.Bytes()) || !bytes.Equal(detached.Bytes(), replayDetached.Bytes()) {
+		t.Fatal("fixed-time APT metadata signatures are not retry-deterministic")
+	}
 	tampered := append([]byte(nil), message...)
 	tampered[0] ^= 1
 	if err := signer.Verify(tampered, inRelease.Bytes(), detached.Bytes(), signedAt); !errors.Is(err, ErrSigningFailed) {

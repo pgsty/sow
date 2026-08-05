@@ -131,9 +131,44 @@ func inspectEmbeddedRPMSignaturePackets(ctx context.Context, r io.Reader) ([]emb
 		})
 	}
 	if len(signatures) == 0 {
-		return nil, fmt.Errorf("%w: RPM signature header contains no PGP, GPG, RSA, or DSA signature tag", ErrEmbeddedSignature)
+		return nil, fmt.Errorf("%w: %w: RPM signature header contains no PGP, GPG, RSA, or DSA signature tag", ErrEmbeddedSignature, ErrUnsignedRPMPackage)
 	}
 	return signatures, nil
+}
+
+// RPMSignatureNeutralDigest hashes the immutable main header and payload while
+// excluding the mutable RPM signature header. It lets callers prove that an
+// external signing helper changed only signature material.
+func RPMSignatureNeutralDigest(ctx context.Context, r io.ReadSeeker) (_ string, resultErr error) {
+	if ctx == nil {
+		return "", errors.New("yumrepo: nil context")
+	}
+	if r == nil {
+		return "", fmt.Errorf("%w: nil RPM reader", ErrInvalidPackage)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	original, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return "", fmt.Errorf("%w: read RPM offset: %v", ErrInvalidPackage, err)
+	}
+	defer func() {
+		if _, err := r.Seek(original, io.SeekStart); err != nil && resultErr == nil {
+			resultErr = fmt.Errorf("%w: restore RPM offset: %v", ErrInvalidPackage, err)
+		}
+	}()
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf("%w: seek RPM start: %v", ErrInvalidPackage, err)
+	}
+	if _, err := crpm.ReadSignatureHeader(&contextReader{ctx: ctx, r: r}); err != nil {
+		return "", fmt.Errorf("%w: parse RPM signature header: %v", ErrInvalidPackage, err)
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, &contextReader{ctx: ctx, r: r}); err != nil {
+		return "", fmt.Errorf("%w: hash RPM signature-neutral bytes: %v", ErrInvalidPackage, err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // VerifyEmbeddedRPMSignatures verifies every recognized signature packet in a
