@@ -217,8 +217,9 @@ func TestR2PublishAndTargetGCRemainReportOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	future := func() time.Time { return time.Now().UTC().Add(31 * 24 * time.Hour) }
-	firstMaintenance, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: future})
+	firstMaintenanceAt := time.Now().UTC().Add(31 * 24 * time.Hour)
+	firstMaintenanceClock := func() time.Time { return firstMaintenanceAt }
+	firstMaintenance, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: firstMaintenanceClock})
 	if err != nil || firstMaintenance.CompletedAttempts != 1 || firstMaintenance.DeletedObjects != 0 {
 		t.Fatalf("first R2 maintenance=%#v err=%v", firstMaintenance, err)
 	}
@@ -226,7 +227,9 @@ func TestR2PublishAndTargetGCRemainReportOnly(t *testing.T) {
 	if err != nil || collected.Noop || collected.Objects != 1 {
 		t.Fatalf("local gc=%#v err=%v", collected, err)
 	}
-	second, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend})
+	secondPublishAt := firstMaintenanceAt.Add(time.Second)
+	secondPublishClock := func() time.Time { return secondPublishAt }
+	second, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: secondPublishClock})
 	if err != nil || second.Generation == first.Generation {
 		t.Fatalf("second R2 publish=%#v err=%v", second, err)
 	}
@@ -235,7 +238,9 @@ func TestR2PublishAndTargetGCRemainReportOnly(t *testing.T) {
 	if !existedBefore {
 		t.Fatalf("old R2 payload missing before report-only maintenance: %s", oldKey)
 	}
-	maintenance, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: future})
+	secondMaintenanceAt := secondPublishAt.Add(31 * 24 * time.Hour)
+	secondMaintenanceClock := func() time.Time { return secondMaintenanceAt }
+	maintenance, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: secondMaintenanceClock})
 	if err != nil || maintenance.RetainedObjects != 1 || maintenance.DeletedObjects != 0 || maintenance.DeletedBytes != 0 {
 		t.Fatalf("R2 report-only maintenance=%#v err=%v", maintenance, err)
 	}
@@ -254,7 +259,7 @@ func TestR2PublishAndTargetGCRemainReportOnly(t *testing.T) {
 	if report.Mode != "report_only" || len(report.Candidates) != 1 || report.Candidates[0].Path != fixture.object.PoolPath {
 		t.Fatalf("unexpected R2 retained report: %#v", report)
 	}
-	noop, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend})
+	noop, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: secondMaintenanceClock})
 	if err != nil || !noop.Noop {
 		t.Fatalf("R2 noop after retained report=%#v err=%v", noop, err)
 	}

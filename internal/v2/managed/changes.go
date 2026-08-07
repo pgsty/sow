@@ -38,8 +38,8 @@ func Changes(ctx context.Context, opts ChangesOptions) (result ChangesResult, re
 		if err := store.RequireTerminalLayout(ctx); err != nil {
 			return result, fmt.Errorf("%w: changes are unavailable during repository layout transition: %v", ErrNotReady, err)
 		}
-		if layout.Transition != nil || layout.Control != nil {
-			return result, fmt.Errorf("%w: changes are unavailable while stale transition evidence exists", ErrIntegrity)
+		if layout.transitionActive() {
+			return result, fmt.Errorf("%w: changes are unavailable while transition evidence is incomplete", ErrIntegrity)
 		}
 	}
 	workspaceOperation, err := inspectWorkspaceJournal(ws.Root)

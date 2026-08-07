@@ -205,8 +205,9 @@ func TestFilesystemTargetGCEvidenceDeletionCrashReplayAndLiveInventory(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	future := func() time.Time { return time.Now().UTC().Add(31 * 24 * time.Hour) }
-	settled, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "local", now: future})
+	firstMaintenanceAt := time.Now().UTC().Add(31 * 24 * time.Hour)
+	firstMaintenanceClock := func() time.Time { return firstMaintenanceAt }
+	settled, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "local", now: firstMaintenanceClock})
 	if err != nil || settled.CompletedAttempts != 1 || settled.Candidates != 0 {
 		t.Fatalf("settle first target grace=%#v err=%v", settled, err)
 	}
@@ -214,7 +215,9 @@ func TestFilesystemTargetGCEvidenceDeletionCrashReplayAndLiveInventory(t *testin
 	if err != nil || collected.Noop || collected.Objects != 1 {
 		t.Fatalf("local gc after remote checkpoint=%#v err=%v", collected, err)
 	}
-	second, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local"})
+	secondPublishAt := firstMaintenanceAt.Add(time.Second)
+	secondPublishClock := func() time.Time { return secondPublishAt }
+	second, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", now: secondPublishClock})
 	if err != nil || second.Generation == first.Generation || second.Checkpoint == first.Checkpoint {
 		t.Fatalf("second publish=%#v first=%#v err=%v", second, first, err)
 	}
@@ -222,13 +225,15 @@ func TestFilesystemTargetGCEvidenceDeletionCrashReplayAndLiveInventory(t *testin
 	if _, err := os.Stat(stalePayload); err != nil {
 		t.Fatalf("old payload disappeared before target grace: %v", err)
 	}
-	pending, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "local"})
+	pending, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "local", now: secondPublishClock})
 	if err != nil || !pending.Noop || pending.PendingGrace == 0 {
 		t.Fatalf("premature target gc=%#v err=%v", pending, err)
 	}
 	faulted := false
+	secondMaintenanceAt := secondPublishAt.Add(31 * 24 * time.Hour)
+	secondMaintenanceClock := func() time.Time { return secondMaintenanceAt }
 	_, err = TargetGC(ctx, TargetGCOptions{
-		WorkspaceOptions: fixture.options, Target: "local", now: future,
+		WorkspaceOptions: fixture.options, Target: "local", now: secondMaintenanceClock,
 		Fault: func(point string) error {
 			if !faulted && strings.HasPrefix(point, "target_gc.deleted.") {
 				faulted = true
@@ -243,10 +248,10 @@ func TestFilesystemTargetGCEvidenceDeletionCrashReplayAndLiveInventory(t *testin
 	if _, err := os.Lstat(stalePayload); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("conditionally deleted payload remains: %v", err)
 	}
-	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local"}); !errors.Is(err, ErrNotReady) {
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", now: secondMaintenanceClock}); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("publish crossed an unfinished deletion report: %v", err)
 	}
-	resumed, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "local", now: future})
+	resumed, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "local", now: secondMaintenanceClock})
 	if err != nil || resumed.DeletedObjects != 1 || resumed.CompletedAttempts != 1 {
 		t.Fatalf("resumed target gc=%#v err=%v", resumed, err)
 	}
@@ -265,7 +270,7 @@ func TestFilesystemTargetGCEvidenceDeletionCrashReplayAndLiveInventory(t *testin
 			t.Fatalf("terminal deletion receipt did not project out %q", object.Path)
 		}
 	}
-	noop, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local"})
+	noop, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", now: secondMaintenanceClock})
 	if err != nil || !noop.Noop || noop.Checkpoint != second.Checkpoint {
 		t.Fatalf("post-deletion noop publish=%#v err=%v", noop, err)
 	}

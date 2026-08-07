@@ -40,6 +40,17 @@ func (layout repositoryReadLayout) transitionActive() bool {
 	if layout.FrozenC2 {
 		return false
 	}
-	return layout.IdentityErr == nil && layout.Identity.LayoutVersion != state.LayoutSinglePayloadV1 ||
-		layout.Transition != nil || layout.TransitionErr != nil || layout.Control != nil || layout.ControlErr != nil
+	if layout.IdentityErr != nil {
+		return false
+	}
+	if layout.Identity.LayoutVersion != state.LayoutSinglePayloadV1 || layout.Transition != nil || layout.TransitionErr != nil || layout.ControlErr != nil {
+		return true
+	}
+	// A completed migration intentionally retains its SQLite control row as the
+	// durable plan/commit anchor after the filesystem journal is removed. Fresh
+	// single-payload repositories have neither a receipt nor that anchor.
+	if layout.Identity.TransitionReceiptSHA256 == "" {
+		return layout.Control != nil
+	}
+	return layout.Control == nil
 }
