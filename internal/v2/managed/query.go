@@ -176,7 +176,12 @@ func WherePackage(ctx context.Context, opts PackageWhereOptions) (result Package
 }
 
 func openReadRepository(ctx context.Context, root, repoName string) (*state.Store, *fileLock, error) {
-	if err := validateRepositoryLayout(root, repoName); err != nil {
+	// Validate only the frozen private/public shell before opening SQLite.  The
+	// schema-aware v0.3 additions are checked after the immutable database probe.
+	if err := validateLegacyRepositoryPrivateLayout(root, repoName); err != nil {
+		return nil, nil, err
+	}
+	if err := validateRepositoryPublicLayout(root, repoName); err != nil {
 		return nil, nil, err
 	}
 	lock, err := acquireSharedFileLock(ctx, filepath.Join(root, ".sow", "repo-locks", repoName+".lock"))
@@ -187,6 +192,11 @@ func openReadRepository(ctx context.Context, root, repoName string) (*state.Stor
 	if err != nil {
 		lock.Close()
 		return nil, nil, fmt.Errorf("%w: %v", ErrIntegrity, err)
+	}
+	if err := validateRepositoryLayoutForRead(root, repoName, store.SchemaVersion()); err != nil {
+		store.Close()
+		lock.Close()
+		return nil, nil, err
 	}
 	return store, lock, nil
 }

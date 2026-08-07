@@ -11,10 +11,38 @@ import (
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
 
 const maxOpenPGPKeyBytes = 16 << 20
+
+// DetachedSignatureCreationTime returns the exact whole-second creation time
+// carried by one armored OpenPGP detached signature.  Recovery validators use
+// this persisted signed fact as the verification clock for frozen metadata,
+// rather than requiring the original private signing capability or wall clock.
+func DetachedSignatureCreationTime(signature io.Reader) (time.Time, error) {
+	if signature == nil {
+		return time.Time{}, fmt.Errorf("yumrepo: nil detached signature")
+	}
+	block, err := armor.Decode(io.LimitReader(signature, maxOpenPGPKeyBytes+1))
+	if err != nil || block.Type != openpgp.SignatureType {
+		return time.Time{}, fmt.Errorf("yumrepo: decode detached signature armor: %w", err)
+	}
+	reader := packet.NewReader(block.Body)
+	next, err := reader.Next()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("yumrepo: read detached signature packet: %w", err)
+	}
+	signed, ok := next.(*packet.Signature)
+	if !ok || signed.CreationTime.IsZero() {
+		return time.Time{}, fmt.Errorf("yumrepo: detached signature lacks a creation time")
+	}
+	if _, err := reader.Next(); err != io.EOF {
+		return time.Time{}, fmt.Errorf("yumrepo: detached signature has trailing packets")
+	}
+	return signed.CreationTime.UTC().Truncate(time.Second), nil
+}
 
 // OpenPGPKey is an io-injected, single-key detached signer/verifier backed by
 // ProtonMail/go-crypto. It never shells out to gpg and never writes key bytes.

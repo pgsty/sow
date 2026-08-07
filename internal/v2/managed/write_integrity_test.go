@@ -33,7 +33,7 @@ func TestOrdinaryWritersRejectSemanticStateCorruptionBeforeOperation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DB().ExecContext(ctx, `UPDATE built_memberships SET generation = generation + 99`); err != nil {
+	if _, err := store.DB().ExecContext(ctx, `UPDATE built_memberships SET generation = '00000000000000000999'`); err != nil {
 		store.Close()
 		t.Fatal(err)
 	}

@@ -47,7 +47,7 @@ func readWorkspace(ctx context.Context, opts WorkspaceOptions, requireState bool
 	fail := func(result error) (config.Workspace, config.Config, *fileLock, error) {
 		return config.Workspace{}, config.Config{}, nil, errors.Join(result, rootGuard.Close())
 	}
-	preflightConfig, loadErr := config.LoadWorkspace(ws)
+	preflightConfig, _, _, _, loadErr := config.LoadWorkspaceDocumentForMigration(ws)
 	if loadErr != nil {
 		return fail(fmt.Errorf("%w: %v", ErrWorkspaceInput, loadErr))
 	}
@@ -71,7 +71,7 @@ func readWorkspace(ctx context.Context, opts WorkspaceOptions, requireState bool
 		return fail(classifyReadLockError("acquire workspace read lock", err))
 	}
 	lock.rootGuard = rootGuard
-	cfg, err := config.LoadWorkspace(ws)
+	cfg, _, _, _, err := config.LoadWorkspaceDocumentForMigration(ws)
 	if err != nil {
 		lock.Close()
 		return config.Workspace{}, config.Config{}, nil, fmt.Errorf("%w: %v", ErrWorkspaceInput, err)
@@ -516,12 +516,19 @@ func checkConfigAtRootMode(ctx context.Context, root string, cfg config.Config, 
 				}
 				readLocks = append(readLocks, repoLock)
 			}
-			if err := validateRepositoryLayout(root, repoName); err != nil {
+			if err := validateLegacyRepositoryPrivateLayout(root, repoName); err != nil {
+				return ConfigCheckResult{}, err
+			}
+			if err := validateRepositoryPublicLayout(root, repoName); err != nil {
 				return ConfigCheckResult{}, err
 			}
 			store, openErr := openReadOnlyState(dbPath)
 			if openErr != nil {
 				return ConfigCheckResult{}, fmt.Errorf("%w: repository %q state: %v", ErrIntegrity, repoName, openErr)
+			}
+			if layoutErr := validateRepositoryLayoutForRead(root, repoName, store.SchemaVersion()); layoutErr != nil {
+				store.Close()
+				return ConfigCheckResult{}, layoutErr
 			}
 			dists, listErr := store.ListDists(ctx)
 			architectureRefs, refsErr := store.ArchitectureReferences(ctx)
@@ -876,7 +883,7 @@ func ensureRepositoryShell(root, name string) (bool, error) {
 	} else {
 		return false, statErr
 	}
-	for _, child := range []string{"stage", "pending", "recovery"} {
+	for _, child := range []string{"stage", "pending", "recovery", "retained", "transitions"} {
 		path := filepath.Join(private, child)
 		if info, err := os.Lstat(path); err == nil {
 			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {

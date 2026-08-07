@@ -119,7 +119,7 @@ func Generate(ctx context.Context, dest string, opts Options, packages PackageIt
 		{"filelists", bodies.filelistsFile.Name()},
 		{"other", bodies.otherFile.Name()},
 	}
-	generation := &Generation{Dir: dest, Packages: count, Revision: opts.Revision}
+	generation := &Generation{Dir: dest, Packages: count, Revision: uint64(opts.Revision)}
 	for i, item := range types {
 		rawPath := filepath.Join(tmp, item.name+".xml")
 		if err := assembleXML(rawPath, item.name, item.body, count); err != nil {

@@ -127,12 +127,20 @@ type packageMetadata struct {
 // contract. Bucket is the lowercase first ASCII alphanumeric of RPM Name, or
 // underscore when the name has no ASCII alphanumeric character.
 func PackageLocation(name, basename string) (string, error) {
+	return packageLocation(name, basename, false)
+}
+
+func packageLocation(name, basename string, managed bool) (string, error) {
 	if name == "" || !utf8.ValidString(name) {
 		return "", fmt.Errorf("%w: missing or invalid RPM name", ErrUnsafeLocation)
 	}
+	validBasename := safeRPMBasename(basename)
+	if managed {
+		validBasename = safeManagedRPMBasename(basename)
+	}
 	if basename == "" || basename == "." || basename == ".." || !strings.HasSuffix(basename, ".rpm") ||
 		path.Base(basename) != basename || filepath.Base(basename) != basename ||
-		!safeRPMBasename(basename) {
+		!validBasename {
 		return "", fmt.Errorf("%w: invalid basename %q", ErrUnsafeLocation, basename)
 	}
 	bucket := byte('_')
@@ -164,6 +172,10 @@ func safeRPMBasename(value string) bool {
 		}
 	}
 	return true
+}
+
+func safeManagedRPMBasename(value string) bool {
+	return value != ".rpm" && strings.HasSuffix(value, ".rpm") && safeManagedPackageComponent(value)
 }
 
 // InspectPackage hashes and parses one real RPM and returns its stable package
@@ -200,7 +212,7 @@ func InspectPackageReader(ctx context.Context, input io.ReadSeeker, originalBase
 		return PackageInfo{}, fmt.Errorf("%w: nil RPM reader", ErrInvalidPackage)
 	}
 	if originalBasename == "" || path.Base(originalBasename) != originalBasename || filepath.Base(originalBasename) != originalBasename ||
-		!strings.HasSuffix(originalBasename, ".rpm") || !safeRPMBasename(originalBasename) {
+		!strings.HasSuffix(originalBasename, ".rpm") || !safeManagedRPMBasename(originalBasename) {
 		return PackageInfo{}, fmt.Errorf("%w: invalid RPM basename %q", ErrInvalidPackage, originalBasename)
 	}
 	hashRPM := func() (string, int64, error) {
@@ -247,7 +259,7 @@ func InspectPackageReader(ctx context.Context, input io.ReadSeeker, originalBase
 		!validXMLString(name) || !validXMLString(version) || !validXMLString(release) || !validXMLString(architecture) || epoch < 0 {
 		return PackageInfo{}, fmt.Errorf("%w: RPM reader lacks required NEVRA fields", ErrInvalidPackage)
 	}
-	location, err := PackageLocation(name, originalBasename)
+	location, err := packageLocation(name, originalBasename, true)
 	if err != nil {
 		return PackageInfo{}, err
 	}
@@ -263,6 +275,15 @@ func InspectPackageReader(ctx context.Context, input io.ReadSeeker, originalBase
 }
 
 func readPackage(ctx context.Context, in PackageInput) (*packageMetadata, error) {
+	return readPackageWithManagedBasename(ctx, in, false)
+}
+
+// readPackageWithManagedBasename permits the wider managed-pool basename
+// alphabet without pretending the input already carries a managed view/href
+// triple. RPM leaf exports need exactly this mode: the payload basename is
+// already admitted by ParseManagedPoolPath, while the generated href is local
+// to the exported leaf rather than a canonical managed Repository view.
+func readPackageWithManagedBasename(ctx context.Context, in PackageInput, allowManagedBasename bool) (*packageMetadata, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -316,13 +337,31 @@ func readPackage(ctx context.Context, in PackageInput) (*packageMetadata, error)
 		basename = filepath.Base(in.Path)
 	}
 	name := tagString(&pkg.Header, tagName)
-	location, err := PackageLocation(name, basename)
+	managedInput := in.PoolPath != "" || in.ViewPath.String() != "" || in.Location != ""
+	location, err := packageLocation(name, basename, managedInput || allowManagedBasename)
 	if err != nil {
 		return nil, err
 	}
-	if in.Location != "" {
-		if err := validateManagedPackageLocation(name, basename, in.Location); err != nil {
-			return nil, err
+	if managedInput {
+		if in.PoolPath == "" || in.ViewPath.String() == "" || in.Location == "" {
+			return nil, fmt.Errorf("%w: managed package input requires PoolPath, ViewPath, and Location", ErrUnsafeLocation)
+		}
+		pool, err := ParseManagedPoolPath(in.PoolPath)
+		if err != nil || pool.Filename() != basename {
+			return nil, fmt.Errorf("%w: managed package PoolPath does not match basename %q", ErrUnsafeLocation, basename)
+		}
+		_, hrefPool, err := ParseManagedRPMHref(in.Location)
+		if err != nil || hrefPool != pool {
+			return nil, fmt.Errorf("%w: managed package href does not resolve to PoolPath %q", ErrUnsafeLocation, in.PoolPath)
+		}
+		view, err := ParseManagedRPMViewPath(in.ViewPath.String())
+		wantHref, hrefErr := RPMParentRelativeHref(view, pool)
+		if err != nil || hrefErr != nil || view != in.ViewPath || wantHref.String() != in.Location {
+			return nil, fmt.Errorf("%w: managed package href is not canonical for ViewPath %q", ErrUnsafeLocation, in.ViewPath.String())
+		}
+		source := sourceNameFromRPM(tagString(&pkg.Header, tagSourceRPM), name, tagString(&pkg.Header, tagVersion), tagString(&pkg.Header, tagRelease))
+		if pool.Source() != source {
+			return nil, fmt.Errorf("%w: managed Pool source %q differs from RPM source %q", ErrUnsafeLocation, pool.Source(), source)
 		}
 		location = in.Location
 	}
@@ -439,31 +478,6 @@ func sourceNameFromRPM(sourceRPM, fallback, version, release string) string {
 	return base
 }
 
-func validateManagedPackageLocation(name, basename, location string) error {
-	if location == "" || path.Clean(location) != location || strings.ContainsAny(location, "\\%?#\x00\r\n\t") {
-		return fmt.Errorf("%w: unsafe managed package location %q", ErrUnsafeLocation, location)
-	}
-	parts := strings.Split(location, "/")
-	if len(parts) != 4 || parts[0] != "pool" || path.Base(parts[3]) != basename || !safeRPMBasename(basename) ||
-		!safeManagedPackageComponent(parts[1]) || !safeManagedPackageComponent(parts[2]) {
-		return fmt.Errorf("%w: managed location %q must be pool/<prefix>/<source>/<basename>", ErrUnsafeLocation, location)
-	}
-	source := parts[2]
-	prefix := source[:1]
-	if strings.HasPrefix(source, "lib") {
-		if len(source) < 4 {
-			prefix = source
-		} else {
-			prefix = source[:4]
-		}
-	}
-	prefix = strings.ToLower(prefix)
-	if parts[1] != prefix || name == "" {
-		return fmt.Errorf("%w: managed location %q has a non-canonical source prefix", ErrUnsafeLocation, location)
-	}
-	return nil
-}
-
 func safeManagedPackageComponent(value string) bool {
 	if value == "" || value == "." || value == ".." {
 		return false
@@ -474,7 +488,7 @@ func safeManagedPackageComponent(value string) bool {
 			continue
 		}
 		switch c {
-		case '.', '-', '_', '+', '~', '^':
+		case '.', '-', '_', '+', '~', '^', ':', '%':
 			continue
 		default:
 			return false

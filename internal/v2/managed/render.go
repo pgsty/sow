@@ -20,7 +20,7 @@ type EmptyDistSpec struct {
 	Name          string
 	Format        string
 	Architectures []string
-	Generation    int64
+	Generation    state.GenerationID
 }
 
 type RenderedDist struct {
@@ -92,7 +92,7 @@ func RenderEmptyDist(ctx context.Context, repositoryStage string, spec EmptyDist
 		}
 		for _, family := range architectures {
 			dest := filepath.Join(distRoot, family, "repodata")
-			if _, err := yumrepo.GenerateFlatUnsigned(ctx, dest, spec.Generation, &yumrepo.SliceIterator{}); err != nil {
+			if _, err := yumrepo.GenerateFlatUnsigned(ctx, dest, uint64(spec.Generation), &yumrepo.SliceIterator{}); err != nil {
 				return RenderedDist{}, fmt.Errorf("managed: render empty RPM view %s: %w", family, err)
 			}
 			if _, err := yumrepo.ValidateFlatUnsignedDirectory(ctx, dest, yumrepo.CompressionGzip); err != nil {

@@ -49,7 +49,7 @@ func TestAddFailsClosedWhenWorkspaceRootIsReboundMidCommand(t *testing.T) {
 	if err := os.Mkdir(root, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	data := []byte("schema: sow/v2\nrepos:\n  repo:\n    dists:\n      el9: {format: rpm}\n")
+	data := []byte("schema: sow/v3\nrepos:\n  repo:\n    dists:\n      el9: {format: rpm}\n")
 	if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), data, 0o644); err != nil {
 		t.Fatal(err)
 	}

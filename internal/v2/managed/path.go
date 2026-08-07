@@ -751,6 +751,119 @@ func removeRootedRegular(root, relative string, expectedSize int64) error {
 	return finish(errors.Join(file.Close(), parent.directory().Sync()))
 }
 
+// removeRootedRegularExact unlinks only the plan-bound regular inode after
+// checking its complete content identity. A missing entry (or missing parent
+// left by an earlier successful replay step) is already complete.
+func removeRootedRegularExact(ctx context.Context, root, relative string, expectedSize int64, expectedSHA string) error {
+	if ctx == nil || expectedSize < 0 || !lowercaseSHA256.MatchString(expectedSHA) {
+		return errors.New("managed: invalid exact rooted removal identity")
+	}
+	components, err := rootedPathComponents(relative, false)
+	if err != nil {
+		return err
+	}
+	parent, err := openRootedDirectoryChain(root, filepath.Join(components[:len(components)-1]...), false, 0o700)
+	if errors.Is(err, unix.ENOENT) || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	finish := func(result error) error { return errors.Join(result, parent.close(true)) }
+	name := components[len(components)-1]
+	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return finish(nil)
+	}
+	if err != nil {
+		return finish(err)
+	}
+	file := os.NewFile(uintptr(fd), name)
+	closeFile := func(result error) error { return finish(errors.Join(result, file.Close())) }
+	var before unix.Stat_t
+	statErr := unix.Fstat(fd, &before)
+	if statErr != nil || uint32(before.Mode)&unix.S_IFMT != unix.S_IFREG || before.Size != expectedSize {
+		return closeFile(errors.Join(errors.New("managed: exact rooted removal target differs in size or kind"), statErr))
+	}
+	digest, hashErr := hashRegularDescriptor(ctx, file)
+	if hashErr != nil || digest != expectedSHA {
+		return closeFile(errors.Join(errors.New("managed: exact rooted removal target differs in digest"), hashErr))
+	}
+	var entry, afterHash unix.Stat_t
+	entryErr := unix.Fstatat(int(parent.directory().Fd()), name, &entry, unix.AT_SYMLINK_NOFOLLOW)
+	afterErr := unix.Fstat(fd, &afterHash)
+	if entryErr != nil || afterErr != nil || entry.Dev != before.Dev || entry.Ino != before.Ino || entry.Size != before.Size ||
+		afterHash.Dev != before.Dev || afterHash.Ino != before.Ino || afterHash.Size != before.Size ||
+		uint32(entry.Mode)&unix.S_IFMT != unix.S_IFREG || uint32(afterHash.Mode)&unix.S_IFMT != unix.S_IFREG {
+		return closeFile(errors.Join(errors.New("managed: exact rooted removal entry changed while hashing"), entryErr, afterErr))
+	}
+	if err := parent.verify(); err != nil {
+		return closeFile(err)
+	}
+	if err := unix.Unlinkat(int(parent.directory().Fd()), name, 0); err != nil {
+		return closeFile(err)
+	}
+	var after unix.Stat_t
+	if err := unix.Fstatat(int(parent.directory().Fd()), name, &after, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+		return closeFile(errors.Join(errors.New("managed: exact rooted removal entry remains after unlink"), err))
+	}
+	return closeFile(parent.directory().Sync())
+}
+
+// removeRootedEmptyDirectory removes one exact directory entry and never
+// traverses it. Unknown children therefore make the operation fail closed.
+func removeRootedEmptyDirectory(root, relative string) error {
+	components, err := rootedPathComponents(relative, false)
+	if err != nil {
+		return err
+	}
+	parent, err := openRootedDirectoryChain(root, filepath.Join(components[:len(components)-1]...), false, 0)
+	if errors.Is(err, unix.ENOENT) || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	finish := func(result error) error { return errors.Join(result, parent.close(true)) }
+	name := components[len(components)-1]
+	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return finish(nil)
+	}
+	if err != nil {
+		return finish(err)
+	}
+	directory := os.NewFile(uintptr(fd), name)
+	closeDirectory := func(result error) error { return finish(errors.Join(result, directory.Close())) }
+	var opened, entry unix.Stat_t
+	statErr := unix.Fstat(fd, &opened)
+	entryErr := unix.Fstatat(int(parent.directory().Fd()), name, &entry, unix.AT_SYMLINK_NOFOLLOW)
+	if statErr != nil || entryErr != nil || opened.Dev != entry.Dev || opened.Ino != entry.Ino ||
+		uint32(opened.Mode)&unix.S_IFMT != unix.S_IFDIR || uint32(entry.Mode)&unix.S_IFMT != unix.S_IFDIR || opened.Dev != parent.binding.stat.Dev {
+		return closeDirectory(errors.Join(errors.New("managed: exact empty directory changed while opening"), statErr, entryErr))
+	}
+	names, readErr := directory.Readdirnames(1)
+	if len(names) != 0 || !errors.Is(readErr, io.EOF) {
+		return closeDirectory(errors.Join(fmt.Errorf("%w: exact empty directory %q contains an unknown entry", ErrIntegrity, relative), readErr))
+	}
+	if err := errors.Join(directory.Sync(), parent.verify()); err != nil {
+		return closeDirectory(err)
+	}
+	var before unix.Stat_t
+	entryErr = unix.Fstatat(int(parent.directory().Fd()), name, &before, unix.AT_SYMLINK_NOFOLLOW)
+	if entryErr != nil || before.Dev != opened.Dev || before.Ino != opened.Ino || uint32(before.Mode)&unix.S_IFMT != unix.S_IFDIR {
+		return closeDirectory(errors.Join(errors.New("managed: exact empty directory changed before unlink"), entryErr))
+	}
+	if err := unix.Unlinkat(int(parent.directory().Fd()), name, unix.AT_REMOVEDIR); err != nil {
+		return closeDirectory(err)
+	}
+	var after unix.Stat_t
+	if err := unix.Fstatat(int(parent.directory().Fd()), name, &after, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+		return closeDirectory(errors.Join(errors.New("managed: exact empty directory remains after unlink"), err))
+	}
+	return closeDirectory(parent.directory().Sync())
+}
+
 func removeOwnedRegularPath(root, target string, expectedSize int64) error {
 	relative, err := relativeToRoot(root, target)
 	if err != nil {
@@ -995,6 +1108,99 @@ func realDirectory(path string, create bool, mode os.FileMode) (string, error) {
 		return "", err
 	}
 	return filepath.Abs(real)
+}
+
+// prospectiveRealDirectory resolves the nearest existing directory without
+// creating any component, then appends the missing suffix. The returned path
+// uses the directory-entry spelling observed by the filesystem, so symlink
+// aliases and case aliases cannot pass an overlap check on macOS.
+func prospectiveRealDirectory(path string) (physical string, exists bool, err error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", false, err
+	}
+	abs = filepath.Clean(abs)
+	ancestor := abs
+	missing := []string{}
+	for {
+		info, statErr := os.Lstat(ancestor)
+		if statErr == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				resolved, evalErr := filepath.EvalSymlinks(ancestor)
+				if evalErr != nil {
+					return "", false, evalErr
+				}
+				ancestor = resolved
+				info, statErr = os.Stat(ancestor)
+			}
+			if statErr != nil || !info.IsDir() {
+				return "", false, fmt.Errorf("%w: existing path %q is not a directory", ErrRejected, ancestor)
+			}
+			break
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return "", false, statErr
+		}
+		parent := filepath.Dir(ancestor)
+		if parent == ancestor {
+			return "", false, fmt.Errorf("%w: no existing directory ancestor for %q", ErrRejected, abs)
+		}
+		missing = append(missing, filepath.Base(ancestor))
+		ancestor = parent
+	}
+	resolved, err := filepath.EvalSymlinks(ancestor)
+	if err != nil {
+		return "", false, err
+	}
+	resolved, err = canonicalDirectoryEntrySpelling(resolved)
+	if err != nil {
+		return "", false, err
+	}
+	for index := len(missing) - 1; index >= 0; index-- {
+		resolved = filepath.Join(resolved, missing[index])
+	}
+	return filepath.Clean(resolved), len(missing) == 0, nil
+}
+
+func canonicalDirectoryEntrySpelling(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	volume := filepath.VolumeName(abs)
+	root := volume + string(filepath.Separator)
+	relative, err := filepath.Rel(root, abs)
+	if err != nil {
+		return "", err
+	}
+	if relative == "." {
+		return root, nil
+	}
+	current := root
+	for _, component := range strings.Split(relative, string(filepath.Separator)) {
+		requested := filepath.Join(current, component)
+		requestedInfo, err := os.Stat(requested)
+		if err != nil || !requestedInfo.IsDir() {
+			return "", errors.Join(fmt.Errorf("%w: inspect directory component %q", ErrRejected, requested), err)
+		}
+		entries, err := os.ReadDir(current)
+		if err != nil {
+			return "", err
+		}
+		matched := ""
+		for _, entry := range entries {
+			entryInfo, infoErr := entry.Info()
+			if infoErr == nil && entryInfo.IsDir() && os.SameFile(requestedInfo, entryInfo) {
+				matched = entry.Name()
+				break
+			}
+		}
+		if matched == "" {
+			return "", fmt.Errorf("%w: cannot bind directory spelling for %q", ErrRejected, requested)
+		}
+		current = filepath.Join(current, matched)
+	}
+	return current, nil
 }
 
 func ownedPath(root string, parts ...string) (string, error) {
@@ -1377,6 +1583,85 @@ func durableRenameWithHook(root, source, target string, afterSourceParent func()
 	return closeHeld(errors.Join(sourceParent.directory().Sync(), targetParent.directory().Sync()))
 }
 
+// exchangeRootedDirectories atomically swaps two directory entries reached
+// from one held owner descriptor.  Both parents and both leaf inodes are
+// rebound immediately before the kernel exchange and verified afterwards.
+func exchangeRootedDirectories(root, leftRelative, rightRelative string) error {
+	return exchangeRootedDirectoriesWithHook(root, leftRelative, rightRelative, nil)
+}
+
+func exchangeRootedDirectoriesWithHook(root, leftRelative, rightRelative string, afterBind func() error) error {
+	leftComponents, err := rootedPathComponents(leftRelative, false)
+	if err != nil {
+		return err
+	}
+	rightComponents, err := rootedPathComponents(rightRelative, false)
+	if err != nil {
+		return err
+	}
+	leftParent, err := openRootedDirectoryChain(root, filepath.Join(leftComponents[:len(leftComponents)-1]...), false, 0)
+	if err != nil {
+		return err
+	}
+	rightRoot, rightBinding, err := duplicateRootedDirectoryChainRoot(leftParent)
+	if err != nil {
+		return errors.Join(err, leftParent.close(true))
+	}
+	rightParent, err := openRootedDirectoryChainFromHandle(rightRoot, rightBinding, filepath.Join(rightComponents[:len(rightComponents)-1]...), false, 0)
+	if err != nil {
+		return errors.Join(err, leftParent.close(true))
+	}
+	finish := func(result error) error { return errors.Join(result, rightParent.close(true), leftParent.close(true)) }
+	leftName, rightName := leftComponents[len(leftComponents)-1], rightComponents[len(rightComponents)-1]
+	openLeaf := func(parent *rootedDirectoryChain, name string) (*os.File, unix.Stat_t, error) {
+		var entry unix.Stat_t
+		if err := unix.Fstatat(int(parent.directory().Fd()), name, &entry, unix.AT_SYMLINK_NOFOLLOW); err != nil || uint32(entry.Mode)&unix.S_IFMT != unix.S_IFDIR {
+			return nil, unix.Stat_t{}, errors.Join(errors.New("managed: rooted exchange leaf is not a directory"), err)
+		}
+		fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return nil, unix.Stat_t{}, err
+		}
+		leaf := os.NewFile(uintptr(fd), name)
+		var opened unix.Stat_t
+		if err := unix.Fstat(fd, &opened); err != nil || opened.Dev != entry.Dev || opened.Ino != entry.Ino || uint32(opened.Mode)&unix.S_IFMT != unix.S_IFDIR {
+			return nil, unix.Stat_t{}, errors.Join(errors.New("managed: rooted exchange leaf changed while opening"), err, leaf.Close())
+		}
+		return leaf, opened, nil
+	}
+	left, leftStat, err := openLeaf(leftParent, leftName)
+	if err != nil {
+		return finish(err)
+	}
+	right, rightStat, err := openLeaf(rightParent, rightName)
+	if err != nil {
+		return finish(errors.Join(err, left.Close()))
+	}
+	closeLeaves := func(result error) error { return finish(errors.Join(result, right.Close(), left.Close())) }
+	if leftStat.Dev != rightStat.Dev {
+		return closeLeaves(fmt.Errorf("%w: rooted exchange crosses filesystems", ErrRejected))
+	}
+	if afterBind != nil {
+		if err := afterBind(); err != nil {
+			return closeLeaves(err)
+		}
+	}
+	if err := errors.Join(leftParent.verify(), rightParent.verify()); err != nil {
+		return closeLeaves(err)
+	}
+	if err := exchangeDirectoriesAt(int(leftParent.directory().Fd()), leftName, int(rightParent.directory().Fd()), rightName); err != nil {
+		return closeLeaves(err)
+	}
+	var afterLeft, afterRight unix.Stat_t
+	leftErr := unix.Fstatat(int(leftParent.directory().Fd()), leftName, &afterLeft, unix.AT_SYMLINK_NOFOLLOW)
+	rightErr := unix.Fstatat(int(rightParent.directory().Fd()), rightName, &afterRight, unix.AT_SYMLINK_NOFOLLOW)
+	if leftErr != nil || rightErr != nil || afterLeft.Dev != rightStat.Dev || afterLeft.Ino != rightStat.Ino ||
+		afterRight.Dev != leftStat.Dev || afterRight.Ino != leftStat.Ino || uint32(afterLeft.Mode)&unix.S_IFMT != unix.S_IFDIR || uint32(afterRight.Mode)&unix.S_IFMT != unix.S_IFDIR {
+		return closeLeaves(errors.Join(errors.New("managed: rooted directory exchange result is inconsistent"), leftErr, rightErr))
+	}
+	return closeLeaves(errors.Join(leftParent.directory().Sync(), rightParent.directory().Sync()))
+}
+
 // readBoundedRegularNoFollow binds every parent component and the regular file
 // itself with no-follow descriptors. It rejects symlink components and any
 // parent or final-entry replacement during the bounded read.
@@ -1526,7 +1811,12 @@ func validateReadOnlyStateRoot(root string, allowMissing bool) (bool, error) {
 	return true, nil
 }
 
-func validateRepositoryPrivateLayout(root, repoName string) error {
+// validateLegacyRepositoryPrivateLayout validates the private directory set
+// that was already part of the frozen v0.2 Repository contract.  Read-only
+// discovery must start from this smaller set: retained/ and transitions/ are
+// v0.3 additions and therefore cannot be required before the database schema
+// has identified the Repository as current.
+func validateLegacyRepositoryPrivateLayout(root, repoName string) error {
 	if err := config.ValidateName(repoName); err != nil {
 		return fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
@@ -1550,10 +1840,23 @@ func validateRepositoryPrivateLayout(root, repoName string) error {
 	return nil
 }
 
-func validateRepositoryLayout(root, repoName string) error {
-	if err := validateRepositoryPrivateLayout(root, repoName); err != nil {
+func validateCurrentRepositoryPrivateLayout(root, repoName string) error {
+	if err := validateLegacyRepositoryPrivateLayout(root, repoName); err != nil {
 		return err
 	}
+	for _, path := range []string{
+		filepath.Join(root, ".sow", repoName, "retained"),
+		filepath.Join(root, ".sow", repoName, "transitions"),
+	} {
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: repository private path %q is missing or unsafe", ErrIntegrity, path)
+		}
+	}
+	return nil
+}
+
+func validateRepositoryPublicLayout(root, repoName string) error {
 	for _, path := range []string{
 		filepath.Join(root, repoName),
 		filepath.Join(root, repoName, "pool"),
@@ -1565,6 +1868,29 @@ func validateRepositoryLayout(root, repoName string) error {
 		}
 	}
 	return nil
+}
+
+func validateRepositoryLayoutForRead(root, repoName string, schemaVersion int) error {
+	if err := validateLegacyRepositoryPrivateLayout(root, repoName); err != nil {
+		return err
+	}
+	if schemaVersion != 6 {
+		if err := validateCurrentRepositoryPrivateLayout(root, repoName); err != nil {
+			return err
+		}
+	}
+	return validateRepositoryPublicLayout(root, repoName)
+}
+
+func validateRepositoryPrivateLayout(root, repoName string) error {
+	return validateCurrentRepositoryPrivateLayout(root, repoName)
+}
+
+func validateRepositoryLayout(root, repoName string) error {
+	if err := validateCurrentRepositoryPrivateLayout(root, repoName); err != nil {
+		return err
+	}
+	return validateRepositoryPublicLayout(root, repoName)
 }
 
 func removeOwnedDirectory(path, parent string) error {
@@ -1621,6 +1947,102 @@ func removeOwnedDirectory(path, parent string) error {
 		return closeDirectory(errors.Join(fmt.Errorf("%w: removal directory remains after unlink", ErrIntegrity), afterErr))
 	}
 	return closeDirectory(parentChain.directory().Sync())
+}
+
+// removeRootedEmptyDirectoryTree removes only directories beneath relative.
+// Any regular file, symlink, device, or other unknown entry fails closed; the
+// caller must unlink every journal-owned file separately before pruning.
+func removeRootedEmptyDirectoryTree(root, relative string) error {
+	components, err := rootedPathComponents(relative, false)
+	if err != nil {
+		return err
+	}
+	parent, err := openRootedDirectoryChain(root, filepath.Join(components[:len(components)-1]...), false, 0)
+	if errors.Is(err, unix.ENOENT) || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	finish := func(result error) error { return errors.Join(result, parent.close(true)) }
+	name := components[len(components)-1]
+	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return finish(nil)
+	}
+	if err != nil {
+		return finish(err)
+	}
+	directory := os.NewFile(uintptr(fd), name)
+	closeDirectory := func(result error) error { return finish(errors.Join(result, directory.Close())) }
+	var opened, entry unix.Stat_t
+	statErr := unix.Fstat(fd, &opened)
+	entryErr := unix.Fstatat(int(parent.directory().Fd()), name, &entry, unix.AT_SYMLINK_NOFOLLOW)
+	if statErr != nil || entryErr != nil || opened.Dev != entry.Dev || opened.Ino != entry.Ino || uint32(opened.Mode)&unix.S_IFMT != unix.S_IFDIR {
+		return closeDirectory(errors.Join(errors.New("managed: empty-only prune root changed while opening"), statErr, entryErr))
+	}
+	if err := pruneRootedDirectoriesOnly(directory, uint64(opened.Dev)); err != nil {
+		return closeDirectory(err)
+	}
+	if err := parent.verify(); err != nil {
+		return closeDirectory(err)
+	}
+	var before unix.Stat_t
+	entryErr = unix.Fstatat(int(parent.directory().Fd()), name, &before, unix.AT_SYMLINK_NOFOLLOW)
+	if entryErr != nil || before.Dev != opened.Dev || before.Ino != opened.Ino || uint32(before.Mode)&unix.S_IFMT != unix.S_IFDIR {
+		return closeDirectory(errors.Join(errors.New("managed: empty-only prune root changed before removal"), entryErr))
+	}
+	if err := unix.Unlinkat(int(parent.directory().Fd()), name, unix.AT_REMOVEDIR); err != nil {
+		return closeDirectory(err)
+	}
+	return closeDirectory(parent.directory().Sync())
+}
+
+func pruneRootedDirectoriesOnly(directory *os.File, ownerDevice uint64) error {
+	if directory == nil {
+		return errors.New("managed: invalid empty-only prune directory")
+	}
+	names, err := directory.Readdirnames(-1)
+	if err != nil {
+		return err
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if name == "" || name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
+			return fmt.Errorf("%w: unsafe empty-only prune entry", ErrIntegrity)
+		}
+		var entry unix.Stat_t
+		if err := unix.Fstatat(int(directory.Fd()), name, &entry, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return err
+		}
+		if uint32(entry.Mode)&unix.S_IFMT != unix.S_IFDIR || uint64(entry.Dev) != ownerDevice {
+			return fmt.Errorf("%w: empty-only prune found unknown entry %q", ErrIntegrity, name)
+		}
+		fd, err := unix.Openat(int(directory.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return err
+		}
+		child := os.NewFile(uintptr(fd), name)
+		var opened unix.Stat_t
+		if err := unix.Fstat(fd, &opened); err != nil || opened.Dev != entry.Dev || opened.Ino != entry.Ino || uint32(opened.Mode)&unix.S_IFMT != unix.S_IFDIR {
+			return errors.Join(errors.New("managed: empty-only prune child changed while opening"), err, child.Close())
+		}
+		if err := pruneRootedDirectoriesOnly(child, ownerDevice); err != nil {
+			return errors.Join(err, child.Close())
+		}
+		var before unix.Stat_t
+		entryErr := unix.Fstatat(int(directory.Fd()), name, &before, unix.AT_SYMLINK_NOFOLLOW)
+		if entryErr != nil || before.Dev != opened.Dev || before.Ino != opened.Ino || uint32(before.Mode)&unix.S_IFMT != unix.S_IFDIR {
+			return errors.Join(errors.New("managed: empty-only prune child changed before removal"), entryErr, child.Close())
+		}
+		if err := unix.Unlinkat(int(directory.Fd()), name, unix.AT_REMOVEDIR); err != nil {
+			return errors.Join(err, child.Close())
+		}
+		if err := child.Close(); err != nil {
+			return err
+		}
+	}
+	return directory.Sync()
 }
 
 func emptyRootedDirectory(directory *os.File, ownerDevice uint64) error {

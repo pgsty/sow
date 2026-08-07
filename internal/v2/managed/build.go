@@ -40,7 +40,7 @@ func marshalMutationBaseManifestLimit(manifest []state.GenerationFile, limit int
 
 type mutationBuildPreflight struct {
 	distNames        []string
-	generation       int64
+	generation       state.GenerationID
 	publicationTime  time.Time
 	baseManifest     []state.GenerationFile
 	metadataSnapshot metadataSignerSnapshot
@@ -61,7 +61,10 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 	if err != nil {
 		return nil, err
 	}
-	generation := summary.BuiltGeneration + 1
+	generation, err := summary.BuiltGeneration.Next()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrRejected, err)
+	}
 	baseManifest, err := scanPublicManifest(ctx, filepath.Join(root, repoName))
 	if err != nil {
 		return nil, err
@@ -139,6 +142,9 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 	if _, err := marshalMutationManifest(projected); err != nil {
 		return nil, err
 	}
+	if err := rejectPublishedPointerWithdrawal(ctx, cfg, repoName, store, distNames, projectedPublicationPointers(cfg, repoName, projectedDists)); err != nil {
+		return nil, err
+	}
 	return &mutationBuildPreflight{
 		distNames: append([]string(nil), distNames...), generation: generation, publicationTime: publicationTime,
 		baseManifest: append([]state.GenerationFile(nil), baseManifest...), metadataSnapshot: metadataSnapshot,
@@ -174,10 +180,14 @@ func samePreparedBuildDists(actual, expected []mutationBuildDist) bool {
 	return true
 }
 
-func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, operationID string, store *state.Store, jobs int, fault func(string) error, preflight *mutationBuildPreflight) (int64, error) {
+func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, operationID string, store *state.Store, jobs int, fault func(string) error, preflight *mutationBuildPreflight) (state.GenerationID, error) {
 	summary, err := store.Summary(ctx)
 	if err != nil {
 		return 0, err
+	}
+	nextGeneration, err := summary.BuiltGeneration.Next()
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrRejected, err)
 	}
 	operation, _, manifest, err := loadMutationOperation(ctx, store, root, repoName, operationID)
 	if err != nil {
@@ -190,7 +200,7 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	if err := (yumrepo.NativeDirectoryExchanger{}).Probe(filepath.Join(root, repoName, "dists")); err != nil {
 		return 0, fmt.Errorf("%w: atomic Dist exchange is unavailable: %v", ErrRejected, err)
 	}
-	var generation int64
+	var generation state.GenerationID
 	var baseManifest []state.GenerationFile
 	var buildDists []mutationBuildDist
 	var pooled []string
@@ -198,14 +208,14 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	if manifest.Build == nil {
 		var publicationTime time.Time
 		if preflight != nil {
-			if preflight.generation != summary.BuiltGeneration+1 || !sameStringSet(preflight.distNames, distNames) {
+			if preflight.generation != nextGeneration || !sameStringSet(preflight.distNames, distNames) {
 				return 0, fmt.Errorf("%w: mutation build preflight no longer matches repository state", ErrIntegrity)
 			}
 			generation = preflight.generation
 			publicationTime = preflight.publicationTime
 			baseManifest = append([]state.GenerationFile(nil), preflight.baseManifest...)
 		} else {
-			generation = summary.BuiltGeneration + 1
+			generation = nextGeneration
 			baseManifest, err = scanPublicManifest(ctx, filepath.Join(root, repoName))
 			if err != nil {
 				return 0, err
@@ -247,7 +257,7 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 			return 0, err
 		}
 	}
-	if generation != summary.BuiltGeneration+1 || generation < 1 || len(buildDists) == 0 {
+	if generation != nextGeneration || generation < 1 || len(buildDists) == 0 {
 		return 0, fmt.Errorf("%w: mutation build generation is inconsistent", ErrIntegrity)
 	}
 	stateBuilds := make([]state.DistBuild, 0, len(buildDists))
@@ -257,9 +267,10 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 			return 0, err
 		}
 		stateBuilds = append(stateBuilds, state.DistBuild{
-			Name: dist.Name, EffectiveConfigSHA256: dist.EffectiveConfigSHA256, Architectures: dist.Architectures,
+			Name: dist.Name, Format: cfg.Repositories[repoName].Dists[dist.Name].Format, EffectiveConfigSHA256: dist.EffectiveConfigSHA256, Architectures: dist.Architectures,
 			MetadataSignerFingerprint: dist.MetadataSignerFingerprint, MetadataSignerPublicKey: dist.MetadataSignerPublicKey,
-			EffectiveSigningJSON: string(effectiveSigningJSON),
+			MetadataSignerIdentity: metadataSignerRecordIdentity(dist.MetadataSignerFingerprint, dist.MetadataSignerPublicKey),
+			EffectiveSigningJSON:   string(effectiveSigningJSON),
 		})
 	}
 	for _, digest := range pooled {
@@ -342,7 +353,7 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	return generation, nil
 }
 
-func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, generation int64, publicationTime time.Time, buildRoot string, store *state.Store, jobs int, fault func(string) error, preflight *mutationBuildPreflight) (buildDists []mutationBuildDist, pooled []string, retainedRPMKeys []state.RPMSigningKey, resultErr error) {
+func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, generation state.GenerationID, publicationTime time.Time, buildRoot string, store *state.Store, jobs int, fault func(string) error, preflight *mutationBuildPreflight) (buildDists []mutationBuildDist, pooled []string, retainedRPMKeys []state.RPMSigningKey, resultErr error) {
 	// A build plan is journaled only after every Dist has rendered and synced.
 	// Therefore an existing build root while manifest.Build is still nil is
 	// necessarily an incomplete prior attempt (ordinary error or process
@@ -430,11 +441,11 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 		allSources = append(allSources, source)
 	}
 	sort.Slice(allSources, func(i, j int) bool { return allSources[i].Object.SHA256 < allSources[j].Object.SHA256 })
-	pendingLinks, err := newPendingLinkTracker(allSources)
+	pendingGuard, err := newPendingSourceGuard(allSources)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	defer func() { resultErr = errors.Join(resultErr, pendingLinks.Close()) }()
+	defer func() { resultErr = errors.Join(resultErr, pendingGuard.Close()) }()
 	buildDists = make([]mutationBuildDist, 0, len(distNames))
 	pooledSet := map[string]struct{}{}
 	for _, distName := range distNames {
@@ -462,21 +473,7 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		aliases := []ManagedPackageSource{}
-		if distState.Format == "rpm" {
-			priorBuilt, err := store.ListPackageObjects(ctx, []string{distName}, true)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			for _, object := range priorBuilt {
-				source, err := availableManagedPackageSource(root, repoName, object)
-				if err != nil {
-					return nil, nil, nil, err
-				}
-				aliases = append(aliases, source)
-			}
-		}
-		spec := ManagedDistSpec{Name: distName, Format: distState.Format, Architectures: architectures, Generation: generation, Jobs: jobs, PublishedAt: publicationTime, Packages: sources, Aliases: aliases, pendingLinks: pendingLinks}
+		spec := ManagedDistSpec{Name: distName, Format: distState.Format, Architectures: architectures, Generation: generation, Jobs: jobs, PublishedAt: publicationTime, Packages: sources}
 		if distState.Format == "rpm" {
 			spec.RPMSigner = metadataSnapshot.RPMSigner
 		} else {
@@ -724,7 +721,7 @@ func retainPriorAPTByHash(ctx context.Context, liveDist, stagedDist string, arch
 	return nil
 }
 
-func persistMutationBuildPlan(ctx context.Context, store *state.Store, root, repoName, operationID string, generation int64, dists []mutationBuildDist, pooled []string, retainedRPMKeys []state.RPMSigningKey, base []state.GenerationFile) error {
+func persistMutationBuildPlan(ctx context.Context, store *state.Store, root, repoName, operationID string, generation state.GenerationID, dists []mutationBuildDist, pooled []string, retainedRPMKeys []state.RPMSigningKey, base []state.GenerationFile) error {
 	operation, err := store.LastOperation(ctx)
 	if err != nil || operation == nil || operation.ID != operationID {
 		return fmt.Errorf("%w: active mutation operation is not the latest journal entry", ErrIntegrity)
@@ -880,11 +877,15 @@ func normalizeManagedPublicTree(ctx context.Context, repositoryRoot string, faul
 		if !strings.HasPrefix(relative, "pool/") && !strings.HasPrefix(relative, "dists/") {
 			return fmt.Errorf("%w: public Repository contains an unmanaged root entry", ErrIntegrity)
 		}
+		phase := publicFilePhase(relative)
+		if phase == "" {
+			return fmt.Errorf("%w: dists contains package payload %s", ErrIntegrity, relative)
+		}
 		hash := sha256.New()
 		if _, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file}); err != nil {
 			return err
 		}
-		files = append(files, state.GenerationFile{Path: relative, Phase: publicFilePhase(relative), Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
+		files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
 		if info.Mode().Perm() == 0o644 {
 			return nil
 		}
@@ -969,16 +970,24 @@ func recordNormalizedPublicModes(ctx context.Context, store *state.Store, operat
 }
 
 func scanPublicManifest(ctx context.Context, repositoryRoot string) ([]state.GenerationFile, error) {
+	return scanPublicManifestForLayout(ctx, repositoryRoot, state.LayoutSinglePayloadV1)
+}
+
+func scanPublicManifestForLayout(ctx context.Context, repositoryRoot, layout string) ([]state.GenerationFile, error) {
 	files := []state.GenerationFile{}
 	err := walkRootedTree(ctx, repositoryRoot, func(relative string, file *os.File, info os.FileInfo) error {
 		if !strings.HasPrefix(relative, "pool/") && !strings.HasPrefix(relative, "dists/") {
 			return fmt.Errorf("%w: public Repository contains an unmanaged root entry", ErrIntegrity)
 		}
+		phase := publicFilePhaseForLayout(relative, layout)
+		if phase == "" {
+			return fmt.Errorf("%w: dists contains package payload %s", ErrIntegrity, relative)
+		}
 		hash := sha256.New()
 		if _, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file}); err != nil {
 			return err
 		}
-		files = append(files, state.GenerationFile{Path: relative, Phase: publicFilePhase(relative), Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
+		files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
 		return nil
 	}, nil)
 	if err != nil {
@@ -989,7 +998,17 @@ func scanPublicManifest(ctx context.Context, repositoryRoot string) ([]state.Gen
 }
 
 func publicFilePhase(path string) string {
-	if strings.HasPrefix(path, "pool/") || strings.Contains(path, "/pool/") {
+	return publicFilePhaseForLayout(path, state.LayoutSinglePayloadV1)
+}
+
+func publicFilePhaseForLayout(path, layout string) string {
+	if layout == state.LayoutC2V1 && strings.HasPrefix(path, "dists/") && strings.Contains(path, "/pool/") {
+		return "payload"
+	}
+	if strings.HasPrefix(path, "dists/") && (strings.Contains(path, "/pool/") || strings.HasSuffix(path, ".rpm") || strings.HasSuffix(path, ".deb")) {
+		return ""
+	}
+	if strings.HasPrefix(path, "pool/") {
 		return "payload"
 	}
 	base := filepath.Base(path)

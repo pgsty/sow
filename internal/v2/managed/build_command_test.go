@@ -25,7 +25,7 @@ func TestAPTConfigOnlyBuildAdvancesGenerationWithinSameReleaseSecondAndRecovers(
 		}}
 		return cfg
 	}
-	readReleaseIdentity := func() (time.Time, int64) {
+	readReleaseIdentity := func() (time.Time, state.GenerationID) {
 		t.Helper()
 		data, err := os.ReadFile(filepath.Join(root, "repo", "dists", "noble", "Release"))
 		if err != nil {
@@ -555,7 +555,7 @@ func TestNextWriteBootstrapsMigratedGenerationLedger(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(before, after) {
 		t.Fatalf("bootstrap changed public tree: err=%v", err)
 	}
-	zero := int64(0)
+	zero := state.GenerationID(0)
 	changes, err := Changes(ctx, ChangesOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Base: &zero})
 	if err != nil || changes.Dirty || changes.Generation != summary.BuiltGeneration || len(changes.Changes) != len(after) {
 		t.Fatalf("bootstrapped changes=%#v err=%v", changes, err)

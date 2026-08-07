@@ -250,9 +250,9 @@ func TestCheckCoversUnreferencedPublicPoolObjectsAndRequiresObjectBijection(t *t
 		if _, err := Remove(ctx, RemoveOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Packages: []string{"pgdg-redhat-nonfree-repo"}, Jobs: 1}); err != nil {
 			t.Fatal(err)
 		}
-		// A later config-only build advances the Dist and intentionally clears
-		// the one-generation C2 membership projection. The immutable Pool
-		// object and its Generation payload remain retained.
+		// A later config-only build advances the Dist and clears the previous
+		// membership projection. The immutable Pool object and its Generation
+		// payload remain retained.
 		dist := cfg.Repositories["repo"].Dists["el9"]
 		dist.Limit = 1
 		repository := cfg.Repositories["repo"]
@@ -325,7 +325,7 @@ func TestCheckCoversUnreferencedPublicPoolObjectsAndRequiresObjectBijection(t *t
 	})
 }
 
-func TestCheckRejectsByteIdenticalNonHardlinkC2Alias(t *testing.T) {
+func TestCheckRejectsAnyC2AliasPayload(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	cfg := config.Default()
@@ -353,27 +353,22 @@ func TestCheckRejectsByteIdenticalNonHardlinkC2Alias(t *testing.T) {
 	}
 	canonical := filepath.Join(root, "repo", filepath.FromSlash(objects[0].PoolPath))
 	alias := filepath.Join(root, "repo", "dists", "el9", "x86_64", filepath.FromSlash(objects[0].PoolPath))
-	data, err := os.ReadFile(alias)
-	if err != nil {
+	if _, err := os.Lstat(alias); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed build created a C2 alias before tamper: %v", err)
+	}
+	clean, err := Check(ctx, CheckOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Jobs: 1})
+	if err != nil || !clean.ReadyToCopy || clean.Status != "clean" {
+		t.Fatalf("metadata-only RPM baseline check=%#v err=%v", clean, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(alias), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Remove(alias); err != nil {
+	if err := os.Link(canonical, alias); err != nil {
 		t.Fatal(err)
-	}
-	if err := os.WriteFile(alias, data, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	canonicalInfo, err := os.Stat(canonical)
-	if err != nil {
-		t.Fatal(err)
-	}
-	aliasInfo, err := os.Stat(alias)
-	if err != nil || os.SameFile(canonicalInfo, aliasInfo) {
-		t.Fatalf("test did not replace hardlink with independent bytes: %v", err)
 	}
 	checked, err := Check(ctx, CheckOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Jobs: 1})
 	if !errors.Is(err, ErrIntegrity) || checked.Status != "error" {
-		t.Fatalf("check accepted byte-identical non-hardlink alias: checked=%#v err=%v", checked, err)
+		t.Fatalf("check accepted forbidden C2 alias payload: checked=%#v err=%v", checked, err)
 	}
 }
 
@@ -430,10 +425,10 @@ func TestCheckRejectsOrphanPendingPayload(t *testing.T) {
 
 func TestCheckStateLayerValidatesCrossTableSemanticRelations(t *testing.T) {
 	mutations := map[string]string{
-		"built membership generation": `UPDATE built_memberships SET generation = 999`,
-		"prior membership generation": `UPDATE prior_built_memberships SET generation = 999`,
-		"architecture generation":     `UPDATE dist_architectures SET built_generation = 999`,
-		"dist generation":             `UPDATE dists SET built_generation = 999`,
+		"built membership generation": `UPDATE built_memberships SET generation = '00000000000000000999'`,
+		"prior membership generation": `UPDATE prior_built_memberships SET generation = '00000000000000000999'`,
+		"architecture generation":     `UPDATE dist_architectures SET built_generation = '00000000000000000999'`,
+		"dist generation":             `UPDATE dists SET built_generation = '00000000000000000999'`,
 		"object revision":             `UPDATE package_objects SET created_revision = 999`,
 		"membership revision":         `UPDATE memberships SET created_revision = 999`,
 		"built object storage":        `UPDATE package_objects SET storage = 'pending'`,
@@ -509,7 +504,7 @@ func TestGenerationZeroRequiresEmptyPublicDeliveryTree(t *testing.T) {
 	if err != nil || !clean.ReadyToCopy || clean.Generation != 0 {
 		t.Fatalf("clean Generation 0=%#v err=%v", clean, err)
 	}
-	zero := int64(0)
+	zero := state.GenerationID(0)
 	if changes, err := Changes(ctx, ChangesOptions{WorkspaceOptions: options, Repository: "repo", Base: &zero}); err != nil || len(changes.Changes) != 0 {
 		t.Fatalf("clean Generation 0 changes=%#v err=%v", changes, err)
 	}

@@ -86,7 +86,7 @@ type mutationManifest struct {
 }
 
 type mutationBuildManifest struct {
-	Generation         int64               `json:"generation"`
+	Generation         state.GenerationID  `json:"generation"`
 	BaseManifestSHA256 string              `json:"base_manifest_sha256"`
 	Dists              []mutationBuildDist `json:"dists"`
 	Pooled             []string            `json:"pooled"`
@@ -156,6 +156,9 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
+		return result, err
+	}
+	if err := requireNoWriteActivePublication(ctx, store); err != nil {
 		return result, err
 	}
 	distNames, effectiveDists, err := selectedMutationDists(ws, cfg, repoName, opts.Dists)
@@ -550,7 +553,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 // non-zero JSON output from falsely reporting pre-commit revision/generation
 // or cleanliness. It is also safe before commit because it only snapshots the
 // currently committed projection.
-func retainCommittedProjection(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, generation *int64, dirty *bool) {
+func retainCommittedProjection(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, generation *state.GenerationID, dirty *bool) {
 	if summary, err := store.Summary(ctx); err == nil {
 		*generation = summary.BuiltGeneration
 		*dirty = summary.Status != "clean"
@@ -560,7 +563,7 @@ func retainCommittedProjection(ctx context.Context, root, repoName string, cfg c
 	}
 }
 
-func retainCommittedTerminalProjection(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, operationID string, terminal state.OperationState, generation *int64, dirty *bool) bool {
+func retainCommittedTerminalProjection(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, operationID string, terminal state.OperationState, generation *state.GenerationID, dirty *bool) bool {
 	retainCommittedProjection(ctx, root, repoName, cfg, store, generation, dirty)
 	detail, err := store.GetOperation(ctx, operationID)
 	return err == nil && detail.Operation.State == terminal

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -85,6 +86,16 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 		return result, err
 	}
 	result.Generation, result.Revision, result.Status = summary.BuiltGeneration, summary.DesiredRevision, "clean"
+	layout := inspectRepositoryReadLayout(ctx, ws.Root, repoName, store)
+	legacyC2, identity := layout.FrozenC2, layout.Identity
+	retainedChecked := int64(0)
+	retainedIssues := []string{}
+	if !legacyC2 && layout.IdentityErr != nil {
+		retainedIssues = append(retainedIssues, layout.IdentityErr.Error())
+	} else if !legacyC2 {
+		retainedChecked, retainedIssues = verifyAllRetainedGenerationsLocked(ctx, ws.Root, repoName, identity.RepositoryID)
+	}
+	addLayer("retained", retainedChecked, retainedIssues)
 	if !scoped || summary.Status == "error" {
 		result.Status = summary.Status
 	}
@@ -114,6 +125,34 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 	addLayer("state", 1, stateIssues)
 	publicModeIssues, publicModeCount := validateManagedPublicModes(ctx, filepath.Join(ws.Root, repoName))
 	addLayer("public-modes", publicModeCount, publicModeIssues)
+	transition, transitionErr := layout.Transition, layout.TransitionErr
+	transitionActive := layout.transitionActive()
+	if transitionActive {
+		transitionIssues := []string{}
+		if transitionErr != nil {
+			transitionIssues = append(transitionIssues, transitionErr.Error())
+		} else if layout.ControlErr != nil {
+			transitionIssues = append(transitionIssues, layout.ControlErr.Error())
+		} else if transition == nil {
+			transitionIssues = append(transitionIssues, "non-terminal Repository or stale transition control has no transition journal")
+		} else if _, err := validateTransitionBinding(ctx, ws.Root, repoName, cfg, store, *transition, time.Now().UTC()); err != nil {
+			transitionIssues = append(transitionIssues, err.Error())
+		}
+		addLayer("layout-transition", 1, transitionIssues)
+		integrityIssues := []string{}
+		for _, layer := range result.Layers {
+			if !layer.OK {
+				integrityIssues = append(integrityIssues, layer.Issues...)
+			}
+		}
+		result.ReadyToCopy = false
+		if len(integrityIssues) != 0 {
+			result.Status = "error"
+			return result, fmt.Errorf("%w: %s", ErrIntegrity, strings.Join(integrityIssues, "; "))
+		}
+		result.Status = statusAtLeast(result.Status, "recovering")
+		return result, fmt.Errorf("%w: repository layout transition is %s", ErrNotReady, transition.Phase)
+	}
 
 	objectsByDigest := map[string]state.PackageObject{}
 	allObjects, err := store.ListPackageObjects(ctx, nil, false)
@@ -349,6 +388,8 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 	addLayer("desired-membership", summary.MembershipCount, membershipIssues)
 
 	indexIssues := []string{}
+	repositoryRoot := filepath.Join(ws.Root, repoName)
+	repositoryBase := &url.URL{Scheme: "file", Path: filepath.ToSlash(repositoryRoot) + "/"}
 	for _, distName := range distNames {
 		dist, distErr := store.GetDist(ctx, distName)
 		if distErr != nil {
@@ -373,11 +414,6 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 				}
 			}
 		}
-		priorBuiltObjects, listErr := store.ListPriorBuiltPackageObjects(ctx, []string{distName})
-		if listErr != nil {
-			indexIssues = append(indexIssues, listErr.Error())
-			continue
-		}
 		validationObjects := builtObjects
 		validationArchitectures := dist.Architectures
 		recoveringTarget, targetIsPublic := mutationBuildDist{}, false
@@ -393,46 +429,92 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 			validationArchitectures = recoveringTarget.Architectures
 		}
 		if dist.Format == "rpm" {
-			aliasObjects := append(append([]state.PackageObject(nil), builtObjects...), priorBuiltObjects...)
 			verifier, signed, verifierErr := builtRPMMetadataVerifier(ctx, store, dist)
 			if targetIsPublic {
-				aliasObjects = append(append([]state.PackageObject(nil), validationObjects...), builtObjects...)
-				for index := range aliasObjects {
-					if _, promoted := recoveryView.pooledPublic[aliasObjects[index].SHA256]; promoted {
-						aliasObjects[index].Storage = "pool"
-					}
-				}
 				verifier, signed, verifierErr = recoveringRPMMetadataVerifier(recoveringTarget, recoveryView.operation)
 			}
 			if verifierErr != nil {
 				signatureIssues = append(signatureIssues, fmt.Sprintf("Dist %s retained metadata signer is invalid: %v", distName, verifierErr))
 			}
+			if legacyC2 {
+				priorBuiltObjects, priorErr := store.ListPriorBuiltPackageObjects(ctx, []string{distName})
+				if priorErr != nil {
+					indexIssues = append(indexIssues, priorErr.Error())
+					continue
+				}
+				aliasObjects := append(append([]state.PackageObject(nil), builtObjects...), priorBuiltObjects...)
+				for _, architecture := range validationArchitectures {
+					signatureChecked++
+					repodata := filepath.Join(ws.Root, repoName, "dists", distName, architecture.Family, "repodata")
+					if aliasErr := validateLegacyRPMViewAliases(ctx, repositoryRoot, distName, architecture.Family, aliasObjects); aliasErr != nil {
+						indexIssues = append(indexIssues, aliasErr.Error())
+					}
+					if verifierErr == nil {
+						if signatureErr := validateRPMMetadataSignature(ctx, repodata, verifier, signed); signatureErr != nil {
+							signatureIssues = append(signatureIssues, fmt.Sprintf("Dist %s/%s RPM metadata signature differs: %v", distName, architecture.Family, signatureErr))
+						}
+					}
+					var generation *yumrepo.Generation
+					var validateErr error
+					if signed {
+						generation, validateErr = yumrepo.ValidateManagedDirectory(ctx, repodata, yumrepo.CompressionGzip, structuralDetachedVerifier{})
+					} else {
+						generation, validateErr = yumrepo.ValidateManagedUnsignedDirectory(ctx, repodata, yumrepo.CompressionGzip)
+					}
+					expected := int64(0)
+					expectedIdentities := []string{}
+					for _, object := range validationObjects {
+						if object.CanonicalArch == "neutral" || object.CanonicalArch == architecture.Family {
+							expected++
+							expectedIdentities = append(expectedIdentities, object.SHA256)
+						}
+					}
+					sort.Strings(expectedIdentities)
+					expectedIdentitySHA := bytesSHA([]byte(strings.Join(expectedIdentities, "\n")))
+					if len(expectedIdentities) != 0 {
+						expectedIdentitySHA = bytesSHA([]byte(strings.Join(expectedIdentities, "\n") + "\n"))
+					}
+					if validateErr != nil || generation == nil || generation.Packages != expected || generation.IdentitySHA256 != expectedIdentitySHA {
+						indexIssues = append(indexIssues, fmt.Sprintf("Dist %s/%s legacy rpm-md package count or index differs: %v", distName, architecture.Family, validateErr))
+					}
+				}
+				continue
+			}
 			for _, architecture := range validationArchitectures {
 				signatureChecked++
 				repodata := filepath.Join(ws.Root, repoName, "dists", distName, architecture.Family, "repodata")
-				if aliasErr := validateRPMViewAliases(ctx, filepath.Join(ws.Root, repoName), distName, architecture.Family, aliasObjects); aliasErr != nil {
-					indexIssues = append(indexIssues, aliasErr.Error())
+				if payloadErr := validateRPMViewContainsNoPayload(ctx, repositoryRoot, distName, architecture.Family); payloadErr != nil {
+					indexIssues = append(indexIssues, payloadErr.Error())
 				}
 				if verifierErr == nil {
 					if signatureErr := validateRPMMetadataSignature(ctx, repodata, verifier, signed); signatureErr != nil {
 						signatureIssues = append(signatureIssues, fmt.Sprintf("Dist %s/%s RPM metadata signature differs: %v", distName, architecture.Family, signatureErr))
 					}
 				}
-				var generation *yumrepo.Generation
-				var validateErr error
-				if signed {
-					generation, validateErr = yumrepo.ValidateManagedDirectory(ctx, repodata, yumrepo.CompressionGzip, structuralDetachedVerifier{})
-				} else {
-					generation, validateErr = yumrepo.ValidateManagedUnsignedDirectory(ctx, repodata, yumrepo.CompressionGzip)
-				}
 				expected := int64(0)
 				expectedIdentities := []string{}
+				expectedPackages := []yumrepo.ManagedRPMPackageExpectation{}
+				var validateErr error
 				for _, object := range validationObjects {
 					if object.CanonicalArch != "neutral" && object.CanonicalArch != architecture.Family {
 						continue
 					}
+					poolPath, poolErr := yumrepo.ParseManagedPoolPath(object.PoolPath)
+					if poolErr != nil {
+						validateErr = errors.Join(validateErr, poolErr)
+						continue
+					}
 					expected++
 					expectedIdentities = append(expectedIdentities, object.SHA256)
+					expectedPackages = append(expectedPackages, yumrepo.ManagedRPMPackageExpectation{SHA256: object.SHA256, Size: object.Size, PoolPath: poolPath})
+				}
+				viewPath, viewErr := yumrepo.ParseManagedRPMViewPath(filepath.ToSlash(filepath.Join("dists", distName, architecture.Family)))
+				validateErr = errors.Join(validateErr, viewErr)
+				var generation *yumrepo.Generation
+				if validateErr == nil && signed {
+					generation, validateErr = yumrepo.ValidateManagedRPMViewDirectory(ctx, repodata, yumrepo.CompressionGzip, structuralDetachedVerifier{}, repositoryBase, viewPath, expectedPackages)
+				} else if validateErr == nil {
+					generation, validateErr = yumrepo.ValidateManagedRPMViewUnsignedDirectory(ctx, repodata, yumrepo.CompressionGzip, repositoryBase, viewPath, expectedPackages)
 				}
 				sort.Strings(expectedIdentities)
 				expectedIdentitySHA := bytesSHA([]byte(strings.Join(expectedIdentities, "\n")))
@@ -494,7 +576,11 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 		// promoted payloads, and atomically exchanged old/new Dist trees.
 		// It is intentionally not equal to the last committed Generation yet.
 	} else {
-		physical, scanErr := scanPublicManifest(ctx, filepath.Join(ws.Root, repoName))
+		layout := state.LayoutSinglePayloadV1
+		if legacyC2 {
+			layout = state.LayoutC2V1
+		}
+		physical, scanErr := scanPublicManifestForLayout(ctx, filepath.Join(ws.Root, repoName), layout)
 		if scanErr != nil {
 			manifestIssues = append(manifestIssues, fmt.Sprintf("public delivery tree cannot be scanned: %v", scanErr))
 		} else if summary.BuiltGeneration == 0 {
@@ -510,7 +596,7 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 			}
 		}
 	}
-	addLayer("generation-manifest", int64(summary.BuiltGeneration), manifestIssues)
+	addLayer("generation-manifest", 1, manifestIssues)
 
 	integrityIssues := []string{}
 	for _, layer := range result.Layers {
@@ -696,7 +782,7 @@ func validatePublicPoolObjectBijection(ctx context.Context, repositoryRoot strin
 	return issues, checked
 }
 
-func builtGenerationPublicationTime(ctx context.Context, store *state.Store, generation int64) (time.Time, error) {
+func builtGenerationPublicationTime(ctx context.Context, store *state.Store, generation state.GenerationID) (time.Time, error) {
 	info, err := store.GetGeneration(ctx, generation)
 	if err != nil {
 		return time.Time{}, err
@@ -745,10 +831,21 @@ func builtAPTMetadataVerifier(ctx context.Context, store *state.Store, dist stat
 	return &inProcessAPTMetadataVerifier{verifier: verifier}, true, nil
 }
 
-func validateRPMViewAliases(ctx context.Context, repositoryRoot, distName, family string, objects []state.PackageObject) error {
+func validateRPMViewContainsNoPayload(ctx context.Context, repositoryRoot, distName, family string) error {
+	viewRoot := filepath.Join(repositoryRoot, "dists", distName, family)
+	return walkRootedTree(ctx, viewRoot, func(relative string, _ *os.File, _ os.FileInfo) error {
+		relative = filepath.ToSlash(relative)
+		if strings.HasPrefix(relative, "pool/") || strings.HasSuffix(relative, ".rpm") || strings.HasSuffix(relative, ".deb") {
+			return fmt.Errorf("Dist %s/%s metadata view contains package payload %s", distName, family, relative)
+		}
+		return nil
+	}, nil)
+}
+
+func validateLegacyRPMViewAliases(ctx context.Context, repositoryRoot, distName, family string, objects []state.PackageObject) error {
 	expected := make(map[string]state.PackageObject)
 	for _, object := range objects {
-		if object.Format != "rpm" || object.Storage != "pool" || (object.CanonicalArch != "neutral" && object.CanonicalArch != family) {
+		if object.Format != "rpm" || object.Storage != "pool" || object.CanonicalArch != "neutral" && object.CanonicalArch != family {
 			continue
 		}
 		expected[object.PoolPath] = object

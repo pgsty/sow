@@ -6,6 +6,8 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -50,12 +52,24 @@ func TestWeakDependenciesRoundTripThroughRPMAndPrimaryXML(t *testing.T) {
 }
 
 func TestGenerateManagedConcurrentIsWorkerDeterministic(t *testing.T) {
+	view, err := ParseManagedRPMViewPath("dists/el9/x86_64")
+	if err != nil {
+		t.Fatal(err)
+	}
 	inputs := make([]PackageInput, 0, 4)
 	for _, name := range []string{"alpha", "beta", "delta", "gamma"} {
 		basename := name + "-1.2.3-4.x86_64.rpm"
 		filename := filepath.Join(t.TempDir(), basename)
 		writeRPMFixture(t, filename, name)
-		inputs = append(inputs, PackageInput{Path: filename, Basename: basename, Location: "pool/" + name[:1] + "/" + name + "/" + basename})
+		pool, err := NewManagedPoolPath(name, basename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		href, err := RPMParentRelativeHref(view, pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inputs = append(inputs, PackageInput{Path: filename, Basename: basename, PoolPath: pool.String(), ViewPath: view, Location: href.String()})
 	}
 	left, right := filepath.Join(t.TempDir(), "repodata"), filepath.Join(t.TempDir(), "repodata")
 	one, err := GenerateManagedConcurrent(context.Background(), left, 7, &SliceIterator{Inputs: inputs}, nil, 1)
@@ -85,12 +99,114 @@ func TestGenerateManagedConcurrentIsWorkerDeterministic(t *testing.T) {
 	}
 }
 
+func TestManagedRevisionPreservesMaxUint64(t *testing.T) {
+	repodata := filepath.Join(t.TempDir(), "repodata")
+	written, err := GenerateManaged(context.Background(), repodata, math.MaxUint64, &SliceIterator{}, nil)
+	if err != nil || written.Revision != math.MaxUint64 {
+		t.Fatalf("generated=%#v err=%v", written, err)
+	}
+	repomd, err := os.ReadFile(filepath.Join(repodata, "repomd.xml"))
+	if err != nil || !bytes.Contains(repomd, []byte("<revision>18446744073709551615</revision>")) {
+		t.Fatalf("repomd MaxUint64 revision missing: err=%v\n%s", err, repomd)
+	}
+	validated, err := ValidateManagedUnsignedDirectory(context.Background(), repodata, CompressionGzip)
+	if err != nil || validated.Revision != math.MaxUint64 {
+		t.Fatalf("validated=%#v err=%v", validated, err)
+	}
+}
+
+func TestValidateManagedRPMViewBindsHrefSizeAndDigestClosure(t *testing.T) {
+	ctx := context.Background()
+	view, err := ParseManagedRPMViewPath("dists/el9/x86_64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const basename = "fixture-1.2.3-4.x86_64.rpm"
+	rpmPath := filepath.Join(t.TempDir(), basename)
+	writeRPMFixture(t, rpmPath, "fixture")
+	pool, err := NewManagedPoolPath("fixture", basename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	href, err := RPMParentRelativeHref(view, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := InspectPackage(ctx, PackageInput{Path: rpmPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repodata := filepath.Join(t.TempDir(), "repodata")
+	input := PackageInput{Path: rpmPath, Basename: basename, PoolPath: pool.String(), ViewPath: view, Location: href.String()}
+	if _, err := GenerateManagedConcurrent(ctx, repodata, 7, &SliceIterator{Inputs: []PackageInput{input}}, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	base, err := url.Parse("file:///srv/non-root/repo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := []ManagedRPMPackageExpectation{{SHA256: info.SHA256, Size: info.Size, PoolPath: pool}}
+	if _, err := ValidateManagedRPMViewUnsignedDirectory(ctx, repodata, CompressionGzip, base, view, expected); err != nil {
+		t.Fatalf("exact managed view validation failed: %v", err)
+	}
+	wrongSize := append([]ManagedRPMPackageExpectation(nil), expected...)
+	wrongSize[0].Size++
+	if _, err := ValidateManagedRPMViewUnsignedDirectory(ctx, repodata, CompressionGzip, base, view, wrongSize); err == nil {
+		t.Fatal("managed view validation accepted a wrong canonical Pool size")
+	}
+	wrongPool, err := NewManagedPoolPath("fixture2", basename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongTarget := append([]ManagedRPMPackageExpectation(nil), expected...)
+	wrongTarget[0].PoolPath = wrongPool
+	if _, err := ValidateManagedRPMViewUnsignedDirectory(ctx, repodata, CompressionGzip, base, view, wrongTarget); err == nil {
+		t.Fatal("managed view validation accepted an href targeting another Pool path")
+	}
+}
+
+func TestLegacyC2ViewValidationIsExplicitAndRejectsForwardHref(t *testing.T) {
+	view, err := ParseManagedRPMViewPath("dists/el9/x86_64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := NewManagedPoolPath("pkg", "pkg-1-1.x86_64.rpm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := strings.Repeat("a", 64)
+	expected := []ManagedRPMPackageExpectation{{SHA256: identity, Size: 5, PoolPath: pool}}
+	legacy, err := newLegacyC2RPMViewValidation(view, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primary := `<metadata xmlns="` + commonNS + `" packages="1"><package type="rpm"><name>pkg</name><checksum type="sha256" pkgid="YES">` + identity + `</checksum><size package="5"/><location href="pool/p/pkg/pkg-1-1.x86_64.rpm"/></package></metadata>`
+	if count, err := validateMetadataXMLMode(strings.NewReader(primary), "primary", false, true, nil, legacy); err != nil || count != 1 {
+		t.Fatalf("legacy C2 primary count=%d err=%v", count, err)
+	}
+	if err := legacy.finish(); err != nil {
+		t.Fatal(err)
+	}
+	base, err := url.Parse("file:///srv/repo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	forward, err := newManagedRPMViewValidation(base, view, expected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateMetadataXMLMode(strings.NewReader(primary), "primary", false, true, nil, forward); err == nil {
+		t.Fatal("forward validator accepted legacy C2 view-local href")
+	}
+}
+
 func TestManagedPackageLocationRequiresPortableLowercaseShard(t *testing.T) {
 	const basename = "PolarDB-17.9.1.0-1.el10.aarch64.rpm"
-	if err := validateManagedPackageLocation("PolarDB", basename, "pool/p/PolarDB/"+basename); err != nil {
-		t.Fatalf("portable location rejected: %v", err)
+	pool, err := ParseManagedPoolPath("pool/p/PolarDB/" + basename)
+	if err != nil || pool.Source() != "PolarDB" {
+		t.Fatalf("portable Pool path rejected: %#v %v", pool, err)
 	}
-	if err := validateManagedPackageLocation("PolarDB", basename, "pool/P/PolarDB/"+basename); err == nil {
+	if _, err := ParseManagedPoolPath("pool/P/PolarDB/" + basename); err == nil {
 		t.Fatal("case-preserving shard accepted")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
@@ -30,7 +31,7 @@ func Status(ctx context.Context, opts StatusOptions) (result StatusResult, resul
 		return result, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, rootGuard.Close()) }()
-	cfg, configSHA, err := config.LoadWorkspaceWithSHA(ws)
+	cfg, _, configSHA, _, err := config.LoadWorkspaceDocumentForMigration(ws)
 	if err != nil {
 		return result, fmt.Errorf("%w: %v", ErrWorkspaceInput, err)
 	}
@@ -98,6 +99,27 @@ func Status(ctx context.Context, opts StatusOptions) (result StatusResult, resul
 		}
 		result.Status = "error"
 		result.DirtyReasons = append(result.DirtyReasons, "repository state relations are invalid: "+stateErr.Error())
+	}
+	identity, identityErr := store.RepositoryIdentity(ctx)
+	transition, _, transitionErr := loadTransitionJournal(ws.Root, repoName)
+	transitionActive := identityErr == nil && identity.LayoutVersion != state.LayoutSinglePayloadV1 || transition != nil || transitionErr != nil
+	if identityErr != nil {
+		result.Status = "error"
+		result.DirtyReasons = append(result.DirtyReasons, "repository identity is invalid: "+identityErr.Error())
+	} else if transitionActive {
+		if transitionErr != nil {
+			result.Status = "error"
+			result.DirtyReasons = append(result.DirtyReasons, "transition journal is invalid: "+transitionErr.Error())
+		} else if transition == nil {
+			result.Status = "error"
+			result.DirtyReasons = append(result.DirtyReasons, "non-terminal Repository has no transition journal")
+		} else if _, transitionErr := validateTransitionBinding(ctx, ws.Root, repoName, cfg, store, *transition, time.Now().UTC()); transitionErr != nil {
+			result.Status = "error"
+			result.DirtyReasons = append(result.DirtyReasons, "transition closure is invalid: "+transitionErr.Error())
+		} else {
+			result.Status = statusAtLeast(result.Status, "recovering")
+			result.DirtyReasons = append(result.DirtyReasons, fmt.Sprintf("layout transition is %s", transition.Phase))
+		}
 	}
 	result.DesiredRevision, result.BuiltGeneration = summary.DesiredRevision, summary.BuiltGeneration
 	result.RepositoryLocked, result.LockHolder = initialLocked, initialHolder
@@ -191,7 +213,7 @@ func Status(ctx context.Context, opts StatusOptions) (result StatusResult, resul
 	}
 	finalLocked, finalHolder, finalProbeErr := probeFileLock(filepath.Join(ws.Root, ".sow", "repo-locks", repoName+".lock"))
 	finalSummary, finalSummaryErr := store.Summary(ctx)
-	_, finalConfigSHA, finalConfigErr := config.LoadWorkspaceWithSHA(ws)
+	_, _, finalConfigSHA, _, finalConfigErr := config.LoadWorkspaceDocumentForMigration(ws)
 	if finalProbeErr != nil || finalSummaryErr != nil || finalConfigErr != nil {
 		result.Status = "error"
 		result.RepositoryLocked = true

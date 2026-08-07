@@ -63,7 +63,7 @@ type RepositoryInfo struct {
 	Path            string                     `json:"path"`
 	Protected       bool                       `json:"protected"`
 	Dists           int64                      `json:"dists"`
-	Generation      int64                      `json:"generation"`
+	Generation      state.GenerationID         `json:"generation"`
 	DesiredRevision int64                      `json:"desired_revision"`
 	Status          string                     `json:"status"`
 	Packages        int64                      `json:"packages"`
@@ -117,7 +117,7 @@ type DistInfo struct {
 	Architectures      []state.Architecture `json:"architectures"`
 	DesiredMembers     int64                `json:"desired_members"`
 	BuiltMembers       int64                `json:"built_members"`
-	Generation         int64                `json:"generation"`
+	Generation         state.GenerationID   `json:"generation"`
 	Dirty              bool                 `json:"dirty"`
 	Status             string               `json:"status"`
 	EffectiveConfigSHA string               `json:"effective_config_sha256"`
@@ -177,16 +177,16 @@ type MutationItem struct {
 }
 
 type AddResult struct {
-	Operation         string         `json:"operation"`
-	Repository        string         `json:"repository"`
-	Revision          int64          `json:"desired_revision"`
-	Generation        int64          `json:"built_generation"`
-	Dirty             bool           `json:"dirty"`
-	Accepted          int            `json:"accepted"`
-	Failed            int            `json:"failed"`
-	MembershipAdded   int            `json:"memberships_added"`
-	MembershipRemoved int            `json:"memberships_removed"`
-	Items             []MutationItem `json:"items"`
+	Operation         string             `json:"operation"`
+	Repository        string             `json:"repository"`
+	Revision          int64              `json:"desired_revision"`
+	Generation        state.GenerationID `json:"built_generation"`
+	Dirty             bool               `json:"dirty"`
+	Accepted          int                `json:"accepted"`
+	Failed            int                `json:"failed"`
+	MembershipAdded   int                `json:"memberships_added"`
+	MembershipRemoved int                `json:"memberships_removed"`
+	Items             []MutationItem     `json:"items"`
 }
 
 type RemoveOptions struct {
@@ -212,7 +212,7 @@ type RemoveResult struct {
 	Operation  string              `json:"operation,omitempty"`
 	Repository string              `json:"repository"`
 	Revision   int64               `json:"desired_revision"`
-	Generation int64               `json:"built_generation"`
+	Generation state.GenerationID  `json:"built_generation"`
 	Dirty      bool                `json:"dirty"`
 	Check      bool                `json:"check"`
 	Removed    []RemovedMembership `json:"removed"`
@@ -230,13 +230,13 @@ type BuildOptions struct {
 }
 
 type BuildResult struct {
-	Operation  string   `json:"operation"`
-	Repository string   `json:"repository"`
-	Dists      []string `json:"dists"`
-	Revision   int64    `json:"desired_revision"`
-	Generation int64    `json:"built_generation"`
-	Noop       bool     `json:"noop"`
-	Dirty      bool     `json:"dirty"`
+	Operation  string             `json:"operation"`
+	Repository string             `json:"repository"`
+	Dists      []string           `json:"dists"`
+	Revision   int64              `json:"desired_revision"`
+	Generation state.GenerationID `json:"built_generation"`
+	Noop       bool               `json:"noop"`
+	Dirty      bool               `json:"dirty"`
 }
 
 type PackageListOptions struct {
@@ -300,7 +300,7 @@ type StatusResult struct {
 	Status           string             `json:"status"`
 	ReadyToCopy      bool               `json:"ready_to_copy"`
 	DesiredRevision  int64              `json:"desired_revision"`
-	BuiltGeneration  int64              `json:"built_generation"`
+	BuiltGeneration  state.GenerationID `json:"built_generation"`
 	DirtyDists       []string           `json:"dirty_dists"`
 	DirtyReasons     []string           `json:"dirty_reasons"`
 	Pending          PendingPayloadInfo `json:"pending"`
@@ -313,13 +313,13 @@ type StatusResult struct {
 type ChangesOptions struct {
 	WorkspaceOptions
 	Repository string
-	Base       *int64
+	Base       *state.GenerationID
 }
 
 type ChangesResult struct {
 	Repository string             `json:"repository"`
-	Base       int64              `json:"base"`
-	Generation int64              `json:"generation"`
+	Base       state.GenerationID `json:"base"`
+	Generation state.GenerationID `json:"generation"`
 	Dirty      bool               `json:"dirty"`
 	Changes    []state.FileChange `json:"changes"`
 }
@@ -367,12 +367,12 @@ type CheckLayer struct {
 }
 
 type CheckResult struct {
-	Repository  string       `json:"repository"`
-	Status      string       `json:"status"`
-	ReadyToCopy bool         `json:"ready_to_copy"`
-	Generation  int64        `json:"built_generation"`
-	Revision    int64        `json:"desired_revision"`
-	Layers      []CheckLayer `json:"layers"`
+	Repository  string             `json:"repository"`
+	Status      string             `json:"status"`
+	ReadyToCopy bool               `json:"ready_to_copy"`
+	Generation  state.GenerationID `json:"built_generation"`
+	Revision    int64              `json:"desired_revision"`
+	Layers      []CheckLayer       `json:"layers"`
 }
 
 type PartialError struct {

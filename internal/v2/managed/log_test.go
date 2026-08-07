@@ -75,7 +75,7 @@ func TestLogDetailExportAndSafePrune(t *testing.T) {
 	if err != nil || buildDetail.Detail == nil || len(buildDetail.Detail.Files) == 0 {
 		t.Fatalf("generation operation was pruned: %#v err=%v", buildDetail, err)
 	}
-	zero := int64(0)
+	zero := state.GenerationID(0)
 	if changes, err := Changes(ctx, ChangesOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Base: &zero}); err != nil || changes.Generation != built.Generation || len(changes.Changes) == 0 {
 		t.Fatalf("changes after prune=%#v err=%v", changes, err)
 	}
@@ -283,7 +283,7 @@ func TestLogPruneRecoversFirstAndPreservesCurrentGeneration(t *testing.T) {
 	if err != nil || status.Status != "clean" || !status.ReadyToCopy || status.BuiltGeneration < 1 {
 		t.Fatalf("status after prune=%#v err=%v", status, err)
 	}
-	zero := int64(0)
+	zero := state.GenerationID(0)
 	changes, err := Changes(ctx, ChangesOptions{WorkspaceOptions: options, Repository: "repo", Base: &zero})
 	if err != nil || changes.Generation != status.BuiltGeneration || len(changes.Changes) == 0 {
 		t.Fatalf("changes after recovered prune=%#v err=%v", changes, err)
@@ -344,7 +344,7 @@ func TestLogPruneCrashPhasesRecoverWithoutLosingGenerationOrChanges(t *testing.T
 			if err != nil || built.Dirty || built.Noop {
 				t.Fatalf("baseline build=%#v err=%v", built, err)
 			}
-			zero := int64(0)
+			zero := state.GenerationID(0)
 			before, err := Changes(ctx, ChangesOptions{WorkspaceOptions: options, Repository: "repo", Base: &zero})
 			if err != nil || before.Generation != built.Generation || len(before.Changes) == 0 {
 				t.Fatalf("baseline changes=%#v err=%v", before, err)

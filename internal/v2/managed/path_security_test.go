@@ -238,6 +238,52 @@ func TestDurableRenameRejectsOwnerReplacementBetweenParentBindings(t *testing.T)
 	}
 }
 
+func TestRootedDirectoryExchangeRejectsAncestorSymlinkRaceWithoutEscape(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "owner")
+	originalRepo := filepath.Join(parent, "repo-original")
+	outside := filepath.Join(parent, "outside")
+	left := filepath.Join(root, "repo", "dists", "el9", "x86_64", "repodata")
+	right := filepath.Join(root, ".sow", "repo", "stage", "c2-to-single-v1", "dists", "el9", "x86_64", "repodata")
+	for _, directory := range []string{left, right, filepath.Join(outside, "dists", "el9", "x86_64", "repodata")} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(left, "marker"), []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(right, "marker"), []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outsideMarker := filepath.Join(outside, "dists", "el9", "x86_64", "repodata", "marker")
+	if err := os.WriteFile(outsideMarker, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := exchangeRootedDirectoriesWithHook(root,
+		filepath.Join("repo", "dists", "el9", "x86_64", "repodata"),
+		filepath.Join(".sow", "repo", "stage", "c2-to-single-v1", "dists", "el9", "x86_64", "repodata"),
+		func() error {
+			if err := os.Rename(filepath.Join(root, "repo"), originalRepo); err != nil {
+				return err
+			}
+			return os.Symlink(outside, filepath.Join(root, "repo"))
+		})
+	if err == nil {
+		t.Fatal("rooted directory exchange accepted an ancestor symlink race")
+	}
+	for path, want := range map[string]string{
+		filepath.Join(originalRepo, "dists", "el9", "x86_64", "repodata", "marker"): "old",
+		filepath.Join(right, "marker"):                                              "new",
+		outsideMarker:                                                               "outside",
+	} {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil || string(data) != want {
+			t.Fatalf("marker %s=%q want=%q err=%v", path, data, want, readErr)
+		}
+	}
+}
+
 func TestReadBoundedRegularNoFollowRejectsSymlinkedAncestor(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()

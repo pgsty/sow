@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -51,6 +52,136 @@ type checksumXML struct {
 
 type locationXML struct {
 	Href string `xml:"href,attr"`
+}
+
+// ManagedRPMPackageExpectation binds one package identity in an RPM view to
+// its canonical Pool object. PoolPath is deliberately typed so callers cannot
+// pass the rendered href as repository state.
+type ManagedRPMPackageExpectation struct {
+	SHA256   string
+	Size     int64
+	PoolPath ManagedPoolPath
+}
+
+type managedRPMViewValidation struct {
+	repositoryBase *url.URL
+	view           ManagedRPMViewPath
+	expected       map[string]ManagedRPMPackageExpectation
+	seen           map[string]struct{}
+}
+
+type rpmViewValidation interface {
+	check(identity, href string, size int64) error
+	finish() error
+}
+
+// legacyC2RPMViewValidation exists only for the explicit v0.2 layout
+// migration gate.  C2 metadata names a view-local hardlink with the canonical
+// pool/... path; forward renderers and ordinary validators never use it.
+type legacyC2RPMViewValidation struct {
+	expected map[string]ManagedRPMPackageExpectation
+	seen     map[string]struct{}
+}
+
+func newLegacyC2RPMViewValidation(view ManagedRPMViewPath, expected []ManagedRPMPackageExpectation) (*legacyC2RPMViewValidation, error) {
+	parsedView, err := ParseManagedRPMViewPath(view.String())
+	if err != nil || parsedView != view {
+		return nil, fmt.Errorf("%w: invalid legacy C2 RPM view path", ErrInvalidRepodata)
+	}
+	validation := &legacyC2RPMViewValidation{expected: make(map[string]ManagedRPMPackageExpectation, len(expected)), seen: make(map[string]struct{}, len(expected))}
+	for _, item := range expected {
+		parsedPool, poolErr := ParseManagedPoolPath(item.PoolPath.String())
+		if !validSHA256(item.SHA256) || item.Size < 0 || poolErr != nil || parsedPool != item.PoolPath || !safeManagedRPMBasename(item.PoolPath.Filename()) {
+			return nil, fmt.Errorf("%w: invalid legacy C2 RPM package expectation", ErrInvalidRepodata)
+		}
+		if _, duplicate := validation.expected[item.SHA256]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate legacy C2 RPM package expectation %s", ErrInvalidRepodata, item.SHA256)
+		}
+		validation.expected[item.SHA256] = item
+	}
+	return validation, nil
+}
+
+func (validation *legacyC2RPMViewValidation) check(identity, href string, size int64) error {
+	expected, exists := validation.expected[identity]
+	if !exists {
+		return fmt.Errorf("%w: legacy C2 metadata references unexpected package %q", ErrInvalidRepodata, identity)
+	}
+	if _, duplicate := validation.seen[identity]; duplicate {
+		return fmt.Errorf("%w: legacy C2 metadata repeats package %s", ErrInvalidRepodata, identity)
+	}
+	if size != expected.Size || href != expected.PoolPath.String() {
+		return fmt.Errorf("%w: legacy C2 package %s size or view-local href differs", ErrInvalidRepodata, identity)
+	}
+	validation.seen[identity] = struct{}{}
+	return nil
+}
+
+func (validation *legacyC2RPMViewValidation) finish() error {
+	if validation == nil {
+		return fmt.Errorf("%w: legacy C2 metadata closure is unavailable", ErrInvalidRepodata)
+	}
+	if len(validation.seen) != len(validation.expected) {
+		return fmt.Errorf("%w: legacy C2 metadata closure has %d packages, want %d", ErrInvalidRepodata, len(validation.seen), len(validation.expected))
+	}
+	return nil
+}
+
+func newManagedRPMViewValidation(repositoryBase *url.URL, view ManagedRPMViewPath, expected []ManagedRPMPackageExpectation) (*managedRPMViewValidation, error) {
+	if err := validateRepositoryBaseURI(repositoryBase); err != nil {
+		return nil, fmt.Errorf("%w: invalid managed RPM view base: %v", ErrInvalidRepodata, err)
+	}
+	parsedView, err := ParseManagedRPMViewPath(view.String())
+	if err != nil || parsedView != view {
+		return nil, fmt.Errorf("%w: invalid managed RPM view path", ErrInvalidRepodata)
+	}
+	baseCopy := *repositoryBase
+	validation := &managedRPMViewValidation{
+		repositoryBase: &baseCopy, view: view,
+		expected: make(map[string]ManagedRPMPackageExpectation, len(expected)), seen: make(map[string]struct{}, len(expected)),
+	}
+	for _, item := range expected {
+		parsedPool, poolErr := ParseManagedPoolPath(item.PoolPath.String())
+		if !validSHA256(item.SHA256) || item.Size < 0 || poolErr != nil || parsedPool != item.PoolPath || !safeManagedRPMBasename(item.PoolPath.Filename()) {
+			return nil, fmt.Errorf("%w: invalid managed RPM package expectation", ErrInvalidRepodata)
+		}
+		if _, duplicate := validation.expected[item.SHA256]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate managed RPM package expectation %s", ErrInvalidRepodata, item.SHA256)
+		}
+		validation.expected[item.SHA256] = item
+	}
+	return validation, nil
+}
+
+func (validation *managedRPMViewValidation) check(identity, href string, size int64) error {
+	if validation == nil {
+		return nil
+	}
+	expected, exists := validation.expected[identity]
+	if !exists {
+		return fmt.Errorf("%w: managed RPM metadata references unexpected package %q", ErrInvalidRepodata, identity)
+	}
+	if _, duplicate := validation.seen[identity]; duplicate {
+		return fmt.Errorf("%w: managed RPM metadata repeats package %s", ErrInvalidRepodata, identity)
+	}
+	if size != expected.Size {
+		return fmt.Errorf("%w: managed RPM package %s size %d differs from canonical Pool size %d", ErrInvalidRepodata, identity, size, expected.Size)
+	}
+	if err := ValidateRPMHrefRoundTrip(validation.repositoryBase, validation.view, expected.PoolPath, href); err != nil {
+		return fmt.Errorf("%w: managed RPM package %s href is invalid: %v", ErrInvalidRepodata, identity, err)
+	}
+	validation.seen[identity] = struct{}{}
+	return nil
+}
+
+func (validation *managedRPMViewValidation) finish() error {
+	if validation == nil {
+		return fmt.Errorf("%w: managed RPM view validation is unavailable", ErrInvalidRepodata)
+	}
+	if len(validation.seen) != len(validation.expected) {
+		return fmt.Errorf("%w: managed RPM metadata closure has %d packages, want %d", ErrInvalidRepodata, len(validation.seen), len(validation.expected))
+	}
+	return nil
 }
 
 // ValidateDirectory cryptographically and structurally validates a complete
@@ -130,11 +261,11 @@ func ValidateFlatUnsignedDirectory(ctx context.Context, dir string, compression 
 }
 
 // ValidateManagedUnsignedDirectory validates unsigned managed rpm-md. Package
-// hrefs use the root-pool projection shape pool/<prefix>/<source>/<basename>;
-// the managed layer separately proves that each view-local href is a regular
-// hardlink alias of its canonical root Pool object.
+// hrefs must be canonical encode-once parent-relative references to a Pool
+// path. Use ValidateManagedRPMViewUnsignedDirectory when the actual view URI
+// and exact package closure are available.
 func ValidateManagedUnsignedDirectory(ctx context.Context, dir string, compression Compression) (*Generation, error) {
-	return validateDirectoryModeRetained(ctx, dir, compression, nil, false, false, false, true)
+	return validateDirectoryModeRetained(ctx, dir, compression, nil, false, true, false, false, true, nil)
 }
 
 // ValidateManagedDirectory validates signed managed rpm-md while permitting
@@ -142,7 +273,77 @@ func ValidateManagedUnsignedDirectory(ctx context.Context, dir string, compressi
 // client closure. repomd.xml and its detached signature always describe only
 // the current three metadata artifacts.
 func ValidateManagedDirectory(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier) (*Generation, error) {
-	return validateDirectoryModeRetained(ctx, dir, compression, verifier, false, true, false, true)
+	return validateDirectoryModeRetained(ctx, dir, compression, verifier, false, true, true, false, true, nil)
+}
+
+// ValidateManagedRPMViewUnsignedDirectory performs full managed rpm-md
+// validation and additionally proves every primary href, size, and digest
+// against the expected canonical Pool closure at the actual Repository URI.
+func ValidateManagedRPMViewUnsignedDirectory(ctx context.Context, dir string, compression Compression, repositoryBase *url.URL, view ManagedRPMViewPath, expected []ManagedRPMPackageExpectation) (*Generation, error) {
+	validation, err := newManagedRPMViewValidation(repositoryBase, view, expected)
+	if err != nil {
+		return nil, err
+	}
+	generation, err := validateDirectoryModeRetained(ctx, dir, compression, nil, false, true, false, false, true, validation)
+	if err != nil {
+		return nil, err
+	}
+	if err := validation.finish(); err != nil {
+		return nil, err
+	}
+	return generation, nil
+}
+
+// ValidateManagedRPMViewDirectory is the signed counterpart of
+// ValidateManagedRPMViewUnsignedDirectory.
+func ValidateManagedRPMViewDirectory(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, repositoryBase *url.URL, view ManagedRPMViewPath, expected []ManagedRPMPackageExpectation) (*Generation, error) {
+	validation, err := newManagedRPMViewValidation(repositoryBase, view, expected)
+	if err != nil {
+		return nil, err
+	}
+	generation, err := validateDirectoryModeRetained(ctx, dir, compression, verifier, false, true, true, false, true, validation)
+	if err != nil {
+		return nil, err
+	}
+	if err := validation.finish(); err != nil {
+		return nil, err
+	}
+	return generation, nil
+}
+
+// ValidateLegacyC2RPMViewUnsignedDirectory validates the frozen v0.2
+// view-local pool/... href contract.  It is an admission gate for explicit
+// migration only and must not be used by a forward renderer.
+func ValidateLegacyC2RPMViewUnsignedDirectory(ctx context.Context, dir string, compression Compression, view ManagedRPMViewPath, expected []ManagedRPMPackageExpectation) (*Generation, error) {
+	validation, err := newLegacyC2RPMViewValidation(view, expected)
+	if err != nil {
+		return nil, err
+	}
+	generation, err := validateDirectoryModeRetained(ctx, dir, compression, nil, false, true, false, false, true, validation)
+	if err != nil {
+		return nil, err
+	}
+	if err := validation.finish(); err != nil {
+		return nil, err
+	}
+	return generation, nil
+}
+
+// ValidateLegacyC2RPMViewDirectory is the signed counterpart of
+// ValidateLegacyC2RPMViewUnsignedDirectory.
+func ValidateLegacyC2RPMViewDirectory(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, view ManagedRPMViewPath, expected []ManagedRPMPackageExpectation) (*Generation, error) {
+	validation, err := newLegacyC2RPMViewValidation(view, expected)
+	if err != nil {
+		return nil, err
+	}
+	generation, err := validateDirectoryModeRetained(ctx, dir, compression, verifier, false, true, true, false, true, validation)
+	if err != nil {
+		return nil, err
+	}
+	if err := validation.finish(); err != nil {
+		return nil, err
+	}
+	return generation, nil
 }
 
 // ValidateFlatEmptyUnsignedDirectory validates the empty unsigned rpm-md
@@ -159,10 +360,10 @@ func validateDirectory(ctx context.Context, dir string, compression Compression,
 }
 
 func validateDirectoryMode(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, flatCompatibility, signed, requireEmpty bool) (*Generation, error) {
-	return validateDirectoryModeRetained(ctx, dir, compression, verifier, flatCompatibility, signed, requireEmpty, false)
+	return validateDirectoryModeRetained(ctx, dir, compression, verifier, flatCompatibility, false, signed, requireEmpty, false, nil)
 }
 
-func validateDirectoryModeRetained(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, flatCompatibility, signed, requireEmpty, retained bool) (*Generation, error) {
+func validateDirectoryModeRetained(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, flatCompatibility, managed, signed, requireEmpty, retained bool, viewValidation rpmViewValidation) (*Generation, error) {
 	dir = filepath.Clean(dir)
 	absolute, err := filepath.Abs(dir)
 	if err != nil {
@@ -186,7 +387,7 @@ func validateDirectoryModeRetained(ctx context.Context, dir string, compression 
 		!current.IsDir() || !os.SameFile(info, opened) || !os.SameFile(info, current) {
 		return nil, fmt.Errorf("%w: generation directory changed while binding: %v", ErrInvalidRepodata, errors.Join(openErr, pathErr))
 	}
-	generation, _, err := validateRootWithProofMode(ctx, root, dir, compression, verifier, flatCompatibility, signed, requireEmpty, retained)
+	generation, _, err := validateRootWithProofMode(ctx, root, dir, compression, verifier, flatCompatibility, managed, signed, requireEmpty, retained, viewValidation)
 	if err != nil {
 		return nil, err
 	}
@@ -200,10 +401,10 @@ func validateDirectoryModeRetained(ctx context.Context, dir string, compression 
 }
 
 func validateRootWithProof(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier, flatCompatibility bool) (*Generation, *ValidatedRootProof, error) {
-	return validateRootWithProofMode(ctx, root, diagnostic, compression, verifier, flatCompatibility, true, false, false)
+	return validateRootWithProofMode(ctx, root, diagnostic, compression, verifier, flatCompatibility, false, true, false, false, nil)
 }
 
-func validateRootWithProofMode(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier, flatCompatibility, signed, requireEmpty, retained bool) (*Generation, *ValidatedRootProof, error) {
+func validateRootWithProofMode(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier, flatCompatibility, managed, signed, requireEmpty, retained bool, viewValidation rpmViewValidation) (*Generation, *ValidatedRootProof, error) {
 	if ctx == nil {
 		return nil, nil, fmt.Errorf("%w: nil context", ErrInvalidRepodata)
 	}
@@ -245,8 +446,9 @@ func validateRootWithProofMode(ctx context.Context, root *os.Root, diagnostic st
 	if document.XMLName.Space != repoNS || document.XMLName.Local != "repomd" {
 		return nil, nil, fmt.Errorf("%w: repomd root is {%s}%s", ErrInvalidRepodata, document.XMLName.Space, document.XMLName.Local)
 	}
-	revision, err := strconv.ParseInt(strings.TrimSpace(document.Revision), 10, 64)
-	if err != nil || revision < 0 {
+	revisionText := strings.TrimSpace(document.Revision)
+	revision, err := strconv.ParseUint(revisionText, 10, 64)
+	if err != nil || strconv.FormatUint(revision, 10) != revisionText {
 		return nil, nil, fmt.Errorf("%w: invalid revision %q", ErrInvalidRepodata, document.Revision)
 	}
 	if len(document.Data) != 3 {
@@ -274,7 +476,7 @@ func validateRootWithProofMode(ctx context.Context, root *os.Root, diagnostic st
 		if !ok {
 			return nil, nil, fmt.Errorf("%w: missing %q record", ErrInvalidRepodata, kind)
 		}
-		artifact, count, identities, validatedEntry, err := validateArtifactRoot(ctx, root, kind, record, compression, flatCompatibility, identityTemp, requireEmpty)
+		artifact, count, identities, validatedEntry, err := validateArtifactRoot(ctx, root, kind, record, compression, flatCompatibility, managed, identityTemp, requireEmpty, viewValidation)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -368,7 +570,7 @@ func readUnsignedRepomdRoot(root *os.Root) ([]byte, []validatedRegularEntry, err
 	return messageBytes, []validatedRegularEntry{entry}, nil
 }
 
-func validateArtifactRoot(ctx context.Context, root *os.Root, kind string, record repomdRecord, compression Compression, flatCompatibility bool, identityTemp string, requireEmpty bool) (Artifact, int64, string, validatedRegularEntry, error) {
+func validateArtifactRoot(ctx context.Context, root *os.Root, kind string, record repomdRecord, compression Compression, flatCompatibility, managed bool, identityTemp string, requireEmpty bool, viewValidation rpmViewValidation) (Artifact, int64, string, validatedRegularEntry, error) {
 	if record.Checksum.Type != "sha256" || record.OpenChecksum.Type != "sha256" ||
 		!validSHA256(record.Checksum.Value) || !validSHA256(record.OpenChecksum.Value) {
 		return Artifact{}, 0, "", validatedRegularEntry{}, fmt.Errorf("%w: %s requires SHA256 checksums", ErrInvalidRepodata, kind)
@@ -401,7 +603,7 @@ func validateArtifactRoot(ctx context.Context, root *os.Root, kind string, recor
 	if err := file.Reset(); err != nil {
 		return Artifact{}, 0, "", validatedRegularEntry{}, err
 	}
-	openSHA, openSize, count, identities, err := validateOpenXML(ctx, file.file, kind, compression, flatCompatibility, identityTemp, requireEmpty)
+	openSHA, openSize, count, identities, err := validateOpenXML(ctx, file.file, kind, compression, flatCompatibility, managed, identityTemp, requireEmpty, viewValidation)
 	if err != nil {
 		return Artifact{}, 0, "", validatedRegularEntry{}, err
 	}
@@ -422,7 +624,7 @@ func validateArtifactRoot(ctx context.Context, root *os.Root, kind string, recor
 	}, count, identities, validatedEntry, nil
 }
 
-func validateOpenXML(ctx context.Context, source io.Reader, kind string, compression Compression, flatCompatibility bool, identityTemp string, requireEmpty bool) (string, int64, int64, string, error) {
+func validateOpenXML(ctx context.Context, source io.Reader, kind string, compression Compression, flatCompatibility, managed bool, identityTemp string, requireEmpty bool, viewValidation rpmViewValidation) (string, int64, int64, string, error) {
 	var reader io.Reader
 	var closer io.Closer
 	switch compression {
@@ -449,7 +651,7 @@ func validateOpenXML(ctx context.Context, source io.Reader, kind string, compres
 	if !requireEmpty {
 		spool = newMetadataIdentitySpool(ctx, identityTemp, kind)
 	}
-	count, err := validateMetadataXMLMode(tee, kind, flatCompatibility, spool)
+	count, err := validateMetadataXMLMode(tee, kind, flatCompatibility, managed, spool, viewValidation)
 	if err != nil {
 		spool.Close()
 		return "", 0, 0, "", err
@@ -469,10 +671,10 @@ func validateOpenXML(ctx context.Context, source io.Reader, kind string, compres
 }
 
 func validateMetadataXML(reader io.Reader, kind string) (int64, error) {
-	return validateMetadataXMLMode(reader, kind, false, nil)
+	return validateMetadataXMLMode(reader, kind, false, false, nil, nil)
 }
 
-func validateMetadataXMLMode(reader io.Reader, kind string, flatCompatibility bool, identities *metadataIdentitySpool) (int64, error) {
+func validateMetadataXMLMode(reader io.Reader, kind string, flatCompatibility, managed bool, identities *metadataIdentitySpool, viewValidation rpmViewValidation) (int64, error) {
 	wantedLocal, wantedNS := "metadata", commonNS
 	switch kind {
 	case "filelists":
@@ -488,7 +690,9 @@ func validateMetadataXMLMode(reader io.Reader, kind string, flatCompatibility bo
 	depth := 0
 	var declared, actual int64 = -1, 0
 	var packageName, packageIdentity strings.Builder
-	var capturePackageName, capturePackageIdentity, packageLocationSeen bool
+	var packageHref string
+	var packageSize int64
+	var capturePackageName, capturePackageIdentity, packageLocationSeen, packageSizeSeen bool
 	for {
 		token, err := decoder.Token()
 		if errors.Is(err, io.EOF) {
@@ -524,7 +728,10 @@ func validateMetadataXMLMode(reader io.Reader, kind string, flatCompatibility bo
 				actual++
 				packageName.Reset()
 				packageIdentity.Reset()
+				packageHref = ""
+				packageSize = 0
 				packageLocationSeen = false
+				packageSizeSeen = false
 				if kind != "primary" {
 					for _, attr := range value.Attr {
 						if attr.Name.Local == "pkgid" {
@@ -544,6 +751,24 @@ func validateMetadataXMLMode(reader io.Reader, kind string, flatCompatibility bo
 					return 0, fmt.Errorf("%w: primary package requires SHA256 pkgid checksum", ErrInvalidRepodata)
 				}
 				capturePackageIdentity = true
+			} else if kind == "primary" && depth == 3 && value.Name.Space == commonNS && value.Name.Local == "size" {
+				if packageSizeSeen {
+					return 0, fmt.Errorf("%w: primary package has duplicate size", ErrInvalidRepodata)
+				}
+				packageSizeSeen = true
+				packageSize = -1
+				for _, attr := range value.Attr {
+					if attr.Name.Local == "package" {
+						parsed, parseErr := strconv.ParseInt(attr.Value, 10, 64)
+						if parseErr != nil {
+							return 0, fmt.Errorf("%w: primary package has invalid package size", ErrInvalidRepodata)
+						}
+						packageSize = parsed
+					}
+				}
+				if packageSize < 0 {
+					return 0, fmt.Errorf("%w: primary package has invalid package size", ErrInvalidRepodata)
+				}
 			} else if kind == "primary" && depth == 3 && value.Name.Space == commonNS && value.Name.Local == "location" {
 				if packageLocationSeen {
 					return 0, fmt.Errorf("%w: primary package has duplicate location", ErrInvalidRepodata)
@@ -554,9 +779,14 @@ func validateMetadataXMLMode(reader io.Reader, kind string, flatCompatibility bo
 						href = attr.Value
 					}
 				}
-				if err := validatePackageHrefForMode(packageName.String(), href, flatCompatibility); err != nil {
-					return 0, err
+				if viewValidation == nil {
+					if err := validatePackageHrefForModes(packageName.String(), href, flatCompatibility, managed); err != nil {
+						return 0, err
+					}
+				} else if href == "" {
+					return 0, fmt.Errorf("%w: primary package has an empty location href", ErrInvalidRepodata)
 				}
+				packageHref = href
 				packageLocationSeen = true
 			}
 		case xml.CharData:
@@ -573,8 +803,15 @@ func validateMetadataXMLMode(reader io.Reader, kind string, flatCompatibility bo
 			if kind == "primary" && depth == 3 && value.Name.Space == commonNS && value.Name.Local == "checksum" {
 				capturePackageIdentity = false
 			}
-			if kind == "primary" && depth == 2 && value.Name.Space == commonNS && value.Name.Local == "package" && !packageLocationSeen {
-				return 0, fmt.Errorf("%w: primary package %q lacks location", ErrInvalidRepodata, packageName.String())
+			if kind == "primary" && depth == 2 && value.Name.Space == commonNS && value.Name.Local == "package" {
+				if !packageLocationSeen || !packageSizeSeen {
+					return 0, fmt.Errorf("%w: primary package %q lacks location or size", ErrInvalidRepodata, packageName.String())
+				}
+				if viewValidation != nil {
+					if err := viewValidation.check(strings.TrimSpace(packageIdentity.String()), packageHref, packageSize); err != nil {
+						return 0, err
+					}
+				}
 			}
 			if depth == 2 && value.Name.Space == wantedNS && value.Name.Local == "package" {
 				identity := strings.TrimSpace(packageIdentity.String())
@@ -604,6 +841,17 @@ func validatePackageHref(name, href string) error {
 }
 
 func validatePackageHrefForMode(name, href string, flatCompatibility bool) error {
+	return validatePackageHrefForModes(name, href, flatCompatibility, false)
+}
+
+func validatePackageHrefForModes(name, href string, flatCompatibility, managed bool) error {
+	if managed {
+		_, pool, err := ParseManagedRPMHref(href)
+		if err != nil || name == "" || !safeManagedRPMBasename(pool.Filename()) {
+			return fmt.Errorf("%w: package href %q is not a canonical managed parent-relative reference", ErrInvalidRepodata, href)
+		}
+		return nil
+	}
 	if href == "" || path.Clean(href) != href || strings.ContainsAny(href, "\\%?#\x00\r\n\t") {
 		return fmt.Errorf("%w: unsafe package href %q", ErrInvalidRepodata, href)
 	}
@@ -614,12 +862,6 @@ func validatePackageHrefForMode(name, href string, flatCompatibility bool) error
 		return nil
 	}
 	parts := strings.Split(href, "/")
-	if len(parts) == 4 && parts[0] == "pool" {
-		if err := validateManagedPackageLocation(name, parts[3], href); err != nil {
-			return fmt.Errorf("%w: package href %q is not a canonical managed pool location", ErrInvalidRepodata, href)
-		}
-		return nil
-	}
 	if len(parts) != 3 || parts[0] != "Packages" || len(parts[1]) != 1 {
 		return fmt.Errorf("%w: package href %q violates Packages/<bucket>/<basename>", ErrInvalidRepodata, href)
 	}

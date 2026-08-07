@@ -32,7 +32,7 @@ func TestChangesZeroExactlyMatchesPublicDeliveryTree(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	zero := int64(0)
+	zero := state.GenerationID(0)
 	result, err := Changes(ctx, ChangesOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Base: &zero})
 	if err != nil || result.Generation != added.Generation || result.Dirty {
 		t.Fatalf("changes=%#v err=%v", result, err)
@@ -121,7 +121,7 @@ WHERE operation_id = (SELECT operation_id FROM generations ORDER BY generation D
 	if err := errors.Join(tamperErr, closeErr); err != nil {
 		t.Fatal(err)
 	}
-	zero := int64(0)
+	zero := state.GenerationID(0)
 	result, err := Changes(ctx, ChangesOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Base: &zero})
 	if !errors.Is(err, ErrIntegrity) || len(result.Changes) != 0 {
 		t.Fatalf("changes=%#v err=%v", result, err)
@@ -141,7 +141,7 @@ func TestChangesRejectsPublicTreeDriftWithoutEmittingPlan(t *testing.T) {
 	if err := os.WriteFile(extra, []byte("not part of the retained Generation\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	zero := int64(0)
+	zero := state.GenerationID(0)
 	result, err := Changes(ctx, ChangesOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Base: &zero})
 	if !errors.Is(err, ErrIntegrity) || len(result.Changes) != 0 {
 		t.Fatalf("changes emitted a plan for drifted public tree: result=%#v err=%v", result, err)
@@ -182,7 +182,7 @@ func TestChangesRejectsCheckObservedPublicModeErrorWithoutEmittingPlan(t *testin
 	if !errors.Is(err, ErrIntegrity) || checked.Status != "error" {
 		t.Fatalf("bad-mode check=%#v err=%v", checked, err)
 	}
-	zero := int64(0)
+	zero := state.GenerationID(0)
 	result, err := Changes(ctx, ChangesOptions{WorkspaceOptions: options, Repository: "repo", Base: &zero})
 	if !errors.Is(err, ErrIntegrity) || len(result.Changes) != 0 {
 		t.Fatalf("changes emitted a plan for public-mode error: result=%#v err=%v", result, err)
@@ -209,7 +209,7 @@ func TestChangesConsumerReconstructsExactTreeInPhaseOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	zero := int64(0)
+	zero := state.GenerationID(0)
 	first, err := Changes(ctx, ChangesOptions{WorkspaceOptions: options, Repository: "repo", Base: &zero})
 	if err != nil || first.Generation != added.Generation || first.Dirty {
 		t.Fatalf("changes 0=%#v err=%v", first, err)

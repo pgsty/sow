@@ -12,26 +12,23 @@ import (
 	"sync"
 )
 
-// GenerateManaged builds one managed architecture view using safe pool/...
-// hrefs. A nil signer produces an unsigned repomd.xml; a non-nil signer also
-// produces and self-verifies repomd.xml.asc. The caller owns view-local
-// hardlink projection and pointer-last publication.
-func GenerateManaged(ctx context.Context, dest string, revision int64, packages PackageIterator, signer DetachedSigner) (*Generation, error) {
+// GenerateManaged builds one managed architecture view whose package hrefs
+// are canonical parent-relative references to Repository-root Pool objects.
+// A nil signer produces an unsigned repomd.xml; a non-nil signer also produces
+// and self-verifies repomd.xml.asc.
+func GenerateManaged(ctx context.Context, dest string, revision uint64, packages PackageIterator, signer DetachedSigner) (*Generation, error) {
 	return GenerateManagedConcurrent(ctx, dest, revision, packages, signer, 1)
 }
 
 // GenerateManagedConcurrent is GenerateManaged with bounded parallel package
 // parsing. Results are written in iterator order, so worker count cannot affect
 // metadata bytes or package selection.
-func GenerateManagedConcurrent(ctx context.Context, dest string, revision int64, packages PackageIterator, signer DetachedSigner, workers int) (*Generation, error) {
+func GenerateManagedConcurrent(ctx context.Context, dest string, revision uint64, packages PackageIterator, signer DetachedSigner, workers int) (*Generation, error) {
 	if ctx == nil {
 		return nil, errors.New("yumrepo: nil context")
 	}
 	if packages == nil {
 		return nil, errors.New("yumrepo: nil package iterator")
-	}
-	if revision < 0 {
-		return nil, errors.New("yumrepo: revision must be non-negative")
 	}
 	if workers < 1 {
 		return nil, errors.New("yumrepo: managed generation workers must be positive")
@@ -96,9 +93,9 @@ func GenerateManagedConcurrent(ctx context.Context, dest string, revision int64,
 				bodies.closeDiscard()
 				return nil, nextErr
 			}
-			if input.Location == "" {
+			if input.PoolPath == "" || input.ViewPath.String() == "" || input.Location == "" {
 				bodies.closeDiscard()
-				return nil, errors.New("yumrepo: managed package input requires an explicit pool location")
+				return nil, errors.New("yumrepo: managed package input requires an explicit PoolPath, ViewPath, and rendered href")
 			}
 			input.FileTime = unixEpoch
 			batch = append(batch, input)
@@ -150,7 +147,7 @@ func GenerateManagedConcurrent(ctx context.Context, dest string, revision int64,
 		if err := assembleXML(rawPath, item.name, item.body, count); err != nil {
 			return nil, err
 		}
-		artifact, err := compressXML(ctx, tmp, item.name, rawPath, CompressionGzip, count, revision)
+		artifact, err := compressXML(ctx, tmp, item.name, rawPath, CompressionGzip, count, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -174,7 +171,7 @@ func GenerateManagedConcurrent(ctx context.Context, dest string, revision int64,
 		if err := signRepomd(ctx, tmp, signer); err != nil {
 			return nil, err
 		}
-		validated, err := ValidateDirectory(ctx, tmp, CompressionGzip, signer)
+		validated, err := ValidateManagedDirectory(ctx, tmp, CompressionGzip, signer)
 		if err != nil {
 			return nil, fmt.Errorf("yumrepo: generated managed signed repodata failed self-validation: %w", err)
 		}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -50,6 +51,9 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
+		return result, err
+	}
+	if err := requireNoWriteActivePublication(ctx, store); err != nil {
 		return result, err
 	}
 	distNames, effectiveDists, err := selectedMutationDists(ws, cfg, repoName, opts.Dists)
@@ -235,7 +239,14 @@ func previewRemove(ctx context.Context, opts RemoveOptions) (result RemoveResult
 		// A successful default rm immediately commits one Desired revision and
 		// one physical Generation. --check reports that predicted identity while
 		// remaining entirely read-only.
-		result.Revision, result.Generation = summary.DesiredRevision+1, summary.BuiltGeneration+1
+		nextGeneration, nextErr := summary.BuiltGeneration.Next()
+		if nextErr != nil {
+			if err == nil {
+				err = fmt.Errorf("%w: %v", ErrRejected, nextErr)
+			}
+		} else {
+			result.Revision, result.Generation = summary.DesiredRevision+1, nextGeneration
+		}
 		if dirty, dirtyErr := predictedDirtyAfterBuild(ctx, ws.Root, repoName, cfg, store, affected); dirtyErr == nil {
 			result.Dirty = dirty
 		} else if err == nil {
@@ -296,6 +307,10 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 	if err != nil {
 		return nil, err
 	}
+	nextGeneration, err := summary.BuiltGeneration.Next()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrRejected, err)
+	}
 	base, err := scanPublicManifest(ctx, filepath.Join(root, repoName))
 	if err != nil {
 		return nil, err
@@ -347,16 +362,12 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 			}
 		}
 		if dist.Format == "rpm" {
-			priorBuilt, err := store.ListPackageObjects(ctx, []string{distName}, true)
-			if err != nil {
-				return nil, err
-			}
-			if err := previewRPMDist(ctx, filepath.Join(root, repoName), previewRoot, distName, summary.BuiltGeneration+1, architectures, sources, priorBuilt, rpmSigner, jobs, base, target); err != nil {
+			if err := previewRPMDist(ctx, filepath.Join(root, repoName), previewRoot, distName, nextGeneration, architectures, sources, rpmSigner, jobs, base, target); err != nil {
 				return nil, err
 			}
 			continue
 		}
-		spec := ManagedDistSpec{Name: distName, Format: dist.Format, Architectures: architectures, Generation: summary.BuiltGeneration + 1, Jobs: jobs, PublishedAt: publicationTime, Packages: sources, APTSigner: debSigner}
+		spec := ManagedDistSpec{Name: distName, Format: dist.Format, Architectures: architectures, Generation: nextGeneration, Jobs: jobs, PublishedAt: publicationTime, Packages: sources, APTSigner: debSigner}
 		rendered, err := RenderManagedDist(ctx, previewRoot, spec)
 		if err != nil {
 			return nil, err
@@ -380,14 +391,12 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 	return state.DiffManifests(base, targetManifest), nil
 }
 
-func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName string, generation int64, architectures []state.Architecture, sources []ManagedPackageSource, priorBuilt []state.PackageObject, signer yumrepo.DetachedSigner, jobs int, base []state.GenerationFile, target map[string]state.GenerationFile) error {
+func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName string, generation state.GenerationID, architectures []state.Architecture, sources []ManagedPackageSource, signer yumrepo.DetachedSigner, jobs int, base []state.GenerationFile, target map[string]state.GenerationFile) error {
 	baseByPath := make(map[string]state.GenerationFile, len(base))
 	for _, file := range base {
 		baseByPath[file.Path] = file
 	}
-	architectureSet := make(map[string]struct{}, len(architectures))
 	for _, architecture := range architectures {
-		architectureSet[architecture.Family] = struct{}{}
 		priorRoot := filepath.Join(repositoryRoot, "dists", distName, architecture.Family, "repodata")
 		var prior *yumrepo.Generation
 		var err error
@@ -410,35 +419,33 @@ func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName s
 			target[path] = file
 		}
 	}
-	aliasByDigest := map[string]state.PackageObject{}
-	for _, object := range priorBuilt {
-		if object.Format == "rpm" && object.Storage == "pool" {
-			aliasByDigest[object.SHA256] = object
-		}
-	}
-	for _, source := range sources {
-		aliasByDigest[source.Object.SHA256] = source.Object
-	}
-	for _, object := range aliasByDigest {
-		for family := range architectureSet {
-			if object.CanonicalArch != "neutral" && object.CanonicalArch != family {
-				continue
-			}
-			path := filepath.ToSlash(filepath.Join("dists", distName, family, filepath.FromSlash(object.PoolPath)))
-			target[path] = state.GenerationFile{Path: path, Phase: "payload", Size: object.Size, SHA256: object.SHA256}
-		}
-	}
+	repositoryBase := &url.URL{Scheme: "file", Path: filepath.ToSlash(repositoryRoot) + "/"}
 	for _, architecture := range architectures {
+		viewPath, err := yumrepo.ParseManagedRPMViewPath(filepath.ToSlash(filepath.Join("dists", distName, architecture.Family)))
+		if err != nil {
+			return err
+		}
 		inputs := []yumrepo.PackageInput{}
 		for _, source := range sources {
 			if source.Object.CanonicalArch != "neutral" && source.Object.CanonicalArch != architecture.Family {
 				continue
 			}
-			inputs = append(inputs, yumrepo.PackageInput{Path: source.Path, Basename: source.Object.Filename, Location: source.Object.PoolPath})
+			poolPath, err := yumrepo.ParseManagedPoolPath(source.Object.PoolPath)
+			if err != nil {
+				return err
+			}
+			href, err := yumrepo.RPMParentRelativeHref(viewPath, poolPath)
+			if err != nil {
+				return err
+			}
+			if err := yumrepo.ValidateRPMHrefRoundTrip(repositoryBase, viewPath, poolPath, href.String()); err != nil {
+				return err
+			}
+			inputs = append(inputs, yumrepo.PackageInput{Path: source.Path, Basename: source.Object.Filename, PoolPath: source.Object.PoolPath, ViewPath: viewPath, Location: href.String()})
 		}
 		sort.Slice(inputs, func(i, j int) bool { return inputs[i].Location < inputs[j].Location })
 		dest := filepath.Join(previewRoot, "dists", distName, architecture.Family, "repodata")
-		if _, err := yumrepo.GenerateManagedConcurrent(ctx, dest, generation, &yumrepo.SliceIterator{Inputs: inputs}, signer, jobs); err != nil {
+		if _, err := yumrepo.GenerateManagedConcurrent(ctx, dest, uint64(generation), &yumrepo.SliceIterator{Inputs: inputs}, signer, jobs); err != nil {
 			return err
 		}
 	}
@@ -460,7 +467,11 @@ func scanPreviewFiles(ctx context.Context, root, prefix string) ([]state.Generat
 			return err
 		}
 		path := prefix + relative
-		files = append(files, state.GenerationFile{Path: path, Phase: publicFilePhase(path), Size: info.Size(), SHA256: digest})
+		phase := publicFilePhase(path)
+		if phase == "" {
+			return fmt.Errorf("%w: removal preview dists contains package payload %s", ErrIntegrity, path)
+		}
+		files = append(files, state.GenerationFile{Path: path, Phase: phase, Size: info.Size(), SHA256: digest})
 		return nil
 	}, nil)
 	if err != nil {

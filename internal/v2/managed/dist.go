@@ -26,7 +26,7 @@ type distOperationPayload struct {
 	Name                         string                         `json:"name"`
 	Format                       string                         `json:"format"`
 	Architectures                []state.Architecture           `json:"architectures"`
-	Generation                   int64                          `json:"generation"`
+	Generation                   state.GenerationID             `json:"generation"`
 	EffectiveConfigSHA256        string                         `json:"effective_config_sha256"`
 	EffectiveSigning             *config.EffectiveSigningConfig `json:"effective_signing,omitempty"`
 	MetadataSignerSnapshotSHA256 string                         `json:"metadata_signer_snapshot_sha256,omitempty"`
@@ -428,6 +428,9 @@ func NewDist(ctx context.Context, opts DistNewOptions) (result DistInfo, resultE
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
 		return DistInfo{}, err
 	}
+	if err := requireNoWriteActivePublication(ctx, store); err != nil {
+		return DistInfo{}, err
+	}
 	if err := store.Checkpoint(ctx); err != nil {
 		return DistInfo{}, fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
@@ -525,6 +528,9 @@ func removeDist(ctx context.Context, opts DistRemoveOptions, result *RemovalResu
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
 		return err
 	}
+	if err := requireNoWriteActivePublication(ctx, store); err != nil {
+		return err
+	}
 	if err := store.Checkpoint(ctx); err != nil {
 		return fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
@@ -553,6 +559,9 @@ func removeDist(ctx context.Context, opts DistRemoveOptions, result *RemovalResu
 	}
 	if counts.Memberships != 0 && !opts.Force {
 		return fmt.Errorf("%w: dist %q is not empty; use --force", ErrRejected, opts.Name)
+	}
+	if err := rejectPublishedPointerWithdrawal(ctx, cfg, repoName, store, []string{opts.Name}, nil); err != nil {
+		return err
 	}
 	delete(repo.Dists, opts.Name)
 	cfg.Repositories[repoName] = repo
@@ -603,6 +612,9 @@ func initializeDeclaredDists(ctx context.Context, root, repoName string, fault f
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	if err := recoverDistOperations(ctx, root, repoName, store); err != nil {
+		return 0, err
+	}
+	if err := requireNoWriteActivePublication(ctx, store); err != nil {
 		return 0, err
 	}
 	if err := store.Checkpoint(ctx); err != nil {
@@ -665,7 +677,10 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 	if err != nil {
 		return DistInfo{}, err
 	}
-	generation := summary.BuiltGeneration + 1
+	generation, err := summary.BuiltGeneration.Next()
+	if err != nil {
+		return DistInfo{}, fmt.Errorf("%w: %v", ErrRejected, err)
+	}
 	payload := distOperationPayload{Version: distOperationVersion, Repository: repoName, Name: distName, Format: distCfg.Format, Generation: generation, OldConfigSHA256: bytesSHA(oldData), NewConfigSHA256: bytesSHA(newData), NewConfig: newData}
 	for _, family := range architectures {
 		ecosystem := family
@@ -844,7 +859,11 @@ func executeDistRemove(ctx context.Context, root, repoName, distName string, old
 	if err != nil {
 		return err
 	}
-	payload := distOperationPayload{Version: distOperationVersion, Repository: repoName, Name: distName, Generation: summary.BuiltGeneration + 1, OldConfigSHA256: bytesSHA(oldData), NewConfigSHA256: bytesSHA(newData), NewConfig: newData, TreeSHA256: treeSHA}
+	generation, err := summary.BuiltGeneration.Next()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrRejected, err)
+	}
+	payload := distOperationPayload{Version: distOperationVersion, Repository: repoName, Name: distName, Generation: generation, OldConfigSHA256: bytesSHA(oldData), NewConfigSHA256: bytesSHA(newData), NewConfig: newData, TreeSHA256: treeSHA}
 	id, err := operationID()
 	if err != nil {
 		return err
@@ -976,7 +995,7 @@ func finalizePreApplyDistOperation(parent context.Context, root, repoName, id st
 	return returned
 }
 
-func distLifecycleGeneration(ctx context.Context, root, repoName string, generation int64, store *state.Store) ([]state.GenerationFile, []state.FileChange, error) {
+func distLifecycleGeneration(ctx context.Context, root, repoName string, generation state.GenerationID, store *state.Store) ([]state.GenerationFile, []state.FileChange, error) {
 	if generation < 1 {
 		return nil, nil, fmt.Errorf("%w: invalid Dist lifecycle generation", ErrIntegrity)
 	}
@@ -1007,6 +1026,12 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 	for _, operation := range pending {
 		if !validStoredOperationID(operation.ID) {
 			return fmt.Errorf("%w: invalid pending operation id", ErrIntegrity)
+		}
+		if operation.Kind == "local.gc" {
+			if err := recoverLocalGCOperation(ctx, root, repoName, store, operation); err != nil {
+				return err
+			}
+			continue
 		}
 		if operation.Kind == "add" || operation.Kind == "rm" || operation.Kind == "build" {
 			if err := recoverMutationOperation(ctx, root, repoName, store, operation); err != nil {
@@ -1136,6 +1161,17 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 	return nil
 }
 
+func requireNoWriteActivePublication(ctx context.Context, store *state.Store) error {
+	active, err := store.HasWriteActivePublication(ctx)
+	if err != nil {
+		return err
+	}
+	if active {
+		return fmt.Errorf("%w: a target publication must roll forward before Repository bytes can change", ErrNotReady)
+	}
+	return nil
+}
+
 func validateCurrentPublicGeneration(ctx context.Context, root, repoName string, store *state.Store) error {
 	return validateCurrentPublicGenerationExceptDist(ctx, root, repoName, store, "")
 }
@@ -1233,6 +1269,12 @@ func recoverDoneDistCleanup(ctx context.Context, root, repoName string, store *s
 			continue
 		}
 		if operation.Kind == "log.prune" {
+			continue
+		}
+		if operation.Kind == "local.gc" {
+			if err := recoverDoneLocalGCCleanup(ctx, root, repoName, operation); err != nil {
+				return err
+			}
 			continue
 		}
 		if operation.Kind == "add" || operation.Kind == "rm" || operation.Kind == "build" {
@@ -1340,7 +1382,8 @@ func validateDistPayloadForRecovery(ctx context.Context, root, operationID, kind
 	if err != nil {
 		return err
 	}
-	if payload.Generation != summary.BuiltGeneration+1 {
+	nextGeneration, nextErr := summary.BuiltGeneration.Next()
+	if nextErr != nil || payload.Generation != nextGeneration {
 		return fmt.Errorf("payload generation %d does not follow repository generation %d", payload.Generation, summary.BuiltGeneration)
 	}
 	if payload.TreeSHA256 != "" && !lowercaseSHA256.MatchString(payload.TreeSHA256) {

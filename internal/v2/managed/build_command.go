@@ -39,6 +39,9 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
 		return result, err
 	}
+	if err := requireNoWriteActivePublication(ctx, store); err != nil {
+		return result, err
+	}
 	distNames, effective, err := selectedBuildDists(cfg, repoName, opts.Dists)
 	if err != nil {
 		return result, err

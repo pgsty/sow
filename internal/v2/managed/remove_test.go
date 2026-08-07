@@ -3,6 +3,7 @@ package managed
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,6 +14,91 @@ import (
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
 )
+
+func TestRemovePreviewAndBuildPreserveGenerationAboveMaxInt64(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := scanPublicManifest(ctx, filepath.Join(root, "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	high := state.GenerationID(math.MaxInt64)
+	tx, err := store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`DELETE FROM generation_view_signers`,
+		`DELETE FROM generation_files`,
+		`DELETE FROM generations`,
+		`DELETE FROM prior_built_memberships`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			tx.Rollback()
+			store.Close()
+			t.Fatal(err)
+		}
+	}
+	for _, statement := range []string{
+		`UPDATE repository_state SET built_generation = ? WHERE singleton = 1`,
+		`UPDATE dists SET built_generation = ?`,
+		`UPDATE dist_architectures SET built_generation = ?`,
+		`UPDATE built_memberships SET generation = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement, high); err != nil {
+			tx.Rollback()
+			store.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.BootstrapLegacyGeneration(ctx, strings.Repeat("e", 64), high, manifest); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	summary, summaryErr := store.Summary(ctx)
+	checkErr := store.Check(ctx)
+	ledgerErr := store.ValidateGenerationLedger(ctx)
+	if err := errors.Join(summaryErr, checkErr, ledgerErr, store.Close()); err != nil || summary.BuiltGeneration != high {
+		t.Fatalf("high Generation summary=%#v err=%v", summary, err)
+	}
+	checked, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})
+	if err != nil || !checked.ReadyToCopy || checked.Generation != high {
+		t.Fatalf("high Generation check=%#v err=%v", checked, err)
+	}
+	preview, err := Remove(ctx, RemoveOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Packages: []string{"pgdg-redhat-nonfree-repo"}, Check: true, Jobs: 1})
+	want, nextErr := high.Next()
+	if err != nil || nextErr != nil || preview.Generation != want || len(preview.Changes) == 0 {
+		t.Fatalf("high Generation preview=%#v want=%s err=%v nextErr=%v", preview, want, err, nextErr)
+	}
+	actual, err := Remove(ctx, RemoveOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Packages: []string{"pgdg-redhat-nonfree-repo"}, Jobs: 1})
+	if err != nil || actual.Generation != want || !reflect.DeepEqual(actual.Changes, preview.Changes) {
+		t.Fatalf("high Generation remove=%#v preview=%#v err=%v", actual, preview, err)
+	}
+}
 
 func TestRemoveCheckSkipAndDefaultBuild(t *testing.T) {
 	newRepo := func(t *testing.T) (string, string) {

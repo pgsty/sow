@@ -92,7 +92,10 @@ func repositoryInfo(ctx context.Context, root, name string, cfg config.Config) (
 	if err != nil {
 		return RepositoryInfo{}, fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
-	if err := validateRepositoryLayout(root, name); err != nil {
+	if err := validateLegacyRepositoryPrivateLayout(root, name); err != nil {
+		return RepositoryInfo{}, err
+	}
+	if err := validateRepositoryPublicLayout(root, name); err != nil {
 		return RepositoryInfo{}, err
 	}
 	store, err := openReadOnlyState(filepath.Join(root, ".sow", name+".db"))
@@ -100,6 +103,9 @@ func repositoryInfo(ctx context.Context, root, name string, cfg config.Config) (
 		return RepositoryInfo{}, fmt.Errorf("%w: repository %q is not initialized: %v", ErrIntegrity, name, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
+	if err := validateRepositoryLayoutForRead(root, name, store.SchemaVersion()); err != nil {
+		return RepositoryInfo{}, err
+	}
 	summary, err := store.Summary(ctx)
 	if err != nil {
 		return RepositoryInfo{}, fmt.Errorf("%w: %v", ErrIntegrity, err)
@@ -111,6 +117,30 @@ func repositoryInfo(ctx context.Context, root, name string, cfg config.Config) (
 	effectiveRepo := effectiveView.Repositories[name]
 	status := summary.Status
 	dirtyReasons := []string{}
+	layout := inspectRepositoryReadLayout(ctx, root, name, store)
+	legacyC2, transition := layout.FrozenC2, layout.Transition
+	transitionActive := layout.transitionActive()
+	if !legacyC2 && layout.IdentityErr != nil {
+		status = "error"
+		dirtyReasons = append(dirtyReasons, "repository identity is invalid: "+layout.IdentityErr.Error())
+	} else if transitionActive {
+		if layout.TransitionErr != nil {
+			status = "error"
+			dirtyReasons = append(dirtyReasons, "transition journal is invalid: "+layout.TransitionErr.Error())
+		} else if layout.ControlErr != nil {
+			status = "error"
+			dirtyReasons = append(dirtyReasons, "transition control is invalid: "+layout.ControlErr.Error())
+		} else if transition == nil {
+			status = "error"
+			dirtyReasons = append(dirtyReasons, "non-terminal Repository or stale transition control has no transition journal")
+		} else if _, transitionErr := validateTransitionBinding(ctx, root, name, cfg, store, *transition, time.Now().UTC()); transitionErr != nil {
+			status = "error"
+			dirtyReasons = append(dirtyReasons, "transition closure is invalid: "+transitionErr.Error())
+		} else {
+			status = statusAtLeast(status, "recovering")
+			dirtyReasons = append(dirtyReasons, fmt.Sprintf("layout transition is %s", transition.Phase))
+		}
+	}
 	if summary.BuiltGeneration > 0 {
 		if _, generationErr := store.GetGeneration(ctx, summary.BuiltGeneration); errors.Is(generationErr, state.ErrNotFound) {
 			status = statusAtLeast(status, "dirty")
@@ -176,9 +206,11 @@ func repositoryInfo(ctx context.Context, root, name string, cfg config.Config) (
 			status = statusAtLeast(status, "dirty")
 			dirtyReasons = append(dirtyReasons, fmt.Sprintf("dist %s effective configuration differs from built state", dist.Name))
 		}
-		if err := validateLiveDistViews(ctx, root, name, dist.Format, dist.Name, dist.Architectures); err != nil {
-			status = statusAtLeast(status, "error")
-			dirtyReasons = append(dirtyReasons, fmt.Sprintf("dist %s views are invalid: %v", dist.Name, err))
+		if !transitionActive {
+			if err := validateLiveDistViews(ctx, root, name, dist.Format, dist.Name, dist.Architectures); err != nil {
+				status = statusAtLeast(status, "error")
+				dirtyReasons = append(dirtyReasons, fmt.Sprintf("dist %s views are invalid: %v", dist.Name, err))
+			}
 		}
 	}
 	for distName := range repo.Dists {
@@ -388,7 +420,21 @@ func removeRepository(ctx context.Context, opts RepositoryRemoveOptions, result 
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
+	if err := store.RequireTerminalLayout(ctx); err != nil {
+		store.Close()
+		return fmt.Errorf("%w: repository removal is forbidden during layout transition: %v", ErrNotReady, err)
+	}
+	transition, _, transitionErr := loadTransitionJournal(ws.Root, opts.Name)
+	control, controlErr := store.LayoutTransitionControl(ctx)
+	if transitionErr != nil || controlErr != nil || transition != nil || control != nil {
+		store.Close()
+		return errors.Join(fmt.Errorf("%w: repository removal requires no transition evidence", ErrNotReady), transitionErr, controlErr)
+	}
 	if err := recoverDistOperations(ctx, ws.Root, opts.Name, store); err != nil {
+		store.Close()
+		return err
+	}
+	if err := requireNoWriteActivePublication(ctx, store); err != nil {
 		store.Close()
 		return err
 	}

@@ -98,9 +98,13 @@ func CompressionForEL(major int) (Compression, error) {
 type PackageInput struct {
 	Path     string
 	Basename string
-	// Location optionally overrides the canonical Packages/<bucket>/<basename>
-	// href for a managed architecture view. It is restricted to the frozen
-	// pool/<prefix>/<source>/<basename> shape and never changes package identity.
+	// PoolPath, ViewPath, and Location form one typed managed-view projection:
+	// PoolPath is the unescaped canonical Repository path, ViewPath is the
+	// Repository-relative RPM view root, and Location is its encoded
+	// parent-relative URI reference. They must either all be zero or all be
+	// present and resolve to the same object.
+	PoolPath string
+	ViewPath ManagedRPMViewPath
 	Location string
 	FileTime time.Time
 }
@@ -245,7 +249,7 @@ type Generation struct {
 	Dir            string
 	Artifacts      [3]Artifact
 	Packages       int64
-	Revision       int64
+	Revision       uint64
 	RepomdSHA256   string
 	IdentitySHA256 string
 	Reused         bool

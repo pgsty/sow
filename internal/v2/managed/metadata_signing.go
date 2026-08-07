@@ -43,6 +43,13 @@ type metadataSignerSnapshot struct {
 	DEB       metadataSignerIdentity
 }
 
+func metadataSignerRecordIdentity(fingerprint string, publicKey []byte) string {
+	if fingerprint == "" || len(publicKey) == 0 {
+		return "none"
+	}
+	return bytesSHA(publicKey)
+}
+
 const (
 	distMetadataSignerSnapshotVersion = 1
 	maxDistSignerSnapshotBytes        = 24 << 20
@@ -325,7 +332,7 @@ func loadMetadataSignerSnapshotForFormats(ctx context.Context, root string, repo
 // an immediately following rm render byte-identical timestamped metadata while
 // a retry of the same journal remains reproducible. Key activation times raise
 // the floor so a newly rotated certificate is never backdated before it exists.
-func nextMutationPublicationTime(ctx context.Context, root string, repository config.RepositoryConfig, store *state.Store, generation int64, wantRPM, wantDEB bool) (time.Time, error) {
+func nextMutationPublicationTime(ctx context.Context, root string, repository config.RepositoryConfig, store *state.Store, generation state.GenerationID, wantRPM, wantDEB bool) (time.Time, error) {
 	floor := time.Unix(0, 0).UTC()
 	if generation > 0 {
 		info, err := store.GetGeneration(ctx, generation)

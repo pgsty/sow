@@ -76,7 +76,8 @@ func inspectMutationRecoveryView(ctx context.Context, root, repoName string, sto
 	if operation.State != state.OperationApplied && operation.State != state.OperationBuilt && operation.State != state.OperationRecovering {
 		return nil, fmt.Errorf("%w: mutation build plan exists in state %s", ErrIntegrity, operation.State)
 	}
-	if manifest.Build.Generation != summary.BuiltGeneration+1 || manifest.Build.Generation < 1 || !lowercaseSHA256.MatchString(manifest.Build.BaseManifestSHA256) {
+	nextGeneration, nextErr := summary.BuiltGeneration.Next()
+	if nextErr != nil || manifest.Build.Generation != nextGeneration || manifest.Build.Generation < 1 || !lowercaseSHA256.MatchString(manifest.Build.BaseManifestSHA256) {
 		return nil, fmt.Errorf("%w: mutation build generation is inconsistent", ErrIntegrity)
 	}
 	base, err := readMutationBaseManifest(root, repoName, operation.ID, manifest.Build.BaseManifestSHA256)
@@ -220,11 +221,15 @@ func scanTreeManifest(ctx context.Context, root, prefix string) ([]state.Generat
 	files := []state.GenerationFile{}
 	err := walkRootedTree(ctx, root, func(relative string, file *os.File, info os.FileInfo) error {
 		path := prefix + relative
+		phase := publicFilePhase(path)
+		if phase == "" {
+			return fmt.Errorf("%w: recovery dists contains package payload %s", ErrIntegrity, path)
+		}
 		hash := sha256.New()
 		if _, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file}); err != nil {
 			return err
 		}
-		files = append(files, state.GenerationFile{Path: path, Phase: publicFilePhase(path), Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
+		files = append(files, state.GenerationFile{Path: path, Phase: phase, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
 		return nil
 	}, nil)
 	if err != nil {

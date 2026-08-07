@@ -134,7 +134,7 @@ func TestGenerateLegacyFrozenEL7Gzip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Generate frozen EL7: %v", err)
 	}
-	if generation.Packages != 1 || generation.Revision != opts.Revision {
+	if generation.Packages != 1 || generation.Revision != uint64(opts.Revision) {
 		t.Fatalf("frozen EL7 generation = %#v", generation)
 	}
 	for _, artifact := range generation.Artifacts {

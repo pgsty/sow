@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -296,28 +295,11 @@ func inspectDEBSnapshotReader(ctx context.Context, file *os.File, originalBasena
 }
 
 func managedPoolPath(source, filename string) (string, error) {
-	if source == "" || strings.ContainsAny(source, "/\\\x00\r\n\t") || source == "." || source == ".." || path.Base(source) != source {
-		return "", fmt.Errorf("managed: unsafe package source name %q", source)
+	pool, err := yumrepo.NewManagedPoolPath(source, filename)
+	if err != nil {
+		return "", fmt.Errorf("managed: unsafe package Pool path: %w", err)
 	}
-	if filename == "" || path.Base(filename) != filename || strings.ContainsAny(filename, "/\\\x00\r\n\t") {
-		return "", fmt.Errorf("managed: unsafe package filename %q", filename)
-	}
-	prefix := source[:1]
-	if strings.HasPrefix(source, "lib") {
-		if len(source) < 4 {
-			prefix = source
-		} else {
-			prefix = source[:4]
-		}
-	}
-	// The shard component is a portable filesystem identity, not a display
-	// copy of Source.  A case-preserving shard lets pool/P and pool/p coexist
-	// in SQLite while they alias the same directory on the default macOS
-	// filesystem; exporting that tree to case-sensitive Linux then loses one
-	// of the two spellings.  Source and filename remain byte-preserving, while
-	// the Debian-style shard is always lower-case ASCII.
-	prefix = strings.ToLower(prefix)
-	return path.Join("pool", prefix, source, filename), nil
+	return pool.String(), nil
 }
 
 type managedContextReader struct {

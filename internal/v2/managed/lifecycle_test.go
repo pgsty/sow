@@ -218,7 +218,7 @@ func TestInitCompletesDeclaredStateWithoutReset(t *testing.T) {
 	if _, err := store.DB().Exec(`DELETE FROM generations`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DB().Exec(`UPDATE repository_state SET desired_revision=77, built_generation=77`); err != nil {
+	if _, err := store.DB().Exec(`UPDATE repository_state SET desired_revision=77, built_generation='00000000000000000077'`); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {

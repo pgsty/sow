@@ -15,15 +15,12 @@ import (
 // `sow create`. It deliberately has no EL policy, modulemd, signature, or
 // Packages/<bucket> placement: every package location is its safe basename.
 // The destination is installed only after a complete structural validation.
-func GenerateFlatUnsigned(ctx context.Context, dest string, revision int64, packages PackageIterator) (*Generation, error) {
+func GenerateFlatUnsigned(ctx context.Context, dest string, revision uint64, packages PackageIterator) (*Generation, error) {
 	if ctx == nil {
 		return nil, errors.New("yumrepo: nil context")
 	}
 	if packages == nil {
 		return nil, errors.New("yumrepo: nil package iterator")
-	}
-	if revision < 0 {
-		return nil, errors.New("yumrepo: revision must be non-negative")
 	}
 	dest = filepath.Clean(dest)
 	if dest == "." || dest == string(filepath.Separator) {
@@ -117,7 +114,7 @@ func GenerateFlatUnsigned(ctx context.Context, dest string, revision int64, pack
 		if err := assembleXML(rawPath, item.name, item.body, count); err != nil {
 			return nil, err
 		}
-		artifact, err := compressXML(ctx, tmp, item.name, rawPath, CompressionGzip, count, revision)
+		artifact, err := compressXML(ctx, tmp, item.name, rawPath, CompressionGzip, count, 0)
 		if err != nil {
 			return nil, err
 		}

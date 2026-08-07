@@ -29,6 +29,19 @@ func Changes(ctx context.Context, opts ChangesOptions) (result ChangesResult, re
 	}
 	defer func() { resultErr = errors.Join(resultErr, repoLock.Close()) }()
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
+	layout := inspectRepositoryReadLayout(ctx, ws.Root, repoName, store)
+	legacyC2 := layout.FrozenC2
+	if !legacyC2 {
+		if layout.IdentityErr != nil || layout.TransitionErr != nil || layout.ControlErr != nil {
+			return result, fmt.Errorf("%w: changes are unavailable because repository layout evidence is invalid", ErrIntegrity)
+		}
+		if err := store.RequireTerminalLayout(ctx); err != nil {
+			return result, fmt.Errorf("%w: changes are unavailable during repository layout transition: %v", ErrNotReady, err)
+		}
+		if layout.Transition != nil || layout.Control != nil {
+			return result, fmt.Errorf("%w: changes are unavailable while stale transition evidence exists", ErrIntegrity)
+		}
+	}
 	workspaceOperation, err := inspectWorkspaceJournal(ws.Root)
 	if err != nil {
 		return result, fmt.Errorf("%w: workspace journal evidence is invalid", ErrIntegrity)
@@ -73,7 +86,11 @@ func Changes(ctx context.Context, opts ChangesOptions) (result ChangesResult, re
 	}
 	result.Generation, result.Dirty = summary.BuiltGeneration, observedStatus != "clean"
 	if summary.BuiltGeneration == 0 {
-		physical, scanErr := scanPublicManifest(ctx, filepath.Join(ws.Root, repoName))
+		manifestLayout := state.LayoutSinglePayloadV1
+		if legacyC2 {
+			manifestLayout = state.LayoutC2V1
+		}
+		physical, scanErr := scanPublicManifestForLayout(ctx, filepath.Join(ws.Root, repoName), manifestLayout)
 		if scanErr != nil || len(physical) != 0 {
 			return result, fmt.Errorf("%w: Generation 0 public delivery tree is not empty or readable: %v", ErrIntegrity, scanErr)
 		}
@@ -84,7 +101,11 @@ func Changes(ctx context.Context, opts ChangesOptions) (result ChangesResult, re
 	if err != nil {
 		return result, fmt.Errorf("%w: current generation manifest is unavailable", ErrIntegrity)
 	}
-	physicalCurrent, err := scanPublicManifest(ctx, filepath.Join(ws.Root, repoName))
+	manifestLayout := state.LayoutSinglePayloadV1
+	if legacyC2 {
+		manifestLayout = state.LayoutC2V1
+	}
+	physicalCurrent, err := scanPublicManifestForLayout(ctx, filepath.Join(ws.Root, repoName), manifestLayout)
 	if err != nil || !sameGenerationManifest(retainedCurrent, physicalCurrent) {
 		return result, fmt.Errorf("%w: current public delivery tree differs from Generation %d: %v", ErrIntegrity, summary.BuiltGeneration, err)
 	}
@@ -98,7 +119,7 @@ func Changes(ctx context.Context, opts ChangesOptions) (result ChangesResult, re
 		return result, err
 	}
 	base := *opts.Base
-	if base < 0 || base > summary.BuiltGeneration {
+	if base > summary.BuiltGeneration {
 		return result, fmt.Errorf("%w: base generation %d is outside 0..%d", ErrRejected, base, summary.BuiltGeneration)
 	}
 	result.Base = base

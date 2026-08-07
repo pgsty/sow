@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,19 +45,12 @@ type ManagedDistSpec struct {
 	Name          string
 	Format        string
 	Architectures []state.Architecture
-	Generation    int64
+	Generation    state.GenerationID
 	Jobs          int
 	PublishedAt   time.Time
 	Packages      []ManagedPackageSource
-	// Aliases are package objects that are not part of the new RPM metadata,
-	// but whose view-local C2 hardlinks must remain addressable while clients
-	// finish transactions that started from the previous repomd.xml. DEB Pool
-	// objects live at Repository root and therefore need no view alias set.
-	Aliases   []ManagedPackageSource
-	RPMSigner yumrepo.DetachedSigner
-	APTSigner APTMetadataSigner
-
-	pendingLinks *pendingLinkTracker
+	RPMSigner     yumrepo.DetachedSigner
+	APTSigner     APTMetadataSigner
 }
 
 type ManagedPackageSource struct {
@@ -81,86 +75,61 @@ func (source ManagedPackageSource) open() (*rootedRegularFile, error) {
 	return opened, nil
 }
 
-type pendingLinkEntry struct {
-	opened   *rootedRegularFile
-	expected uint64
+// pendingSourceGuard binds every private pending inode for the duration of a
+// build. Canonical rendering no longer changes link counts, so any Nlink other
+// than one before or after rendering is hostile external aliasing rather than
+// a protocol projection owned by SOW.
+type pendingSourceGuard struct {
+	entries map[string]*rootedRegularFile
 }
 
-// pendingLinkTracker binds every private pending inode before C2 fan-out and
-// accounts for each controlled hardlink made across all selected RPM Dists.
-// This permits neutral packages in multiple architectures without accepting
-// a pre-existing external hardlink substitution.
-type pendingLinkTracker struct {
-	entries map[string]*pendingLinkEntry
-}
-
-func newPendingLinkTracker(sources []ManagedPackageSource) (*pendingLinkTracker, error) {
-	tracker := &pendingLinkTracker{entries: map[string]*pendingLinkEntry{}}
+func newPendingSourceGuard(sources []ManagedPackageSource) (*pendingSourceGuard, error) {
+	guard := &pendingSourceGuard{entries: map[string]*rootedRegularFile{}}
 	for _, source := range sources {
 		if source.Object.Storage != "pending" {
 			continue
 		}
-		if _, exists := tracker.entries[source.Object.SHA256]; exists {
+		if _, exists := guard.entries[source.Object.SHA256]; exists {
 			continue
 		}
 		opened, err := source.open()
 		if err != nil {
-			return nil, errors.Join(err, tracker.Close())
+			return nil, errors.Join(err, guard.Close())
 		}
 		if opened.stat.Nlink != 1 {
-			return nil, errors.Join(fmt.Errorf("%w: pending package source %s is multiply linked before build", ErrIntegrity, source.Object.SHA256), opened.CloseVerified(), tracker.Close())
+			return nil, errors.Join(fmt.Errorf("%w: pending package source %s is multiply linked before build", ErrIntegrity, source.Object.SHA256), opened.CloseVerified(), guard.Close())
 		}
-		tracker.entries[source.Object.SHA256] = &pendingLinkEntry{opened: opened, expected: 1}
+		guard.entries[source.Object.SHA256] = opened
 	}
-	return tracker, nil
+	return guard, nil
 }
 
-func (tracker *pendingLinkTracker) link(ctx context.Context, viewRoot string, source ManagedPackageSource, target string) error {
-	entry := tracker.entries[source.Object.SHA256]
-	if source.Object.Storage != "pending" || entry == nil {
-		return ensureManagedPackageHardlinkAliasUntracked(ctx, viewRoot, source, target)
-	}
-	var before unix.Stat_t
-	if err := unix.Fstat(int(entry.opened.file.Fd()), &before); err != nil || uint64(before.Nlink) != entry.expected {
-		return errors.Join(fmt.Errorf("%w: pending package %s hardlink count changed before C2 publication", ErrIntegrity, source.Object.SHA256), err)
-	}
-	linkErr := ensureManagedPackageHardlinkAliasUntracked(ctx, viewRoot, source, target)
-	var after unix.Stat_t
-	statErr := unix.Fstat(int(entry.opened.file.Fd()), &after)
-	if statErr == nil && uint64(after.Nlink) == entry.expected+1 {
-		entry.expected++
-	} else if statErr != nil || uint64(after.Nlink) != entry.expected {
-		return errors.Join(linkErr, fmt.Errorf("%w: pending package %s hardlink count changed outside the controlled C2 projection", ErrIntegrity, source.Object.SHA256), statErr)
-	}
-	return linkErr
-}
-
-func (tracker *pendingLinkTracker) Close() error {
-	if tracker == nil {
+func (guard *pendingSourceGuard) Close() error {
+	if guard == nil {
 		return nil
 	}
 	var result error
-	digests := make([]string, 0, len(tracker.entries))
-	for digest := range tracker.entries {
+	digests := make([]string, 0, len(guard.entries))
+	for digest := range guard.entries {
 		digests = append(digests, digest)
 	}
 	sort.Strings(digests)
 	for _, digest := range digests {
-		entry := tracker.entries[digest]
+		opened := guard.entries[digest]
 		var raw unix.Stat_t
-		statErr := unix.Fstat(int(entry.opened.file.Fd()), &raw)
-		if statErr != nil || uint64(raw.Nlink) != entry.expected {
-			result = errors.Join(result, fmt.Errorf("%w: pending package %s hardlink accounting changed", ErrIntegrity, digest), statErr)
+		statErr := unix.Fstat(int(opened.file.Fd()), &raw)
+		if statErr != nil || raw.Nlink != 1 {
+			result = errors.Join(result, fmt.Errorf("%w: pending package %s acquired an external hardlink during build", ErrIntegrity, digest), statErr)
 		}
-		result = errors.Join(result, entry.opened.CloseVerified())
+		result = errors.Join(result, opened.CloseVerified())
 	}
-	tracker.entries = nil
+	guard.entries = nil
 	return result
 }
 
 // RenderManagedDist renders a complete non-empty-capable Dist under a private
-// repository stage. RPM views use C2 regular hardlink aliases and pool/...
-// hrefs; DEB views use componentless root Pool Filenames plus by-hash indexes.
+// repository stage. RPM views contain metadata-only parent-relative hrefs;
+// DEB views use raw root Pool Filenames plus by-hash index hardlinks.
 func RenderManagedDist(ctx context.Context, repositoryStage string, spec ManagedDistSpec) (RenderedDist, error) {
 	if ctx == nil {
 		return RenderedDist{}, errors.New("managed: nil context")
@@ -178,7 +147,7 @@ func RenderManagedDist(ctx context.Context, repositoryStage string, spec Managed
 		if spec.RPMSigner != nil || spec.APTSigner != nil {
 			return RenderedDist{}, errors.New("managed: signed Dist publication time is required")
 		}
-		spec.PublishedAt = time.Unix(spec.Generation, 0).UTC()
+		spec.PublishedAt = time.Unix(0, 0).UTC()
 	} else {
 		spec.PublishedAt = spec.PublishedAt.UTC()
 	}
@@ -200,7 +169,7 @@ func RenderManagedDist(ctx context.Context, repositoryStage string, spec Managed
 	if err := durableMkdir(distRoot, 0o755); err != nil {
 		return RenderedDist{}, err
 	}
-	for _, source := range append(append([]ManagedPackageSource(nil), spec.Packages...), spec.Aliases...) {
+	for _, source := range spec.Packages {
 		if source.Object.Format != spec.Format || source.Path == "" {
 			return RenderedDist{}, errors.New("managed: package source does not match Dist format")
 		}
@@ -213,7 +182,7 @@ func RenderManagedDist(ctx context.Context, repositoryStage string, spec Managed
 		}
 	}
 	if spec.Format == "rpm" {
-		err = renderManagedRPMDist(ctx, distRoot, spec)
+		err = renderManagedRPMDist(ctx, root, distRoot, spec)
 	} else {
 		err = renderManagedDEBDist(ctx, distRoot, spec)
 	}
@@ -233,42 +202,42 @@ func RenderManagedDist(ctx context.Context, repositoryStage string, spec Managed
 	return RenderedDist{Path: distRoot, TreeSHA256: digest, Files: files}, nil
 }
 
-func renderManagedRPMDist(ctx context.Context, distRoot string, spec ManagedDistSpec) error {
+func renderManagedRPMDist(ctx context.Context, repositoryRoot, distRoot string, spec ManagedDistSpec) error {
+	repositoryBase := &url.URL{Scheme: "file", Path: filepath.ToSlash(repositoryRoot) + "/"}
 	for _, architecture := range spec.Architectures {
 		view := filepath.Join(distRoot, architecture.Family)
 		if err := durableMkdir(view, 0o755); err != nil {
 			return err
 		}
+		viewRelative, err := filepath.Rel(repositoryRoot, view)
+		if err != nil {
+			return err
+		}
+		viewPath, err := yumrepo.ParseManagedRPMViewPath(filepath.ToSlash(viewRelative))
+		if err != nil {
+			return fmt.Errorf("managed: invalid RPM view %s: %w", architecture.Family, err)
+		}
 		inputs := []yumrepo.PackageInput{}
-		aliasByDigest := make(map[string]ManagedPackageSource, len(spec.Packages)+len(spec.Aliases))
-		for _, source := range append(append([]ManagedPackageSource(nil), spec.Aliases...), spec.Packages...) {
-			aliasByDigest[source.Object.SHA256] = source
-		}
-		aliases := make([]ManagedPackageSource, 0, len(aliasByDigest))
-		for _, source := range aliasByDigest {
-			aliases = append(aliases, source)
-		}
-		sort.Slice(aliases, func(i, j int) bool { return aliases[i].Object.PoolPath < aliases[j].Object.PoolPath })
-		for _, source := range aliases {
-			object := source.Object
-			if object.CanonicalArch != "neutral" && object.CanonicalArch != architecture.Family {
-				continue
-			}
-			alias := filepath.Join(view, filepath.FromSlash(object.PoolPath))
-			if err := ensureManagedPackageHardlinkAlias(ctx, view, source, alias, spec.pendingLinks); err != nil {
-				return err
-			}
-		}
 		for _, source := range spec.Packages {
 			object := source.Object
 			if object.CanonicalArch != "neutral" && object.CanonicalArch != architecture.Family {
 				continue
 			}
-			alias := filepath.Join(view, filepath.FromSlash(object.PoolPath))
-			inputs = append(inputs, yumrepo.PackageInput{Path: alias, Basename: object.Filename, Location: object.PoolPath})
+			poolPath, err := yumrepo.ParseManagedPoolPath(object.PoolPath)
+			if err != nil || poolPath.Filename() != object.Filename || poolPath.Source() != object.Source {
+				return fmt.Errorf("%w: RPM package %s has an invalid canonical Pool path", ErrIntegrity, object.SHA256)
+			}
+			href, err := yumrepo.RPMParentRelativeHref(viewPath, poolPath)
+			if err != nil {
+				return err
+			}
+			if err := yumrepo.ValidateRPMHrefRoundTrip(repositoryBase, viewPath, poolPath, href.String()); err != nil {
+				return fmt.Errorf("managed: render RPM href for %s: %w", object.SHA256, err)
+			}
+			inputs = append(inputs, yumrepo.PackageInput{Path: source.Path, Basename: object.Filename, PoolPath: object.PoolPath, ViewPath: viewPath, Location: href.String()})
 		}
 		sort.Slice(inputs, func(i, j int) bool { return inputs[i].Location < inputs[j].Location })
-		if _, err := yumrepo.GenerateManagedConcurrent(ctx, filepath.Join(view, "repodata"), spec.Generation, &yumrepo.SliceIterator{Inputs: inputs}, spec.RPMSigner, spec.Jobs); err != nil {
+		if _, err := yumrepo.GenerateManagedConcurrent(ctx, filepath.Join(view, "repodata"), uint64(spec.Generation), &yumrepo.SliceIterator{Inputs: inputs}, spec.RPMSigner, spec.Jobs); err != nil {
 			return fmt.Errorf("managed: render RPM view %s: %w", architecture.Family, err)
 		}
 	}
@@ -487,24 +456,6 @@ func ensureHardlinkAlias(ctx context.Context, viewRoot, source, target string, e
 		return err
 	}
 	return linkRootedRegular(ctx, viewRoot, sourceRelative, viewRoot, targetRelative, expectedSize, expectedSHA, 0o755)
-}
-
-func ensureManagedPackageHardlinkAlias(ctx context.Context, viewRoot string, source ManagedPackageSource, target string, tracker *pendingLinkTracker) error {
-	if source.Object.Storage == "pending" {
-		if tracker == nil {
-			return fmt.Errorf("%w: pending package C2 publication has no bound link tracker", ErrIntegrity)
-		}
-		return tracker.link(ctx, viewRoot, source, target)
-	}
-	return ensureManagedPackageHardlinkAliasUntracked(ctx, viewRoot, source, target)
-}
-
-func ensureManagedPackageHardlinkAliasUntracked(ctx context.Context, viewRoot string, source ManagedPackageSource, target string) error {
-	targetRelative, err := relativeToRoot(viewRoot, target)
-	if err != nil {
-		return err
-	}
-	return linkRootedRegular(ctx, source.Owner, source.Relative, viewRoot, targetRelative, source.Object.Size, source.Object.SHA256, 0o755)
 }
 
 func familiesOf(architectures []state.Architecture) []string {

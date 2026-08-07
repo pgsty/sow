@@ -190,7 +190,7 @@ func TestPackageQueriesRejectAmbiguousBareName(t *testing.T) {
 		FROM package_objects WHERE sha256 = ?`,
 		alternateSHA, alternateCoordinate, "pool/p/pgdg-redhat-nonfree-repo/alternate.rpm", "alternate.rpm", original.SHA256)
 	_, insertMembershipErr := tx.ExecContext(ctx, `INSERT INTO memberships(dist_name, package_sha256, created_revision) VALUES ('el9', ?, 0)`, alternateSHA)
-	var generation int64
+	var generation state.GenerationID
 	generationErr := tx.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&generation)
 	_, insertBuiltErr := tx.ExecContext(ctx, `INSERT INTO built_memberships(dist_name, package_sha256, generation) VALUES ('el9', ?, ?)`, alternateSHA, generation)
 	commitErr := tx.Commit()
@@ -457,7 +457,7 @@ func TestStatusReportsRecoveringAndErrorWithoutRepair(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, mutationErr := store.DB().ExecContext(ctx, `UPDATE built_memberships SET generation = generation + 99`)
+		_, mutationErr := store.DB().ExecContext(ctx, `UPDATE built_memberships SET generation = '00000000000000000999'`)
 		checkpointErr := store.Checkpoint(ctx)
 		closeErr := store.Close()
 		if err := errors.Join(mutationErr, checkpointErr, closeErr); err != nil {

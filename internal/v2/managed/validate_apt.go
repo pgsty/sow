@@ -49,7 +49,7 @@ func validateManagedAPTDist(ctx context.Context, repositoryRoot, distName string
 	return nil
 }
 
-func validateManagedAPTIndex(ctx context.Context, repositoryRoot, distName string, architectures []state.Architecture, expectedPackages map[string]map[string]state.PackageObject, expectedGeneration *int64) error {
+func validateManagedAPTIndex(ctx context.Context, repositoryRoot, distName string, architectures []state.Architecture, expectedPackages map[string]map[string]state.PackageObject, expectedGeneration *state.GenerationID) error {
 	releaseRelative := filepath.ToSlash(filepath.Join("dists", distName, "Release"))
 	release, err := readRootedRegular(repositoryRoot, releaseRelative, 16<<20, false)
 	if err != nil {
@@ -242,7 +242,7 @@ func parseReleaseDate(data []byte) (time.Time, error) {
 	return parsed.UTC(), nil
 }
 
-func parseReleaseGeneration(data []byte) (int64, bool, error) {
+func parseReleaseGeneration(data []byte) (state.GenerationID, bool, error) {
 	value := ""
 	for _, line := range strings.Split(string(data), "\n") {
 		if !strings.HasPrefix(line, "X-SOW-Generation:") {
@@ -256,8 +256,9 @@ func parseReleaseGeneration(data []byte) (int64, bool, error) {
 	if value == "" {
 		return 0, false, nil
 	}
-	generation, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || generation < 1 || strconv.FormatInt(generation, 10) != value {
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	generation := state.GenerationID(parsed)
+	if err != nil || generation < 1 || strconv.FormatUint(parsed, 10) != value {
 		return 0, false, errors.New("Release has an invalid X-SOW-Generation")
 	}
 	return generation, true, nil
