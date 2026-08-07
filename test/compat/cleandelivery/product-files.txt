@@ -525,6 +525,7 @@ internal/v2/managed/publication_r2_test.go
 internal/v2/managed/publication_test.go
 internal/v2/managed/query.go
 internal/v2/managed/query_status_test.go
+internal/v2/managed/read_layout.go
 internal/v2/managed/remove.go
 internal/v2/managed/remove_test.go
 internal/v2/managed/rename_noreplace_darwin.go
@@ -595,6 +596,7 @@ internal/v2/state/signing_keys.go
 internal/v2/state/signing_keys_test.go
 internal/v2/state/state.go
 internal/v2/state/state_test.go
+internal/v2/state/time_witness.go
 internal/v2cli/app.go
 internal/v2cli/app_test.go
 internal/v2cli/create.go
