@@ -1,6 +1,7 @@
 # SOW
 
-SOW 0.2 is a local RPM/DEB repository manager written in Go. It supports two
+SOW is a local RPM/DEB repository manager written in Go. The current 0.3
+development line supports two
 workflows:
 
 - `sow create` turns a directory of RPM or DEB packages into a simple
@@ -10,10 +11,14 @@ workflows:
   Desired and Built state, publish immutable Generations, and provide bounded
   locking, recovery, validation, queries, change reports, and operation logs.
 
-The v0.2 P0-P3 command contract and implementation evidence live under
-[`design/v0.2/`](design/v0.2/). Public/user documentation is maintained in the
-separate `sow.pgsty.com` checkout; newly generated files under this repository's
-`docs/` directory are intentionally ignored.
+The current Repository-scoped single-payload contract and implementation status
+live under [`design/next/`](design/next/). A Repository and each configured
+publish prefix contain one canonical `pool/` payload per Package Object plus
+metadata-only `dists/` views. The archived v0.2 P0-P3 contract and its C2
+per-view-hardlink evidence remain under [`design/v0.2/`](design/v0.2/).
+Public/user documentation is maintained in the separate `sow.pgsty.com`
+checkout; newly generated files under this repository's `docs/` directory are
+intentionally ignored.
 
 ## Build and test
 
@@ -30,7 +35,7 @@ make test          # all Go modules plus edge contracts
 make check         # format, module, vet, staticcheck, focused tests
 ```
 
-The binary is written to `bin/sow`. Its default version is `0.2.0`; release
+The binary is written to `bin/sow`. Its default version is `0.3.0`; release
 builds also inject that version at link time.
 
 ## Simple repositories
@@ -66,6 +71,31 @@ sow status --workdir ./lab --repo local
 sow changes --workdir ./lab --repo local
 sow log --workdir ./lab --repo local
 ```
+
+Managed repositories expose only `pool/ + dists/`; package hardlinks are not a
+canonical layout requirement. Configure a `filesystem` or `r2` target in
+`sow.yml`, then use `sow publish TARGET`. `sow gc` collects unreachable local
+payloads, while `sow gc TARGET` performs target-scoped maintenance. R2 target
+maintenance is deliberately report-only and never deletes remote objects.
+
+If a publication stops before durable commit intent, `sow publish TARGET --abort`
+reconciles and abandons it without copying or deleting remote objects;
+already-created payload/checksum objects remain exact private inventory evidence
+and may be reused. After commit intent, recovery is forward-only. A configured
+target with an Applied Checkpoint also fences removal of its published Dist,
+architecture, or signing pointers: retire/unbind that target, or configure a
+differently named target on a new prefix, before withdrawing those views.
+
+The one-copy boundary is one Repository per publish prefix. Publishing the same
+Repository to two prefixes deliberately stores one payload copy in each prefix.
+Filesystem target roots are compared by their effective canonical paths, even
+when their endpoint spellings differ; an RPM leaf export must remain outside the
+Repository, private state, and every configured filesystem publication root.
+
+Default EL `dnf reposync` is not supported for the canonical parent-relative
+RPM layout. When a self-contained RPM leaf is explicitly required, use
+`sow export rpm-leaf DIST ARCH DIR`; it copies by default, while `--hardlink`
+is an opt-in local optimization for a same-filesystem, trusted read-only export.
 
 Use `sow help`, `sow help COMMAND`, or `sow help GROUP SUBCOMMAND` as the
 authoritative CLI reference shipped with the binary. Machine consumers can use

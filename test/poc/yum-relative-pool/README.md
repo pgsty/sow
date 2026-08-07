@@ -15,15 +15,21 @@ Both views use package `location href` values rooted at
 `../../../pool/...`. The metadata contains no deployment hostname, absolute
 URL, or absolute filesystem path.
 
-## Current result: original rejected, C2 redesign gate passed
+## Historical v0.2 result and current interpretation
 
 AlmaLinux 9.8 with DNF 4.14.0 refreshes, locates, downloads, and installs from
 the original views, but `dnf reposync` rejects `../../../pool/...` because it
-escapes reposync's per-repo download directory. That parent-traversing renderer
-policy is permanently rejected. The C2 redesign uses root-pool canonical
+escapes reposync's per-repo download directory. v0.2 treated reposync as a hard
+gate and therefore rejected that renderer policy. The C2 redesign uses root-pool canonical
 objects plus view-local regular hardlink aliases and safe `pool/...` hrefs; it
 passes the full two-view client matrix before and after a copy that discards
-hardlink identity. C2 is therefore adoptable. See
+hardlink identity. This remains valid evidence for v0.2, not the forward design.
+
+The approved next design deliberately revises the product gate: ordinary DNF
+support and one payload object per Repository/publish prefix take priority;
+default EL reposync is unsupported, so the original parent-relative href is
+adopted and C2 package aliases are retired. See
+[`design/next`](../../../design/next/) and
 [`evidence/2026-08-01-almalinux-9.8.md`](evidence/2026-08-01-almalinux-9.8.md).
 
 ## Run
@@ -86,11 +92,11 @@ is in [`evidence/2026-08-01-redesign-matrix.md`](evidence/2026-08-01-redesign-ma
 | A | `xml:base="../../../"`, `href="pool/..."` | fail | fail | DNF turns the relative XML base into `http://../...` |
 | B | view symlink `pool -> ../../../pool`, `href="pool/..."` | pass | pass | controlled symlink conflicts with current path-safety and generic static-copy contract |
 | C | view-local hardlinks, `href="Packages/..."` | pass | pass | regular-file projection control |
-| C2 | view-local `pool/...` hardlinks, `href="pool/..."` | pass | pass | recommended candidate; copy without links remains functional but duplicates bytes |
+| C2 | view-local `pool/...` hardlinks, `href="pool/..."` | pass | pass | v0.2 choice; copy without links remains functional but duplicates bytes |
 
 B, C, and C2 pass x86_64 native + noarch and forced-aarch64 noarch client
-flows. C2 is the suggested candidate because it combines safe `pool/...`
+flows. C2 was the v0.2 candidate because it combines safe `pool/...`
 locations, root-pool canonical ownership, and regular-file aliases. The same
 two-view matrix also passes after a copy that deliberately discards hardlink
-identity. This fixture provides evidence only; it does not implement a
-production layout.
+identity. This fixture provides historical evidence only; it neither
+implements nor overrides the next production layout.

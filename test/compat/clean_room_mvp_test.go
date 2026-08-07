@@ -80,7 +80,7 @@ func TestShippedExampleSupportsCleanRoomLocalMVP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"schema: sow/v2", "- x86_64", "- aarch64"} {
+	for _, want := range []string{"schema: sow/v3", "- x86_64", "- aarch64"} {
 		if !strings.Contains(string(initialConfig), want) {
 			t.Fatalf("default V2 config omitted %q:\n%s", want, initialConfig)
 		}
@@ -183,20 +183,20 @@ func TestShippedExampleSupportsCleanRoomLocalMVP(t *testing.T) {
 	}
 	shown := runCleanRoomV2OK(ctx, t, moduleRoot, cliPath, environment,
 		"config", "show", "--all", "-C", workspace)
-	for _, want := range []string{"schema: sow/v2", "pgsql:", "el9:", "format: rpm", "noble:", "format: deb"} {
+	for _, want := range []string{"schema: sow/v3", "pgsql:", "el9:", "format: rpm", "noble:", "format: deb"} {
 		if !strings.Contains(shown, want) {
 			t.Fatalf("config show --all omitted %q:\n%s", want, shown)
 		}
 	}
 
-	// Root help is the closed P0-P3 command surface. V1 commands are not merely
-	// undocumented: the binary must reject them as usage errors.
+	// Root help is the closed v0.3 command surface. Retired V1 commands are not
+	// merely undocumented: the binary must reject them as usage errors.
 	help := runCleanRoomV2OK(ctx, t, moduleRoot, cliPath, environment, "help")
 	assertCleanRoomV2RootCommands(t, help)
 	for _, args := range [][]string{
-		{"publish"},
 		{"sync"},
-		{"gc"},
+		{"snapshot"},
+		{"serve"},
 	} {
 		output, code := runCleanRoomV2(ctx, t, moduleRoot, cliPath, environment, args...)
 		if code != 2 || !strings.Contains(output, "usage") {
@@ -204,7 +204,7 @@ func TestShippedExampleSupportsCleanRoomLocalMVP(t *testing.T) {
 		}
 	}
 	version := runCleanRoomV2OK(ctx, t, moduleRoot, cliPath, environment, "version")
-	if !strings.HasPrefix(version, "sow 0.2.0 ") {
+	if !strings.HasPrefix(version, "sow 0.3.0 ") {
 		t.Fatalf("unexpected V2 version output: %q", version)
 	}
 }
@@ -347,7 +347,7 @@ func assertCleanRoomV2RootCommands(t *testing.T, output string) {
 		commands = append(commands, command)
 	}
 	sort.Strings(commands)
-	want := []string{"add", "build", "changes", "check", "config", "create", "dist", "help", "init", "log", "ls", "repo", "rm", "show", "status", "version", "where"}
+	want := []string{"add", "build", "changes", "check", "config", "create", "dist", "export", "gc", "help", "init", "log", "ls", "publish", "repo", "retain", "rm", "show", "status", "version", "where"}
 	if fmt.Sprint(commands) != fmt.Sprint(want) {
 		t.Fatalf("root help command surface=%v want=%v\n%s", commands, want, output)
 	}

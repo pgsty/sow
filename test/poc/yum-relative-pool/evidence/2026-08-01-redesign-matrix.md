@@ -1,5 +1,7 @@
 # YUM shared-pool redesign candidates — 2026-08-01
 
+> **Historical v0.2 candidate matrix.** C2 was selected only because reposync was then mandatory. The approved next design rejects its object-storage duplication cost and adopts root-Pool parent-relative hrefs with default EL reposync explicitly unsupported; see [`design/next`](../../../../design/next/). The measured rows below remain factual.
+
 ## Scope and runtime
 
 This is follow-up evidence after the original `../../../pool/...` href failed
@@ -140,7 +142,7 @@ Trade-offs remain:
 `Packages/...` namespace differs from the desired pool-shaped projection and
 changes the delivery-dedupe model.**
 
-## C2 — view-local `pool/...` regular hardlinks (suggested)
+## C2 — view-local `pool/...` regular hardlinks (v0.2 choice)
 
 C2 keeps `<repo>/pool/...` as canonical ownership and creates real directories
 with regular-file aliases inside each architecture view:
@@ -191,7 +193,7 @@ cross-device projection fails the build; the candidate intentionally has no
 copy fallback, because silent fallback would make capacity and generation
 semantics environment-dependent.
 
-**C2 is the suggested redesign candidate:** it passes every tested client,
+**C2 was the suggested v0.2 redesign candidate:** it passes every tested client,
 keeps safe `pool/...` hrefs, preserves canonical root-pool ownership locally,
 and remains functionally copyable as a regular-file tree. Its explicit cost is
 that non-hardlink-preserving delivery repeats package bytes per view.
@@ -200,5 +202,5 @@ that non-hardlink-preserving delivery repeats package bytes per view.
 
 The original layout and Candidate A must remain unfrozen. B, C, and C2 are
 evidence for architecture selection, not authorization to modify schema,
-renderer, or CLI. C2 is the suggested candidate; B is only viable if the
+renderer, or CLI. C2 was the v0.2 candidate; B is only viable if the
 product explicitly allows controlled symlinks and defines copy behavior.
