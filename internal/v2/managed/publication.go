@@ -730,7 +730,7 @@ func recognizePublicationAbandonedObjects(remote []publicationRemoteObject, base
 		if !ok || orphan.Size != object.Size || orphan.SHA256 != object.SHA256 || orphan.RemoteIdentity != object.RemoteIdentity {
 			continue // The exact-inventory check reports the unknown path.
 		}
-		result = append(result, state.PublicationInventoryObject{Path: orphan.Path, Phase: orphan.Phase, Size: orphan.Size, SHA256: orphan.SHA256, RemoteIdentity: orphan.RemoteIdentity})
+		result = append(result, state.PublicationInventoryObject(orphan))
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
 	return result, nil

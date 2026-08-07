@@ -1887,7 +1887,7 @@ func validateRepositoryPrivateLayout(root, repoName string) error {
 }
 
 func validateRepositoryLayout(root, repoName string) error {
-	if err := validateCurrentRepositoryPrivateLayout(root, repoName); err != nil {
+	if err := validateRepositoryPrivateLayout(root, repoName); err != nil {
 		return err
 	}
 	return validateRepositoryPublicLayout(root, repoName)

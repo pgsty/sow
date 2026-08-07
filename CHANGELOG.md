@@ -2,7 +2,7 @@
 
 All notable changes to SOW are recorded here.
 
-## 0.3.0 - Unreleased
+## 0.3.0 - 2026-08-08
 
 - Replaced per-view RPM payload aliases with one canonical payload object per
   Repository/publish prefix and metadata-only `dists/` views.
@@ -23,7 +23,8 @@ All notable changes to SOW are recorded here.
   retaining the canonical SOW layout and the opt-in `sow-rpm-leaf-v1` export
   profile.
 - Added local and mocked publication evidence. Real APT/DNF HTTP clients,
-  exported RPM leaf compatibility, and live R2 remain release gates.
+  exported RPM leaf compatibility, and live R2 remain unverified and are not
+  claimed by this release.
 
 ## 0.2.0 - 2026-08-05
 
