@@ -1,5 +1,8 @@
 # Nginx 直接托管
 
+> **历史 V1 托管合同。** 本文的 generation route、mirrorlist 与 CAS materialization
+> 不属于下一版 canonical static layout；前向合同见 [`../design/next/`](../design/next/)。
+
 SOW 的服务树可由静态 Nginx 直接托管，但路由正典来自 `sow.yaml` 与已确认的本地发布
 状态，不是手写配置。唯一受支持的仓库路由入口是 `sow materialize ...
 --nginx-include` 生成的 server-context include。

@@ -11,6 +11,8 @@ context:
   - '{project-root}/_bmad-output/planning-artifacts/prds/prd-sow-2026-07-31/api-contract.md'
 ---
 
+> **历史 v0.2 完工规格。** 本文及其 C2/reposync PASS 继续证明 `v0.2.0`，但不约束下一版布局。前向合同是 [`../../next/specs/SPEC.md`](../../next/specs/SPEC.md)。
+
 <frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
 
 ## Intent

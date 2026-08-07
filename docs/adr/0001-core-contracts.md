@@ -1,5 +1,8 @@
 # ADR-0001: Core Repository and Publication Contracts
 
+> **Historical V1 ADR.** It cannot override the approved forward contract in
+> [`../../design/next/`](../../design/next/).
+
 Status: accepted  
 Date: 2026-07-11  
 Scope: contracts whose later migration cost or security impact makes them irreversible

@@ -1,5 +1,7 @@
 # SOW Architecture Contract
 
+> **Historical V1 contract.** This document governs the archived Git/CAS/remote implementation at tag `v1`; it is not the v0.2 Managed contract and must not override the approved forward design in [`../design/next/`](../design/next/). In particular, its workspace-global CAS, route materialization, and hardlink assumptions are not part of the next Repository-scoped `pool/ + dists/` architecture.
+
 Status: adopted  
 Date: 2026-07-11  
 Decision record: [ADR-0001](adr/0001-core-contracts.md)

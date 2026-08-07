@@ -8,6 +8,10 @@ inputs:
   - _bmad-output/planning-artifacts/research/technical-sow-repo-cli-tech-validation-research-2026-07-11.md
 ---
 
+> **历史 V1 PRD。** 本文继续解释归档 Git/CAS/route 实现，不能作为下一版 Repository
+> 物理布局、snapshot、publish 或 GC 的前向要求。其中 `.pool/`、bucket 1:1 hardlink 物化树
+> 与 YUM per-snapshot payload tree 已由 [`design/next`](../../../../design/next/) 取代。
+
 # sow — Pigsty 软件仓库管理 CLI PRD
 
 ## 1. 概述

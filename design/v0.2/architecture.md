@@ -1,5 +1,7 @@
 # SOW V2 P0–P3 实现架构
 
+> **v0.2 历史实现说明。** 本文准确描述 `v0.2.0` 的 C2 view-local package hardlink 实现，不再决定下一版布局。前向权威是 [`../next/`](../next/)；其中 package payload 只存在于 root `pool/`，RPM view 为 metadata-only，默认 EL reposync 不受支持。不要把 next 设计反写成本文已经实现。
+
 状态：当前实现说明（2026-08-02；最终验收结果另见 P1–P3 evidence）
 范围：P0 Plain Create、P1 Managed Control Plane、P2 Mutation/Recovery、P3 Verification/Handoff
 范式：纯本地、单机单写的事务式仓库引擎；Plain 与 Managed 为隔离的两条运行路径

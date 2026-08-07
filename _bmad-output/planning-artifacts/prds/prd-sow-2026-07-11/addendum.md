@@ -1,5 +1,9 @@
 # sow PRD Addendum
 
+> **历史 V1 Addendum。** 本文的 CAS/publish hardlink 等技术输入只解释归档实现；下一版
+> Repository-scoped single-payload 合同以 [`design/next`](../../../../design/next/) 为准。
+> 下文原样保留，用于审计当时的取舍，不得覆盖新架构。
+
 > 本文档承载不属于 PRD 主干、但下游文档（架构/解决方案设计）需要的深度内容。主要来源：技术验证调研报告（`technical-sow-repo-cli-tech-validation-research-2026-07-11.md`，下称"调研报告"）与意图文档。此处为定案摘录 + 指针；完整论证与来源 URL 见调研报告原文。
 
 ## 1. 技术选型定案（供架构阶段直接引用）

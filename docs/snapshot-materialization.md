@@ -1,5 +1,9 @@
 # Snapshot materialization contract
 
+> **Historical V1 contract.** 本文的 Git/CAS、YUM snapshot payload copy 与 route
+> materialization 只解释归档 V1；下一版 snapshot 必须 metadata/refset-only，见
+> [`../design/next/specs/publication-retention.md`](../design/next/specs/publication-retention.md)。
+
 `sow promote stable <suite>-YYYYMMDD` captures the stable manifest into immutable
 `refs/sow/snapshots/...` refs. The date must be the UTC capture date; an
 operator cannot backdate or future-date a snapshot to manipulate retention.

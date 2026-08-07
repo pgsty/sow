@@ -1,5 +1,8 @@
 # SOW V2 Architecture Spine 对抗审查
 
+> **历史审查记录。** 本文审查的是 v0.2 spine，不能覆盖
+> [`../../../next/architecture/`](../../../next/architecture/) 的前向决定。
+
 日期：2026-08-01
 审查对象：[`architecture-spine.md`](../architecture-spine.md)
 对照实现基线：[`architecture.md`](../../architecture.md)

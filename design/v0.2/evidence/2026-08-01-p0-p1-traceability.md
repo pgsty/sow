@@ -2,6 +2,8 @@
 
 > **历史追踪矩阵，已被后续 P1–P3 工作取代。** 本文只说明 2026-08-01 的 P0/P1 命令与证据身份；它不代表当前 checkout 的 CLI、schema、signing 或 P2/P3 状态。当前完成判定必须引用最终 P1–P3 traceability。
 
+> C2/reposync 行属于 v0.2 证据，不是前向 requirement；下一版矩阵见 [`../../next/specs/acceptance-matrix.md`](../../next/specs/acceptance-matrix.md)。
+
 日期：2026-08-01
 状态：当前 checkout 的 P0 Plain 源码与验证证据闭合；整个 P0/P1 目标仍受生产目录零修改证明失效及旧 V1 全包累计测试时限约束。
 汇总报告：[`2026-08-01-p0-p1-acceptance.md`](2026-08-01-p0-p1-acceptance.md)

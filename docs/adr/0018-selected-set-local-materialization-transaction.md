@@ -1,5 +1,8 @@
 # ADR-0018: Selected-set local materialization transaction
 
+> **Historical V1 ADR.** Next keeps only the explicitly external export boundary;
+> see [`../../design/next/specs/compatibility.md`](../../design/next/specs/compatibility.md).
+
 Status: accepted — 2026-07-13; clarified — 2026-07-14 and 2026-07-15
 
 ## Context

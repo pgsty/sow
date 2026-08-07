@@ -5,9 +5,9 @@ purpose: build-substrate
 altitude: feature
 paradigm: 'local transactional repository engine with two isolated execution paths'
 scope: 'SOW V2 P0 Plain Create and P1 Managed Control Plane'
-status: draft
+status: superseded
 created: '2026-08-01'
-updated: '2026-08-01'
+updated: '2026-08-05'
 binds: ['P0', 'P1']
 sources:
   - '../../prds/prd-sow-2026-07-31/api-contract.md'
@@ -17,6 +17,8 @@ companions: ['../../../../../docs/architecture-v2.md']
 ---
 
 # Architecture Spine — SOW V2 P0-P1
+
+> **Superseded for forward design.** AD-13 remains the historical `v0.2.0` C2 rule. The next architecture preserves its stable ID but replaces the rule with root-Pool parent-relative RPM hrefs; see [`../../next/architecture/ARCHITECTURE-SPINE.md`](../../next/architecture/ARCHITECTURE-SPINE.md). This file must only be used to explain v0.2 implementation/evidence.
 
 ## Design Paradigm
 

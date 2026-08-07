@@ -6,6 +6,10 @@ source: .memlog.md（同目录）
 consumers: bmad-prd / bmad-architecture / bmad-spec
 ---
 
+> **历史 V1 brainstorming 输入。** 本文保留最初问题与探索结论，不是下一版物理布局的
+> 权威；其中 `.pool/`、bucket 1:1 hardlink 物化树、YUM per-snapshot payload tree 等选择已由
+> [`design/next`](../../../design/next/) 取代。历史内容不回写，以保留决策轨迹。
+
 # sow 意图文档
 
 ## 1. 定位与约束

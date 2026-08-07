@@ -1,5 +1,8 @@
 # ADR-0026: Offline archive projection intent
 
+> **Historical V1 ADR.** Next offline/leaf output is an external derived export,
+> never a Generation or publish input; see [`../../design/next/specs/compatibility.md`](../../design/next/specs/compatibility.md).
+
 Status: Accepted
 
 Date: 2026-07-15

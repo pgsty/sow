@@ -9,7 +9,7 @@ sources:
   - ../../planning-artifacts/prds/prd-sow-2026-07-31/addendum.md
 ---
 
-> **Canonical contract.** This SPEC and the files in `companions:` are the complete, preservation-validated contract for what to build, test, and validate. Source documents listed in frontmatter are for traceability only.
+> **Historical v0.2 canonical contract.** This SPEC remains authoritative only for the implemented/tagged `v0.2.0` result and its evidence. It is superseded for future layout/publication work by [`../../next/specs/SPEC.md`](../../next/specs/SPEC.md), which retires C2 package aliases and default EL reposync support. Source documents listed in frontmatter are for v0.2 traceability only.
 
 # SOW V2 P1–P3 完整实现与验收
 

@@ -1,5 +1,7 @@
 # SOW V2 P1/P2/P3 验收证据
 
+> **v0.2 历史验收证据。** 本文保留 C2/reposync 的原始 PASS 结论，只用于证明 `v0.2.0`。它不证明 [`../../next/`](../../next/) 已实现；下一版明确撤销 canonical package aliases 并把默认 EL reposync 记为已接受限制。
+
 日期：2026-08-02
 代码库：`/Users/vonng/pgsty/sow`
 基础 commit：`50f183cc8125d09199dcdf38eec4fd86eeb338bf`

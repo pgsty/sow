@@ -1,6 +1,6 @@
 # sow V2 阶段一 PRD 技术附录
 
-> 本文保存 PRD 下游需要的取舍理由、行业依据、恢复边界、V1 资产盘点和验证事实。产品范围以 `prd.md` 为准，公共 CLI 以 `api-contract.md` 为准。
+> **历史 v0.2 附录。** 本文保存当时的取舍理由、行业依据、恢复边界、V1 资产盘点和验证事实。产品范围以 v0.2 `prd.md` 为准，公共 CLI 以 v0.2 `api-contract.md` 为准；未来 Repository layout 由 [`../../next/`](../../next/) 取代，尤其不再以 reposync 强制 C2 package aliases。
 
 ## 1. 配置与发现取舍
 

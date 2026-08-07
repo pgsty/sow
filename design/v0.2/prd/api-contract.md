@@ -8,6 +8,8 @@ updated: 2026-08-02
 
 # sow V2 阶段一 API 契约
 
+> **v0.2 历史 API/布局合同。** CLI 行为仍用于解释 `v0.2.0`；其中“相对 Pool 必须通过 reposync”与后续 C2 修正不再是前向要求。下一版 Repository layout、href、publish 与 export 边界见 [`../../next/specs/SPEC.md`](../../next/specs/SPEC.md)。
+
 ## 0. 契约地位
 
 本文是 `sow` V2 阶段一公共 CLI 的规范性文件，回答三个问题：有哪些命令、每条命令有哪些参数、成功或失败分别改变什么状态。PRD 说明为什么做以及如何验收；本文约束用户能够观察到的 API。

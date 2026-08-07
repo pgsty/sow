@@ -2,6 +2,8 @@
 
 > **历史证据快照，已被后续 P1–P3 工作取代。** 本文只绑定 2026-08-01 当时记录的源码 fingerprint、测试和 P0/P1 范围；其中“P2/P3 未实现”、命令面和当前 checkout fingerprint 均不得用于描述现在的二进制。它仍保留用于追溯早期 P0/P1 证据与当时已知限制。当前完成判定必须引用最终 P1–P3 验收报告和 traceability。
 
+> 本文的 C2/reposync 结果只证明 v0.2 历史布局。下一版已接受默认 EL reposync 限制并采用 metadata-only RPM views；见 [`../../next/`](../../next/)。历史日志、hash 与 PASS 不作改写。
+
 日期：2026-08-01
 当前状态：**P0 Plain 建仓/签名的当前 checkout 验证通过；P0/P1 正式完成条件因生产安全事件失败；旧 V1 全包默认测试时限单列**
 代码库：`/Users/vonng/pgsty/sow`

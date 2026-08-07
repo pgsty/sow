@@ -1,5 +1,9 @@
 # SOW 需求可追踪矩阵
 
+> **历史 V1 持续账本。** 本页的 Git/CAS/route/cloud 状态不证明下一版 Repository
+> single-payload 设计；next 只有 [`../design/next/specs/acceptance-matrix.md`](../design/next/specs/acceptance-matrix.md)
+> 中重新保留的证据才可升级为 PASS。
+
 > 状态：持续执行账本（非完成声明）
 > 更新：2026-07-30
 > 范围：G1–G6、FR-01–FR-42、NFR-01–NFR-09、冻结/兼容/技术/范围外契约、迁移、风险、PoC 和开放问题。

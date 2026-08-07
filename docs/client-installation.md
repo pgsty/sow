@@ -1,5 +1,9 @@
 # APT / DNF 客户端安装合同
 
+> **历史 V1 客户端合同。** 本文保留 generation-pinned route 的已归档配置；下一版
+> `pool/ + dists/` 客户端与兼容矩阵见
+> [`../design/next/specs/compatibility.md`](../design/next/specs/compatibility.md)。
+
 本页描述 SOW 仓库的客户端侧配置。它不改变仓库元数据格式，也不让 SOW 生成
 modulemd；签名、通道和认证失败时必须修复原因，禁止用 `trusted=yes`、
 `gpgcheck=0` 或 `repo_gpgcheck=0` 绕过。

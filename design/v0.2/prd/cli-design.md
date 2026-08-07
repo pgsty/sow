@@ -1,7 +1,7 @@
 # sow V2 CLI 设计候选（历史探索稿，已废弃）
 
 > 状态：superseded，仅保留为探索记录；下文包含已经删除的命令、modulemd 与旧配置位置，不得作为阶段一实现依据。
-> 规范性取代文档：[`api-contract.md`](./api-contract.md)；产品需求：[`prd.md`](./prd.md)。
+> v0.2 规范性取代文档：[`api-contract.md`](./api-contract.md)；产品需求：[`prd.md`](./prd.md)。未来布局与 external export 的唯一权威是 [`../../next/`](../../next/)；本稿中的 export 命令形状仍非承诺。
 > 本文件不再维护一致性，也不接受增量修订。
 > 安全边界：`/Users/vonng/pgsty/repo` 仅作为只读事实来源；任何后续实验只能在 `/Users/vonng/repo/sow-v2-lab/` 中进行。
 

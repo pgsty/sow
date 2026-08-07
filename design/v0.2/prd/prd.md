@@ -8,6 +8,8 @@ api_contract: ./api-contract.md
 
 # sow V2 阶段一 PRD
 
+> **v0.2 历史产品合同。** 本文的 C2/reposync 结论准确描述 `v0.2.0`，但已被 [`../../next/specs/SPEC.md`](../../next/specs/SPEC.md) 对未来布局取代。下一版保持 Repository-owned `pool/ + dists/`，撤销 canonical package hardlinks，并接受默认 EL reposync 不兼容。
+
 ## 0. 文档目的与状态
 
 本文重新定义 `sow` V2 阶段一的产品边界、用户价值、功能需求和验收标准。公共命令、参数、默认值、状态变化和退出码以同目录的 [API 契约](./api-contract.md) 为准；本文不再维护第二份略有差异的 CLI 清单。

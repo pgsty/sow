@@ -1,5 +1,8 @@
 # ADR-0024: Materialized Route Receipts Are Read Capabilities
 
+> **Historical V1 ADR.** Materialized routes are not canonical next state; see
+> [`../../design/next/`](../../design/next/).
+
 - Status: Accepted; clarified 2026-07-15
 - Date: 2026-07-14
 - Scope: local APT, YUM, and asset trees rendered into static Nginx routes

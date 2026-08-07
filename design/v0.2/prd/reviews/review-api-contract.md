@@ -1,5 +1,9 @@
 # sow V2 阶段一 API 契约 Adversarial Review
 
+> **历史 v0.2 评审。** 本文只保留当时的 API 决策过程；前向
+> Repository/publish 设计及其新的验收边界见
+> [`../../../next/`](../../../next/)。
+
 审查对象：`api-contract.md` 0.2、`prd.md` 与 `addendum.md`。本次从三份最新文档重新建立事实基线，不沿用旧版 CLI 结论。审查边界为公共命令、参数作用域、自动选择、Desired/Built/Generation/Changeset/Log 状态机、失败后置条件和跨文档一致性。
 
 **Verdict: NOT READY FOR ARCHITECTURE OR STORY BREAKDOWN.** 产品边界已经比 V1 清晰，但当前 API 仍无法导出唯一、可测的实现；尤其是写操作失败、Policy 配置变更、Repository 创建/删除和 Changeset 的后置条件必须先封闭。

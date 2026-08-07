@@ -1,5 +1,7 @@
 # SOW V1 → V2 P0–P3 资产清单
 
+> **历史迁移资产表。** 其中 C2 是 v0.2 的已实现替代项；下一版实现应以 [`../next/specs/migration.md`](../next/specs/migration.md) 为迁移代码图，不得继续复制 C2 package aliases。
+
 日期：2026-08-01
 方法：只读源码审计；没有把 V1 测试结果计入 V2 完成证据。
 

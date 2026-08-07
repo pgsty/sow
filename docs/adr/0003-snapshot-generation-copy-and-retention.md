@@ -1,5 +1,8 @@
 # ADR-0003: snapshot generation gate, vendor copy, and inventory-bound retention
 
+> **Historical V1 ADR.** YUM snapshot CopyObject is explicitly superseded; next
+> retained points are metadata/refset-only under [`../../design/next/`](../../design/next/).
+
 Status: accepted for local/protocol implementation; live-cloud PoC remains open.
 
 ## Decision

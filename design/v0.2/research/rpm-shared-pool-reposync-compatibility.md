@@ -10,9 +10,12 @@ user_name: 'Vonng'
 date: '2026-08-05'
 web_research_enabled: true
 source_verification: true
+forward_status: superseded-by-design-next
 ---
 
 # Research Report: technical
+
+> **Superseded decision record.** 本文保留调查过程与被评估的替代方案，但其 workspace/target-global CAS + route-mapper 推荐已撤销。已批准结论是单个 Repository/publish prefix 内 one payload、canonical 根直接 `pool/ + dists/`、RPM parent-relative href、默认 EL reposync 不支持；见 [`../../next/research/rpm-shared-pool-reposync-compatibility.md`](../../next/research/rpm-shared-pool-reposync-compatibility.md)。下文与该结论冲突的段落只能作为 discarded alternative 阅读。
 
 **Date:** 2026-08-05
 **Author:** Vonng
@@ -50,7 +53,7 @@ source_verification: true
 
 **Scope Confirmed:** 2026-08-05
 
-**Non-negotiable publication invariant added:** Object storage must contain exactly one canonical payload object per package digest. Per-dist, per-architecture, or per-snapshot hardlink aliases are not a valid publication mechanism because object stores materialize every key as a separate full object. Local inode deduplication may be used only as a workspace optimization and must not define repository correctness.
+**Non-negotiable publication invariant added:** Within each Repository and target publish prefix, object storage must contain exactly one canonical payload object per Package Object/path. Per-dist, per-architecture, or per-snapshot hardlink aliases are not a valid publication mechanism because object stores materialize every key as a separate full object. Cross-Repository and cross-prefix deduplication is explicitly out of scope. Local inode deduplication must not define repository correctness.
 
 **Priority revision:** Default EL `reposync` compatibility is optional and may be dropped. The architecture should first maximize single-key object storage, ordinary DNF/APT consumption, direct static hosting, relocatability, `file://` where feasible, simple mirroring, and protocol-native metadata; reposync must not force abandonment of several stronger properties.
 
@@ -62,7 +65,7 @@ SOW 的活动 v2 实现使用 Go 直接生成 RPM-MD XML 与 APT control metadat
 
 当前 checkout 中，RPM renderer 把每个 `dists/<dist>/<family>` 当作一个独立 RPM repository root；它为该 view 创建 `pool/...` regular hardlink，再把同一个安全的 `pool/...` 写入 `<location href>`。DEB renderer 则把 `Filename: pool/...` 直接写入嵌套在 `dists/.../binary-*` 下的 `Packages`，包体只存在于 archive-root `pool/`。关键实现见 [`render_packages.go`](../../../internal/v2/managed/render_packages.go) 和 [`packages.go`](../../../internal/aptrepo/packages.go)。
 
-这不是 EL9 专用分支：所有 managed RPM architecture view 都使用 C2；EL9 只是当前 PoC 的实际客户端环境。当前 v2 目录尚未提交，因此这里描述的是活动工作树行为，不是已发布版本契约。
+这不是 EL9 专用分支：`v0.2.0` 的所有 managed RPM architecture view 都使用 C2；EL9 只是当前 PoC 的实际客户端环境。这里描述的是已发布 v0.2 实现，下一版已明确取代该布局。
 
 _语言与数据模型：Go、SQLite、RPM-MD XML、Debian control paragraphs。_
 _置信度：高，来自当前 checkout 的直接源码检查。_
@@ -154,7 +157,7 @@ _置信度：高，来自当前实现与 PoC 的 inode/copy 验证。_
 
 ### Revised Non-Negotiable Boundary
 
-对象存储以 object key 为身份，不存在 POSIX inode 或 hardlink。Amazon S3 的数据模型是 flat object namespace，复制操作创建另一个 object；Cloudflare R2 同样以每次 `put(key, value)` 创建的 key/object 为存储单位。[Amazon S3 object-key model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html)、[Amazon S3 CopyObject semantics](https://docs.aws.amazon.com/AmazonS3/latest/userguide/copy-object.html)、[Cloudflare R2 Workers API](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/)。因此发布正确性必须新增硬约束：每个 target、每个 package digest 只能有一个 canonical payload key；workspace hardlink 最多是本地临时优化，不能进入 remote manifest 语义。
+对象存储以 object key 为身份，不存在 POSIX inode 或 hardlink。Amazon S3 的数据模型是 flat object namespace，复制操作创建另一个 object；Cloudflare R2 同样以每次 `put(key, value)` 创建的 key/object 为存储单位。[Amazon S3 object-key model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html)、[Amazon S3 CopyObject semantics](https://docs.aws.amazon.com/AmazonS3/latest/userguide/copy-object.html)、[Cloudflare R2 Workers API](https://developers.cloudflare.com/r2/api/workers/workers-api-reference/)。因此发布正确性必须新增硬约束：每个 Repository/publish prefix、每个 Package Object/canonical Pool path 只能有一个 payload key；workspace hardlink 最多是私有事务或显式导出优化，不能进入 remote manifest 语义。
 
 现存完整发布路径（V1 `internal/cli`；当前活动 V2 明确尚未纳入 publish/snapshot）违反这一约束并非偶然。YUM snapshot payload 被分类到 `.sow/gated/snapshots/<snapshot>/yum/...`，随后显式改为 `ObjectCopyImmutable`，以当前稳定包作为 server-side copy source；见 [`publish_plan.go`](../../../internal/cli/publish_plan.go#L1486) 与 [`publish_plan.go`](../../../internal/cli/publish_plan.go#L1663)。[`validateSnapshotCopy`](../../../internal/publish/plan.go#L1131)还把“snapshot 下必须有 Packages payload key”固定成协议校验。相反，APT snapshot pool 已使用 `ObjectReuseImmutable`；未来 V2 发布模型中的 YUM 应采用同样的存储引用原则，而不是继承该复制协议。
 
@@ -203,16 +206,16 @@ SOW 当前已经区分 `RemoteKey` 与 `CDNPath`，并通过 generation-pinned m
 要满足 object-store single-payload invariant，应明确放宽或删除以下旧条件：
 
 - 删除“C2 hardlink 是冻结发布布局”；hardlink 只能出现在显式的 disposable offline materialization 中。
-- 删除“Repository 是存储去重边界、不同 Repository 不去重”；Package Object/CAS 必须提升为 workspace + target 级边界。Repository 可继续作为 metadata 与操作锁边界，但 GC 需要 workspace-wide reachability fence。
-- Managed multi-generation repository 不再承诺 canonical workspace 可直接通过 `file://` 消费；本地验收使用 route-aware `sow serve`/Nginx。需要离线目录时显式 materialize 单个 view，且该输出不进入对象存储发布计划。
-- 不再承诺把 workspace 目录树盲目同步到 bucket 即可发布。`publish` 必须是语义化映射：payload key、metadata key、pointer 和 CDN route 分层处理。
-- raw static YUM baseurl 若无法执行同样的 pool mapping，应降为迁移兼容入口；正式契约使用 generation-pinned mirrorlist。
+- 保留 Repository 作为去重、锁、Generation、Changeset、publish prefix 与 GC 边界；不同 Repository/prefix 不去重是已接受取舍。
+- 保留完整 Repository root 的 `file://`、普通 HTTP 与静态搬迁；只放弃单 architecture leaf 自包含。
+- 保留 `pool/ + dists/` 到对象 key 的一对一发布；publish 仍按 payload/metadata/pointer/delete phase 执行，但不要求 URL-to-object route mapper。
+- raw static YUM baseurl 继续是普通 DNF 的正式入口；默认 EL reposync 降为 unsupported，不能反向强迫 payload alias。
 
-“workspace 必须位于 repository 根”可以作为 root-bound 安全约束，也便于拥有统一 `pool/`，但它本身不能修复 reposync：reposync 检查的是镜像端 `<download-path>/<repoid>`，不知道构建机 workspace 在哪里。真正必要的约束是**所有 Repo/Dist/Snapshot 属于同一 workspace-level canonical object namespace，并且所有正式 HTTP 入口实现确定性的 URL-to-object mapping**。
+“workspace 必须位于 repository 根”可以作为 root-bound 安全约束，也便于拥有统一 `pool/`，但它本身不能修复 reposync：reposync 检查的是镜像端 `<download-path>/<repoid>`，不知道构建机 workspace 在哪里。最终采用的约束是**每个 Repository/publish prefix 保持一个 root Pool，所有 Dist/retained view 的 metadata 引用该 Pool，whole Repository 是 mirror/auth/GC unit**；不建立 workspace-global payload namespace，也不强制 HTTP mapping。
 
 ### Integration Security and Operations
 
-Canonical bucket 应保持 private，edge route 按 public/gated view 决定鉴权；否则全局 `/pool` 会绕过 gated route。mapper 只能接受 metadata 已允许的 canonical path grammar，并必须正确处理 `GET`、`HEAD`、Range、ETag、Content-Length 与 checksum。payload key 内容寻址且不可变，可设置长期 immutable cache；Cloudflare 支持 Worker 重写和 custom cache key，EdgeOne 也支持回源正则 rewrite 与自定义 cache key。[Cloudflare Workers cache integration](https://developers.cloudflare.com/cache/interaction-cloudflare-products/workers/)、[EdgeOne cache guidance](https://cloud.tencent.com/document/product/1552/96052)。
+每个 Repository publish prefix 的鉴权必须覆盖 `pool/` 与 `dists/`，不能只保护 view path。若一个静态 prefix 内需要互斥 public/private ACL，应拆分 Repository/prefix 或使用统一 private origin + edge authorization。任何可选 mapper 都只能接受 metadata 允许的 canonical path grammar，并正确处理 `GET`、`HEAD`、Range、ETag、Content-Length 与 checksum；它不是 canonical layout 的必需组件。[Cloudflare Workers cache integration](https://developers.cloudflare.com/cache/interaction-cloudflare-products/workers/)、[EdgeOne cache guidance](https://cloud.tencent.com/document/product/1552/96052)。
 
 S3 website redirect object 只能在 website endpoint 生效，REST endpoint 会返回 redirect object 本身，因此不能作为 R2/COS/多目标通用契约。[Amazon S3 website redirect behavior](https://docs.aws.amazon.com/AmazonS3/latest/userguide/how-to-page-redirect.html)。Combined multi-architecture RPM repo 可以减少 metadata/view 数量，但不能消除跨 snapshot payload duplication，也不是根本解法。
 
@@ -220,4 +223,4 @@ S3 website redirect object 只能在 website endpoint 生效，REST endpoint 会
 
 ### Integration-Level Recommendation
 
-首选模式是：**workspace/target-global content-addressed pool + generation-only repodata + safe relative href + route-aware HTTP namespace**。Absolute `xml:base` 只保留为无需自包含镜像时的 fallback；redirect objects、parent-relative href 和 per-view hardlinks均不进入正式发布契约。
+本研究最初提出的 workspace/target-global CAS + route-aware HTTP namespace **未被采纳**。最终首选模式是：**Repository-scoped root Pool + metadata-only `dists/` + computed parent-relative RPM href + object-key-equals-canonical-path**。Absolute/root-relative URL、redirect objects、强制 mapper 与 per-view package hardlinks均不进入正式发布契约；默认 EL reposync 明确降为 unsupported，standalone 需求由 whole-root mirror 或 external export 解决。

@@ -13,6 +13,10 @@ web_research_enabled: true
 source_verification: true
 ---
 
+> **历史 V1 技术调研。** 这里的资料与结论是旧 PRD 的研究输入，不是下一版实现证据或
+> 布局权威。Repository-scoped `pool/ + dists/`、RPM parent-relative href、默认 reposync
+> 降级与对象存储 single-payload 取舍见 [`design/next`](../../../design/next/)。
+
 # Research Report: technical
 
 **Date:** 2026-07-11

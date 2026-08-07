@@ -1,5 +1,9 @@
 # SOW V2 P0-P1 Architecture Rubric Review
 
+> **Historical review record.** Its findings and C2 gate belong to the v0.2
+> decision process. The forward architecture is reviewed separately under
+> [`../../../next/architecture/`](../../../next/architecture/).
+
 Date: 2026-08-01
 Reviewer lens: BMad `good-spine` rubric walker
 Verdict: **FAIL — two blocking contradictions/open decisions prevent this from being a final P0/P1 build substrate.**

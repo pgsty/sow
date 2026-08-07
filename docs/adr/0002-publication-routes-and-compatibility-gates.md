@@ -1,5 +1,8 @@
 # ADR-0002: Publication routes and compatibility gates
 
+> **Historical V1 ADR.** Its route/CAS decisions are brownfield evidence only;
+> next publication is governed by [`../../design/next/`](../../design/next/).
+
 Status: accepted for implementation; external compatibility gates remain open
 
 ## Context

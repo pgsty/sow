@@ -1,5 +1,7 @@
 # P1–P3 acceptance matrix
 
+> **历史 v0.2 验收矩阵。** C2/reposync 行证明当时实现，不是下一版发布门禁。下一版矩阵见 [`../../next/specs/acceptance-matrix.md`](../../next/specs/acceptance-matrix.md)。
+
 每一行都需要绑定最终 checkout 的源码 fingerprint、命令、exit code、日志 hash 和 retained lab；旧报告只能作回归线索。
 
 ## P1 — Managed Control Plane

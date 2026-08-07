@@ -10,6 +10,9 @@ context:
   - '{project-root}/design/v0.2/evidence/2026-08-02-p1-p3-traceability.md'
 ---
 
+> **Historical v0.2 release record.** 该冻结任务只解释 tag `v0.2.0` 的源码、验收和本地
+> 封版，不是下一版 layout/publish 合同；前向权威见 [`../next/`](../next/)。
+
 <frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
 
 ## Intent

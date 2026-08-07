@@ -1,5 +1,8 @@
 # PRD Quality Review — sow V2 阶段一
 
+> **历史 v0.2 评审。** 本文记录当时把 reposync 作为布局门禁的过程；前向
+> Repository/publish 设计以 [`../../../next/`](../../../next/) 为准。
+
 ## Review snapshot
 
 本评审只针对以下冻结快照；没有修改三份规范文件：

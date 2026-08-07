@@ -1,5 +1,8 @@
 # PRD High-Priority Resolution Verification — sow V2 阶段一
 
+> **历史 v0.2 复核。** 这里的 PASS 只说明当时的 PRD 问题已关闭，不代表
+> C2 是前向方案；新设计见 [`../../../next/`](../../../next/)。
+
 ## Verdict
 
 **PASS。** 上轮五个 high 均已充分关闭；本轮定向扫描未发现新增 critical/high。此结论只复核 high-priority resolution，不重新评级上一轮 medium/low 项。

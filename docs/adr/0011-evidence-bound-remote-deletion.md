@@ -1,5 +1,8 @@
 # ADR-0011：证据绑定的远端删除闭包
 
+> **历史 V1 ADR。** 可复用其 fail-closed 原则，但 next 的 target-scoped deletion fence
+> 以 [`../../design/next/specs/state-publication.md`](../../design/next/specs/state-publication.md) 为准。
+
 - 状态：Accepted
 - 日期：2026-07-12
 - 决策范围：FR-07、FR-09、FR-11、FR-25、FR-27、FR-28、NFR-09

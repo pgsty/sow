@@ -1,5 +1,7 @@
 # SOW V2 P1/P2/P3 验收追踪
 
+> **v0.2 历史追踪。** C2 client fixture 与 reposync PASS 只闭合当时合同；下一版要求由 [`../../next/specs/acceptance-matrix.md`](../../next/specs/acceptance-matrix.md) 单独验收。
+
 日期：2026-08-02
 规范：`_bmad-output/specs/spec-sow-v2-p1-p3/{SPEC.md,acceptance-matrix.md}`
 汇总：[`2026-08-02-p1-p3-acceptance.md`](2026-08-02-p1-p3-acceptance.md)

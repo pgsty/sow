@@ -1,5 +1,10 @@
 # Brownfield baseline
 
+> **Historical v0.2 baseline.** This file describes the implementation surface
+> that led to C2 and is not a forward layout contract. The approved
+> Repository-scoped single-payload design is [`../../next/`](../../next/);
+> current code remains v0.2 until that migration is implemented.
+
 ## Current active surface
 
 - `cmd/sow` 只进入 `internal/v2cli`；当前公开能力为 P0 `create` 和 P1 `init/config/repo/dist`。

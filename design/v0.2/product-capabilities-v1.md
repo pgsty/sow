@@ -1,6 +1,6 @@
 # SOW 当前实现：功能与能力全景
 
-> **历史 V1 产品文档。** 本文描述基础 commit `50f183cc8125d09199dcdf38eec4fd86eeb338bf` 上的 Git/CAS/远端发布架构，不是当前 `cmd/sow` 的 SOW V2 产品契约，也不能用来判断 V2 命令、配置、签名依赖或验收状态。当前本地 Workspace/Repository/Dist、Managed signing、Desired/Built/Generation 与查询/校验行为以 [`architecture.md`](architecture.md) 和 P1–P3 canonical SPEC 为准。本文保留作 brownfield 资产与历史设计参考。
+> **历史 V1 产品文档。** 本文描述基础 commit `50f183cc8125d09199dcdf38eec4fd86eeb338bf` 上的 Git/CAS/远端发布架构，不是当前 `cmd/sow` 的 SOW V2 产品契约，也不能用来判断 V2 命令、配置、签名依赖或验收状态。v0.2 行为以 [`architecture.md`](architecture.md) 和 P1–P3 historical SPEC 为准；下一版 Repository/publish 设计以 [`../next/`](../next/) 为准。本文的 workspace-global CAS、snapshot copy、route 与 hardlink 物化只能作为 brownfield 资产和历史设计参考。
 
 > 文档类型：产品能力说明与使用导览
 >

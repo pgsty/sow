@@ -1,5 +1,7 @@
 # SOW 全量实现 Goal 提示词
 
+> **历史 V1 Goal 提示词。** 本文及其 `_bmad-output` 输入用于解释已归档的 Git/CAS/remote V1 实现，不是当前 v0.2 或下一版 Repository layout 的权威。前向 single-payload 设计见 [`design/next/`](design/next/)；不得据本文恢复 target-global CAS、route-mapped payload 或 per-view hardlink 结论。
+
 你正在 `/Users/vonng/pgsty/sow` 工作。请先创建并持续执行一个长期 Goal；不要只制定计划、生成架构文档或完成单个里程碑后停止。
 
 ## Goal

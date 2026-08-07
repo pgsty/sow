@@ -1,5 +1,10 @@
 # ADR-0036：供应商删除能力与 checkpoint-fenced 降级
 
+> **历史 V1 ADR。** 本文保留当时为 R2 接受的 checkpoint-fenced unconditional-delete
+> 降级，只解释归档 V1 实现；下一版明确不继承该降级，缺少 atomic conditional delete
+> 时 remote delete 必须禁用。前向权威见
+> [`../../design/next/specs/state-publication.md`](../../design/next/specs/state-publication.md)。
+
 - 状态：Accepted
 - 日期：2026-07-18
 - 决策范围：FR-04、FR-07、FR-09、FR-25、FR-27、FR-28、NFR-03、NFR-08、NFR-09、MIG-06、POC-05、POC-06

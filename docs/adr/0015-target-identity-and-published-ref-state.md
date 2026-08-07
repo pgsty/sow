@@ -1,5 +1,8 @@
 # ADR-0015: target 配置只声明身份，published refs 属于 canonical state
 
+> **历史 V1 ADR。** Git ref vector 与 target-global state 不进入 next；新的 Repository/
+> target identity 见 [`../../design/next/specs/state-publication.md`](../../design/next/specs/state-publication.md)。
+
 - 状态：Accepted
 - 日期：2026-07-12
 - 决策范围：FR-03、FR-04、FR-41、NFR-08、NFR-09

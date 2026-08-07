@@ -1,5 +1,8 @@
 # ADR-0008：GC 自动判定与显式删除确认
 
+> **历史 V1 ADR。** Git/CAS root 集只解释归档实现；下一版 local/target GC closure
+> 见 [`../../design/next/specs/state-publication.md`](../../design/next/specs/state-publication.md)。
+
 - 状态：Accepted
 - 日期：2026-07-12
 - 决策范围：FR-06、FR-13、ADR-T03

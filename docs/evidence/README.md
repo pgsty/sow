@@ -1,5 +1,9 @@
 # 验收证据目录
 
+> **历史 V1 evidence root。** 这里的 Git/CAS/route/cloud 结果继续作为原实现事实保留，
+> 但不能证明或覆盖 [`../../design/next/`](../../design/next/) 的 Repository-scoped
+> single-payload 设计；next PASS 必须写入自己的 acceptance evidence。
+
 本目录保存可复现命令、环境与日期化结果摘要；只有明确内嵌或链接日志的报告才包含原始 stdout/stderr。文件只有在实际命令成功运行后才可作为需求矩阵证据；设计说明、资料调研和 Mock-only 测试不得放宽通过标准。
 
 安全冻结（2026-07-14）：任何测试、PoC、探测或 purge 都不得使用 CO/COS 或
