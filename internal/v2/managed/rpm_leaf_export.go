@@ -321,10 +321,18 @@ func prepareRPMLeafRoot(protectedRoots []string, raw string) (string, error) {
 		return "", err
 	}
 	target = filepath.Clean(target)
+	if info, statErr := os.Lstat(target); statErr == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("%w: RPM leaf root must not be a symlink", ErrRejected)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return "", statErr
+	}
 	physicalTarget, _, err := prospectiveRealDirectory(target)
-	if err != nil || physicalTarget != target {
+	if err != nil {
 		return "", fmt.Errorf("%w: RPM leaf root must use one canonical physical path: %v", ErrRejected, err)
 	}
+	target = physicalTarget
 	for _, protected := range protectedRoots {
 		physicalProtected, _, err := prospectiveRealDirectory(protected)
 		if err != nil {
