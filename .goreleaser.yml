@@ -1,0 +1,46 @@
+version: 2
+
+project_name: sow
+
+builds:
+  - id: sow
+    main: ./cmd/sow
+    binary: sow
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    goamd64:
+      - v1
+    flags:
+      - -trimpath
+    ldflags:
+      - >-
+        -s -w
+        -X github.com/pgsty/sow/internal/v2cli.Version={{ .Version }}
+
+archives:
+  - id: sow
+    ids:
+      - sow
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: SHA256SUMS
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ .Env.SOW_VERSION }}"
+
+changelog:
+  disable: true
+
+release:
+  disable: true

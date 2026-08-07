@@ -3,7 +3,8 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 GO ?= go
-VERSION ?= 0.2.0
+GORELEASER ?= goreleaser
+VERSION ?= 0.3.0
 TEST_TIMEOUT ?= 60m
 V2_TEST_TIMEOUT ?= 20m
 RACE_TIMEOUT ?= 30m
@@ -19,7 +20,7 @@ V2_PACKAGES := ./internal/v2/... ./internal/v2cli ./internal/aptrepo ./internal/
 
 .PHONY: all help version build run install fmt fmt-check tidy tidy-check vet lint \
 	test test-go test-rpm test-edge test-v2 race check clean-delivery dist \
-	release clean clean-bin clean-dist
+	goreleaser-check release-local release clean clean-bin clean-dist
 
 all: build
 
@@ -27,15 +28,16 @@ help:
 	@printf '%s\n' \
 		'SOW v$(VERSION)' \
 		'' \
-		'  make build           Build bin/sow for the current platform' \
+		'  make build           Fast local go build to bin/sow' \
 		'  make run ARGS=...    Run the CLI from source (example: ARGS=version)' \
 		'  make install         Install sow with the release version embedded' \
 		'  make test            Run all Go modules and edge contract tests' \
-		'  make test-v2         Run the focused SOW v0.2 package tests' \
-		'  make race            Race-test the v0.2 core packages' \
+		'  make test-v2         Run the focused SOW v0.3 package tests' \
+		'  make race            Race-test the v0.3 core packages' \
 		'  make check           Run format, module, vet, lint, and focused tests' \
 		'  make clean-delivery  Rebuild and verify the deterministic source archive' \
 		'  make dist            Cross-build four release binaries and SHA256SUMS' \
+		'  make release-local   Build local GoReleaser archives without publishing' \
 		'  make release         Run all release gates, then build dist/' \
 		'  make clean           Remove only managed bin/ and dist/ outputs'
 
@@ -118,6 +120,17 @@ dist: clean-dist
 		shasum -a 256 sow_* > SHA256SUMS; \
 	fi
 	@printf 'release artifacts: %s\n' '$(DIST_DIR)'
+
+goreleaser-check:
+	@command -v '$(GORELEASER)' >/dev/null 2>&1 || { \
+		printf '%s\n' 'goreleaser is required: https://goreleaser.com/install/' >&2; \
+		exit 1; \
+	}
+	SOW_VERSION='$(VERSION)' $(GORELEASER) check
+
+release-local: goreleaser-check
+	SOW_VERSION='$(VERSION)' $(GORELEASER) release --snapshot --clean
+	@printf 'local GoReleaser artifacts: %s\n' '$(DIST_DIR)'
 
 release:
 	@$(MAKE) check
