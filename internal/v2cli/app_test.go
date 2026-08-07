@@ -72,6 +72,47 @@ func TestMainManagedLifecycleAndJSONEnvelope(t *testing.T) {
 	assertCLISuccess(t, []string{"repo", "rm", "pgsql", "-C", root, "--json"}, `"noop":true`)
 }
 
+func TestCLISummaryCheckAndChangesPreserveMaxUint64Generation(t *testing.T) {
+	root := t.TempDir()
+	assertCLISuccess(t, []string{"init", root, "--json"}, `"command":"init"`)
+	assertCLISuccess(t, []string{"repo", "new", "repo", "-C", root, "--json"}, `"repository":"repo"`)
+	ctx := context.Background()
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE repository_state SET built_generation = ? WHERE singleton = 1`, state.MaxGeneration); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.BootstrapLegacyGeneration(ctx, strings.Repeat("f", 64), state.MaxGeneration, nil); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := errors.Join(store.Check(ctx), store.ValidateGenerationLedger(ctx), store.Close()); err != nil {
+		t.Fatal(err)
+	}
+	const maximum = `"18446744073709551615"`
+	for _, command := range [][]string{
+		{"status", "-C", root, "-r", "repo", "--json"},
+		{"check", "-C", root, "-r", "repo", "--json"},
+		{"changes", "-C", root, "-r", "repo", "--json"},
+	} {
+		stdout, stderr, code := runCLI(command)
+		if code != ExitOK || stderr != "" || !strings.Contains(stdout, maximum) {
+			t.Fatalf("%v lost MaxUint64 Generation: code=%d stdout=%q stderr=%q", command, code, stdout, stderr)
+		}
+	}
+	stdout, stderr, code := runCLI([]string{"changes", "-C", root, "-r", "repo", "--json"})
+	if code != ExitOK || stderr != "" || !strings.Contains(stdout, `"base":"00000000000000000000"`) || !strings.Contains(stdout, `"generation":`+maximum) {
+		t.Fatalf("changes MaxUint64 wire: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI([]string{"changes", "18446744073709551615", "-C", root, "-r", "repo", "--json"})
+	if code != ExitOK || stderr != "" || !strings.Contains(stdout, `"base":`+maximum) || !strings.Contains(stdout, `"generation":`+maximum) || !strings.Contains(stdout, `"changes":[]`) {
+		t.Fatalf("explicit MaxUint64 changes base: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
 func TestMainP2P3PackageWorkflowEndToEnd(t *testing.T) {
 	root := t.TempDir()
 	inputs := filepath.Join(root, "inputs")
@@ -83,6 +124,7 @@ func TestMainP2P3PackageWorkflowEndToEnd(t *testing.T) {
 
 	assertCLISuccess(t, []string{"init", root, "--json"}, `"command":"init"`)
 	assertCLISuccess(t, []string{"repo", "new", "repo", "-C", root, "--json"}, `"name":"repo"`)
+	assertCLISuccess(t, []string{"repo", "migrate", "repo", "-C", root, "--json"}, `"complete":true`)
 	assertCLISuccess(t, []string{"dist", "new", "el9", "--format", "rpm", "-C", root, "-r", "repo", "--json"}, `"format":"rpm"`)
 	assertCLISuccess(t, []string{"dist", "new", "noble", "--format", "deb", "-C", root, "-r", "repo", "--json"}, `"format":"deb"`)
 
@@ -90,12 +132,25 @@ func TestMainP2P3PackageWorkflowEndToEnd(t *testing.T) {
 	assertCLISuccess(t, []string{"status", "-C", root, "-r", "repo", "--json"}, `"status":"dirty"`)
 	assertCLISuccess(t, []string{"build", "-C", root, "-r", "repo", "--json"}, `"dirty":false`)
 	assertCLISuccess(t, []string{"add", deb, "-C", root, "-r", "repo", "-d", "noble", "--json"}, `"accepted":1`)
+	store, err := state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, summaryErr := store.Summary(context.Background())
+	if err := errors.Join(summaryErr, store.Close()); err != nil {
+		t.Fatal(err)
+	}
+	generation := summary.BuiltGeneration.String()
+	assertCLIActualRepository(t, []string{"retain", "add", generation, "-C", root, "--json"}, "repo")
+	assertCLIActualRepository(t, []string{"retain", "ls", "-C", root, "--json"}, "repo")
+	assertCLIActualRepository(t, []string{"retain", "rm", generation, "-C", root, "--json"}, "repo")
+	assertCLISuccess(t, []string{"gc", "-C", root, "-r", "repo", "--json"}, `"noop":true`)
 	assertCLISuccess(t, []string{"ls", "-C", root, "-r", "repo", "-d", "el9", "-d", "noble", "--json"}, `"packages"`)
 	assertCLISuccess(t, []string{"show", "pgdg-redhat-nonfree-repo", "-C", root, "-r", "repo", "--json"}, `"coordinate"`)
 	assertCLISuccess(t, []string{"where", "libpqtypes0", "-C", root, "--json"}, `"repository":"repo"`)
 	assertCLISuccess(t, []string{"rm", "pgdg-redhat-nonfree-repo", "--check", "-C", root, "-r", "repo", "-d", "el9", "--json"}, `"check":true`)
 	assertCLISuccess(t, []string{"check", "-C", root, "-r", "repo", "--json"}, `"ready_to_copy":true`)
-	assertCLISuccess(t, []string{"changes", "0", "-C", root, "-r", "repo", "--json"}, `"base":0`)
+	assertCLISuccess(t, []string{"changes", "0", "-C", root, "-r", "repo", "--json"}, `"base":"00000000000000000000"`)
 	assertCLISuccess(t, []string{"log", "-C", root, "-r", "repo", "--json"}, `"operations"`)
 
 	stdout, stderr, code := runCLI([]string{"log", "export", "-", "-C", root, "-r", "repo"})
@@ -106,6 +161,27 @@ func TestMainP2P3PackageWorkflowEndToEnd(t *testing.T) {
 	// Built Generation unchanged rather than creating timestamp-dependent work.
 	assertCLISuccess(t, []string{"add", rpm, "-C", root, "-r", "repo", "-d", "el9", "--json"}, `"memberships_added":0`)
 	assertCLISuccess(t, []string{"status", "-C", root, "-r", "repo", "--json"}, `"ready_to_copy":true`)
+}
+
+func TestMainExportRPMLeafCopyDefault(t *testing.T) {
+	root := t.TempDir()
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeCLIFixture(t, filepath.Join("..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	assertCLISuccess(t, []string{"init", root, "--json"}, `"command":"init"`)
+	assertCLISuccess(t, []string{"repo", "new", "repo", "-C", root, "--json"}, `"repository":"repo"`)
+	assertCLISuccess(t, []string{"dist", "new", "el9", "--format", "rpm", "-C", root, "-r", "repo", "--json"}, `"format":"rpm"`)
+	assertCLISuccess(t, []string{"add", rpm, "-C", root, "-r", "repo", "-d", "el9", "--json"}, `"accepted":1`)
+	target := filepath.Join(root, "leaf")
+	stdout, stderr, code := runCLI([]string{"export", "rpm-leaf", "el9", "x86_64", target, "-C", root, "-r", "repo", "--json"})
+	if code != ExitOK || stderr != "" || !strings.Contains(stdout, `"command":"export rpm-leaf"`) || !strings.Contains(stdout, `"method":"copy"`) {
+		t.Fatalf("export rpm-leaf code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if _, err := managed.VerifyRPMLeafExportStandalone(context.Background(), target, nil); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestMainCheckNotReadyUsesIntegrityExit(t *testing.T) {
@@ -204,7 +280,7 @@ func decodeCLIFixture(t *testing.T, source, destination string) string {
 
 func TestWorkdirControlsImplicitRepositorySelection(t *testing.T) {
 	root := t.TempDir()
-	configData := []byte("schema: sow/v2\nrepos:\n  alpha: {}\n  beta: {}\n")
+	configData := []byte("schema: sow/v3\nrepos:\n  alpha: {}\n  beta: {}\n")
 	if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), configData, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +312,7 @@ func TestWorkdirControlsImplicitRepositorySelection(t *testing.T) {
 func TestMainConfigShowScopeAndAllIgnoresSelectors(t *testing.T) {
 	root := t.TempDir()
 	configData := []byte(`
-schema: sow/v2
+schema: sow/v3
 architectures: [amd64, arm64]
 repos:
   alpha:
@@ -363,7 +439,7 @@ repos:
 func TestMainHumanPackageListReportsScopedDirtyState(t *testing.T) {
 	root := t.TempDir()
 	configData := []byte(`
-schema: sow/v2
+schema: sow/v3
 repos:
   repo:
     dists:
@@ -408,7 +484,7 @@ func TestMainConfigShowRejectsWorkspaceRenameDuringAgentKeyExport(t *testing.T) 
 		t.Fatal(err)
 	}
 	configData := []byte(`
-schema: sow/v2
+schema: sow/v3
 repos:
   repo:
     signing:
@@ -583,7 +659,7 @@ func TestMainHumanShowIncludesConfigDirtyReasonsAndRecentOperation(t *testing.T)
 func TestMainExitCodeAndFailureEnvelopeMatrix(t *testing.T) {
 	t.Run("unresolved active signing reference is rejected", func(t *testing.T) {
 		root := t.TempDir()
-		data := []byte("schema: sow/v2\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        metadata:\n          key: env://KEY\n")
+		data := []byte("schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        metadata:\n          key: env://KEY\n")
 		if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), data, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -592,7 +668,7 @@ func TestMainExitCodeAndFailureEnvelopeMatrix(t *testing.T) {
 	})
 	t.Run("active policy schema is accepted", func(t *testing.T) {
 		root := t.TempDir()
-		data := []byte("schema: sow/v2\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        limit: 1\n")
+		data := []byte("schema: sow/v3\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        limit: 1\n")
 		if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), data, 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -614,7 +690,7 @@ func TestMainExitCodeAndFailureEnvelopeMatrix(t *testing.T) {
 	})
 	t.Run("config", func(t *testing.T) {
 		root := t.TempDir()
-		if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), []byte("schema: sow/v2\nunknown: true\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), []byte("schema: sow/v3\nunknown: true\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		assertCLIFailure(t, []string{"config", "check", "-C", root, "--json"}, ExitUsage, "usage")
@@ -714,7 +790,7 @@ func TestMainP1P3SelectionAndWorkspaceFailureMatrix(t *testing.T) {
 	t.Run("discovery and config are exit 2 for every managed surface", func(t *testing.T) {
 		missing := t.TempDir()
 		invalid := t.TempDir()
-		if err := os.WriteFile(filepath.Join(invalid, config.ConfigFilename), []byte("schema: sow/v2\nunknown: true\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(invalid, config.ConfigFilename), []byte("schema: sow/v3\nunknown: true\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		for _, command := range managedCommands {
@@ -731,7 +807,7 @@ func TestMainP1P3SelectionAndWorkspaceFailureMatrix(t *testing.T) {
 	})
 
 	root := t.TempDir()
-	data := []byte("schema: sow/v2\nrepos:\n  alpha:\n    dists:\n      first: {format: rpm}\n      second: {format: rpm}\n  beta:\n    dists:\n      only: {format: rpm}\n")
+	data := []byte("schema: sow/v3\nrepos:\n  alpha:\n    dists:\n      first: {format: rpm}\n      second: {format: rpm}\n  beta:\n    dists:\n      only: {format: rpm}\n")
 	if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -855,6 +931,26 @@ func assertCLISuccess(t *testing.T, args []string, contains string) {
 	stdout, stderr, code := runCLI(args)
 	if code != ExitOK || stderr != "" || !strings.Contains(stdout, contains) {
 		t.Fatalf("args=%q code=%d stdout=%q stderr=%q want output containing %q", args, code, stdout, stderr, contains)
+	}
+}
+
+func assertCLIActualRepository(t *testing.T, args []string, want string) {
+	t.Helper()
+	stdout, stderr, code := runCLI(args)
+	if code != ExitOK || stderr != "" {
+		t.Fatalf("%v: code=%d stdout=%q stderr=%q", args, code, stdout, stderr)
+	}
+	var envelope struct {
+		Repository string `json:"repository"`
+		Result     struct {
+			Repository string `json:"repository"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Repository != want || envelope.Result.Repository != want {
+		t.Fatalf("%v selected repository envelope=%q result=%q want=%q", args, envelope.Repository, envelope.Result.Repository, want)
 	}
 }
 

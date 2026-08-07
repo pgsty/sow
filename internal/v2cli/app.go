@@ -14,6 +14,7 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/managed"
+	"github.com/pgsty/sow/internal/v2/state"
 )
 
 // Main is the active SOW V2 command entry point. It intentionally dispatches
@@ -170,6 +171,31 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		})
 		return managedOutput{repository: name, result: result, human: repositoryShowHuman(result)}, err
 
+	case "repo migrate":
+		name := inv.Global.Repo
+		if len(inv.Positionals) == 1 {
+			if name != "" && name != inv.Positionals[0] {
+				return managedOutput{}, Errorf(ErrRejected,
+					"repo migrate NAME %q and --repo %q select different repositories",
+					inv.Positionals[0], name)
+			}
+			name = inv.Positionals[0]
+		}
+		migrationOptions := managed.RepositoryMigrationOptions{
+			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: name, Jobs: inv.Jobs,
+		}
+		if inv.Abort {
+			result, err := managed.AbandonRepositoryMigration(ctx, migrationOptions)
+			return managedOutput{repository: nullableString(result.Repository), result: result, human: fmt.Sprintf(
+				"abandoned repository migration %s: phase=%s complete=%t\n", result.Repository, result.Phase, result.Complete,
+			)}, err
+		}
+		result, err := managed.MigrateRepository(ctx, migrationOptions)
+		return managedOutput{repository: nullableString(result.Repository), result: result, human: fmt.Sprintf(
+			"migrated repository %s: %s -> %s generation=%s phase=%s complete=%t\n",
+			result.Repository, result.FromLayout, result.ToLayout, result.Generation, result.Phase, result.Complete,
+		)}, err
+
 	case "repo rm":
 		name := inv.Positionals[0]
 		if _, _, err := loadWorkspace(workspaceOptions); err != nil {
@@ -260,9 +286,9 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		return managedOutput{repository: nullableString(result.Repository), result: result, human: checkHuman(result)}, err
 
 	case "changes":
-		var base *int64
+		var base *state.GenerationID
 		if len(inv.Positionals) == 1 {
-			parsed, parseErr := parseNonnegativeInt64(inv.Positionals[0], "generation")
+			parsed, parseErr := parseGenerationIDArgument(inv.Positionals[0])
 			if parseErr != nil {
 				return managedOutput{}, parseErr
 			}
@@ -270,6 +296,78 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		}
 		result, err := managed.Changes(ctx, managed.ChangesOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo, Base: base})
 		return managedOutput{repository: nullableString(result.Repository), result: result, human: changesHuman(result)}, err
+
+	case "publish":
+		if inv.Abort {
+			result, err := managed.AbandonPublication(ctx, managed.PublicationAbandonOptions{
+				WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Target: inv.Positionals[0],
+			})
+			return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Attempt), result: result, human: fmt.Sprintf(
+				"abandoned publication %s for %s: retained-evidence objects=%d\n", result.Attempt, result.Target, result.Objects,
+			)}, err
+		}
+		result, err := managed.Publish(ctx, managed.PublishOptions{
+			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Target: inv.Positionals[0],
+		})
+		human := fmt.Sprintf("published %s generation=%s to %s (%s): phase=%s objects=%d\n", result.Repository, result.Generation, result.Target, result.Provider, result.Phase, result.Objects)
+		if result.Noop {
+			human = fmt.Sprintf("publication %s generation=%s to %s is already current (noop)\n", result.Repository, result.Generation, result.Target)
+		}
+		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Attempt), result: result, human: human}, err
+
+	case "retain add", "retain rm":
+		generation, parseErr := parseGenerationIDArgument(inv.Positionals[0])
+		if parseErr != nil || generation == 0 {
+			return managedOutput{}, usageError("retained generation must be a decimal integer greater than zero")
+		}
+		if invocationCommand(inv) == "retain add" {
+			result, err := managed.RetainAdd(ctx, managed.RetainAddOptions{
+				WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo, Generation: generation,
+			})
+			return managedOutput{repository: nullableString(result.Repository), result: result, human: fmt.Sprintf(
+				"retained generation %s: %s\n", result.Record.Generation, result.Path,
+			)}, err
+		}
+		result, err := managed.RetainRemove(ctx, managed.RetainRemoveOptions{
+			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo, Generation: generation,
+		})
+		return managedOutput{repository: nullableString(result.Repository), result: result, human: fmt.Sprintf(
+			"removed retained generation %s\n", generation,
+		)}, err
+
+	case "retain ls":
+		result, err := managed.RetainList(ctx, managed.RetainListOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo})
+		return managedOutput{repository: nullableString(result.Repository), result: result, human: retainedHuman(result.Generations)}, err
+
+	case "gc":
+		if len(inv.Positionals) == 1 {
+			result, err := managed.TargetGC(ctx, managed.TargetGCOptions{
+				WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Target: inv.Positionals[0],
+			})
+			human := fmt.Sprintf("target gc %s/%s (%s): phase=%s candidates=%d deleted=%d retained=%d pending=%d\n", result.Repository, result.Target, result.Provider, result.Phase, result.Candidates, result.DeletedObjects, result.RetainedObjects, result.PendingGrace)
+			if result.Noop {
+				human = fmt.Sprintf("target gc %s/%s: no due maintenance (noop)\n", result.Repository, result.Target)
+			}
+			return managedOutput{repository: nullableString(result.Repository), result: result, human: human}, err
+		}
+		result, err := managed.LocalGC(ctx, managed.LocalGCOptions{
+			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo,
+		})
+		human := fmt.Sprintf("local gc %s: generation=%s objects=%d bytes=%d\n", result.Repository, result.Generation, result.Objects, result.Bytes)
+		if result.Noop {
+			human = fmt.Sprintf("local gc %s: no unreachable payloads (noop)\n", result.Repository)
+		}
+		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, human: human}, err
+
+	case "export rpm-leaf":
+		result, err := managed.ExportRPMLeaf(ctx, managed.RPMLeafExportOptions{
+			WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo,
+			Dist: inv.Positionals[0], Arch: inv.Positionals[1], Directory: inv.Positionals[2], Hardlink: inv.Hardlink,
+		})
+		return managedOutput{repository: nullableString(result.Repository), result: result, human: fmt.Sprintf(
+			"exported RPM leaf %s/%s generation=%s method=%s packages=%d to %s\n",
+			result.Dist, result.Arch, result.Generation, result.Method, result.Packages, result.Directory,
+		)}, err
 
 	case "log":
 		operation := ""
@@ -409,6 +507,23 @@ func parseNonnegativeInt64(value, label string) (int64, error) {
 	return parsed, nil
 }
 
+func parseGenerationIDArgument(value string) (state.GenerationID, error) {
+	if value == "" || len(value) > 20 || strings.HasPrefix(value, "+") || strings.HasPrefix(value, "-") {
+		return 0, usageError("generation must be a decimal integer in 0..18446744073709551615")
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, usageError("generation must be a decimal integer in 0..18446744073709551615")
+		}
+	}
+	canonical := strings.Repeat("0", 20-len(value)) + value
+	parsed, err := state.ParseGenerationID(canonical)
+	if err != nil {
+		return 0, usageError("generation must be a decimal integer in 0..18446744073709551615")
+	}
+	return parsed, nil
+}
+
 func parseBefore(value string, location *time.Location) (time.Time, error) {
 	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
 		return parsed, nil
@@ -483,19 +598,25 @@ func failureInvocationContext(args []string) (string, bool) {
 	}
 	command := remaining[0]
 	switch command {
-	case "create", "init", "help", "version", "add", "rm", "ls", "show", "where", "status", "build", "check", "changes":
+	case "create", "init", "help", "version", "add", "rm", "ls", "show", "where", "status", "build", "check", "changes", "gc":
+		return command, jsonOutput
+	case "export":
+		if len(remaining) > 1 && remaining[1] == "rpm-leaf" {
+			return "export rpm-leaf", jsonOutput
+		}
 		return command, jsonOutput
 	case "log":
 		if len(remaining) > 1 && (remaining[1] == "export" || remaining[1] == "prune") {
 			return "log " + remaining[1], jsonOutput
 		}
 		return "log", jsonOutput
-	case "config", "repo", "dist":
+	case "config", "repo", "dist", "retain":
 		if len(remaining) > 1 {
 			allowed := map[string]map[string]struct{}{
 				"config": {"check": {}, "show": {}},
-				"repo":   {"ls": {}, "new": {}, "show": {}, "rm": {}},
+				"repo":   {"ls": {}, "new": {}, "show": {}, "migrate": {}, "rm": {}},
 				"dist":   {"ls": {}, "new": {}, "show": {}, "rm": {}},
+				"retain": {"add": {}, "ls": {}, "rm": {}},
 			}
 			if _, ok := allowed[command][remaining[1]]; ok {
 				return command + " " + remaining[1], jsonOutput
@@ -550,6 +671,15 @@ func repositoryShowHuman(repository managed.RepositoryInfo) string {
 		fmt.Fprintf(&output, "  recent_operation: id=%s kind=%s state=%s error_class=%s created_at=%s updated_at=%s\n",
 			operation.ID, operation.Kind, operation.State, operation.ErrorClass,
 			operation.CreatedAt.UTC().Format(time.RFC3339Nano), operation.UpdatedAt.UTC().Format(time.RFC3339Nano))
+	}
+	return output.String()
+}
+
+func retainedHuman(generations []managed.RetainedGeneration) string {
+	var output strings.Builder
+	output.WriteString("GENERATION\tRECORD_IDENTITY\tPATH\n")
+	for _, generation := range generations {
+		fmt.Fprintf(&output, "%s\t%s\t%s\n", generation.Record.Generation, generation.RecordIdentity, generation.Path)
 	}
 	return output.String()
 }

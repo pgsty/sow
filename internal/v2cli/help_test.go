@@ -19,10 +19,11 @@ func TestRootHelpSnapshot(t *testing.T) {
 	}
 }
 
-func TestHelpTreeIsExactlyP0P3(t *testing.T) {
+func TestHelpTreeIncludesApprovedLocalLifecycle(t *testing.T) {
 	wantTopics := []string{
 		"", "add", "build", "changes", "check", "config", "config check", "config show", "create", "dist", "dist ls", "dist new", "dist rm", "dist show",
-		"help", "init", "log", "log export", "log prune", "ls", "repo", "repo ls", "repo new", "repo rm", "repo show", "rm", "show", "status", "version", "where",
+		"export", "export rpm-leaf", "gc", "help", "init", "log", "log export", "log prune", "ls", "publish", "repo", "repo ls", "repo migrate", "repo new", "repo rm", "repo show",
+		"retain", "retain add", "retain ls", "retain rm", "rm", "show", "status", "version", "where",
 	}
 	gotTopics := make([]string, 0, len(helpText))
 	for topic := range helpText {
@@ -35,7 +36,7 @@ func TestHelpTreeIsExactlyP0P3(t *testing.T) {
 
 	all := strings.ToLower(strings.Join(helpValues(), "\n"))
 	for _, forbidden := range []string{
-		"sow gc", "sow materialize", "sow promote", "sow publish", "sow route", "sow snapshot", "sow sync", "sow verify",
+		"sow materialize", "sow promote", "sow route", "sow snapshot", "sow sync", "sow verify",
 		"modulemd", "cloudflare", "object storage", " v1",
 	} {
 		if strings.Contains(all, forbidden) {
@@ -49,9 +50,11 @@ func TestHelpSupportsRootGroupsLeavesAndInvocation(t *testing.T) {
 		nil,
 		{"config"}, {"config", "check"}, {"config", "show"},
 		{"repo"}, {"repo", "ls"}, {"repo", "new"}, {"repo", "show"}, {"repo", "rm"},
+		{"repo", "migrate"}, {"retain"}, {"retain", "add"}, {"retain", "ls"}, {"retain", "rm"}, {"gc"},
 		{"dist"}, {"dist", "ls"}, {"dist", "new"}, {"dist", "show"}, {"dist", "rm"},
-		{"add"}, {"rm"}, {"ls"}, {"show"}, {"where"}, {"status"}, {"build"}, {"check"}, {"changes"},
+		{"add"}, {"rm"}, {"ls"}, {"show"}, {"where"}, {"status"}, {"build"}, {"check"}, {"changes"}, {"publish"},
 		{"log"}, {"log", "export"}, {"log", "prune"},
+		{"export"}, {"export", "rpm-leaf"},
 		{"create"}, {"init"}, {"help"}, {"version"},
 	} {
 		if text, ok := HelpTopic(topic...); !ok || text == "" {
@@ -93,6 +96,7 @@ func TestLeafHelpMatchesClosedOptionMatrix(t *testing.T) {
 		{topic: "repo ls", want: []string{"--workdir", "--json"}, deny: []string{"--repo", "--dist", "--timeout", "--no-wait", "--force"}},
 		{topic: "repo new", want: []string{"--workdir", "--timeout", "--no-wait", "--json"}, deny: []string{"--repo", "--dist", "--force", "--format"}},
 		{topic: "repo show", want: []string{"--workdir", "--repo", "--json"}, deny: []string{"--dist", "--timeout", "--no-wait", "--force"}},
+		{topic: "repo migrate", want: []string{"--abort", "--jobs", "--workdir", "--repo", "--timeout", "--no-wait", "--json"}, deny: []string{"--dist", "--force", "--format"}},
 		{topic: "repo rm", want: []string{"--force", "--workdir", "--timeout", "--no-wait", "--json"}, deny: []string{"--repo", "--dist", "--format"}},
 		{topic: "dist ls", want: []string{"--workdir", "--repo", "--json"}, deny: []string{"--dist", "--timeout", "--no-wait", "--force"}},
 		{topic: "dist new", want: []string{"--format", "--workdir", "--repo", "--timeout", "--no-wait", "--json"}, deny: []string{"--dist", "--force", "--all"}},
@@ -107,6 +111,12 @@ func TestLeafHelpMatchesClosedOptionMatrix(t *testing.T) {
 		{topic: "build", want: []string{"--jobs", "--workdir", "--repo", "--dist", "--timeout", "--no-wait", "--json"}, deny: []string{"--skip", "--check", "--force"}},
 		{topic: "check", want: []string{"--jobs", "--workdir", "--repo", "--dist", "--json"}, deny: []string{"--timeout", "--no-wait", "--force"}},
 		{topic: "changes", want: []string{"--workdir", "--repo", "--json"}, deny: []string{"--dist", "--jobs", "--timeout"}},
+		{topic: "publish", want: []string{"--abort", "--workdir", "--timeout", "--no-wait", "--json"}, deny: []string{"--repo", "--dist", "--jobs", "--force"}},
+		{topic: "retain add", want: []string{"--workdir", "--repo", "--timeout", "--no-wait", "--json"}, deny: []string{"--dist", "--jobs", "--force"}},
+		{topic: "retain ls", want: []string{"--workdir", "--repo", "--json"}, deny: []string{"--dist", "--jobs", "--timeout", "--no-wait"}},
+		{topic: "retain rm", want: []string{"--workdir", "--repo", "--timeout", "--no-wait", "--json"}, deny: []string{"--dist", "--jobs", "--force"}},
+		{topic: "gc", want: []string{"--workdir", "--repo", "--timeout", "--no-wait", "--json"}, deny: []string{"--dist", "--jobs", "--force"}},
+		{topic: "export rpm-leaf", want: []string{"--hardlink", "--workdir", "--repo", "--json"}, deny: []string{"--dist", "--jobs", "--timeout", "--no-wait"}},
 		{topic: "log", want: []string{"--workdir", "--repo", "--dist", "--json"}, deny: []string{"--jobs", "--force"}},
 		{topic: "log export", want: []string{"--workdir", "--repo", "--dist"}, deny: []string{"--json", "--timeout", "--no-wait"}},
 		{topic: "log prune", want: []string{"--workdir", "--repo", "--timeout", "--no-wait", "--json"}, deny: []string{"--dist", "--jobs", "--force"}},
@@ -144,8 +154,8 @@ func TestVersionStringIncludesVersionAndTarget(t *testing.T) {
 }
 
 func TestDefaultVersionIsRelease(t *testing.T) {
-	if Version != "0.2.0" {
-		t.Fatalf("default Version=%q, want release 0.2.0", Version)
+	if Version != "0.3.0" {
+		t.Fatalf("default Version=%q, want release 0.3.0", Version)
 	}
 }
 

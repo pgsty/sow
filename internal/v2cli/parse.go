@@ -45,6 +45,8 @@ type Invocation struct {
 	Recursive   bool
 	Skip        bool
 	Check       bool
+	Hardlink    bool
+	Abort       bool
 }
 
 type optionUse uint16
@@ -72,39 +74,49 @@ type commandSpec struct {
 	recursive bool
 	skip      bool
 	check     bool
+	hardlink  bool
+	abort     bool
 }
 
 var commandSpecs = map[string]commandSpec{
-	"create":       {globals: useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, pigsty: true, signWith: true, overwrite: true},
-	"init":         {globals: useJSON, minArgs: 0, maxArgs: 1},
-	"config check": {globals: useWorkdir | useJSON},
-	"config show":  {globals: useWorkdir | useRepo | useDist | useJSON, all: true},
-	"repo ls":      {globals: useWorkdir | useJSON},
-	"repo new":     {globals: useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
-	"repo show":    {globals: useWorkdir | useRepo | useJSON, minArgs: 0, maxArgs: 1},
-	"repo rm":      {globals: useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, force: true},
-	"dist ls":      {globals: useWorkdir | useRepo | useJSON},
-	"dist new":     {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, format: true},
-	"dist show":    {globals: useWorkdir | useRepo | useJSON, minArgs: 1, maxArgs: 1},
-	"dist rm":      {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, force: true},
-	"add":          {globals: useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1 << 30, jobs: true, recursive: true, skip: true},
-	"rm":           {globals: useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1 << 30, jobs: true, skip: true, check: true},
-	"ls":           {globals: useWorkdir | useRepo | useDist | useJSON},
-	"show":         {globals: useWorkdir | useRepo | useDist | useJSON, minArgs: 1, maxArgs: 1},
-	"where":        {globals: useWorkdir | useRepo | useDist | useJSON, minArgs: 1, maxArgs: 1},
-	"status":       {globals: useWorkdir | useRepo | useDist | useJSON},
-	"build":        {globals: useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, jobs: true},
-	"check":        {globals: useWorkdir | useRepo | useDist | useJSON, jobs: true},
-	"changes":      {globals: useWorkdir | useRepo | useJSON, minArgs: 0, maxArgs: 1},
-	"log":          {globals: useWorkdir | useRepo | useDist | useJSON, minArgs: 0, maxArgs: 1},
-	"log export":   {globals: useWorkdir | useRepo | useDist, minArgs: 0, maxArgs: 1},
-	"log prune":    {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
+	"create":          {globals: useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, pigsty: true, signWith: true, overwrite: true},
+	"init":            {globals: useJSON, minArgs: 0, maxArgs: 1},
+	"config check":    {globals: useWorkdir | useJSON},
+	"config show":     {globals: useWorkdir | useRepo | useDist | useJSON, all: true},
+	"repo ls":         {globals: useWorkdir | useJSON},
+	"repo new":        {globals: useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
+	"repo show":       {globals: useWorkdir | useRepo | useJSON, minArgs: 0, maxArgs: 1},
+	"repo migrate":    {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, abort: true},
+	"repo rm":         {globals: useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, force: true},
+	"dist ls":         {globals: useWorkdir | useRepo | useJSON},
+	"dist new":        {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, format: true},
+	"dist show":       {globals: useWorkdir | useRepo | useJSON, minArgs: 1, maxArgs: 1},
+	"dist rm":         {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, force: true},
+	"add":             {globals: useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1 << 30, jobs: true, recursive: true, skip: true},
+	"rm":              {globals: useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1 << 30, jobs: true, skip: true, check: true},
+	"ls":              {globals: useWorkdir | useRepo | useDist | useJSON},
+	"show":            {globals: useWorkdir | useRepo | useDist | useJSON, minArgs: 1, maxArgs: 1},
+	"where":           {globals: useWorkdir | useRepo | useDist | useJSON, minArgs: 1, maxArgs: 1},
+	"status":          {globals: useWorkdir | useRepo | useDist | useJSON},
+	"build":           {globals: useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, jobs: true},
+	"check":           {globals: useWorkdir | useRepo | useDist | useJSON, jobs: true},
+	"changes":         {globals: useWorkdir | useRepo | useJSON, minArgs: 0, maxArgs: 1},
+	"publish":         {globals: useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, abort: true},
+	"retain add":      {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
+	"retain ls":       {globals: useWorkdir | useRepo | useJSON},
+	"retain rm":       {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
+	"gc":              {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1},
+	"export rpm-leaf": {globals: useWorkdir | useRepo | useJSON, minArgs: 3, maxArgs: 3, hardlink: true},
+	"log":             {globals: useWorkdir | useRepo | useDist | useJSON, minArgs: 0, maxArgs: 1},
+	"log export":      {globals: useWorkdir | useRepo | useDist, minArgs: 0, maxArgs: 1},
+	"log prune":       {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
 }
 
 var errUsage = errors.New("usage error")
 
 var publicDurationPattern = regexp.MustCompile(`^\+?(?:(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:ms|s|m|h))+$`)
 var gpgKeyIDPattern = regexp.MustCompile(`(?i)^(?:[0-9a-f]{16}|[0-9a-f]{40}|[0-9a-f]{64})$`)
+var exportDistPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
 func usageError(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", errUsage, fmt.Sprintf(format, args...))
@@ -164,7 +176,7 @@ func Parse(args []string) (Invocation, error) {
 
 	inv.Command = remaining[0]
 	remaining = remaining[1:]
-	if inv.Command == "config" || inv.Command == "repo" || inv.Command == "dist" {
+	if inv.Command == "config" || inv.Command == "repo" || inv.Command == "dist" || inv.Command == "retain" {
 		if len(remaining) == 0 {
 			if help {
 				if err := validateGlobalUse(inv.Command+" help", global, 0); err != nil {
@@ -177,6 +189,12 @@ func Parse(args []string) (Invocation, error) {
 		inv.Subcommand = remaining[0]
 		remaining = remaining[1:]
 	} else if inv.Command == "log" && len(remaining) != 0 && (remaining[0] == "export" || remaining[0] == "prune") {
+		inv.Subcommand = remaining[0]
+		remaining = remaining[1:]
+	} else if inv.Command == "export" {
+		if len(remaining) == 0 {
+			return Invocation{}, usageError("export subcommand is required")
+		}
 		inv.Subcommand = remaining[0]
 		remaining = remaining[1:]
 	}
@@ -214,9 +232,21 @@ func Parse(args []string) (Invocation, error) {
 	if len(positionals) < spec.minArgs || len(positionals) > spec.maxArgs {
 		return Invocation{}, usageError("%s expects %s", key, argumentRange(spec.minArgs, spec.maxArgs))
 	}
+	if key == "export rpm-leaf" && (!exportDistPattern.MatchString(positionals[0]) || positionals[1] != "x86_64" && positionals[1] != "aarch64") {
+		return Invocation{}, usageError("export rpm-leaf requires a canonical DIST and ARCH x86_64|aarch64")
+	}
+	if key == "gc" && len(positionals) == 1 && global.repoSet {
+		return Invocation{}, usageError("gc TARGET selects its repository from the target and does not accept --repo")
+	}
 	if key == "log" && len(positionals) == 1 {
 		if _, err := parseNonnegativeInt64(positionals[0], "operation"); err != nil {
 			return Invocation{}, err
+		}
+	}
+	if (key == "retain add" || key == "retain rm") && len(positionals) == 1 {
+		generation, err := parseGenerationIDArgument(positionals[0])
+		if err != nil || generation == 0 {
+			return Invocation{}, usageError("retained generation must be a decimal integer greater than zero")
 		}
 	}
 	if spec.format && inv.Format == "" {
@@ -309,7 +339,7 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 	positionals := make([]string, 0, len(args))
 	stopped := false
 	jobsSet, pigstySet, signWithSet, overwriteSet, allSet, forceSet, formatSet := false, false, false, false, false, false, false
-	recursiveSet, skipSet, checkSet := false, false, false
+	recursiveSet, skipSet, checkSet, hardlinkSet, abortSet := false, false, false, false, false
 	for i := 0; i < len(args); i++ {
 		token := args[i]
 		if token == "--" && !stopped {
@@ -398,6 +428,16 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 				return nil, usageError("option %s is not allowed, duplicated, or has a value", name)
 			}
 			inv.Check, checkSet = true, true
+		case "--hardlink":
+			if !spec.hardlink || hardlinkSet || hasInline {
+				return nil, usageError("option --hardlink is not allowed, duplicated, or has a value")
+			}
+			inv.Hardlink, hardlinkSet = true, true
+		case "--abort":
+			if !spec.abort || abortSet || hasInline {
+				return nil, usageError("option --abort is not allowed, duplicated, or has a value")
+			}
+			inv.Abort, abortSet = true, true
 		default:
 			return nil, usageError("unknown option %q", token)
 		}

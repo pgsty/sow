@@ -15,6 +15,7 @@ Commands:
   repo ls                            List repositories
   repo new NAME                      Create a repository
   repo show [NAME]                   Show a repository
+  repo migrate [NAME] [--abort]      Migrate or abandon a pre-commit transition
   repo rm NAME [-f|--force]          Remove a repository
   dist ls                            List distributions
   dist new NAME --format rpm|deb     Create a distribution
@@ -29,6 +30,12 @@ Commands:
   build                              Converge Desired to a Built Generation
   check                              Verify repository integrity end to end
   changes [BASE_GENERATION]          Show physical delivery changes
+  publish TARGET [--abort]           Publish or abandon a pre-commit attempt
+  retain add GENERATION              Retain one verified Generation
+  retain ls                          List retained Generations
+  retain rm GENERATION               Remove one retained Generation
+  gc [TARGET]                        Collect local payloads or maintain one target
+  export rpm-leaf DIST ARCH DIR      Export a standalone RPM compatibility leaf
   log [OPERATION]                    Show operation audit records
   log export [FILE]                  Export operation audit as JSONL
   log prune BEFORE                   Prune eligible terminal audit records

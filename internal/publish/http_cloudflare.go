@@ -62,6 +62,13 @@ func (c *R2CloudflareControlHTTP) R2ListObjectsV2(ctx context.Context, continuat
 	return c.objects.listObjectsV2(ctx, continuationToken)
 }
 
+// R2ListObjectsV2Prefix is the storage-only, exact-prefix audit surface used by
+// the V2 publisher. It acquires no CDN authority and revalidates every returned
+// key inside signedObjectHTTP.
+func (c *R2CloudflareControlHTTP) R2ListObjectsV2Prefix(ctx context.Context, prefix, continuationToken string) (ObjectListPage, error) {
+	return c.objects.listObjectsV2Prefix(ctx, prefix, continuationToken)
+}
+
 // R2Head, R2OpenObject, and R2Copy keep storage-only callers on the same
 // least-authority client used for leases and checkpoints. They deliberately do
 // not acquire a Cloudflare API token or any CDN/Worker control capability.

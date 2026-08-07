@@ -4,6 +4,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/pgsty/sow/internal/v2/state"
 )
 
 func TestParseCreateDefaultsAndOptionsAnywhere(t *testing.T) {
@@ -42,12 +44,16 @@ func TestParseLocalMatrixAndCardinality(t *testing.T) {
 	valid := [][]string{
 		{"init"}, {"init", "dir"}, {"config", "show", "--all", "-d", "el9", "-d", "noble"},
 		{"repo", "show"}, {"repo", "show", "pgsql", "-r", "pgsql"},
+		{"repo", "migrate"}, {"repo", "migrate", "pgsql", "-j", "2", "-N"}, {"repo", "migrate", "pgsql", "--abort"},
 		{"repo", "rm", "pgsql", "-f"}, {"dist", "new", "el9", "--format", "rpm", "-r", "pgsql"},
 		{"dist", "rm", "noble", "--force", "-r", "pgsql", "-N"},
 		{"add", "one.rpm", "two.deb", "--recursive", "--skip", "-d", "el9"},
 		{"rm", "sha256:abc", "--check", "-d", "el9"}, {"rm", "pkg", "--skip", "-N"},
 		{"ls", "-d", "el9", "-d", "noble"}, {"show", "pkg"}, {"where", "pkg"}, {"status"},
 		{"build", "-j", "2", "-d", "el9", "-N"}, {"check", "-j", "2"}, {"changes"}, {"changes", "0"},
+		{"publish", "prod", "-N"}, {"publish", "prod", "--abort"},
+		{"retain", "add", "1", "-N"}, {"retain", "ls", "-r", "pgsql"}, {"retain", "rm", "18446744073709551615"}, {"gc", "-N"}, {"gc", "prod", "-N"},
+		{"export", "rpm-leaf", "el9", "x86_64", "/tmp/leaf"}, {"export", "rpm-leaf", "el9", "aarch64", "/tmp/leaf", "--hardlink", "--json"},
 		{"log"}, {"log", "123456789"}, {"log", "export", "-"}, {"log", "prune", "2026-08-01T00:00:00Z", "-N"},
 	}
 	for _, args := range valid {
@@ -59,10 +65,14 @@ func TestParseLocalMatrixAndCardinality(t *testing.T) {
 		{"create", "a", "b"}, {"create", "-j", "0"}, {"create", "--all"},
 		{"create", "--overwrite"}, {"create", "--sign-with", "short"},
 		{"repo", "new"}, {"repo", "new", "one", "two"}, {"repo", "ls", "--force"},
+		{"repo", "migrate", "one", "two"}, {"repo", "migrate", "--force"}, {"repo", "migrate", "--abort", "--abort"},
 		{"dist", "new", "el9"}, {"dist", "new", "el9", "--format", "apk"},
 		{"dist", "show"}, {"config", "check", "extra"},
 		{"add"}, {"rm"}, {"rm", "pkg", "--check", "--skip"}, {"rm", "pkg", "--check", "-T", "1s"},
-		{"show"}, {"where"}, {"changes", "1", "2"}, {"check", "-T", "1s"},
+		{"show"}, {"where"}, {"changes", "1", "2"}, {"publish"}, {"publish", "a", "b"}, {"publish", "prod", "-r", "repo"}, {"publish", "prod", "--abort=true"}, {"check", "-T", "1s"},
+		{"retain"}, {"retain", "add", "0"}, {"retain", "add", "-1"}, {"retain", "rm"}, {"retain", "ls", "1"}, {"gc", "prod", "extra"}, {"gc", "prod", "-r", "repo"}, {"gc", "-d", "el9"},
+		{"export"}, {"export", "unknown"}, {"export", "rpm-leaf", "el9", "x86_64"}, {"export", "rpm-leaf", "el9", "x86_64", "/tmp/leaf", "--hardlink", "--hardlink"},
+		{"export", "rpm-leaf", "EL9", "x86_64", "/tmp/leaf"}, {"export", "rpm-leaf", "el9", "noarch", "/tmp/leaf"},
 		{"log", "one", "two"}, {"log", "operation-id"}, {"log", "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}, {"log", "export", "a", "b"}, {"log", "export", "--json"}, {"log", "prune", "date", "-d", "el9"},
 	}
 	for _, args := range invalid {
@@ -93,7 +103,7 @@ func TestParseLockOptions(t *testing.T) {
 }
 
 func TestParseHelpBypassesRequiredOperands(t *testing.T) {
-	for _, args := range [][]string{{"--help"}, {"create", "--help"}, {"dist", "new", "--help"}, {"repo", "--help"}} {
+	for _, args := range [][]string{{"--help"}, {"create", "--help"}, {"dist", "new", "--help"}, {"repo", "--help"}, {"retain", "add", "--help"}, {"gc", "--help"}} {
 		inv, err := Parse(args)
 		if err != nil {
 			t.Errorf("Parse(%q): %v", args, err)
@@ -157,6 +167,22 @@ func TestParseScalarBoundariesAndPruneCutoff(t *testing.T) {
 	for _, input := range []string{"", "+1", "-1", "1.0", " 1", "9223372036854775808"} {
 		if _, err := parseNonnegativeInt64(input, "generation"); err == nil {
 			t.Fatalf("parseNonnegativeInt64(%q) succeeded", input)
+		}
+	}
+	for input, want := range map[string]state.GenerationID{
+		"0":                    0,
+		"0007":                 7,
+		"9223372036854775808":  state.GenerationID(1 << 63),
+		"18446744073709551615": state.MaxGeneration,
+	} {
+		got, err := parseGenerationIDArgument(input)
+		if err != nil || got != want {
+			t.Fatalf("parseGenerationIDArgument(%q)=%s err=%v want=%s", input, got, err, want)
+		}
+	}
+	for _, input := range []string{"", "+1", "-1", "1.0", " 1", "18446744073709551616"} {
+		if _, err := parseGenerationIDArgument(input); err == nil {
+			t.Fatalf("parseGenerationIDArgument(%q) succeeded", input)
 		}
 	}
 	location := time.FixedZone("acceptance", 8*60*60)

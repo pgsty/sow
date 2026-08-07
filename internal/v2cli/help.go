@@ -6,7 +6,7 @@ import (
 )
 
 // Version is a link-time replaceable binary version.
-var Version = "0.2.0"
+var Version = "0.3.0"
 
 func VersionString() string {
 	return "sow " + Version + " " + runtime.GOOS + "/" + runtime.GOARCH + " " + runtime.Version()
@@ -63,6 +63,7 @@ Commands:
   repo ls                            List repositories
   repo new NAME                      Create a repository
   repo show [NAME]                   Show a repository
+  repo migrate [NAME] [--abort]      Migrate or abandon a pre-commit transition
   repo rm NAME [-f|--force]          Remove a repository
   dist ls                            List distributions
   dist new NAME --format rpm|deb     Create a distribution
@@ -77,6 +78,12 @@ Commands:
   build                              Converge Desired to a Built Generation
   check                              Verify repository integrity end to end
   changes [BASE_GENERATION]          Show physical delivery changes
+  publish TARGET [--abort]           Publish or abandon a pre-commit attempt
+  retain add GENERATION              Retain one verified Generation
+  retain ls                          List retained Generations
+  retain rm GENERATION               Remove one retained Generation
+  gc [TARGET]                        Collect local payloads or maintain one target
+  export rpm-leaf DIST ARCH DIR      Export a standalone RPM compatibility leaf
   log [OPERATION]                    Show operation audit records
   log export [FILE]                  Export operation audit as JSONL
   log prune BEFORE                   Prune eligible terminal audit records
@@ -97,6 +104,29 @@ Options:
   -N, --no-wait         Fail immediately when the lock is held
       --json            Emit the versioned JSON envelope
   -h, --help            Show help
+`,
+	"export": `Usage:
+  sow export COMMAND
+
+Commands:
+  rpm-leaf DIST ARCH DIR [--hardlink]  Export a standalone RPM compatibility leaf
+
+Use "sow help export rpm-leaf" for command help.
+`,
+	"export rpm-leaf": `Usage:
+  sow export rpm-leaf DIST ARCH DIR [--hardlink] [-C DIR] [-r NAME] [--json]
+
+Arguments:
+  DIST                 Built RPM distribution name
+  ARCH                 Canonical architecture: x86_64 or aarch64
+  DIR                  Absent or empty external export root
+
+Options:
+      --hardlink       Explicit same-filesystem trusted read-only optimization
+  -C, --workdir DIR    Workspace discovery start directory
+  -r, --repo NAME      Select a repository
+      --json           Emit the versioned JSON envelope
+  -h, --help           Show help
 `,
 	"init": `Usage:
   sow init [DIR] [--json]
@@ -140,6 +170,7 @@ Commands:
   ls                    List repositories
   new NAME              Create a repository
   show [NAME]           Show a repository
+  migrate [NAME] [--abort]  Migrate or abandon a pre-commit transition
   rm NAME [-f|--force]  Remove a repository
 
 Use "sow help repo COMMAND" for command help.
@@ -168,6 +199,19 @@ Options:
 Options:
   -C, --workdir DIR     Workspace discovery start directory
   -r, --repo NAME       Select the repository when NAME is omitted
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
+`,
+	"repo migrate": `Usage:
+  sow repo migrate [NAME] [--abort] [-j N] [-C DIR] [-r NAME] [-T DUR | -N] [--json]
+
+Options:
+  -j, --jobs N          Parallel workers; defaults to logical CPU count
+      --abort           Abandon a pre-commit layout migration
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select the repository when NAME is omitted
+  -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely
+  -N, --no-wait         Fail immediately when the lock is held
       --json            Emit the versioned JSON envelope
   -h, --help            Show help
 `,
@@ -261,6 +305,49 @@ Options:
 `,
 	"changes": `Usage:
   sow changes [BASE_GENERATION] [-C|--workdir DIR] [-r|--repo NAME] [--json]
+`,
+	"publish": `Usage:
+  sow publish TARGET [--abort] [-C|--workdir DIR] [-T|--timeout DUR | -N|--no-wait] [--json]
+
+Arguments:
+  TARGET                Configured filesystem or R2 target name
+
+Options:
+      --abort           Abandon a reconciled pre-commit attempt
+  -C, --workdir DIR     Workspace discovery start directory
+  -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely
+  -N, --no-wait         Fail immediately when the lock is held
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
+`,
+	"retain": `Usage:
+  sow retain COMMAND
+
+Commands:
+  add GENERATION        Retain the current verified Generation
+  ls                    List retained Generations
+  rm GENERATION         Remove one retained Generation
+
+Use "sow help retain COMMAND" for command help.
+`,
+	"retain add": `Usage:
+  sow retain add GENERATION [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json]
+`,
+	"retain ls": `Usage:
+  sow retain ls [-C|--workdir DIR] [-r|--repo NAME] [--json]
+`,
+	"retain rm": `Usage:
+  sow retain rm GENERATION [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json]
+`,
+	"gc": `Usage:
+  sow gc [TARGET] [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json]
+
+Arguments:
+  TARGET                Optional publication target; omitting it runs local GC
+
+Target behavior:
+  Filesystem targets conditionally delete only after grace and absence receipts.
+  R2 targets persist exact retained-candidate reports and never delete objects.
 `,
 	"log": `Usage:
   sow log [OPERATION] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME] [--json]
