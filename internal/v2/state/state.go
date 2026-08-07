@@ -23,13 +23,15 @@ import (
 )
 
 const (
-	SchemaVersion            = 6
+	SchemaVersion            = 8
 	SchemaV1SHA256           = "9953cdc1f655fb03814da8b4c7a45a4a92a74e03facf03c2a45709cc860b9bc7"
 	SchemaV2SHA256           = "aea5b37365510221ab36c4f0fc9e6bc77ba825354649e1e06336b64551c14e25"
 	SchemaV3SHA256           = "9ae957e0e8d9eac21eda3929386f11d001608df5ee7feb75c44194f624f0a177"
 	SchemaV4SHA256           = "2282778aacbb3f1adaab3e038f848d3dfe24addabf9c946811a441d80c425ab2"
 	SchemaV5SHA256           = "0f89b33d7c42d03907d5b73883031723cb177b03c3c74d461b7d943618ecf794"
 	SchemaV6SHA256           = "7ce4382cea6379d2f893e8cd2cd7fc1310c424d4858f82fbbd666f19a18f091a"
+	SchemaV7SHA256           = "b3869aafea84722652738f2ebb352aaa10e13659ae61448f32efafc064c23ac3"
+	SchemaV8SHA256           = "79e1d22b7884dd8cf4f2bcf26d14a973c84264259e85ace0125685c8440788f5"
 	MaxOperationPayloadBytes = 16 << 20
 )
 
@@ -50,6 +52,12 @@ var schemaV5SQL string
 
 //go:embed schema_v6.sql
 var schemaV6SQL string
+
+//go:embed schema_v7.sql
+var schemaV7SQL string
+
+//go:embed schema_v8.sql
+var schemaV8SQL string
 
 var (
 	ErrSchema     = errors.New("unsupported or corrupt repository schema")
@@ -76,6 +84,12 @@ var (
 	schemaV6ContractOnce    sync.Once
 	schemaV6ContractObjects []schemaObject
 	schemaV6ContractErr     error
+	schemaV7ContractOnce    sync.Once
+	schemaV7ContractObjects []schemaObject
+	schemaV7ContractErr     error
+	schemaV8ContractOnce    sync.Once
+	schemaV8ContractObjects []schemaObject
+	schemaV8ContractErr     error
 )
 
 // Legacy lowercase hexadecimal IDs remain readable so interrupted development
@@ -84,8 +98,9 @@ var operationIDPattern = regexp.MustCompile(`^(?:0|[1-9][0-9]*|[0-9a-f]{64})$`)
 var metadataFingerprintPattern = regexp.MustCompile(`^(?:[0-9A-F]{40}|[0-9A-F]{64})$`)
 
 type Store struct {
-	path string
-	db   *sql.DB
+	path          string
+	db            *sql.DB
+	schemaVersion int
 }
 
 type Architecture struct {
@@ -104,7 +119,7 @@ type Dist struct {
 	Name                      string         `json:"name"`
 	Format                    string         `json:"format"`
 	EffectiveConfigSHA256     string         `json:"effective_config_sha256"`
-	BuiltGeneration           int64          `json:"built_generation"`
+	BuiltGeneration           GenerationID   `json:"built_generation"`
 	Architectures             []Architecture `json:"architectures"`
 	MetadataSignerFingerprint string         `json:"metadata_signer_fingerprint,omitempty"`
 	MetadataSignerPublicKey   []byte         `json:"-"`
@@ -112,13 +127,13 @@ type Dist struct {
 }
 
 type RepositorySummary struct {
-	DesiredRevision int64  `json:"desired_revision"`
-	BuiltGeneration int64  `json:"built_generation"`
-	Status          string `json:"status"`
-	DirtyReason     string `json:"dirty_reason,omitempty"`
-	DistCount       int64  `json:"dist_count"`
-	PackageCount    int64  `json:"package_count"`
-	MembershipCount int64  `json:"membership_count"`
+	DesiredRevision int64        `json:"desired_revision"`
+	BuiltGeneration GenerationID `json:"built_generation"`
+	Status          string       `json:"status"`
+	DirtyReason     string       `json:"dirty_reason,omitempty"`
+	DistCount       int64        `json:"dist_count"`
+	PackageCount    int64        `json:"package_count"`
+	MembershipCount int64        `json:"membership_count"`
 }
 
 type DistCounts struct {
@@ -161,7 +176,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := &Store{path: absolute, db: db}
+	store := &Store{path: absolute, db: db, schemaVersion: SchemaVersion}
 	if err := store.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -169,11 +184,42 @@ func Open(path string) (*Store, error) {
 	return store, nil
 }
 
-// OpenExisting opens an existing repository database for mutation without
+// OpenExisting opens an existing current-schema repository database for
+// mutation without
 // permitting SQLite to create a replacement file. Lifecycle operations must
 // use this path so a missing state database is an integrity failure, never an
 // implicit reset beside an existing Pool.
 func OpenExisting(path string) (*Store, error) {
+	absolute, err := cleanDatabasePath(path, true)
+	if err != nil {
+		return nil, err
+	}
+	probe, err := openDatabaseMode(absolute, "ro", false, false)
+	if err != nil {
+		return nil, err
+	}
+	probeStore := &Store{path: absolute, db: probe, schemaVersion: SchemaVersion}
+	probeErr := probeStore.validateSchema(context.Background())
+	closeErr := probe.Close()
+	if err := errors.Join(probeErr, closeErr); err != nil {
+		return nil, err
+	}
+	db, err := openDatabaseMode(absolute, "rw", true, false)
+	if err != nil {
+		return nil, err
+	}
+	store := &Store{path: absolute, db: db, schemaVersion: SchemaVersion}
+	if err := store.validateSchema(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// OpenExistingForMigration is the only existing-file writer authorized to
+// advance a known predecessor schema. Ordinary mutations use OpenExisting and
+// therefore cannot silently cross the explicit Repository migration boundary.
+func OpenExistingForMigration(path string) (*Store, error) {
 	absolute, err := cleanDatabasePath(path, true)
 	if err != nil {
 		return nil, err
@@ -192,7 +238,7 @@ func OpenExisting(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := &Store{path: absolute, db: db}
+	store := &Store{path: absolute, db: db, schemaVersion: SchemaVersion}
 	if err := store.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -225,7 +271,7 @@ func OpenInitializing(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: resume initializing database: %v", ErrSchema, err)
 	}
-	store := &Store{path: absolute, db: db}
+	store := &Store{path: absolute, db: db, schemaVersion: SchemaVersion}
 	if err := store.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -246,8 +292,17 @@ func OpenReadOnly(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	store := &Store{path: absolute, db: db}
-	if err := store.validateSchema(context.Background()); err != nil {
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("%w: read user_version: %v", ErrSchema, err)
+	}
+	if version != 6 && version != SchemaVersion {
+		db.Close()
+		return nil, fmt.Errorf("%w: read-only database version %d is neither frozen v0.2 nor current", ErrSchema, version)
+	}
+	store := &Store{path: absolute, db: db, schemaVersion: version}
+	if err := store.validateSchemaVersion(context.Background(), version); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -293,6 +348,11 @@ func ReadOnlyRequiresLifecycleFence(path string) (bool, error) {
 func (s *Store) DB() *sql.DB { return s.db }
 
 func (s *Store) Path() string { return s.path }
+
+// SchemaVersion reports the byte-for-byte schema contract validated when the
+// Store was opened. Version 6 is the frozen v0.2 C2 read-only compatibility
+// surface; writable Stores are always current.
+func (s *Store) SchemaVersion() int { return s.schemaVersion }
 
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
@@ -520,7 +580,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		return s.validateSchema(ctx)
 	case version > SchemaVersion:
 		return fmt.Errorf("%w: database version %d is newer than supported version %d", ErrSchema, version, SchemaVersion)
-	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5:
+	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7:
 		return fmt.Errorf("%w: cannot migrate version %d", ErrSchema, version)
 	}
 	if version == 0 {
@@ -550,6 +610,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := validateEmbeddedSchema("v6", schemaV6SQL, SchemaV6SHA256); err != nil {
+		return err
+	}
+	if err := validateEmbeddedSchema("v7", schemaV7SQL, SchemaV7SHA256); err != nil {
+		return err
+	}
+	if err := validateEmbeddedSchema("v8", schemaV8SQL, SchemaV8SHA256); err != nil {
 		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -600,22 +666,43 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("record schema v5: %w", err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, schemaV6SQL); err != nil {
-		return fmt.Errorf("apply schema v6: %w", err)
-	}
-	if err := upgradeEffectiveSigningSnapshots(ctx, tx); err != nil {
-		return fmt.Errorf("upgrade retained signing snapshots: %w", err)
-	}
-	if version >= 2 && version < SchemaVersion {
-		if err := normalizeLegacyRetainedGenerationLedgerTx(ctx, tx); err != nil {
-			return fmt.Errorf("%w: validate legacy retained Generation ledger: %v", ErrSchema, err)
+	if version <= 5 {
+		if _, err := tx.ExecContext(ctx, schemaV6SQL); err != nil {
+			return fmt.Errorf("apply schema v6: %w", err)
+		}
+		if err := upgradeEffectiveSigningSnapshots(ctx, tx); err != nil {
+			return fmt.Errorf("upgrade retained signing snapshots: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (6, ?, ?)`, SchemaV6SHA256, nowText()); err != nil {
+			return fmt.Errorf("record schema v6: %w", err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (6, ?, ?)`, SchemaV6SHA256, nowText()); err != nil {
-		return fmt.Errorf("record schema v6: %w", err)
+	if version <= 6 {
+		if _, err := tx.ExecContext(ctx, schemaV7SQL); err != nil {
+			return fmt.Errorf("apply schema v7: %w", err)
+		}
+		if version == 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE repository_state SET layout_version = 'single-payload-v1' WHERE singleton = 1`); err != nil {
+				return fmt.Errorf("initialize terminal repository layout: %w", err)
+			}
+		}
+		if version >= 2 {
+			if err := normalizeLegacyRetainedGenerationLedgerTx(ctx, tx); err != nil {
+				return fmt.Errorf("%w: validate legacy retained Generation ledger: %v", ErrSchema, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (7, ?, ?)`, SchemaV7SHA256, nowText()); err != nil {
+			return fmt.Errorf("record schema v7: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, schemaV8SQL); err != nil {
+		return fmt.Errorf("apply schema v8: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (8, ?, ?)`, SchemaV8SHA256, nowText()); err != nil {
+		return fmt.Errorf("record schema v8: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit schema v6: %w", err)
+		return fmt.Errorf("commit schema v8: %w", err)
 	}
 	return s.validateSchema(ctx)
 }
@@ -636,8 +723,6 @@ func (s *Store) validateInitializingSchema(ctx context.Context) error {
 	switch version {
 	case SchemaVersion:
 		return s.validateSchema(ctx)
-	case 1, 2, 3, 4, 5:
-		return s.validateSchemaVersion(ctx, version)
 	case 0:
 		var objectCount int
 		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'`).Scan(&objectCount); err != nil {
@@ -655,7 +740,7 @@ func (s *Store) validateInitializingSchema(ctx context.Context) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("%w: database version %d cannot be resumed as an initialization", ErrSchema, version)
+		return fmt.Errorf("%w: database version %d cannot be resumed as an initialization; only an empty v0 or current schema is authorized", ErrSchema, version)
 	}
 }
 
@@ -668,7 +753,7 @@ func (s *Store) validateUpgradeableSchema(ctx context.Context) error {
 		return fmt.Errorf("%w: read user_version: %v", ErrSchema, err)
 	}
 	switch version {
-	case 1, 2, 3, 4, 5, SchemaVersion:
+	case 1, 2, 3, 4, 5, 6, 7, SchemaVersion:
 		return s.validateSchemaVersion(ctx, version)
 	case 0:
 		return fmt.Errorf("%w: uninitialized database cannot be adopted", ErrSchema)
@@ -745,6 +830,18 @@ func (s *Store) validateSchemaVersion(ctx context.Context, expectedVersion int) 
 			version  int
 			checksum string
 		}{6, SchemaV6SHA256})
+	}
+	if expectedVersion >= 7 {
+		expectedMigrations = append(expectedMigrations, struct {
+			version  int
+			checksum string
+		}{7, SchemaV7SHA256})
+	}
+	if expectedVersion >= 8 {
+		expectedMigrations = append(expectedMigrations, struct {
+			version  int
+			checksum string
+		}{8, SchemaV8SHA256})
 	}
 	if !reflectMigrations(migrations, expectedMigrations) {
 		return fmt.Errorf("%w: migration ledger does not exactly match schema v%d", ErrSchema, expectedVersion)
@@ -834,6 +931,18 @@ func expectedSchemaObjects(version int) ([]schemaObject, error) {
 		})
 		return append([]schemaObject(nil), schemaV6ContractObjects...), schemaV6ContractErr
 	}
+	if version == 7 {
+		schemaV7ContractOnce.Do(func() {
+			schemaV7ContractObjects, schemaV7ContractErr = buildExpectedSchemaObjects(schemaV1SQL, schemaV2SQL, schemaV3SQL, schemaV4SQL, schemaV5SQL, schemaV6SQL, schemaV7SQL)
+		})
+		return append([]schemaObject(nil), schemaV7ContractObjects...), schemaV7ContractErr
+	}
+	if version == 8 {
+		schemaV8ContractOnce.Do(func() {
+			schemaV8ContractObjects, schemaV8ContractErr = buildExpectedSchemaObjects(schemaV1SQL, schemaV2SQL, schemaV3SQL, schemaV4SQL, schemaV5SQL, schemaV6SQL, schemaV7SQL, schemaV8SQL)
+		})
+		return append([]schemaObject(nil), schemaV8ContractObjects...), schemaV8ContractErr
+	}
 	return nil, fmt.Errorf("unsupported schema contract version %d", version)
 }
 
@@ -889,7 +998,7 @@ func sameSchemaObjects(left, right []schemaObject) bool {
 }
 
 func (s *Store) Check(ctx context.Context) error {
-	if err := s.validateSchema(ctx); err != nil {
+	if err := s.validateSchemaVersion(ctx, s.schemaVersion); err != nil {
 		return err
 	}
 	if err := s.validateSemanticState(ctx); err != nil {
@@ -925,6 +1034,10 @@ func (s *Store) validateSemanticState(ctx context.Context) error {
 	if singletonCount != 1 {
 		return fmt.Errorf("%w: repository_state singleton count is %d", ErrSchema, singletonCount)
 	}
+	zeroGeneration := "'00000000000000000000'"
+	if s.schemaVersion == 6 {
+		zeroGeneration = "0"
+	}
 	checks := []struct {
 		label string
 		query string
@@ -936,10 +1049,10 @@ WHERE r.singleton = 1 AND (d.desired_revision > r.desired_revision OR d.built_ge
 		},
 		{
 			"Dist Built Generation is absent from retained ledger",
-			`SELECT count(*) FROM dists AS d
-WHERE d.built_generation > 0
+			fmt.Sprintf(`SELECT count(*) FROM dists AS d
+WHERE d.built_generation > %s
   AND EXISTS (SELECT 1 FROM generations)
-  AND NOT EXISTS (SELECT 1 FROM generations AS g WHERE g.generation = d.built_generation)`,
+			  AND NOT EXISTS (SELECT 1 FROM generations AS g WHERE g.generation = d.built_generation)`, zeroGeneration),
 		},
 		{
 			"Dist architecture Generation differs from owning Dist",
@@ -956,13 +1069,13 @@ WHERE r.singleton = 1 AND (b.generation != d.built_generation OR b.generation > 
 		},
 		{
 			"Prior Built Membership Generation or storage is invalid",
-			`SELECT count(*) FROM prior_built_memberships AS b
+			fmt.Sprintf(`SELECT count(*) FROM prior_built_memberships AS b
 JOIN dists AS d ON d.name = b.dist_name
 JOIN package_objects AS p ON p.sha256 = b.package_sha256
 CROSS JOIN repository_state AS r
 WHERE r.singleton = 1 AND (b.generation >= d.built_generation OR b.generation > r.built_generation OR p.storage != 'pool'
-  OR (b.generation > 0 AND EXISTS (SELECT 1 FROM generations)
-      AND NOT EXISTS (SELECT 1 FROM generations AS g WHERE g.generation = b.generation)))`,
+  OR (b.generation > %s AND EXISTS (SELECT 1 FROM generations)
+      AND NOT EXISTS (SELECT 1 FROM generations AS g WHERE g.generation = b.generation)))`, zeroGeneration),
 		},
 		{
 			"Package Object creation revision exceeds Repository revision",
@@ -1019,6 +1132,74 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 		}
 		if status == "clean" && reason.Valid || status == "dirty" && (!reason.Valid || strings.TrimSpace(reason.String) == "") {
 			issues = append(issues, fmt.Errorf("Repository status %s has inconsistent dirty_reason", status))
+		}
+	}
+	if s.schemaVersion != 6 {
+		identity, identityErr := s.RepositoryIdentity(ctx)
+		if identityErr != nil {
+			issues = append(issues, identityErr)
+		} else {
+			control, controlErr := s.LayoutTransitionControl(ctx)
+			if controlErr != nil {
+				issues = append(issues, controlErr)
+			} else if control != nil {
+				var head GenerationID
+				headErr := s.db.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&head)
+				if headErr != nil || control.RepositoryID != identity.RepositoryID ||
+					identity.LayoutVersion == LayoutC2V1 || identity.LayoutVersion == LayoutC2ToSingleV1 && head != control.BaseGeneration ||
+					identity.LayoutVersion == LayoutSinglePayloadV1 && (identity.TransitionReceiptSHA256 == "" || control.CommitIntentAt == "") {
+					issues = append(issues, errors.Join(errors.New("Repository layout transition control differs from identity/base/layout"), headErr))
+				}
+				if identity.LayoutVersion == LayoutSinglePayloadV1 && headErr == nil {
+					var headManifest string
+					manifestErr := s.db.QueryRowContext(ctx, `SELECT manifest_sha256 FROM generations WHERE generation = ?`, head).Scan(&headManifest)
+					if manifestErr != nil || headManifest != control.TargetManifestSHA256 {
+						issues = append(issues, errors.Join(errors.New("Repository layout transition control target differs from head Generation"), manifestErr))
+					}
+				}
+			} else if identity.LayoutVersion == LayoutSinglePayloadV1 && identity.TransitionReceiptSHA256 != "" {
+				issues = append(issues, errors.New("migrated Repository has no layout transition control anchor"))
+			}
+			if identity.LayoutVersion != LayoutSinglePayloadV1 && identity.TransitionReceiptSHA256 != "" {
+				issues = append(issues, errors.New("non-terminal Repository layout has a transition receipt"))
+			}
+			var migrationCount int64
+			if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE kind = 'layout.migrate' AND state = 'done'`).Scan(&migrationCount); err != nil {
+				issues = append(issues, err)
+			} else if migrationCount > 1 {
+				issues = append(issues, fmt.Errorf("Repository has %d completed layout migrations", migrationCount))
+			} else if migrationCount == 0 {
+				if identity.TransitionReceiptSHA256 != "" {
+					issues = append(issues, errors.New("Repository transition receipt has no completed layout migration"))
+				}
+			} else {
+				var operationID, payload string
+				if err := s.db.QueryRowContext(ctx, `SELECT id, payload_json FROM operations WHERE kind = 'layout.migrate' AND state = 'done'`).Scan(&operationID, &payload); err != nil {
+					issues = append(issues, err)
+				} else {
+					var wire struct {
+						BaseGeneration          GenerationID `json:"base_generation"`
+						TargetGeneration        GenerationID `json:"target_generation"`
+						TransitionReceiptSHA256 string       `json:"transition_receipt_sha256"`
+					}
+					decoder := json.NewDecoder(strings.NewReader(payload))
+					decoder.DisallowUnknownFields()
+					decodeErr := decoder.Decode(&wire)
+					var trailing any
+					trailingErr := decoder.Decode(&trailing)
+					var head GenerationID
+					headErr := s.db.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&head)
+					next, nextErr := wire.BaseGeneration.Next()
+					var generationLinkCount int64
+					linkErr := s.db.QueryRowContext(ctx, `SELECT count(*) FROM generations WHERE operation_id = ? AND generation = ? AND previous_generation = ?`, operationID, wire.TargetGeneration, wire.BaseGeneration).Scan(&generationLinkCount)
+					if decodeErr != nil || trailingErr != io.EOF || headErr != nil ||
+						identity.LayoutVersion != LayoutSinglePayloadV1 || identity.TransitionReceiptSHA256 == "" ||
+						wire.TransitionReceiptSHA256 != identity.TransitionReceiptSHA256 || wire.TargetGeneration != head ||
+						nextErr != nil || wire.TargetGeneration != next || linkErr != nil || generationLinkCount != 1 {
+						issues = append(issues, errors.Join(errors.New("Repository layout migration identity/layout/receipt/generation coupling is invalid"), decodeErr, headErr, nextErr, linkErr))
+					}
+				}
+			}
 		}
 	}
 	if len(issues) != 0 {
@@ -1142,7 +1323,7 @@ func (s *Store) distArchitectures(ctx context.Context, name string) ([]Architect
 }
 
 func (s *Store) AddDist(ctx context.Context, dist Dist) error {
-	if dist.Name == "" || (dist.Format != "rpm" && dist.Format != "deb") || dist.BuiltGeneration < 0 {
+	if dist.Name == "" || dist.Format != "rpm" && dist.Format != "deb" {
 		return fmt.Errorf("invalid dist state")
 	}
 	architectures := append([]Architecture(nil), dist.Architectures...)
@@ -1174,7 +1355,7 @@ func (s *Store) AddDist(ctx context.Context, dist Dist) error {
 			return fmt.Errorf("insert architecture %q for dist %q: %w", architecture.Family, dist.Name, err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE repository_state SET desired_revision = max(desired_revision, ?), built_generation = max(built_generation, ?), status = 'clean', dirty_reason = NULL WHERE singleton = 1`, dist.BuiltGeneration, dist.BuiltGeneration); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE repository_state SET built_generation = max(built_generation, ?), status = 'clean', dirty_reason = NULL WHERE singleton = 1`, dist.BuiltGeneration); err != nil {
 		return fmt.Errorf("advance repository generation: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -1254,7 +1435,7 @@ func (s *Store) FinalizeDistAdd(ctx context.Context, operationID string, dist Di
 // FinalizeDistRemoval preserves the original error-only API used by P1 state
 // callers. Managed lifecycle code uses FinalizeDistRemovalAndCollect so it can
 // durably remove private pending bytes made unreachable by the Dist cascade.
-func (s *Store) FinalizeDistRemoval(ctx context.Context, operationID, name string, generation int64, manifest []GenerationFile, changes []FileChange) error {
+func (s *Store) FinalizeDistRemoval(ctx context.Context, operationID, name string, generation GenerationID, manifest []GenerationFile, changes []FileChange) error {
 	_, err := s.FinalizeDistRemovalAndCollect(ctx, operationID, name, generation, manifest, changes)
 	return err
 }
@@ -1263,7 +1444,7 @@ func (s *Store) FinalizeDistRemoval(ctx context.Context, operationID, name strin
 // public Pool objects. Pending objects that lose their final Membership are
 // removed from SQLite in the same transaction and returned in result_json so
 // filesystem cleanup remains idempotently recoverable after a process stop.
-func (s *Store) FinalizeDistRemovalAndCollect(ctx context.Context, operationID, name string, generation int64, manifest []GenerationFile, changes []FileChange) ([]string, error) {
+func (s *Store) FinalizeDistRemovalAndCollect(ctx context.Context, operationID, name string, generation GenerationID, manifest []GenerationFile, changes []FileChange) ([]string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin dist removal finalization: %w", err)
@@ -1392,7 +1573,7 @@ func operationStateTx(ctx context.Context, tx *sql.Tx, id string) (OperationStat
 }
 
 func insertDistTx(ctx context.Context, tx *sql.Tx, dist Dist) error {
-	if dist.Name == "" || (dist.Format != "rpm" && dist.Format != "deb") || dist.BuiltGeneration < 0 {
+	if dist.Name == "" || dist.Format != "rpm" && dist.Format != "deb" {
 		return fmt.Errorf("invalid dist state")
 	}
 	effectiveSigning, err := normalizeEffectiveSigningJSON(dist.EffectiveSigningJSON)
@@ -1400,7 +1581,7 @@ func insertDistTx(ctx context.Context, tx *sql.Tx, dist Dist) error {
 		return err
 	}
 	var existingFormat, existingHash, existingSigning string
-	var existingGeneration int64
+	var existingGeneration GenerationID
 	err = tx.QueryRowContext(ctx, `SELECT format, effective_config_sha256, built_generation, effective_signing_json FROM dists WHERE name = ?`, dist.Name).Scan(&existingFormat, &existingHash, &existingGeneration, &existingSigning)
 	if err == nil {
 		if existingFormat == dist.Format && existingHash == dist.EffectiveConfigSHA256 && existingGeneration == dist.BuiltGeneration && existingSigning == effectiveSigning {
@@ -1464,11 +1645,8 @@ func replaceDistMetadataSignerTx(ctx context.Context, tx *sql.Tx, dist Dist) err
 	return nil
 }
 
-func advanceGenerationTx(ctx context.Context, tx *sql.Tx, generation int64) error {
-	if generation < 0 {
-		return errors.New("negative repository generation")
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE repository_state SET desired_revision = max(desired_revision, ?), built_generation = max(built_generation, ?), status = 'clean', dirty_reason = NULL WHERE singleton = 1`, generation, generation); err != nil {
+func advanceGenerationTx(ctx context.Context, tx *sql.Tx, generation GenerationID) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE repository_state SET built_generation = max(built_generation, ?), status = 'clean', dirty_reason = NULL WHERE singleton = 1`, generation); err != nil {
 		return fmt.Errorf("advance repository generation: %w", err)
 	}
 	return nil
@@ -1527,6 +1705,9 @@ ORDER BY 1, 4, 3`)
 }
 
 func (s *Store) BeginOperation(ctx context.Context, operation Operation) error {
+	if err := s.RequireTerminalLayout(ctx); err != nil {
+		return err
+	}
 	if !operationIDPattern.MatchString(operation.ID) || operation.Kind == "" || !validOperationState(operation.State) || isTerminal(operation.State) {
 		return fmt.Errorf("invalid operation")
 	}

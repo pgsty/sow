@@ -15,7 +15,7 @@ func TestSelectRepositoryPriorityMatrix(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cfg, err := Parse([]byte("schema: sow/v2\nrepos:\n  infra: {}\n  pgsql: {}\n"))
+	cfg, err := Parse([]byte("schema: sow/v3\nrepos:\n  infra: {}\n  pgsql: {}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestSelectRepositoryPriorityMatrix(t *testing.T) {
 		t.Fatalf("ambiguous selection error = %v", err)
 	}
 
-	one, err := Parse([]byte("schema: sow/v2\nrepos:\n  pgsql: {}\n"))
+	one, err := Parse([]byte("schema: sow/v3\nrepos:\n  pgsql: {}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestWorkdirChangesRepositoryInferenceStart(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cfg, err := Parse([]byte("schema: sow/v2\nrepos:\n  infra: {}\n  pgsql: {}\n"))
+	cfg, err := Parse([]byte("schema: sow/v3\nrepos:\n  infra: {}\n  pgsql: {}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +100,7 @@ func TestWorkdirChangesRepositoryInferenceStart(t *testing.T) {
 	if sel.Name != "infra" || sel.Source != RepositoryCWD {
 		t.Fatalf("workdir repository selection = %#v", sel)
 	}
-	one, err := Parse([]byte("schema: sow/v2\nrepos:\n  infra: {}\n"))
+	one, err := Parse([]byte("schema: sow/v3\nrepos:\n  infra: {}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestSelectRepositoryRejectsSymlinkedStartComponent(t *testing.T) {
 	if err := os.Symlink(filepath.Join(root, "pgsql", "real"), filepath.Join(root, "pgsql", "link")); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := Parse([]byte("schema: sow/v2\nrepos:\n  pgsql: {}\n"))
+	cfg, err := Parse([]byte("schema: sow/v3\nrepos:\n  pgsql: {}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestDiscoveredWorkdirRetainsSymlinkEvidenceForSelection(t *testing.T) {
 	if err := os.Symlink(filepath.Join(root, "pgsql", "real"), link); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := Parse([]byte("schema: sow/v2\nrepos:\n  pgsql: {}\n"))
+	cfg, err := Parse([]byte("schema: sow/v3\nrepos:\n  pgsql: {}\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +191,7 @@ func TestDistContainingCWDUsesPhysicalSelectedRepositoryScope(t *testing.T) {
 		}
 	}
 	cfg, err := Parse([]byte(`
-schema: sow/v2
+schema: sow/v3
 repos:
   infra:
     dists:

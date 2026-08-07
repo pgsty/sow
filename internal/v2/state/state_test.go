@@ -279,7 +279,7 @@ func TestOperationAuditPreservesPerDistPolicyOutcomesWithoutPoolObjects(t *testi
 	}
 }
 
-func TestOpenExistingMigratesKnownV1OnlyAfterReadOnlyProbe(t *testing.T) {
+func TestOpenExistingForMigrationMigratesKnownV1OnlyAfterReadOnlyProbe(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "repo.db")
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=rwc")
@@ -307,7 +307,7 @@ func TestOpenExistingMigratesKnownV1OnlyAfterReadOnlyProbe(t *testing.T) {
 		t.Fatalf("read-only v1 probe changed database: err=%v", err)
 	}
 
-	store, err := OpenExisting(path)
+	store, err := OpenExistingForMigration(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,12 +318,84 @@ func TestOpenExistingMigratesKnownV1OnlyAfterReadOnlyProbe(t *testing.T) {
 	}
 }
 
-func TestOpenExistingReanchorsTruncatedV2GenerationLedgerAtomically(t *testing.T) {
+func TestFrozenV6IsReadableButOrdinaryWriterCannotMigrateIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "repo.db")
+	db := createSchemaV5Fixture(t, path)
+	if _, err := db.Exec(schemaV6SQL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (6, ?, ?)`, SchemaV6SHA256, "2026-08-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenExisting(path); !errors.Is(err, ErrSchema) {
+		t.Fatalf("ordinary writer error=%v, want ErrSchema", err)
+	}
+	readOnly, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readOnly.SchemaVersion() != 6 {
+		t.Fatalf("read-only schema=%d, want 6", readOnly.SchemaVersion())
+	}
+	if _, err := readOnly.Summary(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := raw.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if version != 6 {
+		t.Fatalf("ordinary writer changed schema to %d", version)
+	}
+	writer, err := OpenExistingForMigration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if writer.SchemaVersion() != SchemaVersion {
+		t.Fatalf("migration writer schema=%d", writer.SchemaVersion())
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGenerationManifestRejectsPackagePayloadUnderDists(t *testing.T) {
+	for _, packagePath := range []string{
+		"dists/el9/x86_64/pool/p/pkg/pkg-1.x86_64.rpm",
+		"dists/el9/x86_64/repodata/hidden.rpm",
+		"dists/noble/main/binary-amd64/hidden.deb",
+	} {
+		manifest := []GenerationFile{{Path: packagePath, Phase: "payload", Size: 1, SHA256: strings.Repeat("a", 64)}}
+		if _, _, err := normalizeManifest(manifest); err == nil {
+			t.Errorf("normalizeManifest accepted dists payload %q", packagePath)
+		}
+	}
+	manifest := []GenerationFile{{Path: "pool/p/pkg/pkg-1.x86_64.rpm", Phase: "payload", Size: 1, SHA256: strings.Repeat("a", 64)}}
+	if _, _, err := normalizeManifest(manifest); err != nil {
+		t.Fatalf("normalizeManifest rejected canonical Pool payload: %v", err)
+	}
+}
+
+func TestOpenExistingForMigrationReanchorsTruncatedV2GenerationLedgerAtomically(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "repo.db")
 	firstManifest, _ := createTruncatedV2GenerationLedger(t, path, false)
 
-	store, err := OpenExisting(path)
+	store, err := OpenExistingForMigration(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -363,7 +435,7 @@ func TestOpenExistingReanchorsTruncatedV2GenerationLedgerAtomically(t *testing.T
 func TestOpenExistingRejectsCorruptTruncatedV2GenerationLedgerWithoutMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "repo.db")
 	createTruncatedV2GenerationLedger(t, path, true)
-	if _, err := OpenExisting(path); !errors.Is(err, ErrSchema) {
+	if _, err := OpenExistingForMigration(path); !errors.Is(err, ErrSchema) {
 		t.Fatalf("OpenExisting(corrupt v2 ledger) error=%v, want ErrSchema", err)
 	}
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro")
@@ -985,8 +1057,8 @@ func TestOpenExistingRejectsUninitializedDatabaseWithoutMutation(t *testing.T) {
 	}
 }
 
-func TestOpenInitializingResumesEmptyV0AndAcceptsValidV2(t *testing.T) {
-	for _, kind := range []string{"zero", "sqlite-v0", "valid-v2"} {
+func TestOpenInitializingResumesEmptyV0AndAcceptsCurrentOnly(t *testing.T) {
+	for _, kind := range []string{"zero", "sqlite-v0", "current"} {
 		t.Run(kind, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "repo.db")
 			switch kind {
@@ -1005,7 +1077,7 @@ func TestOpenInitializingResumesEmptyV0AndAcceptsValidV2(t *testing.T) {
 				if err := db.Close(); err != nil {
 					t.Fatal(err)
 				}
-			case "valid-v2":
+			case "current":
 				store, err := Open(path)
 				if err != nil {
 					t.Fatal(err)
@@ -1031,6 +1103,34 @@ func TestOpenInitializingResumesEmptyV0AndAcceptsValidV2(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestOpenInitializingRejectsKnownPredecessorSchemaWithoutMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "repo.db")
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=rwc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(schemaV1SQL); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (1, ?, ?)`, SchemaV1SHA256, "2026-08-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenInitializing(path); !errors.Is(err, ErrSchema) {
+		t.Fatalf("OpenInitializing(v1) error=%v, want ErrSchema", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("rejected predecessor changed: err=%v", err)
 	}
 }
 
@@ -1191,7 +1291,7 @@ func TestApplyDesiredMutationUsesWholeSetsAndDropsUnreferencedPending(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Changed || result.Revision != 2 || !reflect.DeepEqual(result.ChangedDists, []string{"el9"}) {
+	if !result.Changed || result.Revision != 1 || !reflect.DeepEqual(result.ChangedDists, []string{"el9"}) {
 		t.Fatalf("add result=%#v", result)
 	}
 	objects, err := store.ListPackageObjects(ctx, []string{"el9"}, false)
@@ -1276,7 +1376,7 @@ func assertSchemaV2(t *testing.T, db *sql.DB) {
 		t.Fatalf("user_version=%d want=%d", version, SchemaVersion)
 	}
 	var migrationCount int
-	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE (version = 1 AND checksum = ?) OR (version = 2 AND checksum = ?) OR (version = 3 AND checksum = ?) OR (version = 4 AND checksum = ?) OR (version = 5 AND checksum = ?) OR (version = 6 AND checksum = ?)`, SchemaV1SHA256, SchemaV2SHA256, SchemaV3SHA256, SchemaV4SHA256, SchemaV5SHA256, SchemaV6SHA256).Scan(&migrationCount); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE (version = 1 AND checksum = ?) OR (version = 2 AND checksum = ?) OR (version = 3 AND checksum = ?) OR (version = 4 AND checksum = ?) OR (version = 5 AND checksum = ?) OR (version = 6 AND checksum = ?) OR (version = 7 AND checksum = ?) OR (version = 8 AND checksum = ?)`, SchemaV1SHA256, SchemaV2SHA256, SchemaV3SHA256, SchemaV4SHA256, SchemaV5SHA256, SchemaV6SHA256, SchemaV7SHA256, SchemaV8SHA256).Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
 	if migrationCount != SchemaVersion {

@@ -22,7 +22,8 @@ import (
 
 const (
 	ConfigFilename = "sow.yml"
-	Schema         = "sow/v2"
+	Schema         = "sow/v3"
+	LegacySchema   = "sow/v2"
 	maxConfigBytes = 16 << 20
 )
 
@@ -43,6 +44,7 @@ type Config struct {
 	Schema        string                      `yaml:"schema" json:"schema"`
 	Architectures []string                    `yaml:"architectures" json:"architectures"`
 	Repositories  map[string]RepositoryConfig `yaml:"repos,omitempty" json:"repos,omitempty"`
+	Targets       map[string]TargetConfig     `yaml:"targets,omitempty" json:"targets,omitempty"`
 }
 
 type RepositoryConfig struct {
@@ -91,18 +93,39 @@ type MetadataSigningConfig struct {
 	Passphrase string `yaml:"passphrase,omitempty" json:"passphrase,omitempty"`
 }
 
-// Default returns a fresh default V2 workspace config.
+// Default returns a fresh current workspace config.
 func Default() Config {
 	return Config{
 		Schema:        Schema,
 		Architectures: append([]string(nil), defaultArchitectures...),
 		Repositories:  make(map[string]RepositoryConfig),
+		Targets:       make(map[string]TargetConfig),
 	}
 }
 
 // Parse strictly decodes exactly one YAML document and validates the complete
 // P1 configuration grammar.
 func Parse(data []byte) (Config, error) {
+	return parse(data, false)
+}
+
+// ParseForMigration is the compatibility decoder for a frozen v0.2 workspace.
+// It returns a current in-memory projection plus an explicit legacy bit: read
+// surfaces can operate under the old physical contract, while mutations still
+// use the strict decoder and fail before the explicit layout transition.
+func ParseForMigration(data []byte) (Config, bool, error) {
+	cfg, err := parse(data, true)
+	if err != nil {
+		return Config{}, false, err
+	}
+	legacy := cfg.Schema == LegacySchema
+	if legacy {
+		cfg.Schema = Schema
+	}
+	return cfg, legacy, nil
+}
+
+func parse(data []byte, allowLegacy bool) (Config, error) {
 	var cfg Config
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -119,10 +142,44 @@ func Parse(data []byte) (Config, error) {
 		}
 		return Config{}, fmt.Errorf("parse %s: %w", ConfigFilename, err)
 	}
-	if err := normalizeAndValidate(&cfg); err != nil {
+	if err := normalizeAndValidateSchema(&cfg, allowLegacy); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// LoadDocumentForMigration preserves the descriptor-bound source bytes while
+// allowing only the one frozen predecessor schema. It is shared by explicit
+// migration and mutation-free compatibility reads; callers must use the
+// returned legacy bit to keep those authority domains separate.
+func LoadDocumentForMigration(filename string) (Config, []byte, string, bool, error) {
+	data, digest, err := readConfigFile(filename)
+	if err != nil {
+		return Config{}, nil, "", false, err
+	}
+	cfg, legacy, err := ParseForMigration(data)
+	if err != nil {
+		return Config{}, nil, "", false, fmt.Errorf("load config %q: %w", filename, err)
+	}
+	return cfg, data, digest, legacy, nil
+}
+
+// LoadWorkspaceDocumentForMigration is the root-bound compatibility/migration
+// counterpart of LoadWorkspaceDocument. Ordinary writers continue to use the
+// strict loader and therefore cannot cross the schema boundary implicitly.
+func LoadWorkspaceDocumentForMigration(workspace Workspace) (Config, []byte, string, bool, error) {
+	if workspace.rootDevice == 0 || workspace.rootInode == 0 || filepath.Clean(workspace.ConfigPath) != filepath.Join(filepath.Clean(workspace.Root), ConfigFilename) {
+		return Config{}, nil, "", false, errors.New("load workspace config: invalid discovery root binding")
+	}
+	data, digest, err := readConfigFileBound(workspace.ConfigPath, workspace.rootDevice, workspace.rootInode, nil)
+	if err != nil {
+		return Config{}, nil, "", false, err
+	}
+	cfg, legacy, err := ParseForMigration(data)
+	if err != nil {
+		return Config{}, nil, "", false, fmt.Errorf("load config %q: %w", workspace.ConfigPath, err)
+	}
+	return cfg, data, digest, legacy, nil
 }
 
 // Load reads and strictly parses one sow.yml. It rejects symlinks and anything
@@ -420,7 +477,11 @@ func Marshal(input Config) ([]byte, error) {
 }
 
 func normalizeAndValidate(cfg *Config) error {
-	if cfg.Schema != Schema {
+	return normalizeAndValidateSchema(cfg, false)
+}
+
+func normalizeAndValidateSchema(cfg *Config, allowLegacy bool) error {
+	if cfg.Schema != Schema && (!allowLegacy || cfg.Schema != LegacySchema) {
 		return fmt.Errorf("config schema must be %q, got %q", Schema, cfg.Schema)
 	}
 	if cfg.Architectures == nil {
@@ -439,6 +500,9 @@ func normalizeAndValidate(cfg *Config) error {
 	}
 	if cfg.Repositories == nil {
 		cfg.Repositories = make(map[string]RepositoryConfig)
+	}
+	if cfg.Targets == nil {
+		cfg.Targets = make(map[string]TargetConfig)
 	}
 
 	repositoryNames := sortedRepositoryNames(cfg.Repositories)
@@ -487,6 +551,9 @@ func normalizeAndValidate(cfg *Config) error {
 			repo.Dists[distName] = dist
 		}
 		cfg.Repositories[repoName] = repo
+	}
+	if err := normalizeAndValidateTargets(cfg); err != nil {
+		return err
 	}
 	return nil
 }
@@ -714,6 +781,7 @@ func cloneConfig(input Config) Config {
 		Schema:        input.Schema,
 		Architectures: append([]string(nil), input.Architectures...),
 		Repositories:  make(map[string]RepositoryConfig, len(input.Repositories)),
+		Targets:       make(map[string]TargetConfig, len(input.Targets)),
 	}
 	if input.Architectures == nil {
 		output.Architectures = nil
@@ -732,6 +800,9 @@ func cloneConfig(input Config) Config {
 			copyRepo.Dists[distName] = copyDist
 		}
 		output.Repositories[repoName] = copyRepo
+	}
+	for targetName, target := range input.Targets {
+		output.Targets[targetName] = target
 	}
 	return output
 }
@@ -761,6 +832,7 @@ type EffectiveConfig struct {
 	Schema        string                         `yaml:"schema" json:"schema"`
 	Architectures []string                       `yaml:"architectures" json:"architectures"`
 	Repositories  map[string]EffectiveRepository `yaml:"repos" json:"repos"`
+	Targets       map[string]TargetConfig        `yaml:"targets,omitempty" json:"targets,omitempty"`
 }
 
 type EffectiveRepository struct {
@@ -840,6 +912,7 @@ func EffectiveView(input Config, opts ViewOptions) (EffectiveConfig, error) {
 		Schema:        Schema,
 		Architectures: append([]string(nil), cfg.Architectures...),
 		Repositories:  make(map[string]EffectiveRepository),
+		Targets:       make(map[string]TargetConfig),
 	}
 	for _, repoName := range sortedRepositoryNames(cfg.Repositories) {
 		if opts.Repository != "" && repoName != opts.Repository {
@@ -880,6 +953,11 @@ func EffectiveView(input Config, opts ViewOptions) (EffectiveConfig, error) {
 			}
 		}
 		view.Repositories[repoName] = effectiveRepo
+	}
+	for targetName, target := range cfg.Targets {
+		if opts.Repository == "" || target.Repository == opts.Repository {
+			view.Targets[targetName] = target
+		}
 	}
 	return view, nil
 }

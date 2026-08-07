@@ -1,4 +1,4 @@
-schema: sow/v2
+schema: sow/v3
 architectures:
   - x86_64
   - aarch64

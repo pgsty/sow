@@ -12,9 +12,9 @@ import (
 
 func FuzzParseCanonicalRoundTrip(f *testing.F) {
 	for _, seed := range [][]byte{
-		[]byte("schema: sow/v2\n"),
-		[]byte("schema: sow/v2\narchitectures: [amd64, arm64]\nrepos:\n  repo:\n    dists:\n      el9: {format: rpm}\n"),
-		[]byte("schema: sow/v2\nrepos:\n  repo:\n    dists:\n      noble:\n        format: deb\n        limit: 2\n        exclude:\n          - kind: [dbgsym]\n"),
+		[]byte("schema: sow/v3\n"),
+		[]byte("schema: sow/v3\narchitectures: [amd64, arm64]\nrepos:\n  repo:\n    dists:\n      el9: {format: rpm}\n"),
+		[]byte("schema: sow/v3\nrepos:\n  repo:\n    dists:\n      noble:\n        format: deb\n        limit: 2\n        exclude:\n          - kind: [dbgsym]\n"),
 	} {
 		f.Add(seed)
 	}
@@ -46,7 +46,7 @@ func FuzzParseCanonicalRoundTrip(f *testing.F) {
 
 func TestParseNormalizesDefaultsAndAliases(t *testing.T) {
 	cfg, err := Parse([]byte(`
-schema: sow/v2
+schema: sow/v3
 architectures: [amd64, arm64]
 repos:
   pgsql:
@@ -77,7 +77,7 @@ repos:
 }
 
 func TestParseUsesDefaultArchitectures(t *testing.T) {
-	cfg, err := Parse([]byte("schema: sow/v2\n"))
+	cfg, err := Parse([]byte("schema: sow/v3\n"))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
@@ -97,35 +97,35 @@ func TestParseRejectsInvalidConfiguration(t *testing.T) {
 	}{
 		{"empty", "", "schema"},
 		{"wrong schema", "schema: sow/v1\n", "schema"},
-		{"unknown root", "schema: sow/v2\nfuture: true\n", "field future"},
-		{"duplicate root", "schema: sow/v2\nschema: sow/v2\n", "already defined"},
-		{"duplicate nested", "schema: sow/v2\nrepos:\n  pgsql:\n    protected: true\n    protected: false\n", "already defined"},
-		{"unknown nested", "schema: sow/v2\nrepos:\n  pgsql:\n    path: elsewhere\n", "field path"},
-		{"duplicate canonical architecture", "schema: sow/v2\narchitectures: [x86_64, amd64]\n", "duplicate architecture"},
-		{"neutral workspace architecture", "schema: sow/v2\narchitectures: [neutral]\n", "neutral"},
-		{"neutral rpm architecture", "schema: sow/v2\narchitectures: [noarch]\n", "noarch"},
-		{"unsupported architecture", "schema: sow/v2\narchitectures: [riscv64]\n", "unsupported architecture"},
-		{"empty explicit architectures", "schema: sow/v2\narchitectures: []\n", "architectures must not be empty"},
-		{"invalid repo name", "schema: sow/v2\nrepos:\n  Bad: {}\n", "repository name"},
-		{"reserved repo name", "schema: sow/v2\nrepos:\n  pool: {}\n", "reserved"},
-		{"invalid dist name", "schema: sow/v2\nrepos:\n  pgsql:\n    dists:\n      ../el9:\n        format: rpm\n", "dist name"},
-		{"reserved dist name", "schema: sow/v2\nrepos:\n  pgsql:\n    dists:\n      dists:\n        format: rpm\n", "reserved"},
-		{"missing format", "schema: sow/v2\nrepos:\n  pgsql:\n    dists:\n      el9: {}\n", "format"},
-		{"invalid format", "schema: sow/v2\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: apk\n", "format"},
-		{"dist architecture outside workspace", "schema: sow/v2\narchitectures: [x86_64]\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        architectures: [aarch64]\n", "not allowed by workspace"},
-		{"empty dist architectures", "schema: sow/v2\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        architectures: []\n", "architectures must not be empty"},
-		{"negative limit", "schema: sow/v2\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        limit: -1\n", "limit must be zero or positive"},
-		{"empty exclude rule", "schema: sow/v2\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        exclude: [{}]\n", "exclude rule 0 is empty"},
-		{"invalid exclude glob", "schema: sow/v2\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        exclude:\n          - name: ['[']\n", "invalid glob"},
-		{"unknown exclude field", "schema: sow/v2\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        exclude:\n          - version: ['1.*']\n", "field version"},
-		{"signing mode without key", "schema: sow/v2\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        packages:\n          mode: fill\n", "requires key"},
-		{"invalid signing mode", "schema: sow/v2\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        packages:\n          mode: sometimes\n          key: env://KEY\n", "mode must be"},
-		{"invalid env key reference", "schema: sow/v2\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        metadata:\n          key: env://BAD-NAME\n", "invalid env key reference"},
-		{"unsupported key reference", "schema: sow/v2\nrepos:\n  pgsql:\n    signing:\n      deb:\n        metadata:\n          key: vault://secret\n", "unsupported key reference scheme"},
-		{"passphrase without key", "schema: sow/v2\nrepos:\n  pgsql:\n    signing:\n      deb:\n        metadata:\n          passphrase: env://PASSPHRASE\n", "passphrase requires key"},
-		{"invalid passphrase reference", "schema: sow/v2\nrepos:\n  pgsql:\n    signing:\n      deb:\n        metadata:\n          key: keys/repo.asc\n          passphrase: vault://secret\n", "unsupported passphrase reference scheme"},
-		{"agent key explicit passphrase", "schema: sow/v2\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        metadata:\n          key: agent://0123456789abcdef\n          passphrase: env://PASSPHRASE\n", "ambient gpg-agent"},
-		{"duplicate trusted key reference", "schema: sow/v2\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        packages:\n          trusted_keys: [keys/a.asc, keys/a.asc]\n", "duplicate rpm trusted key"},
+		{"unknown root", "schema: sow/v3\nfuture: true\n", "field future"},
+		{"duplicate root", "schema: sow/v3\nschema: sow/v3\n", "already defined"},
+		{"duplicate nested", "schema: sow/v3\nrepos:\n  pgsql:\n    protected: true\n    protected: false\n", "already defined"},
+		{"unknown nested", "schema: sow/v3\nrepos:\n  pgsql:\n    path: elsewhere\n", "field path"},
+		{"duplicate canonical architecture", "schema: sow/v3\narchitectures: [x86_64, amd64]\n", "duplicate architecture"},
+		{"neutral workspace architecture", "schema: sow/v3\narchitectures: [neutral]\n", "neutral"},
+		{"neutral rpm architecture", "schema: sow/v3\narchitectures: [noarch]\n", "noarch"},
+		{"unsupported architecture", "schema: sow/v3\narchitectures: [riscv64]\n", "unsupported architecture"},
+		{"empty explicit architectures", "schema: sow/v3\narchitectures: []\n", "architectures must not be empty"},
+		{"invalid repo name", "schema: sow/v3\nrepos:\n  Bad: {}\n", "repository name"},
+		{"reserved repo name", "schema: sow/v3\nrepos:\n  pool: {}\n", "reserved"},
+		{"invalid dist name", "schema: sow/v3\nrepos:\n  pgsql:\n    dists:\n      ../el9:\n        format: rpm\n", "dist name"},
+		{"reserved dist name", "schema: sow/v3\nrepos:\n  pgsql:\n    dists:\n      dists:\n        format: rpm\n", "reserved"},
+		{"missing format", "schema: sow/v3\nrepos:\n  pgsql:\n    dists:\n      el9: {}\n", "format"},
+		{"invalid format", "schema: sow/v3\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: apk\n", "format"},
+		{"dist architecture outside workspace", "schema: sow/v3\narchitectures: [x86_64]\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        architectures: [aarch64]\n", "not allowed by workspace"},
+		{"empty dist architectures", "schema: sow/v3\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        architectures: []\n", "architectures must not be empty"},
+		{"negative limit", "schema: sow/v3\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        limit: -1\n", "limit must be zero or positive"},
+		{"empty exclude rule", "schema: sow/v3\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        exclude: [{}]\n", "exclude rule 0 is empty"},
+		{"invalid exclude glob", "schema: sow/v3\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        exclude:\n          - name: ['[']\n", "invalid glob"},
+		{"unknown exclude field", "schema: sow/v3\nrepos:\n  pgsql:\n    dists:\n      el9:\n        format: rpm\n        exclude:\n          - version: ['1.*']\n", "field version"},
+		{"signing mode without key", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        packages:\n          mode: fill\n", "requires key"},
+		{"invalid signing mode", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        packages:\n          mode: sometimes\n          key: env://KEY\n", "mode must be"},
+		{"invalid env key reference", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        metadata:\n          key: env://BAD-NAME\n", "invalid env key reference"},
+		{"unsupported key reference", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      deb:\n        metadata:\n          key: vault://secret\n", "unsupported key reference scheme"},
+		{"passphrase without key", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      deb:\n        metadata:\n          passphrase: env://PASSPHRASE\n", "passphrase requires key"},
+		{"invalid passphrase reference", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      deb:\n        metadata:\n          key: keys/repo.asc\n          passphrase: vault://secret\n", "unsupported passphrase reference scheme"},
+		{"agent key explicit passphrase", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        metadata:\n          key: agent://0123456789abcdef\n          passphrase: env://PASSPHRASE\n", "ambient gpg-agent"},
+		{"duplicate trusted key reference", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        packages:\n          trusted_keys: [keys/a.asc, keys/a.asc]\n", "duplicate rpm trusted key"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -139,7 +139,7 @@ func TestParseRejectsInvalidConfiguration(t *testing.T) {
 
 func TestParseNormalizesPolicyAndSigning(t *testing.T) {
 	cfg, err := Parse([]byte(`
-schema: sow/v2
+schema: sow/v3
 repos:
   pgsql:
     signing:
@@ -176,7 +176,7 @@ repos:
 
 func TestEffectiveViewExpandsDefaultsAndCanonicalizes(t *testing.T) {
 	cfg, err := Parse([]byte(`
-schema: sow/v2
+schema: sow/v3
 repos:
   pgsql:
     dists:
@@ -215,7 +215,7 @@ repos:
       noble: {format: deb, architectures: [amd64]}
   alpha: {}
 architectures: [arm64, amd64]
-schema: sow/v2
+schema: sow/v3
 `))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
@@ -275,7 +275,7 @@ func TestArchitectureAndNameHelpers(t *testing.T) {
 func TestRepositoryDerivedStatePathCollisionsAreRejected(t *testing.T) {
 	for _, second := range []string{"foo.db", "foo.db-wal", "foo.db-shm", "foo.db-journal"} {
 		t.Run(second, func(t *testing.T) {
-			data := []byte("schema: sow/v2\nrepos:\n  foo: {}\n  " + second + ": {}\n")
+			data := []byte("schema: sow/v3\nrepos:\n  foo: {}\n  " + second + ": {}\n")
 			if _, err := Parse(data); err == nil || !strings.Contains(err.Error(), "collide") {
 				t.Fatalf("Parse collision error=%v", err)
 			}
@@ -285,7 +285,7 @@ func TestRepositoryDerivedStatePathCollisionsAreRejected(t *testing.T) {
 
 func TestEffectiveViewScopeAndStateArchitectureReferences(t *testing.T) {
 	cfg, err := Parse([]byte(`
-schema: sow/v2
+schema: sow/v3
 architectures: [x86_64, aarch64]
 repos:
   infra:
@@ -334,7 +334,7 @@ repos:
 
 func TestEffectiveViewExposesPolicyAndSigningReferencesOnly(t *testing.T) {
 	t.Setenv("SOW_SECRET_KEY", "PRIVATE SECRET MATERIAL")
-	cfg, err := Parse([]byte("schema: sow/v2\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        metadata:\n          key: env://SOW_SECRET_KEY\n    dists:\n      el9:\n        format: rpm\n        limit: 1\n        exclude:\n          - kind: [debuginfo]\n"))
+	cfg, err := Parse([]byte("schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        metadata:\n          key: env://SOW_SECRET_KEY\n    dists:\n      el9:\n        format: rpm\n        limit: 1\n        exclude:\n          - kind: [debuginfo]\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +359,7 @@ func TestEffectiveViewExposesPolicyAndSigningReferencesOnly(t *testing.T) {
 func TestLoadAndPublicHelpers(t *testing.T) {
 	root := t.TempDir()
 	filename := filepath.Join(root, ConfigFilename)
-	if err := os.WriteFile(filename, []byte("schema: sow/v2\nrepos:\n  pgsql:\n    dists:\n      el9: {format: rpm}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filename, []byte("schema: sow/v3\nrepos:\n  pgsql:\n    dists:\n      el9: {format: rpm}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	cfg, digest, err := LoadWithSHA(filename)

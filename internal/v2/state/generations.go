@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -50,45 +51,143 @@ func (change FileChange) MarshalJSON() ([]byte, error) {
 
 type DistBuild struct {
 	Name                      string
+	Format                    string
 	EffectiveConfigSHA256     string
 	Architectures             []Architecture
 	MetadataSignerFingerprint string
 	MetadataSignerPublicKey   []byte
+	MetadataSignerIdentity    string
 	EffectiveSigningJSON      string
 }
 
 type FinalizeBuildInput struct {
-	OperationID    string
-	Generation     int64
-	Dists          []DistBuild
-	Pooled         []string
-	RPMSigningKeys []RPMSigningKey
-	Manifest       []GenerationFile
-	Changes        []FileChange
+	OperationID      string
+	Generation       GenerationID
+	Dists            []DistBuild
+	Pooled           []string
+	RPMSigningKeys   []RPMSigningKey
+	Manifest         []GenerationFile
+	Changes          []FileChange
+	RendererIdentity string
 }
 
 type GenerationInfo struct {
-	Generation         int64     `json:"generation"`
-	PreviousGeneration int64     `json:"previous_generation"`
-	OperationID        string    `json:"operation_id"`
-	ManifestSHA256     string    `json:"manifest_sha256"`
-	CreatedAt          time.Time `json:"created_at"`
+	Generation         GenerationID `json:"generation"`
+	PreviousGeneration GenerationID `json:"previous_generation"`
+	OperationID        string       `json:"operation_id"`
+	ManifestSHA256     string       `json:"manifest_sha256"`
+	RendererIdentity   string       `json:"renderer_identity"`
+	CreatedAt          time.Time    `json:"created_at"`
+}
+
+type GenerationViewSigner struct {
+	Generation       GenerationID `json:"generation"`
+	ViewID           string       `json:"view_id"`
+	SignerIdentity   string       `json:"signer_identity"`
+	TrustedPublicKey []byte       `json:"-"`
+}
+
+func (s *Store) GenerationViewSigner(ctx context.Context, generation GenerationID, viewID string) (GenerationViewSigner, error) {
+	if generation == 0 || path.Clean(viewID) != viewID || !strings.HasPrefix(viewID, "dists/") {
+		return GenerationViewSigner{}, errors.New("invalid Generation view signer lookup")
+	}
+	var record GenerationViewSigner
+	var trusted []byte
+	err := s.db.QueryRowContext(ctx, `SELECT generation, view_id, signer_identity, COALESCE(trusted_public_key, X'') FROM generation_view_signers WHERE generation = ? AND view_id = ?`, generation, viewID).Scan(
+		&record.Generation, &record.ViewID, &record.SignerIdentity, &trusted,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return GenerationViewSigner{}, fmt.Errorf("%w: Generation %s view signer %q", ErrNotFound, generation, viewID)
+	}
+	if err != nil {
+		return GenerationViewSigner{}, err
+	}
+	if record.SignerIdentity == "none" {
+		if len(trusted) != 0 {
+			return GenerationViewSigner{}, fmt.Errorf("%w: unsigned Generation view has a trusted key", ErrSchema)
+		}
+	} else if !validSHA256Text(record.SignerIdentity) || len(trusted) == 0 {
+		return GenerationViewSigner{}, fmt.Errorf("%w: invalid Generation view signer record", ErrSchema)
+	}
+	record.TrustedPublicKey = trusted
+	return record, nil
+}
+
+// ManifestBytes returns the exact canonical manifest wire shared by the
+// Generation digest and retained state.
+func ManifestBytes(input []GenerationFile) ([]byte, string, error) {
+	return ManifestBytesForLayout(input, LayoutSinglePayloadV1)
+}
+
+func ManifestBytesForLayout(input []GenerationFile, layout string) ([]byte, string, error) {
+	files, digest, err := normalizeManifestForLayout(input, layout)
+	if err != nil {
+		return nil, "", err
+	}
+	var output bytes.Buffer
+	for _, file := range files {
+		fmt.Fprintf(&output, "%s %d %s %s\n", file.SHA256, file.Size, file.Phase, file.Path)
+	}
+	return output.Bytes(), digest, nil
+}
+
+// GenerationRetentionIdentity returns the immutable renderer and common RPM
+// view signer identity used by retained/export wire.  A Generation with
+// heterogeneous RPM signing identities cannot be represented by retained/v1
+// and is rejected rather than silently collapsed.
+func (s *Store) GenerationRetentionIdentity(ctx context.Context, generation GenerationID) (string, string, error) {
+	info, err := s.GetGeneration(ctx, generation)
+	if err != nil {
+		return "", "", err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT signer_identity FROM generation_view_signers WHERE generation = ? ORDER BY signer_identity`, generation)
+	if err != nil {
+		return "", "", err
+	}
+	defer rows.Close()
+	identities := []string{}
+	for rows.Next() {
+		var identity string
+		if err := rows.Scan(&identity); err != nil {
+			return "", "", err
+		}
+		identities = append(identities, identity)
+	}
+	if err := rows.Err(); err != nil {
+		return "", "", err
+	}
+	if len(identities) > 1 {
+		return "", "", fmt.Errorf("%w: Generation %s has heterogeneous RPM signer identities", ErrConflict, generation)
+	}
+	signer := "none"
+	if len(identities) == 1 {
+		signer = identities[0]
+	}
+	return info.RendererIdentity, signer, nil
 }
 
 // BootstrapLegacyGeneration anchors a migrated V1 repository whose public
 // tree and built_generation predate the physical Generation ledger. It has no
 // filesystem side effect and records its complete audit operation atomically,
 // so a process stop can observe either no bootstrap or the complete baseline.
-func (s *Store) BootstrapLegacyGeneration(ctx context.Context, operationID string, generation int64, inputManifest []GenerationFile) error {
+func (s *Store) BootstrapLegacyGeneration(ctx context.Context, operationID string, generation GenerationID, inputManifest []GenerationFile) error {
 	if !operationIDPattern.MatchString(operationID) || generation < 1 {
 		return errors.New("invalid legacy generation bootstrap")
 	}
-	manifest, manifestSHA, err := normalizeManifest(inputManifest)
+	identity, err := s.RepositoryIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	layout := identity.LayoutVersion
+	if layout == LayoutC2ToSingleV1 {
+		layout = LayoutC2V1
+	}
+	manifest, manifestSHA, err := normalizeManifestForLayout(inputManifest, layout)
 	if err != nil {
 		return err
 	}
 	changes := DiffManifests(nil, manifest)
-	if err := validateChanges(changes); err != nil {
+	if err := validateChangesForLayout(changes, layout); err != nil {
 		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -96,7 +195,8 @@ func (s *Store) BootstrapLegacyGeneration(ctx context.Context, operationID strin
 		return fmt.Errorf("begin legacy generation bootstrap: %w", err)
 	}
 	defer tx.Rollback()
-	var current, generations, pending int64
+	var current GenerationID
+	var generations, pending int64
 	if err := tx.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&current); err != nil {
 		return err
 	}
@@ -110,7 +210,7 @@ func (s *Store) BootstrapLegacyGeneration(ctx context.Context, operationID strin
 		return fmt.Errorf("%w: legacy generation bootstrap requires one settled unanchored current generation", ErrConflict)
 	}
 	now := nowText()
-	payload := fmt.Sprintf(`{"generation":%d,"source":"schema-v1"}`, generation)
+	payload := fmt.Sprintf(`{"generation":%q,"source":"schema-v1"}`, generation.String())
 	if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id, kind, state, payload_json, result_json, error_class, error_message, created_at, updated_at) VALUES (?, 'generation.bootstrap', 'done', ?, '{"bootstrapped":true}', NULL, NULL, ?, ?)`, operationID, payload, now, now); err != nil {
 		return fmt.Errorf("record legacy generation bootstrap: %w", err)
 	}
@@ -119,7 +219,7 @@ func (s *Store) BootstrapLegacyGeneration(ctx context.Context, operationID strin
 			return fmt.Errorf("record legacy generation bootstrap event: %w", err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, created_at) VALUES (?, 0, ?, ?, ?)`, generation, operationID, manifestSHA, now); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES (?, ?, ?, ?, ?, ?)`, generation, ZeroGeneration, operationID, manifestSHA, strings.Repeat("0", 64), now); err != nil {
 		return fmt.Errorf("anchor legacy generation %d: %w", generation, err)
 	}
 	for _, file := range manifest {
@@ -138,11 +238,11 @@ func (s *Store) BootstrapLegacyGeneration(ctx context.Context, operationID strin
 	return s.Checkpoint(ctx)
 }
 
-func (s *Store) GetGeneration(ctx context.Context, generation int64) (GenerationInfo, error) {
+func (s *Store) GetGeneration(ctx context.Context, generation GenerationID) (GenerationInfo, error) {
 	var info GenerationInfo
 	var created string
-	err := s.db.QueryRowContext(ctx, `SELECT generation, previous_generation, operation_id, manifest_sha256, created_at FROM generations WHERE generation = ?`, generation).Scan(
-		&info.Generation, &info.PreviousGeneration, &info.OperationID, &info.ManifestSHA256, &created,
+	err := s.db.QueryRowContext(ctx, `SELECT generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at FROM generations WHERE generation = ?`, generation).Scan(
+		&info.Generation, &info.PreviousGeneration, &info.OperationID, &info.ManifestSHA256, &info.RendererIdentity, &created,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return GenerationInfo{}, fmt.Errorf("%w: generation %d", ErrNotFound, generation)
@@ -157,7 +257,7 @@ func (s *Store) GetGeneration(ctx context.Context, generation int64) (Generation
 	return info, nil
 }
 
-func (s *Store) GenerationChanges(ctx context.Context, generation int64) ([]FileChange, error) {
+func (s *Store) GenerationChanges(ctx context.Context, generation GenerationID) ([]FileChange, error) {
 	info, err := s.GetGeneration(ctx, generation)
 	if err != nil {
 		return nil, err
@@ -181,7 +281,7 @@ func (s *Store) GenerationChanges(ctx context.Context, generation int64) ([]File
 	return changes, rows.Err()
 }
 
-func (s *Store) GenerationManifest(ctx context.Context, generation int64) ([]GenerationFile, error) {
+func (s *Store) GenerationManifest(ctx context.Context, generation GenerationID) ([]GenerationFile, error) {
 	if generation == 0 {
 		return []GenerationFile{}, nil
 	}
@@ -217,7 +317,20 @@ func (s *Store) GenerationManifest(ctx context.Context, generation int64) ([]Gen
 // public filesystem: predecessor links, manifest hashes, terminal operations,
 // and every phase-ordered physical delta must agree exactly.
 func (s *Store) ValidateGenerationLedger(ctx context.Context) error {
-	var current int64
+	identity := RepositoryIdentity{LayoutVersion: LayoutC2V1}
+	manifestLayout := LayoutC2V1
+	if s.SchemaVersion() != 6 {
+		var err error
+		identity, err = s.RepositoryIdentity(ctx)
+		if err != nil {
+			return err
+		}
+		manifestLayout = identity.LayoutVersion
+		if manifestLayout == LayoutC2ToSingleV1 {
+			manifestLayout = LayoutC2V1
+		}
+	}
+	var current GenerationID
 	if err := s.db.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&current); err != nil {
 		return err
 	}
@@ -246,29 +359,46 @@ func (s *Store) ValidateGenerationLedger(ctx context.Context) error {
 	if current != infos[len(infos)-1].Generation {
 		return fmt.Errorf("%w: current generation %d differs from ledger head %d", ErrConflict, current, infos[len(infos)-1].Generation)
 	}
-	previousGeneration := int64(0)
+	previousGeneration := GenerationID(0)
 	previousManifest := []GenerationFile{}
 	seenOperations := make(map[string]struct{}, len(infos))
+	transitionSeen := false
 	for index, info := range infos {
-		if info.PreviousGeneration != previousGeneration || index > 0 && info.Generation != previousGeneration+1 {
+		follows := true
+		if index > 0 {
+			expected, nextErr := previousGeneration.Next()
+			follows = nextErr == nil && info.Generation == expected
+		}
+		if info.PreviousGeneration != previousGeneration || !follows {
 			return fmt.Errorf("%w: generation %d does not follow retained generation %d", ErrConflict, info.Generation, previousGeneration)
 		}
 		if _, duplicate := seenOperations[info.OperationID]; duplicate {
 			return fmt.Errorf("%w: operation %s owns more than one Generation", ErrConflict, info.OperationID)
 		}
 		seenOperations[info.OperationID] = struct{}{}
-		var operationState string
-		if err := s.db.QueryRowContext(ctx, `SELECT state FROM operations WHERE id = ?`, info.OperationID).Scan(&operationState); err != nil {
+		var operationKind, operationState string
+		if err := s.db.QueryRowContext(ctx, `SELECT kind, state FROM operations WHERE id = ?`, info.OperationID).Scan(&operationKind, &operationState); err != nil {
 			return fmt.Errorf("%w: generation %d operation is unavailable", ErrConflict, info.Generation)
 		}
 		if OperationState(operationState) != OperationDone {
 			return fmt.Errorf("%w: generation %d operation is %s", ErrConflict, info.Generation, operationState)
 		}
+		generationLayout := manifestLayout
+		if identity.LayoutVersion == LayoutSinglePayloadV1 && identity.TransitionReceiptSHA256 != "" && !transitionSeen {
+			if operationKind == "layout.migrate" {
+				transitionSeen = true
+				generationLayout = LayoutSinglePayloadV1
+			} else {
+				generationLayout = LayoutC2V1
+			}
+		} else if operationKind == "layout.migrate" {
+			return fmt.Errorf("%w: unexpected or duplicate layout migration generation %d", ErrConflict, info.Generation)
+		}
 		manifest, err := s.GenerationManifest(ctx, info.Generation)
 		if err != nil {
 			return err
 		}
-		normalized, digest, err := normalizeManifest(manifest)
+		normalized, digest, err := normalizeManifestForLayout(manifest, generationLayout)
 		if err != nil || digest != info.ManifestSHA256 {
 			return fmt.Errorf("%w: generation %d manifest hash differs", ErrConflict, info.Generation)
 		}
@@ -276,10 +406,13 @@ func (s *Store) ValidateGenerationLedger(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := validateChanges(changes); err != nil || !equalFileChanges(changes, DiffManifests(previousManifest, normalized)) {
+		if err := validateChangesForLayout(changes, generationLayout); err != nil || !equalFileChanges(changes, DiffManifests(previousManifest, normalized)) {
 			return fmt.Errorf("%w: generation %d Changeset differs from its manifests", ErrConflict, info.Generation)
 		}
 		previousGeneration, previousManifest = info.Generation, normalized
+	}
+	if identity.LayoutVersion == LayoutSinglePayloadV1 && identity.TransitionReceiptSHA256 != "" && !transitionSeen {
+		return fmt.Errorf("%w: terminal transition receipt has no layout migration Generation", ErrConflict)
 	}
 	return nil
 }
@@ -292,7 +425,7 @@ func (s *Store) ValidateGenerationLedger(ctx context.Context) error {
 // first retained Generation onto 0 and replacing only that operation's delta
 // with a complete baseline.  Arbitrary corrupt ledgers are never repaired.
 func normalizeLegacyRetainedGenerationLedgerTx(ctx context.Context, tx *sql.Tx) error {
-	var current int64
+	var current GenerationID
 	if err := tx.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&current); err != nil {
 		return err
 	}
@@ -321,10 +454,13 @@ func normalizeLegacyRetainedGenerationLedgerTx(ctx context.Context, tx *sql.Tx) 
 		return fmt.Errorf("%w: current generation %d differs from legacy ledger head %d", ErrConflict, current, infos[len(infos)-1].Generation)
 	}
 	reanchor := infos[0].PreviousGeneration > 0
-	if reanchor && infos[0].Generation != infos[0].PreviousGeneration+1 {
-		return fmt.Errorf("%w: first retained generation %d does not follow omitted predecessor %d", ErrConflict, infos[0].Generation, infos[0].PreviousGeneration)
+	if reanchor {
+		expected, nextErr := infos[0].PreviousGeneration.Next()
+		if nextErr != nil || infos[0].Generation != expected {
+			return fmt.Errorf("%w: first retained generation %d does not follow omitted predecessor %d", ErrConflict, infos[0].Generation, infos[0].PreviousGeneration)
+		}
 	}
-	previousGeneration := int64(0)
+	previousGeneration := GenerationID(0)
 	previousManifest := []GenerationFile{}
 	var firstManifest []GenerationFile
 	seenOperations := make(map[string]struct{}, len(infos))
@@ -333,8 +469,11 @@ func normalizeLegacyRetainedGenerationLedgerTx(ctx context.Context, tx *sql.Tx) 
 			if !reanchor && info.PreviousGeneration != 0 {
 				return fmt.Errorf("%w: invalid first retained generation predecessor", ErrConflict)
 			}
-		} else if info.PreviousGeneration != previousGeneration || info.Generation != previousGeneration+1 {
-			return fmt.Errorf("%w: generation %d does not follow retained generation %d", ErrConflict, info.Generation, previousGeneration)
+		} else {
+			expected, nextErr := previousGeneration.Next()
+			if info.PreviousGeneration != previousGeneration || nextErr != nil || info.Generation != expected {
+				return fmt.Errorf("%w: generation %d does not follow retained generation %d", ErrConflict, info.Generation, previousGeneration)
+			}
 		}
 		if _, duplicate := seenOperations[info.OperationID]; duplicate {
 			return fmt.Errorf("%w: operation %s owns more than one legacy Generation", ErrConflict, info.OperationID)
@@ -351,7 +490,7 @@ func normalizeLegacyRetainedGenerationLedgerTx(ctx context.Context, tx *sql.Tx) 
 		if err != nil {
 			return err
 		}
-		normalized, digest, err := normalizeManifest(manifest)
+		normalized, digest, err := normalizeManifestForLayout(manifest, LayoutC2V1)
 		if err != nil || digest != info.ManifestSHA256 {
 			return fmt.Errorf("%w: generation %d manifest hash differs", ErrConflict, info.Generation)
 		}
@@ -359,7 +498,7 @@ func normalizeLegacyRetainedGenerationLedgerTx(ctx context.Context, tx *sql.Tx) 
 		if err != nil {
 			return err
 		}
-		if err := validateChanges(changes); err != nil {
+		if err := validateChangesForLayout(changes, LayoutC2V1); err != nil {
 			return fmt.Errorf("%w: generation %d Changeset is invalid", ErrConflict, info.Generation)
 		}
 		if index == 0 && reanchor {
@@ -376,7 +515,7 @@ func normalizeLegacyRetainedGenerationLedgerTx(ctx context.Context, tx *sql.Tx) 
 		return nil
 	}
 	first := infos[0]
-	if _, err := tx.ExecContext(ctx, `UPDATE generations SET previous_generation = 0 WHERE generation = ? AND previous_generation = ?`, first.Generation, first.PreviousGeneration); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE generations SET previous_generation = ? WHERE generation = ? AND previous_generation = ?`, ZeroGeneration, first.Generation, first.PreviousGeneration); err != nil {
 		return fmt.Errorf("rebase first retained generation: %w", err)
 	}
 	if err := replaceGenerationChangesTx(ctx, tx, first.OperationID, DiffManifests(nil, firstManifest)); err != nil {
@@ -445,7 +584,7 @@ func validateTruncatedLegacyChanges(changes []FileChange, target []GenerationFil
 }
 
 func replaceGenerationChangesTx(ctx context.Context, tx *sql.Tx, operationID string, changes []FileChange) error {
-	if err := validateChanges(changes); err != nil {
+	if err := validateChangesForLayout(changes, LayoutC2V1); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM operation_files WHERE operation_id = ?`, operationID); err != nil {
@@ -499,7 +638,7 @@ func DiffManifests(base, target []GenerationFile) []FileChange {
 	return changes
 }
 
-func recordGenerationTx(ctx context.Context, tx *sql.Tx, operationID string, generation int64, inputManifest []GenerationFile, inputChanges []FileChange) error {
+func recordGenerationTx(ctx context.Context, tx *sql.Tx, operationID string, generation GenerationID, inputManifest []GenerationFile, inputChanges []FileChange, rendererIdentity ...string) error {
 	manifest, manifestSHA, err := normalizeManifest(inputManifest)
 	if err != nil {
 		return err
@@ -508,11 +647,12 @@ func recordGenerationTx(ctx context.Context, tx *sql.Tx, operationID string, gen
 	if err := validateChanges(changes); err != nil {
 		return err
 	}
-	var previous int64
+	var previous GenerationID
 	if err := tx.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&previous); err != nil {
 		return err
 	}
-	if generation != previous+1 {
+	expected, nextErr := previous.Next()
+	if nextErr != nil || generation != expected {
 		return fmt.Errorf("%w: generation %d does not follow %d", ErrConflict, generation, previous)
 	}
 	previousManifest, err := generationManifestTx(ctx, tx, previous)
@@ -523,7 +663,14 @@ func recordGenerationTx(ctx context.Context, tx *sql.Tx, operationID string, gen
 	if !equalFileChanges(changes, expectedChanges) {
 		return fmt.Errorf("%w: generation %d changes do not equal the manifest delta", ErrConflict, generation)
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, created_at) VALUES (?, ?, ?, ?, ?)`, generation, previous, operationID, manifestSHA, nowText()); err != nil {
+	renderer := DefaultRendererIdentity
+	if len(rendererIdentity) > 1 || len(rendererIdentity) == 1 && rendererIdentity[0] != "" && !validSHA256Text(rendererIdentity[0]) {
+		return errors.New("invalid renderer identity")
+	}
+	if len(rendererIdentity) == 1 && rendererIdentity[0] != "" {
+		renderer = rendererIdentity[0]
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES (?, ?, ?, ?, ?, ?)`, generation, previous, operationID, manifestSHA, renderer, nowText()); err != nil {
 		return fmt.Errorf("record generation %d: %w", generation, err)
 	}
 	for _, file := range manifest {
@@ -543,7 +690,7 @@ func recordGenerationTx(ctx context.Context, tx *sql.Tx, operationID string, gen
 	return nil
 }
 
-func generationManifestTx(ctx context.Context, tx *sql.Tx, generation int64) ([]GenerationFile, error) {
+func generationManifestTx(ctx context.Context, tx *sql.Tx, generation GenerationID) ([]GenerationFile, error) {
 	if generation == 0 {
 		return []GenerationFile{}, nil
 	}
@@ -611,7 +758,7 @@ func (s *Store) FinalizeBuild(ctx context.Context, input FinalizeBuildInput) err
 	if err := retainRPMSigningKeysTx(ctx, tx, keys); err != nil {
 		return fmt.Errorf("retain RPM signing verification keys: %w", err)
 	}
-	if err := recordGenerationTx(ctx, tx, input.OperationID, input.Generation, input.Manifest, input.Changes); err != nil {
+	if err := recordGenerationTx(ctx, tx, input.OperationID, input.Generation, input.Manifest, input.Changes, input.RendererIdentity); err != nil {
 		return err
 	}
 	seenDists := make(map[string]struct{}, len(input.Dists))
@@ -647,6 +794,24 @@ func (s *Store) FinalizeBuild(ctx context.Context, input FinalizeBuildInput) err
 		}
 		if err := replaceDistArchitecturesTx(ctx, tx, dist.Name, dist.Architectures, input.Generation); err != nil {
 			return err
+		}
+		if dist.Format == "rpm" {
+			identity := dist.MetadataSignerIdentity
+			var trusted any
+			if dist.MetadataSignerFingerprint == "" {
+				identity = "none"
+			} else {
+				if !validSHA256Text(identity) || len(dist.MetadataSignerPublicKey) == 0 {
+					return fmt.Errorf("invalid immutable RPM signer identity for Dist %q", dist.Name)
+				}
+				trusted = dist.MetadataSignerPublicKey
+			}
+			for _, architecture := range dist.Architectures {
+				viewID := path.Join("dists", dist.Name, architecture.Family)
+				if _, err := tx.ExecContext(ctx, `INSERT INTO generation_view_signers(generation, view_id, signer_identity, trusted_public_key) VALUES (?, ?, ?, ?)`, input.Generation, viewID, identity, trusted); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	for _, digest := range input.Pooled {
@@ -713,7 +878,7 @@ func (s *Store) FinalizeNoopBuild(ctx context.Context, operationID string) error
 	return s.Checkpoint(ctx)
 }
 
-func replaceDistArchitecturesTx(ctx context.Context, tx *sql.Tx, distName string, architectures []Architecture, generation int64) error {
+func replaceDistArchitecturesTx(ctx context.Context, tx *sql.Tx, distName string, architectures []Architecture, generation GenerationID) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM dist_architectures WHERE dist_name = ?`, distName); err != nil {
 		return err
 	}
@@ -750,12 +915,19 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 }
 
 func normalizeManifest(input []GenerationFile) ([]GenerationFile, string, error) {
+	return normalizeManifestForLayout(input, LayoutSinglePayloadV1)
+}
+
+func normalizeManifestForLayout(input []GenerationFile, layout string) ([]GenerationFile, string, error) {
+	if layout != LayoutC2V1 && layout != LayoutSinglePayloadV1 {
+		return nil, "", fmt.Errorf("invalid manifest layout %q", layout)
+	}
 	files := append([]GenerationFile(nil), input...)
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	hash := sha256.New()
 	previous := ""
 	for _, file := range files {
-		if file.Path == "" || path.Clean(file.Path) != file.Path || file.Path == "." || file.Path == previous || strings.ContainsAny(file.Path, "\\\x00\r\n\t") || strings.HasPrefix(file.Path, "/") || strings.HasPrefix(file.Path, "../") || file.Size < 0 || !validSHA256Text(file.SHA256) || file.Phase != generationPhase(file.Path) {
+		if file.Path == "" || !visibleASCIIPath(file.Path) || path.Clean(file.Path) != file.Path || file.Path == "." || file.Path == previous || strings.ContainsAny(file.Path, "\\\x00\r\n\t") || strings.HasPrefix(file.Path, "/") || strings.HasPrefix(file.Path, "../") || file.Size < 0 || !validSHA256Text(file.SHA256) || file.Phase != generationPhaseForLayout(file.Path, layout) {
 			return nil, "", fmt.Errorf("invalid generation file %#v", file)
 		}
 		previous = file.Path
@@ -764,8 +936,26 @@ func normalizeManifest(input []GenerationFile) ([]GenerationFile, string, error)
 	return files, hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func generationPhase(path string) string {
-	if strings.HasPrefix(path, "pool/") || strings.Contains(path, "/pool/") {
+func visibleASCIIPath(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] < 0x21 || value[index] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func generationPhaseForLayout(path, layout string) string {
+	if layout == LayoutC2V1 && strings.HasPrefix(path, "dists/") && strings.Contains(path, "/pool/") {
+		return "payload"
+	}
+	if strings.HasPrefix(path, "dists/") && (strings.Contains(path, "/pool/") || strings.HasSuffix(path, ".rpm") || strings.HasSuffix(path, ".deb")) {
+		return ""
+	}
+	if strings.HasPrefix(path, "pool/") {
 		return "payload"
 	}
 	base := path
@@ -779,7 +969,17 @@ func generationPhase(path string) string {
 }
 
 func validateChanges(changes []FileChange) error {
+	return validateChangesForLayout(changes, LayoutSinglePayloadV1)
+}
+
+func validateChangesForLayout(changes []FileChange, layout string) error {
+	if layout != LayoutC2V1 && layout != LayoutSinglePayloadV1 {
+		return fmt.Errorf("invalid Changeset layout %q", layout)
+	}
 	for _, change := range changes {
+		if !visibleASCIIPath(change.Path) || path.Clean(change.Path) != change.Path || strings.HasPrefix(change.Path, "/") || strings.HasPrefix(change.Path, "../") {
+			return fmt.Errorf("invalid file change path %q", change.Path)
+		}
 		if change.Operation != "add" && change.Operation != "update" && change.Operation != "delete" {
 			return fmt.Errorf("invalid file change operation %q", change.Operation)
 		}
@@ -789,7 +989,7 @@ func validateChanges(changes []FileChange) error {
 			}
 			continue
 		}
-		if change.Phase != generationPhase(change.Path) || change.Size < 0 || !validSHA256Text(change.SHA256) {
+		if change.Phase != generationPhaseForLayout(change.Path, layout) || change.Size < 0 || !validSHA256Text(change.SHA256) {
 			return fmt.Errorf("invalid file change %#v", change)
 		}
 	}
