@@ -73,9 +73,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # test/compat also contains explicit provider and historical gates;
+          # internal/cli is the retired V1 harness and test/compat also contains
+          # explicit provider/history gates. Both still pass vet/staticcheck;
           # integration.yml owns the current always-on compatibility subset.
-          mapfile -t packages < <(go list ./... | grep -v '/test/compat$')
+          mapfile -t packages < <(go list ./... | grep -Ev '/(internal/cli|test/compat)$')
           go test -timeout 30m -count=1 "${packages[@]}"
 
       - name: Test patched RPM parser module
