@@ -1,8 +1,8 @@
 # repo2 ordinary repository acceptance
 
 > **Historical v0.2 C2 harness.** 本 fixture 的 view-local package aliases 与 reposync
-> PASS 仍证明 `v0.2.0`，但下一版明确不生成这些 aliases；前向门禁见
-> [`design/next`](../../../design/next/)。
+> PASS 仍证明 `v0.2.0`，但 0.3 明确不生成这些 aliases；前向门禁见
+> [兼容性设计](https://sow.pgsty.com/zh/docs/design/compatibility/)。
 
 This retained-lab proof uses `/Users/vonng/pgsty/repo2` strictly as read-only
 input. It compares current-checkout SOW Plain metadata with `createrepo_c` and

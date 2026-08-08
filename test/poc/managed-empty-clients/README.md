@@ -1,7 +1,8 @@
 # Managed empty Dist real-client acceptance
 
-> **Historical v0.2 harness.** 空 C2 view 的 refresh/reposync 结果不证明下一版
-> metadata-only shared-Pool layout；前向门禁见 [`design/next`](../../../design/next/)。
+> **Historical v0.2 harness.** 空 C2 view 的 refresh/reposync 结果不证明 0.3
+> metadata-only shared-Pool layout；前向门禁见
+> [兼容性设计](https://sow.pgsty.com/zh/docs/design/compatibility/)。
 
 This harness builds the current checkout's public `sow` binary, creates one
 Managed Repository with an empty RPM Dist and an empty DEB Dist, and consumes

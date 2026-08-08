@@ -1,3 +1,7 @@
+.tmp/
+tmp/
+_bmad/
+_bmad-output/
 .bmad-loop/runs/
 .bmad-loop/cache/
 .bmad-loop/policy.toml
@@ -14,6 +18,11 @@ coverage.out
 .sow/
 .pool/
 
-docs/
+/docs/*
+!/docs/README.md
+!/docs/examples/
+!/docs/examples/**
+!/docs/migration/
+!/docs/migration/**
 bin/
 dist/

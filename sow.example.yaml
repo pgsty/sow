@@ -88,7 +88,7 @@ serving:
 # provider-specific cf/cos production blocks and strict JSON secret formats.
 # storage.delete_mode defaults to conditional. Use checkpoint-fenced only after
 # every legacy writer/credential is revoked; Cloudflare R2 does not enforce
-# DeleteObject If-Match. See docs/adr/0036-provider-delete-capability-and-checkpoint-fenced-fallback.md.
+# DeleteObject If-Match. See https://sow.pgsty.com/docs/design/publication/.
 targets: {}
 
 edge:

@@ -28,8 +28,8 @@ hardlink identity. This remains valid evidence for v0.2, not the forward design.
 The approved next design deliberately revises the product gate: ordinary DNF
 support and one payload object per Repository/publish prefix take priority;
 default EL reposync is unsupported, so the original parent-relative href is
-adopted and C2 package aliases are retired. See
-[`design/next`](../../../design/next/) and
+adopted and C2 package aliases are retired. See the maintained
+[compatibility design](https://sow.pgsty.com/docs/design/compatibility/) and
 [`evidence/2026-08-01-almalinux-9.8.md`](evidence/2026-08-01-almalinux-9.8.md).
 
 ## Run

@@ -1,6 +1,6 @@
 # YUM shared-pool redesign candidates — 2026-08-01
 
-> **Historical v0.2 candidate matrix.** C2 was selected only because reposync was then mandatory. The approved next design rejects its object-storage duplication cost and adopts root-Pool parent-relative hrefs with default EL reposync explicitly unsupported; see [`design/next`](../../../../design/next/). The measured rows below remain factual.
+> **Historical v0.2 candidate matrix.** C2 was selected only because reposync was then mandatory. The 0.3 design rejects its object-storage duplication cost and adopts root-Pool parent-relative hrefs with default EL reposync explicitly unsupported; see the maintained [compatibility design](https://sow.pgsty.com/docs/design/compatibility/). The measured rows below remain factual.
 
 ## Scope and runtime
 

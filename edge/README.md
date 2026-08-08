@@ -121,7 +121,8 @@ Before any gated publication mutation, the Go publisher anonymously requests
 by the existing closed `.sow` namespace gate and never reaches origin. A raw
 bucket 404, old runtime, redirect, Cookie challenge or cacheable response stops
 the publication before its journal/checkpoint/PUT boundary; there is no bypass
-flag. See [ADR-0037](../docs/adr/0037-pre-upload-confidential-edge-denial-attestation.md).
+flag. The maintained publication contract is documented in the
+[SOW design guide](https://sow.pgsty.com/docs/design/publication/).
 Object responses additionally expose `X-SOW-Origin-Transport`, normalized
 `X-SOW-Origin-Cache-Status` and a SHA-256 of the clean origin URL. These contain
 no credential or object bytes; they let the true-cloud harness distinguish a
