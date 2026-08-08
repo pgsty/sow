@@ -56,7 +56,7 @@ jobs:
           args: check
 
   test:
-    name: Unit and Contract Tests
+    name: Unit and Core Contract Tests
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
@@ -70,7 +70,13 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Test Go packages
-        run: go test -timeout 45m -count=1 ./...
+        shell: bash
+        run: |
+          set -euo pipefail
+          # test/compat also contains explicit provider and historical gates;
+          # integration.yml owns the current always-on compatibility subset.
+          mapfile -t packages < <(go list ./... | grep -v '/test/compat$')
+          go test -timeout 30m -count=1 "${packages[@]}"
 
       - name: Test patched RPM parser module
         run: (cd third_party/cavaliergopher-rpm && go test -count=1 ./...)

@@ -309,6 +309,7 @@ pid %s;
 error_log stderr notice;
 events { worker_connections 128; }
 http {
+  access_log off;
   server {
     listen 127.0.0.1:%d;
     include %s;

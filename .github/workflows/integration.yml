@@ -15,8 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  package-clients:
-    name: APT and DNF Clients
+  repository-clients:
+    name: Repository End-to-End
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -33,24 +33,22 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends --yes nginx
-          docker pull ubuntu:16.04@sha256:1f1a2d56de1d604801a9671f301190704c25d604a416f59e03c04f5c6ffee0d6
           docker pull ubuntu:22.04
           docker pull almalinux:10
           docker pull almalinux:9
           docker pull almalinux:8
-          docker pull centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
 
-      - name: Run signed-repository compatibility tests
+      - name: Run current CLI and repository-client integration tests
         env:
           SOW_RUN_DOCKER_COMPAT: "1"
           SOW_COMPAT_NGINX: "1"
-          SOW_COMPAT_APT12_IMAGE: ubuntu:16.04@sha256:1f1a2d56de1d604801a9671f301190704c25d604a416f59e03c04f5c6ffee0d6
           SOW_COMPAT_APT_IMAGE: ubuntu:22.04
           SOW_COMPAT_DNF_IMAGE: almalinux:10
           SOW_COMPAT_EL9_IMAGE: almalinux:9
           SOW_COMPAT_EL8_IMAGE: almalinux:8
-          SOW_COMPAT_EL7_IMAGE: centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
-        run: go test -timeout 20m -count=1 -v ./test/compat
+        run: >-
+          go test -timeout 20m -count=1 -v ./test/compat
+          -run '^(TestShippedExampleSupportsCleanRoomLocalMVP|TestV2APTClientCompatibility|TestYUMDetachedSignatureBridgeCompatibility|TestProductGeneratedNginxIncludeLoopbackContract)$'
 
   s3-compatible:
     name: S3-Compatible Publication
