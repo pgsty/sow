@@ -43,11 +43,11 @@ nfpms:
     package_name: sow
     file_name_template: >-
       {{ .PackageName }}
-      {{- if eq .Format "deb" }}_{{ .Version }}-1_
+      {{- if eq .Format "deb" }}_{{ .Version }}-1PGSTY_
         {{- if eq .Arch "amd64" }}amd64
         {{- else if eq .Arch "arm64" }}arm64
         {{- else }}{{ .Arch }}{{ end }}
-      {{- else if eq .Format "rpm" }}-{{ .Version }}-1.
+      {{- else if eq .Format "rpm" }}-{{ .Version }}-1PGSTY.
         {{- if eq .Arch "amd64" }}x86_64
         {{- else if eq .Arch "arm64" }}aarch64
         {{- else }}{{ .Arch }}{{ end }}
@@ -60,7 +60,7 @@ nfpms:
       - deb
       - rpm
     bindir: /usr/bin
-    release: "1"
+    release: "1PGSTY"
     rpm:
       summary: Local RPM and DEB repository manager
       group: Applications/Databases
@@ -86,7 +86,7 @@ release:
   github:
     owner: pgsty
     name: sow
-  draft: false
+  draft: true
   prerelease: false
   mode: replace
   replace_existing_artifacts: true

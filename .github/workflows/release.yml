@@ -45,7 +45,7 @@ jobs:
           git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
           test -z "$(git status --porcelain)"
 
-      - name: Publish GitHub Release
+      - name: Create Draft GitHub Release
         uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"

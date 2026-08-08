@@ -107,11 +107,13 @@ make release-local
 
 `make release-local` uses GoReleaser to build a local snapshot under `dist/`.
 It creates Linux/macOS archives for amd64/arm64 plus RPM and DEB packages for
-both Linux architectures.
+both Linux architectures. Linux package revisions use the project suffix
+`1PGSTY`, for example `sow-0.2.0-1PGSTY.x86_64.rpm` and
+`sow_0.2.0-1PGSTY_amd64.deb`.
 
 GitHub Actions runs regular checks in `CI` and real Docker-backed client/S3
-coverage in `Integration`. Pushing an exact semantic-version tag publishes the
-release:
+coverage in `Integration`. Pushing an exact semantic-version tag creates a
+draft release:
 
 ```bash
 git tag -a v0.2.0 -m "SOW v0.2.0"
@@ -119,8 +121,9 @@ git push origin v0.2.0
 ```
 
 The tag workflow verifies that the tag points into `main`, agrees with the
-source version, and then lets GoReleaser create the GitHub Release. It does not
-build or publish a Docker image.
+source version, and then lets GoReleaser create a draft GitHub Release. Publishing
+that draft is a separate manual decision. The workflow does not build or publish
+a Docker image.
 
 Documentation ownership and the repository boundary are described in
 [`design/README.md`](design/README.md).
