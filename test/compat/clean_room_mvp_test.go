@@ -189,7 +189,7 @@ func TestShippedExampleSupportsCleanRoomLocalMVP(t *testing.T) {
 		}
 	}
 
-	// Root help is the closed v0.3 command surface. Retired V1 commands are not
+	// Root help is the current command surface. Retired V1 commands are not
 	// merely undocumented: the binary must reject them as usage errors.
 	help := runCleanRoomV2OK(ctx, t, moduleRoot, cliPath, environment, "help")
 	assertCleanRoomV2RootCommands(t, help)

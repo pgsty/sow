@@ -177,7 +177,7 @@ func WherePackage(ctx context.Context, opts PackageWhereOptions) (result Package
 
 func openReadRepository(ctx context.Context, root, repoName string) (*state.Store, *fileLock, error) {
 	// Validate only the frozen private/public shell before opening SQLite.  The
-	// schema-aware v0.3 additions are checked after the immutable database probe.
+	// Current schema additions are checked after the immutable database probe.
 	if err := validateLegacyRepositoryPrivateLayout(root, repoName); err != nil {
 		return nil, nil, err
 	}

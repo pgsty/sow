@@ -1814,7 +1814,7 @@ func validateReadOnlyStateRoot(root string, allowMissing bool) (bool, error) {
 // validateLegacyRepositoryPrivateLayout validates the private directory set
 // that was already part of the frozen v0.2 Repository contract.  Read-only
 // discovery must start from this smaller set: retained/ and transitions/ are
-// v0.3 additions and therefore cannot be required before the database schema
+// later schema additions and therefore cannot be required before the database schema
 // has identified the Repository as current.
 func validateLegacyRepositoryPrivateLayout(root, repoName string) error {
 	if err := config.ValidateName(repoName); err != nil {
