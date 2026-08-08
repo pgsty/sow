@@ -44,6 +44,7 @@ func TestMinIOS3Compatibility(t *testing.T) {
 	containerName := fmt.Sprintf("sow-minio-%d", time.Now().UnixNano())
 	command := exec.CommandContext(ctx, docker,
 		"run", "-d", "--rm", "--name", containerName,
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"-e", "MINIO_ROOT_USER=sowtest",
 		"-e", "MINIO_ROOT_PASSWORD=sowtest-secret-key",
 		"-e", "MINIO_DOMAIN=localhost",
