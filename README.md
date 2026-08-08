@@ -1,7 +1,6 @@
 # SOW
 
-SOW is a local RPM/DEB repository manager written in Go. The current 0.3
-development line supports two
+SOW is a local RPM/DEB repository manager written in Go. SOW 0.2 supports two
 workflows:
 
 - `sow create` turns a directory of RPM or DEB packages into a simple
@@ -11,14 +10,13 @@ workflows:
   Desired and Built state, publish immutable Generations, and provide bounded
   locking, recovery, validation, queries, change reports, and operation logs.
 
-The current Repository-scoped single-payload contract and implementation status
-live under [`design/next/`](design/next/). A Repository and each configured
-publish prefix contain one canonical `pool/` payload per Package Object plus
-metadata-only `dists/` views. The archived v0.2 P0-P3 contract and its C2
-per-view-hardlink evidence remain under [`design/v0.2/`](design/v0.2/).
-Public/user documentation is maintained in the separate `sow.pgsty.com`
-checkout; newly generated files under this repository's `docs/` directory are
-intentionally ignored.
+The authoritative user and design documentation lives at
+[sow.pgsty.com](https://sow.pgsty.com/docs/). The
+[design section](https://sow.pgsty.com/docs/design/) describes the current
+Repository-scoped single-payload model. Historical PRDs, review material, and
+dated evidence remain available from Git history and version tags; they are
+not a second documentation authority. The remaining [`docs/`](docs/) tree
+contains only code-adjacent test and migration assets.
 
 ## Build and test
 
@@ -30,12 +28,12 @@ edge contract and therefore requires Node.js/npm.
 make help
 make build
 make run ARGS=version
-make test-v2       # focused v0.2 tests
+make test-core     # focused repository-manager tests
 make test          # all Go modules plus edge contracts
 make check         # format, module, vet, staticcheck, focused tests
 ```
 
-The binary is written to `bin/sow`. Its default version is `0.3.0`; release
+The binary is written to `bin/sow`. Its default version is `0.2.0`; release
 builds also inject that version at link time.
 
 ## Simple repositories
@@ -104,13 +102,25 @@ the closed `--json` envelopes and documented exit-code contract.
 ## Release
 
 ```bash
-make release
+make release-local
 ```
 
-`make release` runs the local release gates and then creates four static
-binaries under `dist/` for Linux/macOS on amd64/arm64, together with
-`SHA256SUMS`. It does not create a Git tag, push a branch, or publish files to a
-remote service; those are separate, explicit release actions.
+`make release-local` uses GoReleaser to build a local snapshot under `dist/`.
+It creates Linux/macOS archives for amd64/arm64 plus RPM and DEB packages for
+both Linux architectures.
 
-Internal design ownership and the boundary from public documentation are
-described in [`design/README.md`](design/README.md).
+GitHub Actions runs regular checks in `CI` and real Docker-backed client/S3
+coverage in `Integration`. Pushing an exact semantic-version tag publishes the
+release:
+
+```bash
+git tag -a v0.2.0 -m "SOW v0.2.0"
+git push origin v0.2.0
+```
+
+The tag workflow verifies that the tag points into `main`, agrees with the
+source version, and then lets GoReleaser create the GitHub Release. It does not
+build or publish a Docker image.
+
+Documentation ownership and the repository boundary are described in
+[`design/README.md`](design/README.md).

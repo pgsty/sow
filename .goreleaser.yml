@@ -2,12 +2,13 @@ version: 2
 
 project_name: sow
 
+env:
+  - CGO_ENABLED=0
+
 builds:
   - id: sow
     main: ./cmd/sow
     binary: sow
-    env:
-      - CGO_ENABLED=0
     goos:
       - linux
       - darwin
@@ -31,6 +32,38 @@ archives:
       - tar.gz
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - CHANGELOG.md
+
+nfpms:
+  - id: sow-packages
+    ids:
+      - sow
+    package_name: sow
+    file_name_template: >-
+      {{ .PackageName }}
+      {{- if eq .Format "deb" }}_{{ .Version }}-1_
+        {{- if eq .Arch "amd64" }}amd64
+        {{- else if eq .Arch "arm64" }}arm64
+        {{- else }}{{ .Arch }}{{ end }}
+      {{- else if eq .Format "rpm" }}-{{ .Version }}-1.
+        {{- if eq .Arch "amd64" }}x86_64
+        {{- else if eq .Arch "arm64" }}aarch64
+        {{- else }}{{ .Arch }}{{ end }}
+      {{- end }}
+    vendor: PGSTY
+    homepage: https://github.com/pgsty/sow
+    maintainer: Ruohang Feng <rh@vonng.com>
+    description: Local RPM and DEB repository manager.
+    formats:
+      - deb
+      - rpm
+    bindir: /usr/bin
+    release: "1"
+    rpm:
+      summary: Local RPM and DEB repository manager
+      group: Applications/Databases
 
 checksum:
   name_template: SHA256SUMS
@@ -40,7 +73,24 @@ snapshot:
   version_template: "{{ .Env.SOW_VERSION }}"
 
 changelog:
-  disable: true
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"
+      - "Merge branch"
 
 release:
-  disable: true
+  github:
+    owner: pgsty
+    name: sow
+  draft: false
+  prerelease: false
+  mode: replace
+  replace_existing_artifacts: true
+  name_template: "SOW v{{ .Version }}"
+
+announce:
+  skip: true

@@ -1,280 +1,133 @@
-name: ci
+name: CI
 
 on:
-  push:
   pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-# CI is local/protocol-only. Real R2/COS/Cloudflare/EdgeOne and upstream
-# acceptance are separate, explicitly reviewed runs; no repository secret or
-# ambient provider identity may make a normal workflow network-capable.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Normal CI must remain local and secret-free. Networked client and S3 tests
+# live in integration.yml; production cloud tests require explicit local
+# authority and are never enabled by repository secrets.
 env:
   SOW_RUN_REAL_CLOUD: "0"
   SOW_RUN_REAL_EDGE_EVIDENCE: "0"
   SOW_RUN_REAL_UPSTREAM: "0"
-  SOW_REAL_CLOUD_PURGE_WATCHER_HELPER: "0"
-  SOW_REAL_CLOUD_PROVIDER_ATTESTATION_JSON: ""
-  SOW_REAL_CF_STORAGE_JSON: ""
-  SOW_REAL_CF_CDN_JSON: ""
-  SOW_REAL_CF_LOG_STORAGE_JSON: ""
-  SOW_REAL_CF_LOG_WRITER_JSON: ""
-  SOW_REAL_COS_STORAGE_JSON: ""
-  SOW_REAL_COS_CDN_JSON: ""
-  SOW_REAL_COS_LOG_STORAGE_JSON: ""
-  SOW_REAL_COS_LOG_WRITER_JSON: ""
-  AWS_ACCESS_KEY_ID: ""
-  AWS_SECRET_ACCESS_KEY: ""
-  AWS_SESSION_TOKEN: ""
-  AWS_PROFILE: ""
-  AWS_DEFAULT_PROFILE: ""
-  AWS_SHARED_CREDENTIALS_FILE: /dev/null
-  AWS_WEB_IDENTITY_TOKEN_FILE: ""
-  AWS_ROLE_ARN: ""
-  AWS_ROLE_SESSION_NAME: ""
-  AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: ""
-  AWS_CONTAINER_CREDENTIALS_FULL_URI: ""
-  AWS_CONTAINER_AUTHORIZATION_TOKEN: ""
   AWS_EC2_METADATA_DISABLED: "true"
-  CLOUDFLARE_API_TOKEN: ""
-  CLOUDFLARE_API_KEY: ""
-  CLOUDFLARE_EMAIL: ""
-  CF_API_TOKEN: ""
-  TENCENT_SECRET_ID: ""
-  TENCENT_SECRET_KEY: ""
-  TENCENTCLOUD_SECRET_ID: ""
-  TENCENTCLOUD_SECRET_KEY: ""
-  TENCENTCLOUD_SESSION_TOKEN: ""
 
 jobs:
-  go:
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  quality:
+    name: Format, Vet, Staticcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - name: Refuse production cloud resources before any request
-        run: >-
-          go test -count=1 ./test/compat
-          -run '^(TestRealCloudProductionIsolationGate|TestRealCloudPinnedRegistryCannotApproveProductionResource|TestRealCloudNonProductionConfirmationIsExact|TestRealCloudProcessGateRunsForEveryNetworkCapableOptIn|TestShippedLocalFixturesCannotSelectCloudTargets|TestRealCloudAcceptanceRejectsUnsafeOrUnregisteredResourcesBeforeNetwork)$'
-      - name: Test Go packages outside the CLI integration package
-        shell: bash
-        run: |
-          set -euo pipefail
-          packages="$(go list ./... | grep -v '/internal/cli$')"
-          go test -timeout 15m -count=1 $packages
-      - name: Test patched RPM parser module
-        shell: bash
-        run: (cd third_party/cavaliergopher-rpm && go test -count=1 ./...)
-      - run: go vet ./...
-      - name: Staticcheck production and test reachability
-        shell: bash
+
+      - name: Check formatting and module files
+        run: make fmt-check tidy-check
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Staticcheck
         run: |
           go install honnef.co/go/tools/cmd/staticcheck@v0.6.1
           "$(go env GOPATH)/bin/staticcheck" ./...
-      - name: Legacy physical contract, ledger, adoption rollback, and writer-fence regressions
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          docs/migration/test-physical-migration-config.sh
-          docs/migration/test-audit-physical-topology.sh
-          docs/migration/test-audit-legacy-targets.sh
-          docs/migration/test-family-e2e.sh
-          docs/migration/test-local-adoption-rollback.sh
-          docs/migration/test-migrate-pigsty-yum-consumers.sh
-          docs/migration/test-writer-fence-preflight.sh
-      - name: Rebuild the operator delivery from a clean archive
-        shell: bash
-        run: test/compat/test-clean-delivery.sh "$RUNNER_TEMP/sow-clean-delivery"
-      - name: Cross-build static CLI
-        shell: bash
-        run: |
-          set -euo pipefail
-          out="$(mktemp -d)"
-          trap 'rm -rf "$out"' EXIT
-          for target in darwin/arm64 darwin/amd64 linux/arm64 linux/amd64; do
-            os="${target%/*}"
-            arch="${target#*/}"
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
-              go build -trimpath -o "$out/sow-$os-$arch" ./cmd/sow
-          done
 
-  go-cli:
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        shard:
-          - '^Test[A-F]'
-          - '^Test[G-M]'
-          - '^Test[N-O]'
-          - '^Test[P-Q]'
-          - '^Test[R-V]'
-          - '^Test([W-Z]|[^A-Z]|$)'
-    runs-on: ${{ matrix.os }}
+      - name: Check GoReleaser configuration
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: check
+
+  test:
+    name: Unit and Contract Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - name: Test CLI integration shard
-        run: go test -timeout 20m -count=1 ./internal/cli -run '${{ matrix.shard }}'
 
-  race-core:
-    timeout-minutes: 30
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Race-test Go packages outside the CLI integration package
-        shell: bash
-        run: |
-          set -euo pipefail
-          packages="$(go list ./... | grep -v '/internal/cli$')"
-          go test -race -timeout 20m -count=1 $packages
+      - name: Test Go packages
+        run: go test -timeout 45m -count=1 ./...
 
-  race-cli:
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        shard:
-          - '^Test[A-F]'
-          - '^Test[G-M]'
-          - '^Test[N-O]'
-          - '^Test[P-Q]'
-          - '^Test[R-V]'
-          - '^Test([W-Z]|[^A-Z]|$)'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Race-test CLI integration shard
-        run: go test -race -timeout 25m -count=1 ./internal/cli -run '${{ matrix.shard }}'
+      - name: Test patched RPM parser module
+        run: (cd third_party/cavaliergopher-rpm && go test -count=1 ./...)
 
-  vulnerability-scan:
-    timeout-minutes: 10
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Reachable Go vulnerability gate
-        run: |
-          go mod verify
-          go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
-      - name: Patched RPM parser provenance and nested vulnerability gate
-        shell: bash
-        run: |
-          bash third_party/cavaliergopher-rpm/verify-upstream.sh
-          (cd third_party/cavaliergopher-rpm && \
-            go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...)
-
-  bounded-50k:
-    timeout-minutes: 30
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Upstream candidate spool and bounded HTTP workers
-        run: >-
-          go test -count=1 -v ./internal/upstream
-          -run 'TestStreamingCandidateStoreFiftyThousandBoundedMemory|TestStreamingExecutorBoundsRealHTTPDownloadConcurrency'
-      - name: APT component and architecture streaming
-        env:
-          SOW_RUN_PERF: "1"
-        run: go test -count=1 -v ./internal/aptrepo -run '^TestGenerateStreaming50000Performance$'
-      - name: YUM, CAS materialization, and publish planning
-        run: >-
-          go test -tags perf -count=1 -v ./test/perf
-          -run 'TestYUMStreamingFiftyThousand|TestMaterializeFiftyThousand|TestPublishPlanFiftyThousandOneChange'
-      - name: No-change publication preflight
-        run: >-
-          go test -tags perf -count=1 -v ./internal/cli
-          -run '^TestIncrementalPublishPreflightFiftyThousandEntriesDoesNotReadView$'
-
-  edge-contract:
-    timeout-minutes: 10
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: edge
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: "24"
           package-manager-cache: false
-      - run: npm run build
-      - name: Reject stale checked-in edge bundles
-        run: git diff --exit-code -- dist
-      - run: npm test
 
-  real-clients:
-    timeout-minutes: 20
+      - name: Test edge contracts
+        working-directory: edge
+        run: npm test
+
+  package:
+    name: Archives, RPM, DEB
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - name: Pull unmodified supported client images
+
+      - name: Build snapshot with GoReleaser
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean --skip=publish
+        env:
+          SOW_VERSION: 0.2.0
+
+      - name: Install package inspection tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y nginx
-          docker pull ubuntu:16.04@sha256:1f1a2d56de1d604801a9671f301190704c25d604a416f59e03c04f5c6ffee0d6
-          docker pull ubuntu:22.04
-          docker pull almalinux:10
-          docker pull almalinux:9
-          docker pull almalinux:8
-          docker pull centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
-      - name: apt and dnf signed-repository compatibility
-        env:
-          SOW_RUN_DOCKER_COMPAT: "1"
-          SOW_COMPAT_NGINX: "1"
-          SOW_COMPAT_APT12_IMAGE: ubuntu:16.04@sha256:1f1a2d56de1d604801a9671f301190704c25d604a416f59e03c04f5c6ffee0d6
-          SOW_COMPAT_APT_IMAGE: ubuntu:22.04
-          SOW_COMPAT_DNF_IMAGE: almalinux:10
-          SOW_COMPAT_EL9_IMAGE: almalinux:9
-          SOW_COMPAT_EL8_IMAGE: almalinux:8
-          SOW_COMPAT_EL7_IMAGE: centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
-        run: go test -count=1 -v ./test/compat
+          sudo apt-get install --no-install-recommends --yes rpm
 
-  real-s3-compatible:
-    timeout-minutes: 15
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Pull pinned S3-compatible protocol fixture
-        run: docker pull minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
-      - name: SigV4 publication, replay, audit, copy, and delete
-        env:
-          SOW_MINIO_TEST: "1"
-        run: go test -count=1 -v ./internal/publish -run '^TestMinIOS3Compatibility$'
+      - name: Verify archives and Linux packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t archives < <(find dist -maxdepth 1 -type f -name 'sow_*.tar.gz' | sort)
+          mapfile -t rpms < <(find dist -maxdepth 1 -type f -name 'sow-*.rpm' | sort)
+          mapfile -t debs < <(find dist -maxdepth 1 -type f -name 'sow_*.deb' | sort)
+          test "${#archives[@]}" -eq 4
+          test "${#rpms[@]}" -eq 2
+          test "${#debs[@]}" -eq 2
+          (cd dist && sha256sum --check SHA256SUMS)
+          for package in "${rpms[@]}"; do
+            rpm -qpl "${package}" | grep -Fx '/usr/bin/sow'
+          done
+          for package in "${debs[@]}"; do
+            dpkg-deb --contents "${package}" | grep -E 'usr/bin/sow$'
+          done

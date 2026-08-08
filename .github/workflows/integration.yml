@@ -1,0 +1,75 @@
+name: Integration
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-clients:
+    name: APT and DNF Clients
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install Nginx and pull client images
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes nginx
+          docker pull ubuntu:16.04@sha256:1f1a2d56de1d604801a9671f301190704c25d604a416f59e03c04f5c6ffee0d6
+          docker pull ubuntu:22.04
+          docker pull almalinux:10
+          docker pull almalinux:9
+          docker pull almalinux:8
+          docker pull centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
+
+      - name: Run signed-repository compatibility tests
+        env:
+          SOW_RUN_DOCKER_COMPAT: "1"
+          SOW_COMPAT_NGINX: "1"
+          SOW_COMPAT_APT12_IMAGE: ubuntu:16.04@sha256:1f1a2d56de1d604801a9671f301190704c25d604a416f59e03c04f5c6ffee0d6
+          SOW_COMPAT_APT_IMAGE: ubuntu:22.04
+          SOW_COMPAT_DNF_IMAGE: almalinux:10
+          SOW_COMPAT_EL9_IMAGE: almalinux:9
+          SOW_COMPAT_EL8_IMAGE: almalinux:8
+          SOW_COMPAT_EL7_IMAGE: centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
+        run: go test -timeout 20m -count=1 -v ./test/compat
+
+  s3-compatible:
+    name: S3-Compatible Publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Pull pinned MinIO fixture
+        run: docker pull minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+
+      - name: Run publication and recovery integration tests
+        env:
+          SOW_MINIO_TEST: "1"
+        run: go test -timeout 10m -count=1 -v ./internal/publish -run '^TestMinIOS3Compatibility$'

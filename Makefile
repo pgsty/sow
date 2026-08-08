@@ -4,9 +4,9 @@ SHELL := /bin/bash
 
 GO ?= go
 GORELEASER ?= goreleaser
-VERSION ?= 0.3.0
+VERSION ?= 0.2.0
 TEST_TIMEOUT ?= 60m
-V2_TEST_TIMEOUT ?= 20m
+CORE_TEST_TIMEOUT ?= 20m
 RACE_TIMEOUT ?= 30m
 ARGS ?=
 
@@ -16,10 +16,10 @@ DIST_DIR := $(ROOT_DIR)/dist
 BINARY := $(BIN_DIR)/sow
 CLEAN_DELIVERY_OUT ?= $(if $(TMPDIR),$(TMPDIR),/tmp)/sow-clean-delivery
 LDFLAGS := -s -w -X github.com/pgsty/sow/internal/v2cli.Version=$(VERSION)
-V2_PACKAGES := ./internal/v2/... ./internal/v2cli ./internal/aptrepo ./internal/yumrepo
+CORE_PACKAGES := ./internal/v2/... ./internal/v2cli ./internal/aptrepo ./internal/yumrepo
 
 .PHONY: all help version build run install fmt fmt-check tidy tidy-check vet lint \
-	test test-go test-rpm test-edge test-v2 race check clean-delivery dist \
+	test test-go test-rpm test-edge test-core test-v2 race check clean-delivery \
 	goreleaser-check release-local release clean clean-bin clean-dist
 
 all: build
@@ -32,13 +32,12 @@ help:
 		'  make run ARGS=...    Run the CLI from source (example: ARGS=version)' \
 		'  make install         Install sow with the release version embedded' \
 		'  make test            Run all Go modules and edge contract tests' \
-		'  make test-v2         Run the focused SOW v0.3 package tests' \
-		'  make race            Race-test the v0.3 core packages' \
+		'  make test-core       Run the focused repository-manager tests' \
+		'  make race            Race-test the core repository packages' \
 		'  make check           Run format, module, vet, lint, and focused tests' \
 		'  make clean-delivery  Rebuild and verify the deterministic source archive' \
-		'  make dist            Cross-build four release binaries and SHA256SUMS' \
-		'  make release-local   Build local GoReleaser archives without publishing' \
-		'  make release         Run all release gates, then build dist/' \
+		'  make release-local   Build local archives and Linux packages with GoReleaser' \
+		'  make release         Run all local gates, then build the GoReleaser snapshot' \
 		'  make clean           Remove only managed bin/ and dist/ outputs'
 
 version:
@@ -91,35 +90,18 @@ test-edge:
 	@command -v npm >/dev/null 2>&1 || { printf '%s\n' 'npm is required for edge tests' >&2; exit 1; }
 	cd edge && npm run build && npm test
 
-test-v2:
-	$(GO) test -timeout '$(V2_TEST_TIMEOUT)' -count=1 $(V2_PACKAGES)
+test-core:
+	$(GO) test -timeout '$(CORE_TEST_TIMEOUT)' -count=1 $(CORE_PACKAGES)
+
+test-v2: test-core
 
 race:
-	$(GO) test -race -timeout '$(RACE_TIMEOUT)' -count=1 $(V2_PACKAGES)
+	$(GO) test -race -timeout '$(RACE_TIMEOUT)' -count=1 $(CORE_PACKAGES)
 
-check: fmt-check tidy-check vet lint test-v2
+check: fmt-check tidy-check vet lint test-core
 
 clean-delivery:
 	test/compat/test-clean-delivery.sh '$(CLEAN_DELIVERY_OUT)'
-
-dist: clean-dist
-	@mkdir -p '$(DIST_DIR)'
-	@for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do \
-		os="$${target%/*}"; arch="$${target#*/}"; \
-		output='$(DIST_DIR)'/sow_$(VERSION)_$${os}_$${arch}; \
-		printf 'building %s/%s -> %s\n' "$$os" "$$arch" "$$output"; \
-		CGO_ENABLED=0 GOOS="$$os" GOARCH="$$arch" $(GO) build \
-			-trimpath -ldflags '$(LDFLAGS)' -o "$$output" ./cmd/sow; \
-		metadata="$$( $(GO) version -m "$$output" )"; \
-		grep -Fq "GOOS=$$os" <<<"$$metadata"; \
-		grep -Fq "GOARCH=$$arch" <<<"$$metadata"; \
-	done
-	@cd '$(DIST_DIR)' && if command -v sha256sum >/dev/null 2>&1; then \
-		sha256sum sow_* > SHA256SUMS; \
-	else \
-		shasum -a 256 sow_* > SHA256SUMS; \
-	fi
-	@printf 'release artifacts: %s\n' '$(DIST_DIR)'
 
 goreleaser-check:
 	@command -v '$(GORELEASER)' >/dev/null 2>&1 || { \
@@ -129,7 +111,7 @@ goreleaser-check:
 	SOW_VERSION='$(VERSION)' $(GORELEASER) check
 
 release-local: goreleaser-check
-	SOW_VERSION='$(VERSION)' $(GORELEASER) release --snapshot --clean
+	SOW_VERSION='$(VERSION)' $(GORELEASER) release --snapshot --clean --skip=publish
 	@printf 'local GoReleaser artifacts: %s\n' '$(DIST_DIR)'
 
 release:
@@ -137,7 +119,7 @@ release:
 	@$(MAKE) test
 	@$(MAKE) race
 	@$(MAKE) clean-delivery
-	@$(MAKE) dist
+	@$(MAKE) release-local
 	@printf 'SOW v%s release gates passed\n' '$(VERSION)'
 
 clean: clean-bin clean-dist
