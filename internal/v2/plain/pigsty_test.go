@@ -18,7 +18,9 @@ import (
 
 func TestCreatePigstyExactCleanupAndSHA256Marker(t *testing.T) {
 	dir := t.TempDir()
-	writeRPMFixture(t, filepath.Join(dir, "rpm-i686.rpm"), rpmFixture{Name: "legacy", Version: "1", Release: "1", Arch: "i686", Payload: "legacy"})
+	for _, arch := range []string{"i386", "i486", "i586", "i686"} {
+		writeRPMFixture(t, filepath.Join(dir, "rpm-"+arch+".rpm"), rpmFixture{Name: "legacy", Version: "1", Release: "1", Arch: arch, Payload: arch})
+	}
 	writeRPMFixture(t, filepath.Join(dir, "rpm-patroni-bad.rpm"), rpmFixture{Name: "patroni", Version: "3.0.4", Release: "9", Arch: "x86_64", Epoch: 2, Payload: "bad"})
 	writeRPMFixture(t, filepath.Join(dir, "rpm-patroni-plus.rpm"), rpmFixture{Name: "patroni", Version: "3.0.4+foo", Release: "1", Arch: "x86_64", Payload: "plus"})
 	writeRPMFixture(t, filepath.Join(dir, "rpm-good.rpm"), rpmFixture{Name: "good", Version: "1", Release: "1", Arch: "aarch64", Payload: "good"})
@@ -30,7 +32,11 @@ func TestCreatePigstyExactCleanupAndSHA256Marker(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wantRemoved := []string{"deb-i386.deb", "deb-patroni-bad.deb", "rpm-i686.rpm", "rpm-patroni-bad.rpm"}
+	wantRemoved := []string{"deb-i386.deb", "deb-patroni-bad.deb", "rpm-patroni-bad.rpm"}
+	wantKept := []string{
+		"deb-good.deb", "deb-patroni-plus.deb", "rpm-good.rpm",
+		"rpm-i386.rpm", "rpm-i486.rpm", "rpm-i586.rpm", "rpm-i686.rpm", "rpm-patroni-plus.rpm",
+	}
 	result, err := Create(context.Background(), Options{Dir: dir, Jobs: 4, Pigsty: true})
 	if err != nil {
 		t.Fatalf("Create --pigsty: %v", err)
@@ -43,14 +49,17 @@ func TestCreatePigstyExactCleanupAndSHA256Marker(t *testing.T) {
 			t.Fatalf("selected package %s was not removed", name)
 		}
 	}
-	for _, name := range []string{"rpm-patroni-plus.rpm", "rpm-good.rpm", "deb-patroni-plus.deb", "deb-good.deb", "patroni-3.0.4-not-a-package.txt"} {
+	for _, name := range wantKept {
 		if _, err := os.Lstat(filepath.Join(dir, name)); err != nil {
 			t.Fatalf("non-selected file %s was removed: %v", name, err)
 		}
 	}
+	if _, err := os.Lstat(filepath.Join(dir, "patroni-3.0.4-not-a-package.txt")); err != nil {
+		t.Fatalf("non-package file was removed: %v", err)
+	}
 	marker := string(mustRead(t, filepath.Join(dir, "repo_complete")))
 	var wantLines []string
-	for _, name := range []string{"deb-good.deb", "deb-patroni-plus.deb", "rpm-good.rpm", "rpm-patroni-plus.rpm"} {
+	for _, name := range wantKept {
 		wantLines = append(wantLines, fmt.Sprintf("%s  %s", fileSHA(filepath.Join(dir, name)), name))
 	}
 	if marker != strings.Join(wantLines, "\n")+"\n" {
@@ -61,6 +70,11 @@ func TestCreatePigstyExactCleanupAndSHA256Marker(t *testing.T) {
 	for _, removed := range wantRemoved {
 		if bytes.Contains(packages, []byte(removed)) || bytes.Contains(primary, []byte(removed)) {
 			t.Fatalf("metadata still references removed package %s", removed)
+		}
+	}
+	for _, kept := range []string{"rpm-i386.rpm", "rpm-i486.rpm", "rpm-i586.rpm", "rpm-i686.rpm"} {
+		if !bytes.Contains(primary, []byte(`href="`+kept+`"`)) {
+			t.Fatalf("RPM metadata omitted retained package %s", kept)
 		}
 	}
 	if _, err := os.Lstat(filepath.Join(dir, journalFilename)); !os.IsNotExist(err) {
@@ -284,7 +298,7 @@ func TestCompletedPigstyJournalCleansAfterPartialTrashRemoval(t *testing.T) {
 
 func TestCreatePigstyAllPackagesRemovedProducesEmptyRepositories(t *testing.T) {
 	dir := t.TempDir()
-	writeRPMFixture(t, filepath.Join(dir, "legacy.rpm"), rpmFixture{Name: "legacy", Version: "1", Release: "1", Arch: "i686", Payload: "legacy"})
+	writeRPMFixture(t, filepath.Join(dir, "legacy.rpm"), rpmFixture{Name: "patroni", Version: "3.0.4", Release: "1", Arch: "x86_64", Payload: "legacy"})
 	writeDEBFixture(t, dir, "legacy.deb", debControl("legacy", "1.0-1", "i386"), "legacy")
 	result, err := Create(context.Background(), Options{Dir: dir, Pigsty: true})
 	if err != nil {
@@ -375,7 +389,7 @@ func TestCreatePigstyAllRemovedProcessTerminationRecoveryMatrix(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()
-			writeRPMFixture(t, filepath.Join(dir, "legacy.rpm"), rpmFixture{Name: "legacy", Version: "1", Release: "1", Arch: "i686", Payload: "legacy"})
+			writeRPMFixture(t, filepath.Join(dir, "legacy.rpm"), rpmFixture{Name: "patroni", Version: "3.0.4", Release: "1", Arch: "x86_64", Payload: "legacy"})
 			writeDEBFixture(t, dir, "legacy.deb", debControl("legacy", "1.0-1", "i386"), "legacy")
 			if err := os.WriteFile(filepath.Join(dir, "repo_complete"), []byte("old marker\n"), 0o644); err != nil {
 				t.Fatal(err)
@@ -482,7 +496,7 @@ func TestPlainCrashHelper(t *testing.T) {
 func writeCrashFixture(t *testing.T, dir string) {
 	t.Helper()
 	writeRPMFixture(t, filepath.Join(dir, "good.rpm"), rpmFixture{Name: "good", Version: "1", Release: "1", Arch: "x86_64", Payload: "good"})
-	writeRPMFixture(t, filepath.Join(dir, "bad.rpm"), rpmFixture{Name: "legacy", Version: "1", Release: "1", Arch: "i686", Payload: "bad"})
+	writeRPMFixture(t, filepath.Join(dir, "bad.rpm"), rpmFixture{Name: "patroni", Version: "3.0.4", Release: "1", Arch: "x86_64", Payload: "bad"})
 	writeDEBFixture(t, dir, "good.deb", debControl("good", "1.0-1", "amd64"), "good")
 	writeDEBFixture(t, dir, "bad.deb", debControl("legacy", "1.0-1", "i386"), "bad")
 	if _, err := Create(context.Background(), Options{Dir: dir}); err != nil {

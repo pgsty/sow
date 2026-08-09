@@ -217,10 +217,6 @@ func isSourceRPMArch(arch string) bool {
 func shouldRemove(fact packageFact) bool {
 	switch fact.format {
 	case formatRPM:
-		switch fact.arch {
-		case "i386", "i486", "i586", "i686":
-			return true
-		}
 		return fact.name == "patroni" && fact.version == "3.0.4"
 	case formatDEB:
 		if fact.arch == "i386" {
