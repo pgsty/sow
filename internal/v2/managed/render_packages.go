@@ -75,16 +75,26 @@ func (source ManagedPackageSource) open() (*rootedRegularFile, error) {
 	return opened, nil
 }
 
-// pendingSourceGuard binds every private pending inode for the duration of a
-// build. Canonical rendering no longer changes link counts, so any Nlink other
-// than one before or after rendering is hostile external aliasing rather than
-// a protocol projection owned by SOW.
+// pendingSourceGuard snapshots every private pending inode before rendering and
+// rebinds the same pathname afterward. Keeping every file and root descriptor
+// open would consume two descriptors per object. Under Managed's workspace
+// lock and trusted local single-writer model, snapshots detect persistent path
+// replacement and link-count changes with bounded FDs; they intentionally do
+// not claim to defeat a same-user replace-and-restore attack during the build.
 type pendingSourceGuard struct {
-	entries map[string]*rootedRegularFile
+	entries map[string]pendingSourceGuardEntry
+}
+
+type pendingSourceGuardEntry struct {
+	owner    string
+	relative string
+	size     int64
+	before   os.FileInfo
+	stat     unix.Stat_t
 }
 
 func newPendingSourceGuard(sources []ManagedPackageSource) (*pendingSourceGuard, error) {
-	guard := &pendingSourceGuard{entries: map[string]*rootedRegularFile{}}
+	guard := &pendingSourceGuard{entries: map[string]pendingSourceGuardEntry{}}
 	for _, source := range sources {
 		if source.Object.Storage != "pending" {
 			continue
@@ -99,7 +109,15 @@ func newPendingSourceGuard(sources []ManagedPackageSource) (*pendingSourceGuard,
 		if opened.stat.Nlink != 1 {
 			return nil, errors.Join(fmt.Errorf("%w: pending package source %s is multiply linked before build", ErrIntegrity, source.Object.SHA256), opened.CloseVerified(), guard.Close())
 		}
-		guard.entries[source.Object.SHA256] = opened
+		owner, relative := source.Owner, source.Relative
+		if owner == "" {
+			owner, relative = filepath.Dir(source.Path), filepath.Base(source.Path)
+		}
+		entry := pendingSourceGuardEntry{owner: owner, relative: relative, size: source.Object.Size, before: opened.before, stat: opened.stat}
+		if err := opened.CloseVerified(); err != nil {
+			return nil, errors.Join(err, guard.Close())
+		}
+		guard.entries[source.Object.SHA256] = entry
 	}
 	return guard, nil
 }
@@ -115,11 +133,18 @@ func (guard *pendingSourceGuard) Close() error {
 	}
 	sort.Strings(digests)
 	for _, digest := range digests {
-		opened := guard.entries[digest]
-		var raw unix.Stat_t
-		statErr := unix.Fstat(int(opened.file.Fd()), &raw)
-		if statErr != nil || raw.Nlink != 1 {
-			result = errors.Join(result, fmt.Errorf("%w: pending package %s acquired an external hardlink during build", ErrIntegrity, digest), statErr)
+		entry := guard.entries[digest]
+		source := ManagedPackageSource{Object: state.PackageObject{SHA256: digest, Size: entry.size}, Owner: entry.owner, Relative: entry.relative}
+		opened, err := source.open()
+		if err != nil {
+			result = errors.Join(result, fmt.Errorf("%w: pending package %s changed during build: %v", ErrIntegrity, digest, err))
+			continue
+		}
+		sameIdentity := os.SameFile(entry.before, opened.before) &&
+			entry.before.Size() == opened.before.Size() && entry.before.ModTime().Equal(opened.before.ModTime()) &&
+			entry.stat.Dev == opened.stat.Dev && entry.stat.Ino == opened.stat.Ino && entry.stat.Size == opened.stat.Size
+		if !sameIdentity || opened.stat.Nlink != 1 {
+			result = errors.Join(result, fmt.Errorf("%w: pending package %s was replaced or multiply linked during build", ErrIntegrity, digest))
 		}
 		result = errors.Join(result, opened.CloseVerified())
 	}

@@ -23,7 +23,7 @@ func TestManagedMutationSIGKILLRecoveryMatrix(t *testing.T) {
 	}{
 		{
 			operation: "add",
-			points:    []string{"add.planned", "add.staged", "add.applied", "build.rendered.el9", "build.staged", "build.payload.", "build.pointer.el9", "build.built", "build.finalized"},
+			points:    []string{"add.planned", "add.staged", "add.applied", "build.rendered.el9", "build.staged", "build.payload-linked.", "build.payload-targets", "build.payload.", "build.pointer.el9", "build.built", "build.finalized"},
 			before:    0,
 			after:     1,
 		},
@@ -35,7 +35,7 @@ func TestManagedMutationSIGKILLRecoveryMatrix(t *testing.T) {
 		},
 		{
 			operation: "build",
-			points:    []string{"build.command.planned", "build.command.staged", "build.command.applied", "build.rendered.el9", "build.staged", "build.payload.", "build.pointer.el9", "build.built", "build.finalized"},
+			points:    []string{"build.command.planned", "build.command.staged", "build.command.applied", "build.rendered.el9", "build.staged", "build.payload-linked.", "build.payload-targets", "build.payload.", "build.pointer.el9", "build.built", "build.finalized"},
 			before:    0,
 			after:     1,
 		},

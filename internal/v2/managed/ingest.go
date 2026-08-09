@@ -346,12 +346,14 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	outcomes := []state.OperationMembership{}
 	keptByDist := make(map[string]map[string]struct{}, len(distNames))
 	excludedByDist := make(map[string]map[string]string, len(distNames))
+	existingObjects, err := store.ListPackageObjects(ctx, distNames, false)
+	if err != nil {
+		return result, err
+	}
+	existingByDist := packageObjectsByDist(existingObjects, distNames, false)
 	for _, distName := range distNames {
-		existing, err := store.ListPackageObjects(ctx, []string{distName}, false)
-		if err != nil {
-			return result, err
-		}
-		candidates := append(existing, accepted...)
+		existing := existingByDist[distName]
+		candidates := append(append([]state.PackageObject(nil), existing...), accepted...)
 		policyResult, err := ApplyPolicy(candidates, effectiveDists[distName])
 		if err != nil {
 			return result, err
@@ -730,7 +732,14 @@ func installPendingObject(ctx context.Context, root, repoName, staged string, ob
 	if hashErr != nil || verifyErr != nil || digest != object.SHA256 {
 		return fmt.Errorf("%w: staged object %s checksum mismatch", ErrIntegrity, object.SHA256)
 	}
-	if err := renameRootedRegular(ctx, root, stagedRelative, pendingRelative, object.Size, object.SHA256, 0o600, 0o700); err != nil {
+	// Pending lives below a private directory, so storing the immutable object
+	// in its final public mode does not expose it. It also avoids a second
+	// per-file chmod+fsync when a later build hardlinks it into Pool.
+	//
+	// renameRootedRegular fsyncs the payload before this pending name becomes
+	// durable. Payload promotion depends on that barrier to skip its own inode
+	// fsync; see managedPayloadFileMode.
+	if err := renameRootedRegular(ctx, root, stagedRelative, pendingRelative, object.Size, object.SHA256, managedPayloadFileMode, managedPendingDirectoryMode); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {

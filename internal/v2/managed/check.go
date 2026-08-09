@@ -167,10 +167,20 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 			objectsByDigest[object.SHA256] = object
 		}
 	}
+	// Both membership projections are listed once for the complete selection and
+	// regrouped per Dist below. Every per-Dist layer reuses these groups because
+	// a repeated single-Dist query still expands the whole membership table.
+	desiredByDist := map[string][]state.PackageObject{}
+	builtByDist := map[string][]state.PackageObject{}
 	for _, built := range []bool{false, true} {
 		selectedObjects, listErr := store.ListPackageObjects(ctx, distNames, built)
 		if listErr != nil {
 			return result, listErr
+		}
+		if built {
+			builtByDist = packageObjectsByDist(selectedObjects, distNames, true)
+		} else {
+			desiredByDist = packageObjectsByDist(selectedObjects, distNames, false)
 		}
 		for _, object := range selectedObjects {
 			objectsByDigest[object.SHA256] = object
@@ -331,11 +341,7 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 			continue
 		}
 		effective := effectiveView.Repositories[repoName].Dists[distName]
-		desiredObjects, listErr := store.ListPackageObjects(ctx, []string{distName}, false)
-		if listErr != nil {
-			membershipIssues = append(membershipIssues, listErr.Error())
-			continue
-		}
+		desiredObjects := desiredByDist[distName]
 		policy, applyErr := ApplyPolicy(desiredObjects, effective)
 		if applyErr != nil {
 			membershipIssues = append(membershipIssues, applyErr.Error())
@@ -396,11 +402,7 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 			indexIssues = append(indexIssues, distErr.Error())
 			continue
 		}
-		builtObjects, listErr := store.ListPackageObjects(ctx, []string{distName}, true)
-		if listErr != nil {
-			indexIssues = append(indexIssues, listErr.Error())
-			continue
-		}
+		builtObjects := builtByDist[distName]
 		if dist.Format == "rpm" {
 			frozenSigning, signingErr := decodeRetainedEffectiveSigning(dist.EffectiveSigningJSON)
 			if signingErr != nil {
@@ -421,11 +423,7 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 			recoveringTarget, targetIsPublic = recoveryView.targetDists[distName]
 		}
 		if targetIsPublic {
-			validationObjects, listErr = store.ListPackageObjects(ctx, []string{distName}, false)
-			if listErr != nil {
-				indexIssues = append(indexIssues, listErr.Error())
-				continue
-			}
+			validationObjects = desiredByDist[distName]
 			validationArchitectures = recoveringTarget.Architectures
 		}
 		if dist.Format == "rpm" {

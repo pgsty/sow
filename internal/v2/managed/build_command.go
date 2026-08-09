@@ -57,12 +57,13 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 	desired := make(map[string][]string, len(distNames))
 	outcomes := []state.OperationMembership{}
 	affectedDists := []string{}
+	currentObjects, err := store.ListPackageObjects(ctx, distNames, false)
+	if err != nil {
+		return result, err
+	}
+	currentByDist := packageObjectsByDist(currentObjects, distNames, false)
 	for _, distName := range distNames {
-		current, err := store.ListPackageObjects(ctx, []string{distName}, false)
-		if err != nil {
-			return result, err
-		}
-		policy, err := ApplyPolicy(current, effective[distName])
+		policy, err := ApplyPolicy(currentByDist[distName], effective[distName])
 		if err != nil {
 			return result, err
 		}
@@ -164,7 +165,16 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 		return result, err
 	}
 	if !physicalChange {
+		if err := recordBuildProgress(ctx, store, id, "normalizing_public_tree", 0, 1, opts.Jobs); err != nil {
+			return result, err
+		}
 		if _, err := normalizeCurrentPublicTree(ctx, ws.Root, repoName, id, store, opts.Fault); err != nil {
+			return result, err
+		}
+		if err := recordBuildProgress(ctx, store, id, "normalizing_public_tree", 1, 1, opts.Jobs); err != nil {
+			return result, err
+		}
+		if err := recordBuildProgress(ctx, store, id, "finalizing", 0, 1, opts.Jobs); err != nil {
 			return result, err
 		}
 		if err := store.FinalizeNoopBuild(ctx, id); err != nil {

@@ -101,6 +101,14 @@ func inspectMutationRecoveryView(ctx context.Context, root, repoName string, sto
 	}
 	expected := generationManifestMap(base)
 	seenPooled := map[string]struct{}{}
+	pendingObjects, err := store.ListPendingPackageObjects(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pendingByDigest := make(map[string]state.PackageObject, len(pendingObjects))
+	for _, object := range pendingObjects {
+		pendingByDigest[object.SHA256] = object
+	}
 	for _, digest := range manifest.Build.Pooled {
 		if !lowercaseSHA256.MatchString(digest) {
 			return nil, fmt.Errorf("%w: mutation build has invalid pooled digest", ErrIntegrity)
@@ -109,8 +117,8 @@ func inspectMutationRecoveryView(ctx context.Context, root, repoName string, sto
 			return nil, fmt.Errorf("%w: mutation build repeats pooled digest %s", ErrIntegrity, digest)
 		}
 		seenPooled[digest] = struct{}{}
-		object, err := store.GetPackageObject(ctx, digest)
-		if err != nil || object.Storage != "pending" {
+		object, exists := pendingByDigest[digest]
+		if !exists {
 			return nil, fmt.Errorf("%w: mutation pooled package %s is absent from pending state", ErrIntegrity, digest)
 		}
 		pendingRelative := filepath.Join(".sow", repoName, "pending", digest)
@@ -123,8 +131,13 @@ func inspectMutationRecoveryView(ctx context.Context, root, repoName string, sto
 		if err != nil {
 			return nil, err
 		}
-		if pendingOK == publicOK {
-			return nil, fmt.Errorf("%w: pooled package %s has %d durable publication locations, want exactly one", ErrIntegrity, digest, map[bool]int{true: 2, false: 0}[pendingOK])
+		// Promotion deliberately permits a journal-bound object to have both
+		// names while a target-directory barrier has completed but pending cleanup
+		// has not. Both copies were authenticated against the same immutable
+		// manifest identity above, so replay can safely collapse the pending name.
+		// Losing both names is the only unrecoverable namespace state.
+		if !pendingOK && !publicOK {
+			return nil, fmt.Errorf("%w: pooled package %s has no durable publication location", ErrIntegrity, digest)
 		}
 		if publicOK {
 			view.pooledPublic[digest] = struct{}{}

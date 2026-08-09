@@ -581,10 +581,10 @@ func TestBuildRejectsHardlinkedPrivatePendingObjectWithoutPublicEffect(t *testin
 	if before != after {
 		t.Fatalf("failed hardlink build changed public Repository: before=%s after=%s", before, after)
 	}
-	if pendingInfo, err := os.Lstat(pending); err != nil || pendingInfo.Mode().Perm() != 0o600 {
+	if pendingInfo, err := os.Lstat(pending); err != nil || pendingInfo.Mode().Perm() != 0o644 {
 		t.Fatalf("pending object changed: info=%#v err=%v", pendingInfo, err)
 	}
-	if aliasInfo, err := os.Lstat(alias); err != nil || aliasInfo.Mode().Perm() != 0o600 {
+	if aliasInfo, err := os.Lstat(alias); err != nil || aliasInfo.Mode().Perm() != 0o644 {
 		t.Fatalf("external hardlink changed: info=%#v err=%v", aliasInfo, err)
 	}
 }

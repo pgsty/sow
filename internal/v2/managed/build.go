@@ -226,7 +226,10 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 				return 0, err
 			}
 		}
-		buildDists, pooled, retainedRPMKeys, err = stageMutationBuild(ctx, root, repoName, cfg, distNames, generation, publicationTime, buildRoot, store, jobs, fault, preflight)
+		if err := recordBuildProgress(ctx, store, operationID, "rendering", 0, len(distNames), jobs); err != nil {
+			return 0, err
+		}
+		buildDists, pooled, retainedRPMKeys, err = stageMutationBuild(ctx, root, repoName, cfg, distNames, generation, publicationTime, buildRoot, operationID, store, jobs, fault, preflight)
 		if err != nil {
 			return 0, err
 		}
@@ -273,24 +276,31 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 			EffectiveSigningJSON:   string(effectiveSigningJSON),
 		})
 	}
-	for _, digest := range pooled {
-		object, err := store.GetPackageObject(ctx, digest)
-		if err != nil {
-			return 0, err
-		}
-		if err := promotePendingObject(ctx, root, repoName, object); err != nil {
-			return 0, err
-		}
-		if err := callFault(fault, "build.payload."+digest); err != nil {
-			return 0, err
-		}
+	if err := recordBuildProgress(ctx, store, operationID, "promoting_payload", 0, len(pooled), 1); err != nil {
+		return 0, err
+	}
+	pooledObjects, err := pendingObjectsForBuildPlan(ctx, store, pooled)
+	if err != nil {
+		return 0, err
+	}
+	if err := promotePendingObjects(ctx, root, repoName, pooledObjects, fault); err != nil {
+		return 0, err
+	}
+	if err := recordBuildProgress(ctx, store, operationID, "promoting_payload", len(pooled), len(pooled), 1); err != nil {
+		return 0, err
 	}
 	exchanger := yumrepo.NativeDirectoryExchanger{}
-	for _, dist := range buildDists {
+	if err := recordBuildProgress(ctx, store, operationID, "publishing_dists", 0, len(buildDists), jobs); err != nil {
+		return 0, err
+	}
+	for distIndex, dist := range buildDists {
 		live := filepath.Join(root, repoName, "dists", dist.Name)
 		staged := filepath.Join(buildRoot, "dists", dist.Name)
 		liveDigest, _, liveErr := digestTree(ctx, live)
 		if liveErr == nil && liveDigest == dist.TreeSHA256 {
+			if err := recordBuildProgress(ctx, store, operationID, "publishing_dists", distIndex+1, len(buildDists), jobs); err != nil {
+				return 0, err
+			}
 			continue
 		}
 		stagedDigest, _, stagedErr := digestTree(ctx, staged)
@@ -312,6 +322,12 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 		if err := callFault(fault, "build.pointer."+dist.Name); err != nil {
 			return 0, err
 		}
+		if err := recordBuildProgress(ctx, store, operationID, "publishing_dists", distIndex+1, len(buildDists), jobs); err != nil {
+			return 0, err
+		}
+	}
+	if err := recordBuildProgress(ctx, store, operationID, "normalizing_public_tree", 0, 1, jobs); err != nil {
+		return 0, err
 	}
 	targetManifest, normalizedModes, err := normalizeManagedPublicTree(ctx, filepath.Join(root, repoName), fault, "build.mode")
 	if err != nil {
@@ -323,12 +339,18 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	if err := callFault(fault, "build.modes"); err != nil {
 		return 0, err
 	}
+	if err := recordBuildProgress(ctx, store, operationID, "normalizing_public_tree", 1, 1, jobs); err != nil {
+		return 0, err
+	}
 	if operation.State != state.OperationBuilt {
 		if err := store.SetOperationState(ctx, operationID, state.OperationBuilt, ""); err != nil {
 			return 0, err
 		}
 	}
 	if err := callFault(fault, "build.built"); err != nil {
+		return 0, err
+	}
+	if err := recordBuildProgress(ctx, store, operationID, "finalizing", 0, 1, jobs); err != nil {
 		return 0, err
 	}
 	changes := state.DiffManifests(baseManifest, targetManifest)
@@ -353,7 +375,7 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	return generation, nil
 }
 
-func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, generation state.GenerationID, publicationTime time.Time, buildRoot string, store *state.Store, jobs int, fault func(string) error, preflight *mutationBuildPreflight) (buildDists []mutationBuildDist, pooled []string, retainedRPMKeys []state.RPMSigningKey, resultErr error) {
+func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, generation state.GenerationID, publicationTime time.Time, buildRoot, operationID string, store *state.Store, jobs int, fault func(string) error, preflight *mutationBuildPreflight) (buildDists []mutationBuildDist, pooled []string, retainedRPMKeys []state.RPMSigningKey, resultErr error) {
 	// A build plan is journaled only after every Dist has rendered and synced.
 	// Therefore an existing build root while manifest.Build is still nil is
 	// necessarily an incomplete prior attempt (ordinary error or process
@@ -371,20 +393,21 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 		return nil, nil, nil, err
 	}
 	distStates := make(map[string]state.Dist, len(distNames))
-	distObjects := make(map[string][]state.PackageObject, len(distNames))
 	allSourcesBySHA := map[string]ManagedPackageSource{}
 	rpmObjectsBySHA := map[string]state.PackageObject{}
 	wantRPM, wantDEB := false, false
+	selectedObjects, err := store.ListPackageObjects(ctx, distNames, false)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	distObjects := packageObjectsByDist(selectedObjects, distNames, false)
 	for _, distName := range distNames {
 		distState, err := store.GetDist(ctx, distName)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		objects, err := store.ListPackageObjects(ctx, []string{distName}, false)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		distStates[distName], distObjects[distName] = distState, objects
+		objects := distObjects[distName]
+		distStates[distName] = distState
 		for _, object := range objects {
 			if _, exists := allSourcesBySHA[object.SHA256]; exists {
 				continue
@@ -404,10 +427,7 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 			wantDEB = true
 		}
 	}
-	var (
-		metadataSnapshot metadataSignerSnapshot
-		err              error
-	)
+	var metadataSnapshot metadataSignerSnapshot
 	rpmPolicy := rpmSigningPolicy{mode: "never"}
 	if preflight != nil {
 		if preflight.generation != generation || !preflight.publicationTime.Equal(publicationTime) || !sameStringSet(preflight.distNames, distNames) {
@@ -448,7 +468,7 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 	defer func() { resultErr = errors.Join(resultErr, pendingGuard.Close()) }()
 	buildDists = make([]mutationBuildDist, 0, len(distNames))
 	pooledSet := map[string]struct{}{}
-	for _, distName := range distNames {
+	for distIndex, distName := range distNames {
 		distState, objects := distStates[distName], distObjects[distName]
 		frozenSigning, err := frozenEffectiveSigningForFormats(cfg.Repositories[repoName].Signing, rpmPolicy, metadataSnapshot, distState.Format == "rpm", distState.Format == "deb")
 		if err != nil {
@@ -456,10 +476,7 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 		}
 		sources := make([]ManagedPackageSource, 0, len(objects))
 		for _, object := range objects {
-			source, err := availableManagedPackageSource(root, repoName, object)
-			if err != nil {
-				return nil, nil, nil, err
-			}
+			source := allSourcesBySHA[object.SHA256]
 			sources = append(sources, source)
 			if object.Storage == "pending" {
 				pooledSet[object.SHA256] = struct{}{}
@@ -508,6 +525,9 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 		if err := callFault(fault, "build.rendered."+distName); err != nil {
 			return nil, nil, nil, err
 		}
+		if err := recordBuildProgress(ctx, store, operationID, "rendering", distIndex+1, len(distNames), jobs); err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	pooled = make([]string, 0, len(pooledSet))
 	for digest := range pooledSet {
@@ -519,6 +539,48 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 		return nil, nil, nil, fmt.Errorf("%w: staged build differs from its signer-frozen preflight", ErrIntegrity)
 	}
 	return buildDists, pooled, retainedRPMKeys, nil
+}
+
+// packageObjectsByDist regroups one bulk projection into the per-Dist slices a
+// caller would otherwise obtain with one query per Dist. Relative order inside
+// every group is the bulk query's order, so each group equals its own query.
+//
+// built must match the membership table the objects were listed from:
+// ListPackageObjects(ctx, dists, false) projects Desired Membership into Dists,
+// and ListPackageObjects(ctx, dists, true) projects Built Membership into
+// BuiltDists. Grouping a Built listing by Desired Membership silently returns
+// the wrong objects, so the selector is explicit rather than inferred.
+// Prior-Built listings have no reverse projection and cannot be grouped here.
+func packageObjectsByDist(objects []state.PackageObject, distNames []string, built bool) map[string][]state.PackageObject {
+	selected := make(map[string]struct{}, len(distNames))
+	result := make(map[string][]state.PackageObject, len(distNames))
+	for _, distName := range distNames {
+		selected[distName] = struct{}{}
+		result[distName] = []state.PackageObject{}
+	}
+	for _, object := range objects {
+		memberships := object.Dists
+		if built {
+			memberships = object.BuiltDists
+		}
+		for _, distName := range memberships {
+			if _, wanted := selected[distName]; wanted {
+				result[distName] = append(result[distName], object)
+			}
+		}
+	}
+	return result
+}
+
+func recordBuildProgress(ctx context.Context, store *state.Store, operationID, phase string, completed, total, jobs int) error {
+	detail, err := json.Marshal(map[string]any{
+		"version": 1, "kind": "build_progress", "phase": phase,
+		"completed": completed, "total": total, "jobs": jobs,
+	})
+	if err != nil {
+		return err
+	}
+	return store.RecordOperationProgress(ctx, operationID, string(detail))
 }
 
 // validateBuildRPMSigning enforces the active package-signing policy only for
@@ -836,32 +898,263 @@ func availableManagedPackageSource(root, repoName string, object state.PackageOb
 	return ManagedPackageSource{}, fmt.Errorf("%w: package object %s is missing", ErrIntegrity, object.SHA256)
 }
 
-func promotePendingObject(ctx context.Context, root, repoName string, object state.PackageObject) error {
+const (
+	pendingPromotionBatchObjects = 512
+	pendingPromotionBatchBytes   = int64(1 << 30)
+	// managedPayloadFileMode is the one mode an immutable payload ever holds.
+	// Ingest already writes it below the private 0700 pending directory so that
+	// promotion is a pure namespace operation: no chmod, and therefore no
+	// per-object inode fsync between the pending name and the public Pool name.
+	//
+	// Promotion's elided fsync is only sound because installPendingObject
+	// fsyncs the payload before its pending name becomes durable. The pending
+	// and Pool names are the same inode, so a pending name created without that
+	// barrier would let promotion publish non-durable bytes and then unlink the
+	// only other name. Any future writer into the pending store must keep that
+	// contract; see TestPendingObjectsAreIngestedPromotionReady.
+	managedPayloadFileMode = os.FileMode(0o644)
+	// managedPendingDirectoryMode keeps the pending store private even though
+	// its payload files already carry their final public mode.
+	managedPendingDirectoryMode = os.FileMode(0o700)
+	managedPublicDirectoryMode  = os.FileMode(0o755)
+)
+
+type pendingObjectPreparation struct {
+	barriers       []string
+	sourceIdentity *rootedRegularIdentity
+	targetIdentity rootedRegularIdentity
+}
+
+// preparePendingObject makes the public Pool name exact and captures the
+// authenticated identities that cleanup must rebind. It does not remove the
+// already-durable pending name; the caller first group-syncs every barrier.
+func preparePendingObject(ctx context.Context, root, repoName string, object state.PackageObject) (pendingObjectPreparation, error) {
 	sourceRelative := filepath.Join(".sow", repoName, "pending", object.SHA256)
 	targetRelative := filepath.Join(repoName, filepath.FromSlash(object.PoolPath))
+	targetParent := filepath.Dir(targetRelative)
 	targetSource := ManagedPackageSource{Object: object, Owner: root, Relative: targetRelative, Path: filepath.Join(root, targetRelative)}
 	if opened, err := targetSource.open(); err == nil {
 		digest, hashErr := hashOpenedFileContext(ctx, opened.file)
-		modeErr := errors.Join(opened.file.Chmod(0o644), opened.file.Sync())
-		verifyErr := opened.CloseVerified()
-		if hashErr != nil || modeErr != nil || verifyErr != nil || digest != object.SHA256 {
-			return fmt.Errorf("%w: public Pool object checksum mismatch", ErrIntegrity)
+		var modeErr error
+		if opened.before.Mode().Perm() != managedPayloadFileMode.Perm() {
+			modeErr = errors.Join(opened.file.Chmod(managedPayloadFileMode), opened.file.Sync())
 		}
-		return removeRootedRegular(root, sourceRelative, object.Size)
+		targetIdentity, identityErr := snapshotRootedRegularIdentity(opened)
+		verifyErr := opened.CloseVerified()
+		if hashErr != nil || modeErr != nil || identityErr != nil || verifyErr != nil || digest != object.SHA256 || !targetIdentity.valid(object.Size) {
+			return pendingObjectPreparation{}, fmt.Errorf("%w: public Pool object checksum mismatch", ErrIntegrity)
+		}
+		barriers, barrierErr := rootedDirectoryBarrierChain(targetParent)
+		if barrierErr != nil {
+			return pendingObjectPreparation{}, barrierErr
+		}
+		preparation := pendingObjectPreparation{barriers: barriers, targetIdentity: targetIdentity}
+		pendingSource := ManagedPackageSource{Object: object, Owner: root, Relative: sourceRelative, Path: filepath.Join(root, sourceRelative)}
+		pendingOpened, pendingErr := pendingSource.open()
+		if errors.Is(pendingErr, os.ErrNotExist) {
+			return preparation, nil
+		}
+		if pendingErr != nil {
+			return preparation, fmt.Errorf("%w: pending object %s is unsafe during replay: %v", ErrIntegrity, object.SHA256, pendingErr)
+		}
+		sourceIdentity, sourceIdentityErr := snapshotRootedRegularIdentity(pendingOpened)
+		var sourceHashErr error
+		if sourceIdentityErr == nil && !sourceIdentity.sameInode(targetIdentity) {
+			var sourceDigest string
+			sourceDigest, sourceHashErr = hashOpenedFileContext(ctx, pendingOpened.file)
+			if sourceHashErr == nil && sourceDigest != object.SHA256 {
+				sourceHashErr = errors.New("pending digest differs from journal")
+			}
+		}
+		pendingVerifyErr := pendingOpened.CloseVerified()
+		if sourceIdentityErr != nil || sourceHashErr != nil || pendingVerifyErr != nil || !sourceIdentity.valid(object.Size) {
+			return preparation, fmt.Errorf("%w: pending object %s differs during replay", ErrIntegrity, object.SHA256)
+		}
+		preparation.sourceIdentity = &sourceIdentity
+		// A previous attempt may have linked the target without reaching its
+		// directory barrier. Syncing its parent again is cheap and makes replay
+		// independent of how that attempt stopped.
+		return preparation, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("%w: public Pool path conflicts for %s: %v", ErrIntegrity, object.SHA256, err)
+		return pendingObjectPreparation{}, fmt.Errorf("%w: public Pool path conflicts for %s: %v", ErrIntegrity, object.SHA256, err)
 	}
-	source := ManagedPackageSource{Object: object, Owner: root, Relative: sourceRelative, Path: filepath.Join(root, sourceRelative)}
-	opened, err := source.open()
+	barriers, targetIdentity, err := linkRootedRegularDeferredTargetSync(ctx, root, sourceRelative, targetRelative, object.Size, object.SHA256, managedPayloadFileMode, managedPublicDirectoryMode)
+	preparation := pendingObjectPreparation{barriers: barriers, targetIdentity: targetIdentity}
+	if err == nil {
+		sourceIdentity := targetIdentity
+		preparation.sourceIdentity = &sourceIdentity
+	}
+	return preparation, err
+}
+
+func pendingObjectsForBuildPlan(ctx context.Context, store *state.Store, digests []string) ([]state.PackageObject, error) {
+	pending, err := store.ListPendingPackageObjects(ctx)
 	if err != nil {
+		return nil, err
+	}
+	byDigest := make(map[string]state.PackageObject, len(pending))
+	for _, object := range pending {
+		byDigest[object.SHA256] = object
+	}
+	result := make([]state.PackageObject, len(digests))
+	for index, digest := range digests {
+		object, exists := byDigest[digest]
+		if !exists {
+			return nil, fmt.Errorf("%w: mutation pooled package %s is absent from pending state", ErrIntegrity, digest)
+		}
+		result[index] = object
+	}
+	return result, nil
+}
+
+// promotePendingObjects is intentionally a single-writer group commit. Pending
+// bytes and names are durable before this phase begins. Each bounded batch first
+// creates every Pool link, persists each distinct target parent, then removes
+// the pending names and persists their one shared directory. A crash therefore
+// leaves pending-only, exact dual-link, or Pool-only state, all bound to the
+// operation journal; it can never durably lose both names.
+func promotePendingObjects(ctx context.Context, root, repoName string, objects []state.PackageObject, fault func(string) error) error {
+	if ctx == nil {
+		return errors.New("managed: nil payload promotion context")
+	}
+	for start := 0; start < len(objects); {
+		end := pendingPromotionBatchEnd(objects, start)
+		if err := promotePendingBatch(ctx, root, repoName, objects[start:end], fault); err != nil {
+			return err
+		}
+		start = end
+	}
+	return ctx.Err()
+}
+
+func pendingPromotionBatchEnd(objects []state.PackageObject, start int) int {
+	end := start
+	var bytes int64
+	for end < len(objects) && end-start < pendingPromotionBatchObjects {
+		size := objects[end].Size
+		if size < 0 {
+			size = 0
+		}
+		if end > start && (bytes >= pendingPromotionBatchBytes || size > pendingPromotionBatchBytes-bytes) {
+			break
+		}
+		if size >= pendingPromotionBatchBytes-bytes {
+			bytes = pendingPromotionBatchBytes
+		} else {
+			bytes += size
+		}
+		end++
+	}
+	if end == start && start < len(objects) {
+		return start + 1
+	}
+	return end
+}
+
+func promotePendingBatch(ctx context.Context, root, repoName string, objects []state.PackageObject, fault func(string) error) error {
+	targetParents := make(map[string]struct{}, len(objects))
+	preparations := make([]pendingObjectPreparation, 0, len(objects))
+	var prepareErr error
+	for _, object := range objects {
+		if err := ctx.Err(); err != nil {
+			prepareErr = err
+			break
+		}
+		preparation, err := preparePendingObject(ctx, root, repoName, object)
+		for _, parent := range preparation.barriers {
+			targetParents[parent] = struct{}{}
+		}
+		if err != nil {
+			prepareErr = fmt.Errorf("prepare pending object %s: %w", object.SHA256, err)
+			break
+		}
+		preparations = append(preparations, preparation)
+		if err := callFault(fault, "build.payload-linked."+object.SHA256); err != nil {
+			prepareErr = err
+			break
+		}
+	}
+	targetSyncErr := syncPromotionTargetParents(root, targetParents)
+	if prepareErr != nil || targetSyncErr != nil {
+		// No pending name has been removed, so even a failed target barrier leaves
+		// every object recoverable from its already-durable source.
+		return errors.Join(prepareErr, targetSyncErr)
+	}
+	if err := callFault(fault, "build.payload-targets"); err != nil {
 		return err
 	}
-	digest, hashErr := hashOpenedFileContext(ctx, opened.file)
-	verifyErr := opened.CloseVerified()
-	if hashErr != nil || verifyErr != nil || digest != object.SHA256 {
-		return fmt.Errorf("%w: pending object %s checksum mismatch", ErrIntegrity, object.SHA256)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return renameRootedRegular(ctx, root, sourceRelative, targetRelative, object.Size, object.SHA256, 0o644, 0o755)
+	pendingParent := filepath.Join(".sow", repoName, "pending")
+	var cleanupErr error
+	for index, object := range objects {
+		if err := ctx.Err(); err != nil {
+			cleanupErr = err
+			break
+		}
+		preparation := preparations[index]
+		if err := removeRootedRegularBoundToTarget(
+			root,
+			filepath.Join(pendingParent, object.SHA256),
+			filepath.Join(repoName, filepath.FromSlash(object.PoolPath)),
+			preparation.sourceIdentity,
+			preparation.targetIdentity,
+			object.Size,
+		); err != nil {
+			cleanupErr = fmt.Errorf("remove promoted pending object %s: %w", object.SHA256, err)
+			break
+		}
+		if err := callFault(fault, "build.payload."+object.SHA256); err != nil {
+			cleanupErr = err
+			break
+		}
+	}
+	return errors.Join(cleanupErr, syncRootedDirectory(root, pendingParent))
+}
+
+func syncPromotionTargetParents(root string, parents map[string]struct{}) error {
+	ordered := make([]string, 0, len(parents))
+	for parent := range parents {
+		ordered = append(ordered, parent)
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		leftDepth, rightDepth := rootedDirectoryDepth(ordered[i]), rootedDirectoryDepth(ordered[j])
+		if leftDepth != rightDepth {
+			return leftDepth > rightDepth
+		}
+		return ordered[i] < ordered[j]
+	})
+	// Persist leaf contents before the parent entries that make those leaves
+	// reachable. Pending names remain untouched until the complete ordered set
+	// succeeds, so a partial barrier is always replayable.
+	for _, parent := range ordered {
+		if err := syncRootedDirectory(root, parent); err != nil {
+			return fmt.Errorf("sync promoted target directory %s: %w", parent, err)
+		}
+	}
+	return nil
+}
+
+func rootedDirectoryBarrierChain(relative string) ([]string, error) {
+	components, err := rootedPathComponents(relative, true)
+	if err != nil {
+		return nil, err
+	}
+	barriers := make([]string, 1, len(components)+1)
+	barriers[0] = "."
+	for index := range components {
+		barriers = append(barriers, filepath.Join(components[:index+1]...))
+	}
+	return barriers, nil
+}
+
+func rootedDirectoryDepth(relative string) int {
+	clean := filepath.Clean(relative)
+	if clean == "." {
+		return 0
+	}
+	return len(strings.Split(clean, string(filepath.Separator)))
 }
 
 // normalizeManagedPublicTree authenticates the complete public byte tree while

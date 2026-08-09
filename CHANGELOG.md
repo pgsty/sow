@@ -2,6 +2,39 @@
 
 All notable changes to SOW are recorded here.
 
+## Unreleased
+
+- Added repository schema v9, which indexes every membership table by
+  `package_sha256`. Managed builds and checks now expand Desired and Built
+  Membership with one bulk projection instead of one query per object: listing
+  a 5,000-object Dist drops from about 4.1 s to about 33 ms, and 50,000 objects
+  complete in well under a second where they previously did not finish.
+  Migration is automatic on the first write operation; until it runs, a v8
+  repository is not readable by the read-only status path, and a migrated v9
+  repository cannot be opened by SOW 0.2.0 or earlier.
+- Replaced per-object payload promotion with a bounded single-writer group
+  commit. Each batch creates every public Pool link, persists the distinct
+  target directories, then removes the pending names and persists their shared
+  directory, so a crash leaves pending-only, exact dual-link, or Pool-only
+  state and can never durably lose both names. Recovery accepts the dual-link
+  window that this makes reachable.
+- Fixed payload publication to persist the target directory entry before
+  unlinking the source name, instead of relying on the filesystem to order the
+  two metadata operations implicitly.
+- Added structured `build_progress` operation events for the rendering,
+  payload-promotion, Dist-publication, normalization, and finalization phases,
+  observable through the operation log. Progress records no longer checkpoint,
+  so telemetry can neither slow nor fail an otherwise complete build.
+- Changed pending payload files to their final `0644` mode at ingest, keeping
+  them private through the enclosing `0700` pending directory rather than
+  through the file mode. Promotion is therefore a pure namespace operation.
+  Existing `0600` pending files remain valid and are normalized on promotion.
+- Reduced the pending source guard from holding one descriptor per pending
+  object for the whole build to an identity snapshot that is rebound when the
+  build ends. This keeps descriptor use bounded at repository scale; it still
+  detects persistent path replacement and external hardlinks, but no longer
+  claims to defeat a same-user replace-and-restore during a build.
+
 ## 0.2.0 - 2026-08-08
 
 - Added plain RPM and DEB repository generation compatible with supported

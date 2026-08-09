@@ -38,6 +38,56 @@ type rootedCreatedRegular struct {
 	done   bool
 }
 
+// rootedRegularIdentity is a metadata snapshot taken only after a file's
+// content has been authenticated. It lets a later namespace step reject path
+// replacement without re-hashing large immutable payloads.
+type rootedRegularIdentity struct {
+	device      uint64
+	inode       uint64
+	size        int64
+	modUnixNano int64
+	mode        os.FileMode
+}
+
+func newRootedRegularIdentity(info os.FileInfo, raw unix.Stat_t) rootedRegularIdentity {
+	if info == nil {
+		return rootedRegularIdentity{}
+	}
+	return rootedRegularIdentity{
+		device: uint64(raw.Dev), inode: uint64(raw.Ino), size: raw.Size,
+		modUnixNano: info.ModTime().UnixNano(), mode: info.Mode().Perm(),
+	}
+}
+
+func (identity rootedRegularIdentity) valid(expectedSize int64) bool {
+	return identity.inode != 0 && identity.size >= 0 && identity.size == expectedSize
+}
+
+func (identity rootedRegularIdentity) matchesInfo(info os.FileInfo, raw unix.Stat_t) bool {
+	return info != nil && info.Mode().IsRegular() && info.Size() == identity.size && info.ModTime().UnixNano() == identity.modUnixNano && identity.matchesStat(raw)
+}
+
+func (identity rootedRegularIdentity) matchesStat(raw unix.Stat_t) bool {
+	return uint32(raw.Mode)&unix.S_IFMT == unix.S_IFREG && uint64(raw.Dev) == identity.device && uint64(raw.Ino) == identity.inode && raw.Size == identity.size && os.FileMode(raw.Mode).Perm() == identity.mode
+}
+
+func (identity rootedRegularIdentity) sameInode(other rootedRegularIdentity) bool {
+	return identity.device == other.device && identity.inode == other.inode
+}
+
+func snapshotRootedRegularIdentity(opened *rootedRegularFile) (rootedRegularIdentity, error) {
+	if opened == nil || opened.file == nil {
+		return rootedRegularIdentity{}, errors.New("managed: invalid rooted identity source")
+	}
+	info, infoErr := opened.file.Stat()
+	var raw unix.Stat_t
+	statErr := unix.Fstat(int(opened.file.Fd()), &raw)
+	if infoErr != nil || statErr != nil || info == nil || !info.Mode().IsRegular() || uint32(raw.Mode)&unix.S_IFMT != unix.S_IFREG {
+		return rootedRegularIdentity{}, errors.Join(errors.New("managed: rooted identity source is not regular"), infoErr, statErr)
+	}
+	return newRootedRegularIdentity(info, raw), nil
+}
+
 type rootedDirectoryBinding struct {
 	path   string
 	before os.FileInfo
@@ -388,24 +438,39 @@ func openRootedDirectoryChain(root, relative string, create bool, mode os.FileMo
 }
 
 func openRootedDirectoryChainFromHandle(rootHandle *os.File, binding rootedDirectoryBinding, relative string, create bool, mode os.FileMode) (*rootedDirectoryChain, error) {
+	chain, _, err := openRootedDirectoryChainFromHandleMode(rootHandle, binding, relative, create, mode, true)
+	return chain, err
+}
+
+// openRootedDirectoryChainFromHandleDeferredCreateSync records every directory
+// whose inode or child entries must participate in a later group barrier. New
+// namespace state is safe before that barrier because its journaled source
+// names remain durable and untouched.
+func openRootedDirectoryChainFromHandleDeferredCreateSync(rootHandle *os.File, binding rootedDirectoryBinding, relative string, mode os.FileMode) (*rootedDirectoryChain, []string, error) {
+	return openRootedDirectoryChainFromHandleMode(rootHandle, binding, relative, true, mode, false)
+}
+
+func openRootedDirectoryChainFromHandleMode(rootHandle *os.File, binding rootedDirectoryBinding, relative string, create bool, mode os.FileMode, syncCreated bool) (*rootedDirectoryChain, []string, error) {
 	components, err := rootedPathComponents(relative, true)
 	if err != nil {
 		_ = rootHandle.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	chain := &rootedDirectoryChain{binding: binding, directories: []*os.File{rootHandle}, components: components}
-	closeOnError := func(result error) (*rootedDirectoryChain, error) {
-		return nil, errors.Join(result, chain.close(false))
+	barriers := []string{}
+	closeOnError := func(result error) (*rootedDirectoryChain, []string, error) {
+		return nil, barriers, errors.Join(result, chain.close(false))
 	}
 	for index, component := range components {
 		parent := chain.directories[len(chain.directories)-1]
 		fd, openErr := unix.Openat(int(parent.Fd()), component, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
 		created := false
 		if errors.Is(openErr, unix.ENOENT) && create {
-			if mkdirErr := unix.Mkdirat(int(parent.Fd()), component, uint32(mode.Perm())); mkdirErr != nil {
+			mkdirErr := unix.Mkdirat(int(parent.Fd()), component, uint32(mode.Perm()))
+			if mkdirErr != nil && !errors.Is(mkdirErr, unix.EEXIST) {
 				return closeOnError(fmt.Errorf("managed: create rooted directory: %w", mkdirErr))
 			}
-			created = true
+			created = mkdirErr == nil
 			fd, openErr = unix.Openat(int(parent.Fd()), component, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
 		}
 		if openErr != nil {
@@ -419,10 +484,33 @@ func openRootedDirectoryChainFromHandle(rootHandle *os.File, binding rootedDirec
 			_ = child.Close()
 			return closeOnError(errors.New("managed: rooted directory changed while opening"))
 		}
+		if create && !syncCreated {
+			// A directory that already exists may have been created by an earlier
+			// attempt that stopped before its barrier. Re-sync the complete chain,
+			// not only entries created in this process, so replay can safely remove
+			// the last durable pending name after the group barrier.
+			childRelative := filepath.Join(components[:index+1]...)
+			parentRelative := filepath.Join(components[:index]...)
+			if parentRelative == "" {
+				parentRelative = "."
+			}
+			barriers = append(barriers, childRelative, parentRelative)
+		}
 		if create {
-			modeErr := errors.Join(child.Chmod(mode), child.Sync())
+			var modeErr error
+			if created || os.FileMode(openedRaw.Mode).Perm() != mode.Perm() {
+				modeErr = child.Chmod(mode)
+			}
+			// The ordinary helper preserves its historical conservative contract:
+			// every opened ancestor participates in the durability barrier. Only the
+			// explicitly deferred group-commit variant postpones these syncs.
+			if syncCreated {
+				modeErr = errors.Join(modeErr, child.Sync())
+			}
 			if created {
-				modeErr = errors.Join(modeErr, parent.Sync())
+				if syncCreated {
+					modeErr = errors.Join(modeErr, parent.Sync())
+				}
 			}
 			if modeErr != nil {
 				_ = child.Close()
@@ -431,7 +519,7 @@ func openRootedDirectoryChainFromHandle(rootHandle *os.File, binding rootedDirec
 		}
 		chain.directories = append(chain.directories, child)
 	}
-	return chain, nil
+	return chain, barriers, nil
 }
 
 func duplicateRootedDirectoryChainRoot(chain *rootedDirectoryChain) (*os.File, rootedDirectoryBinding, error) {
@@ -545,7 +633,7 @@ func renameRootedRegular(ctx context.Context, root, sourceRelative, targetRelati
 	if err != nil || digest != expectedSHA {
 		return closeFile(errors.Join(errors.New("managed: rooted rename source digest differs"), err))
 	}
-	if err := errors.Join(file.Sync(), sourceParent.verify(), targetParent.verify()); err != nil {
+	if err := errors.Join(sourceParent.verify(), targetParent.verify()); err != nil {
 		return closeFile(err)
 	}
 	linkErr := unix.Linkat(int(sourceParent.directory().Fd()), sourceName, int(targetParent.directory().Fd()), targetName, 0)
@@ -576,6 +664,12 @@ func renameRootedRegular(ctx context.Context, root, sourceRelative, targetRelati
 	if sourceErr != nil || sourceBeforeUnlink.Dev != before.Dev || sourceBeforeUnlink.Ino != before.Ino || sourceBeforeUnlink.Size != before.Size || uint32(sourceBeforeUnlink.Mode)&unix.S_IFMT != unix.S_IFREG {
 		return closeFile(errors.Join(errors.New("managed: rooted rename source changed before unlink"), sourceErr))
 	}
+	// The one file Sync above makes both content and final mode durable. Persist
+	// the target link before removing the source link, then persist the source
+	// removal. This ordering cannot durably lose both names.
+	if err := targetParent.directory().Sync(); err != nil {
+		return closeFile(err)
+	}
 	if err := unix.Unlinkat(int(sourceParent.directory().Fd()), sourceName, 0); err != nil {
 		return closeFile(err)
 	}
@@ -585,7 +679,7 @@ func renameRootedRegular(ctx context.Context, root, sourceRelative, targetRelati
 	if !errors.Is(sourceErr, unix.ENOENT) || targetErr != nil || targetRaw.Dev != before.Dev || targetRaw.Ino != before.Ino {
 		return closeFile(errors.Join(errors.New("managed: rooted rename final entries are inconsistent"), sourceErr, targetErr))
 	}
-	return closeFile(errors.Join(file.Sync(), sourceParent.directory().Sync(), targetParent.directory().Sync()))
+	return closeFile(sourceParent.directory().Sync())
 }
 
 func hashRegularDescriptor(ctx context.Context, file *os.File) (string, error) {
@@ -600,6 +694,143 @@ func hashRegularDescriptor(ctx context.Context, file *os.File) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// linkRootedRegularDeferredTargetSync creates and authenticates one hardlink
+// without persisting the target directory entry. It is restricted to a
+// journaled group-commit caller that keeps the already-durable source name
+// until syncRootedDirectory has persisted every target parent in the batch.
+// The returned relative directories are the barriers the caller must sync.
+func linkRootedRegularDeferredTargetSync(ctx context.Context, root, sourceRelative, targetRelative string, expectedSize int64, expectedSHA string, fileMode, directoryMode os.FileMode) ([]string, rootedRegularIdentity, error) {
+	if ctx == nil || expectedSize < 0 || !lowercaseSHA256.MatchString(expectedSHA) {
+		return nil, rootedRegularIdentity{}, errors.New("managed: invalid deferred rooted link identity")
+	}
+	sourceComponents, err := rootedPathComponents(sourceRelative, false)
+	if err != nil {
+		return nil, rootedRegularIdentity{}, err
+	}
+	targetComponents, err := rootedPathComponents(targetRelative, false)
+	if err != nil {
+		return nil, rootedRegularIdentity{}, err
+	}
+	targetParentRelative := filepath.Join(targetComponents[:len(targetComponents)-1]...)
+	if targetParentRelative == "" {
+		targetParentRelative = "."
+	}
+	sourceParent, err := openRootedDirectoryChain(root, filepath.Join(sourceComponents[:len(sourceComponents)-1]...), false, directoryMode)
+	if err != nil {
+		return nil, rootedRegularIdentity{}, err
+	}
+	targetRootHandle, targetRootBinding, err := duplicateRootedDirectoryChainRoot(sourceParent)
+	if err != nil {
+		return nil, rootedRegularIdentity{}, errors.Join(err, sourceParent.close(true))
+	}
+	targetParent, barriers, err := openRootedDirectoryChainFromHandleDeferredCreateSync(targetRootHandle, targetRootBinding, targetParentRelative, directoryMode)
+	if err != nil {
+		return barriers, rootedRegularIdentity{}, errors.Join(err, sourceParent.close(true))
+	}
+	barriers = append(barriers, targetParentRelative)
+	identity := rootedRegularIdentity{}
+	finish := func(result error) ([]string, rootedRegularIdentity, error) {
+		return barriers, identity, errors.Join(result, targetParent.close(true), sourceParent.close(true))
+	}
+	if err := errors.Join(sourceParent.verify(), targetParent.verify()); err != nil {
+		return finish(err)
+	}
+	sourceName := sourceComponents[len(sourceComponents)-1]
+	targetName := targetComponents[len(targetComponents)-1]
+	fd, err := unix.Openat(int(sourceParent.directory().Fd()), sourceName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return finish(err)
+	}
+	file := os.NewFile(uintptr(fd), sourceName)
+	closeFile := func(result error) ([]string, rootedRegularIdentity, error) {
+		return finish(errors.Join(result, file.Close()))
+	}
+	beforeInfo, infoErr := file.Stat()
+	var before, sourceEntry unix.Stat_t
+	statErr := unix.Fstat(fd, &before)
+	entryErr := unix.Fstatat(int(sourceParent.directory().Fd()), sourceName, &sourceEntry, unix.AT_SYMLINK_NOFOLLOW)
+	if infoErr != nil || statErr != nil || entryErr != nil || !beforeInfo.Mode().IsRegular() || before.Size != expectedSize ||
+		sourceEntry.Dev != before.Dev || sourceEntry.Ino != before.Ino || sourceEntry.Size != before.Size || uint32(sourceEntry.Mode)&unix.S_IFMT != unix.S_IFREG {
+		return closeFile(errors.Join(errors.New("managed: deferred rooted link source is not the expected regular file"), infoErr, statErr, entryErr))
+	}
+	if err := errors.Join(sourceParent.verify(), targetParent.verify()); err != nil {
+		return closeFile(err)
+	}
+	digest, hashErr := hashRegularDescriptor(ctx, file)
+	if hashErr != nil || digest != expectedSHA {
+		return closeFile(errors.Join(errors.New("managed: deferred rooted link source digest differs"), hashErr))
+	}
+	var authenticated, authenticatedEntry unix.Stat_t
+	authenticatedInfo, authenticatedInfoErr := file.Stat()
+	authenticatedErr := unix.Fstat(fd, &authenticated)
+	authenticatedEntryErr := unix.Fstatat(int(sourceParent.directory().Fd()), sourceName, &authenticatedEntry, unix.AT_SYMLINK_NOFOLLOW)
+	if authenticatedInfoErr != nil || authenticatedErr != nil || authenticatedEntryErr != nil || !authenticatedInfo.Mode().IsRegular() ||
+		!authenticatedInfo.ModTime().Equal(beforeInfo.ModTime()) || authenticated.Dev != before.Dev || authenticated.Ino != before.Ino || authenticated.Size != before.Size ||
+		authenticatedEntry.Dev != before.Dev || authenticatedEntry.Ino != before.Ino || authenticatedEntry.Size != before.Size || uint32(authenticatedEntry.Mode)&unix.S_IFMT != unix.S_IFREG {
+		return closeFile(errors.Join(errors.New("managed: deferred rooted link source changed while authenticating"), authenticatedInfoErr, authenticatedErr, authenticatedEntryErr))
+	}
+	modeChanged := authenticatedInfo.Mode().Perm() != fileMode.Perm()
+	if modeChanged {
+		if err := file.Chmod(fileMode); err != nil {
+			return closeFile(err)
+		}
+	}
+	if modeChanged {
+		if err := file.Sync(); err != nil {
+			return closeFile(err)
+		}
+	}
+	var publishSource, publishEntry unix.Stat_t
+	publishInfo, publishInfoErr := file.Stat()
+	publishSourceErr := unix.Fstat(fd, &publishSource)
+	publishEntryErr := unix.Fstatat(int(sourceParent.directory().Fd()), sourceName, &publishEntry, unix.AT_SYMLINK_NOFOLLOW)
+	if publishInfoErr != nil || publishSourceErr != nil || publishEntryErr != nil || !publishInfo.Mode().IsRegular() || publishInfo.Mode().Perm() != fileMode.Perm() ||
+		!publishInfo.ModTime().Equal(beforeInfo.ModTime()) || publishSource.Dev != before.Dev || publishSource.Ino != before.Ino || publishSource.Size != before.Size ||
+		publishEntry.Dev != before.Dev || publishEntry.Ino != before.Ino || publishEntry.Size != before.Size || uint32(publishEntry.Mode)&unix.S_IFMT != unix.S_IFREG || os.FileMode(publishEntry.Mode).Perm() != fileMode.Perm() {
+		return closeFile(errors.Join(errors.New("managed: deferred rooted link source changed before publication"), publishInfoErr, publishSourceErr, publishEntryErr))
+	}
+	if err := errors.Join(sourceParent.verify(), targetParent.verify()); err != nil {
+		return closeFile(err)
+	}
+	linkErr := unix.Linkat(int(sourceParent.directory().Fd()), sourceName, int(targetParent.directory().Fd()), targetName, 0)
+	if linkErr != nil && !errors.Is(linkErr, unix.EEXIST) {
+		return closeFile(linkErr)
+	}
+	var targetRaw unix.Stat_t
+	targetErr := unix.Fstatat(int(targetParent.directory().Fd()), targetName, &targetRaw, unix.AT_SYMLINK_NOFOLLOW)
+	if targetErr != nil || targetRaw.Dev != before.Dev || targetRaw.Ino != before.Ino || targetRaw.Size != before.Size || uint32(targetRaw.Mode)&unix.S_IFMT != unix.S_IFREG {
+		var cleanupErr error
+		if linkErr == nil && targetErr == nil {
+			cleanupErr = unlinkRootedEntryIfInode(targetParent, targetName, targetRaw)
+		}
+		return closeFile(errors.Join(errors.New("managed: deferred rooted link target is not the source inode"), linkErr, targetErr, cleanupErr))
+	}
+	afterInfo, afterInfoErr := file.Stat()
+	var after, sourceAfter, targetAfter unix.Stat_t
+	afterErr := unix.Fstat(fd, &after)
+	sourceErr := unix.Fstatat(int(sourceParent.directory().Fd()), sourceName, &sourceAfter, unix.AT_SYMLINK_NOFOLLOW)
+	targetErr = unix.Fstatat(int(targetParent.directory().Fd()), targetName, &targetAfter, unix.AT_SYMLINK_NOFOLLOW)
+	if afterInfoErr != nil || afterErr != nil || sourceErr != nil || targetErr != nil || !afterInfo.Mode().IsRegular() ||
+		!afterInfo.ModTime().Equal(beforeInfo.ModTime()) || after.Dev != before.Dev || after.Ino != before.Ino || after.Size != before.Size ||
+		sourceAfter.Dev != before.Dev || sourceAfter.Ino != before.Ino || sourceAfter.Size != before.Size ||
+		targetAfter.Dev != before.Dev || targetAfter.Ino != before.Ino || targetAfter.Size != before.Size ||
+		uint32(sourceAfter.Mode)&unix.S_IFMT != unix.S_IFREG || uint32(targetAfter.Mode)&unix.S_IFMT != unix.S_IFREG ||
+		os.FileMode(sourceAfter.Mode).Perm() != fileMode.Perm() || os.FileMode(targetAfter.Mode).Perm() != fileMode.Perm() {
+		var cleanupErr error
+		if linkErr == nil && targetErr == nil {
+			cleanupErr = unlinkRootedEntryIfInode(targetParent, targetName, targetAfter)
+		}
+		return closeFile(errors.Join(errors.New("managed: deferred rooted link changed during publication"), afterInfoErr, afterErr, sourceErr, targetErr, cleanupErr))
+	}
+	// Pending content and its final mode were fsync'd before the journal reached
+	// promotion. Linkat changes namespace metadata only; the target-directory
+	// barrier commits that hardlink while the durable pending name is retained.
+	// Avoiding another per-object inode fsync is the central local single-writer
+	// performance tradeoff of this group commit.
+	identity = newRootedRegularIdentity(afterInfo, after)
+	return closeFile(errors.Join(sourceParent.verify(), targetParent.verify()))
 }
 
 // linkRootedRegular creates one no-replace hardlink between two descriptor-
@@ -706,6 +937,107 @@ func unlinkRootedEntryIfInode(parent *rootedDirectoryChain, name string, expecte
 		return errors.Join(errors.New("managed: rooted cleanup entry remains after unlink"), err)
 	}
 	return parent.directory().Sync()
+}
+
+// removeRootedRegularBoundToTarget removes an authenticated source name only
+// while both source and target still resolve to the identities captured during
+// publication. It avoids a second payload hash while preserving the rooted
+// path-replacement checks across the target barrier and pending cleanup window.
+// A nil source identity means replay already observed the pending name absent;
+// in that case the target is still rebound and verified before returning. The
+// caller must sync the shared source parent after its complete cleanup batch.
+func removeRootedRegularBoundToTarget(root, sourceRelative, targetRelative string, sourceIdentity *rootedRegularIdentity, targetIdentity rootedRegularIdentity, expectedSize int64) error {
+	if !targetIdentity.valid(expectedSize) || sourceIdentity != nil && !sourceIdentity.valid(expectedSize) {
+		return errors.New("managed: invalid rooted promotion identity")
+	}
+	sourceComponents, err := rootedPathComponents(sourceRelative, false)
+	if err != nil {
+		return err
+	}
+	targetComponents, err := rootedPathComponents(targetRelative, false)
+	if err != nil {
+		return err
+	}
+	sourceParent, err := openRootedDirectoryChain(root, filepath.Join(sourceComponents[:len(sourceComponents)-1]...), false, 0)
+	if err != nil {
+		return err
+	}
+	targetRootHandle, targetRootBinding, err := duplicateRootedDirectoryChainRoot(sourceParent)
+	if err != nil {
+		return errors.Join(err, sourceParent.close(true))
+	}
+	targetParent, err := openRootedDirectoryChainFromHandle(targetRootHandle, targetRootBinding, filepath.Join(targetComponents[:len(targetComponents)-1]...), false, 0)
+	if err != nil {
+		return errors.Join(err, sourceParent.close(true))
+	}
+	var sourceFile, targetFile *os.File
+	finish := func(result error) error {
+		if sourceFile != nil {
+			result = errors.Join(result, sourceFile.Close())
+		}
+		if targetFile != nil {
+			result = errors.Join(result, targetFile.Close())
+		}
+		return errors.Join(result, targetParent.close(true), sourceParent.close(true))
+	}
+	if err := errors.Join(sourceParent.verify(), targetParent.verify()); err != nil {
+		return finish(err)
+	}
+	sourceName := sourceComponents[len(sourceComponents)-1]
+	targetName := targetComponents[len(targetComponents)-1]
+	targetFD, err := unix.Openat(int(targetParent.directory().Fd()), targetName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return finish(err)
+	}
+	targetFile = os.NewFile(uintptr(targetFD), targetName)
+	targetInfo, targetInfoErr := targetFile.Stat()
+	var targetRaw, targetEntry unix.Stat_t
+	targetStatErr := unix.Fstat(targetFD, &targetRaw)
+	targetEntryErr := unix.Fstatat(int(targetParent.directory().Fd()), targetName, &targetEntry, unix.AT_SYMLINK_NOFOLLOW)
+	if targetInfoErr != nil || targetStatErr != nil || targetEntryErr != nil || !targetIdentity.matchesInfo(targetInfo, targetRaw) || !targetIdentity.matchesStat(targetEntry) {
+		return finish(errors.Join(errors.New("managed: promoted target changed before pending cleanup"), targetInfoErr, targetStatErr, targetEntryErr))
+	}
+	if sourceIdentity == nil {
+		var unexpected unix.Stat_t
+		if sourceErr := unix.Fstatat(int(sourceParent.directory().Fd()), sourceName, &unexpected, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(sourceErr, unix.ENOENT) {
+			return finish(errors.Join(errors.New("managed: absent pending source reappeared before cleanup"), sourceErr))
+		}
+		return finish(nil)
+	}
+	sourceFD, err := unix.Openat(int(sourceParent.directory().Fd()), sourceName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return finish(err)
+	}
+	sourceFile = os.NewFile(uintptr(sourceFD), sourceName)
+	sourceInfo, sourceInfoErr := sourceFile.Stat()
+	var sourceRaw, sourceEntry unix.Stat_t
+	sourceStatErr := unix.Fstat(sourceFD, &sourceRaw)
+	sourceEntryErr := unix.Fstatat(int(sourceParent.directory().Fd()), sourceName, &sourceEntry, unix.AT_SYMLINK_NOFOLLOW)
+	if sourceInfoErr != nil || sourceStatErr != nil || sourceEntryErr != nil || !sourceIdentity.matchesInfo(sourceInfo, sourceRaw) || !sourceIdentity.matchesStat(sourceEntry) {
+		return finish(errors.Join(errors.New("managed: pending source changed before cleanup"), sourceInfoErr, sourceStatErr, sourceEntryErr))
+	}
+	if err := errors.Join(sourceParent.verify(), targetParent.verify()); err != nil {
+		return finish(err)
+	}
+	var sourceBefore, targetBefore unix.Stat_t
+	sourceBeforeErr := unix.Fstatat(int(sourceParent.directory().Fd()), sourceName, &sourceBefore, unix.AT_SYMLINK_NOFOLLOW)
+	targetBeforeErr := unix.Fstatat(int(targetParent.directory().Fd()), targetName, &targetBefore, unix.AT_SYMLINK_NOFOLLOW)
+	if sourceBeforeErr != nil || targetBeforeErr != nil || !sourceIdentity.matchesStat(sourceBefore) || !targetIdentity.matchesStat(targetBefore) {
+		return finish(errors.Join(errors.New("managed: promotion names changed before pending unlink"), sourceBeforeErr, targetBeforeErr))
+	}
+	if err := unix.Unlinkat(int(sourceParent.directory().Fd()), sourceName, 0); err != nil {
+		return finish(err)
+	}
+	var sourceAfter, targetAfter, targetFDStat unix.Stat_t
+	sourceAfterErr := unix.Fstatat(int(sourceParent.directory().Fd()), sourceName, &sourceAfter, unix.AT_SYMLINK_NOFOLLOW)
+	targetAfterErr := unix.Fstatat(int(targetParent.directory().Fd()), targetName, &targetAfter, unix.AT_SYMLINK_NOFOLLOW)
+	targetFDErr := unix.Fstat(targetFD, &targetFDStat)
+	targetAfterInfo, targetAfterInfoErr := targetFile.Stat()
+	if !errors.Is(sourceAfterErr, unix.ENOENT) || targetAfterErr != nil || targetFDErr != nil || targetAfterInfoErr != nil ||
+		!targetIdentity.matchesStat(targetAfter) || !targetIdentity.matchesInfo(targetAfterInfo, targetFDStat) {
+		return finish(errors.Join(errors.New("managed: promotion names changed during pending unlink"), sourceAfterErr, targetAfterErr, targetFDErr, targetAfterInfoErr))
+	}
+	return finish(nil)
 }
 
 func removeRootedRegular(root, relative string, expectedSize int64) error {
@@ -1332,6 +1664,17 @@ func syncDir(path string) error {
 	chain, err := openPhysicalDirectoryChain(path)
 	if err != nil {
 		return err
+	}
+	return errors.Join(chain.directory().Sync(), chain.close(true))
+}
+
+func syncRootedDirectory(root, relative string) error {
+	chain, err := openRootedDirectoryChain(root, relative, false, 0)
+	if err != nil {
+		return err
+	}
+	if err := chain.verify(); err != nil {
+		return errors.Join(err, chain.close(false))
 	}
 	return errors.Join(chain.directory().Sync(), chain.close(true))
 }

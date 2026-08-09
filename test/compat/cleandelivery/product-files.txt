@@ -454,6 +454,7 @@ internal/v2/config/testdata/effective.golden.yaml
 internal/v2/managed/build.go
 internal/v2/managed/build_command.go
 internal/v2/managed/build_command_test.go
+internal/v2/managed/build_performance_test.go
 internal/v2/managed/build_retention_test.go
 internal/v2/managed/canonical_json.go
 internal/v2/managed/changes.go

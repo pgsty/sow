@@ -488,12 +488,14 @@ func desiredAfterRemoval(ctx context.Context, store *state.Store, distNames []st
 	}
 	desired := make(map[string][]string, len(distNames))
 	removed := []RemovedMembership{}
+	currentObjects, err := store.ListPackageObjects(ctx, distNames, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	currentByDist := packageObjectsByDist(currentObjects, distNames, false)
 	for _, distName := range distNames {
 		desired[distName] = []string{}
-		current, err := store.ListPackageObjects(ctx, []string{distName}, false)
-		if err != nil {
-			return nil, nil, err
-		}
+		current := currentByDist[distName]
 		remaining := make([]state.PackageObject, 0, len(current))
 		for _, object := range current {
 			if _, drop := remove[object.SHA256]; drop {

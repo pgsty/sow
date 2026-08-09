@@ -266,7 +266,7 @@ func TestPostTerminalCleanupFailureRetainsCommittedProjection(t *testing.T) {
 }
 
 func TestAddRecoveryConvergesAtEveryDurablePhase(t *testing.T) {
-	points := []string{"add.planned", "add.staged", "add.applied", "build.staged", "build.payload.", "build.pointer.el9", "build.built", "build.finalized"}
+	points := []string{"add.planned", "add.staged", "add.applied", "build.staged", "build.payload-linked.", "build.payload-targets", "build.payload.", "build.pointer.el9", "build.built", "build.finalized"}
 	for _, point := range points {
 		t.Run(strings.TrimSuffix(point, "."), func(t *testing.T) {
 			ctx := context.Background()
