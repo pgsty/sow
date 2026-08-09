@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	SchemaVersion            = 8
+	SchemaVersion            = 9
 	SchemaV1SHA256           = "9953cdc1f655fb03814da8b4c7a45a4a92a74e03facf03c2a45709cc860b9bc7"
 	SchemaV2SHA256           = "aea5b37365510221ab36c4f0fc9e6bc77ba825354649e1e06336b64551c14e25"
 	SchemaV3SHA256           = "9ae957e0e8d9eac21eda3929386f11d001608df5ee7feb75c44194f624f0a177"
@@ -32,6 +32,7 @@ const (
 	SchemaV6SHA256           = "7ce4382cea6379d2f893e8cd2cd7fc1310c424d4858f82fbbd666f19a18f091a"
 	SchemaV7SHA256           = "b3869aafea84722652738f2ebb352aaa10e13659ae61448f32efafc064c23ac3"
 	SchemaV8SHA256           = "79e1d22b7884dd8cf4f2bcf26d14a973c84264259e85ace0125685c8440788f5"
+	SchemaV9SHA256           = "dcbe4aa8dff14151879b48c069f161261a2f30cb6d2b7668fe0ccac2aff298ce"
 	MaxOperationPayloadBytes = 16 << 20
 )
 
@@ -58,6 +59,9 @@ var schemaV7SQL string
 
 //go:embed schema_v8.sql
 var schemaV8SQL string
+
+//go:embed schema_v9.sql
+var schemaV9SQL string
 
 var (
 	ErrSchema     = errors.New("unsupported or corrupt repository schema")
@@ -90,6 +94,9 @@ var (
 	schemaV8ContractOnce    sync.Once
 	schemaV8ContractObjects []schemaObject
 	schemaV8ContractErr     error
+	schemaV9ContractOnce    sync.Once
+	schemaV9ContractObjects []schemaObject
+	schemaV9ContractErr     error
 )
 
 // Legacy lowercase hexadecimal IDs remain readable so interrupted development
@@ -580,7 +587,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		return s.validateSchema(ctx)
 	case version > SchemaVersion:
 		return fmt.Errorf("%w: database version %d is newer than supported version %d", ErrSchema, version, SchemaVersion)
-	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7:
+	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 && version != 8:
 		return fmt.Errorf("%w: cannot migrate version %d", ErrSchema, version)
 	}
 	if version == 0 {
@@ -616,6 +623,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := validateEmbeddedSchema("v8", schemaV8SQL, SchemaV8SHA256); err != nil {
+		return err
+	}
+	if err := validateEmbeddedSchema("v9", schemaV9SQL, SchemaV9SHA256); err != nil {
 		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -695,14 +705,24 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("record schema v7: %w", err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, schemaV8SQL); err != nil {
-		return fmt.Errorf("apply schema v8: %w", err)
+	if version <= 7 {
+		if _, err := tx.ExecContext(ctx, schemaV8SQL); err != nil {
+			return fmt.Errorf("apply schema v8: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (8, ?, ?)`, SchemaV8SHA256, nowText()); err != nil {
+			return fmt.Errorf("record schema v8: %w", err)
+		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (8, ?, ?)`, SchemaV8SHA256, nowText()); err != nil {
-		return fmt.Errorf("record schema v8: %w", err)
+	if version <= 8 {
+		if _, err := tx.ExecContext(ctx, schemaV9SQL); err != nil {
+			return fmt.Errorf("apply schema v9: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (9, ?, ?)`, SchemaV9SHA256, nowText()); err != nil {
+			return fmt.Errorf("record schema v9: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit schema v8: %w", err)
+		return fmt.Errorf("commit schema v9: %w", err)
 	}
 	return s.validateSchema(ctx)
 }
@@ -753,7 +773,7 @@ func (s *Store) validateUpgradeableSchema(ctx context.Context) error {
 		return fmt.Errorf("%w: read user_version: %v", ErrSchema, err)
 	}
 	switch version {
-	case 1, 2, 3, 4, 5, 6, 7, SchemaVersion:
+	case 1, 2, 3, 4, 5, 6, 7, 8, SchemaVersion:
 		return s.validateSchemaVersion(ctx, version)
 	case 0:
 		return fmt.Errorf("%w: uninitialized database cannot be adopted", ErrSchema)
@@ -842,6 +862,12 @@ func (s *Store) validateSchemaVersion(ctx context.Context, expectedVersion int) 
 			version  int
 			checksum string
 		}{8, SchemaV8SHA256})
+	}
+	if expectedVersion >= 9 {
+		expectedMigrations = append(expectedMigrations, struct {
+			version  int
+			checksum string
+		}{9, SchemaV9SHA256})
 	}
 	if !reflectMigrations(migrations, expectedMigrations) {
 		return fmt.Errorf("%w: migration ledger does not exactly match schema v%d", ErrSchema, expectedVersion)
@@ -942,6 +968,12 @@ func expectedSchemaObjects(version int) ([]schemaObject, error) {
 			schemaV8ContractObjects, schemaV8ContractErr = buildExpectedSchemaObjects(schemaV1SQL, schemaV2SQL, schemaV3SQL, schemaV4SQL, schemaV5SQL, schemaV6SQL, schemaV7SQL, schemaV8SQL)
 		})
 		return append([]schemaObject(nil), schemaV8ContractObjects...), schemaV8ContractErr
+	}
+	if version == 9 {
+		schemaV9ContractOnce.Do(func() {
+			schemaV9ContractObjects, schemaV9ContractErr = buildExpectedSchemaObjects(schemaV1SQL, schemaV2SQL, schemaV3SQL, schemaV4SQL, schemaV5SQL, schemaV6SQL, schemaV7SQL, schemaV8SQL, schemaV9SQL)
+		})
+		return append([]schemaObject(nil), schemaV9ContractObjects...), schemaV9ContractErr
 	}
 	return nil, fmt.Errorf("unsupported schema contract version %d", version)
 }
@@ -1832,6 +1864,57 @@ func (s *Store) UpdateOperationResult(ctx context.Context, id, resultJSON string
 		return fmt.Errorf("%w: operation %q", ErrNotFound, id)
 	}
 	return s.Checkpoint(ctx)
+}
+
+// RecordOperationProgress appends an audit event without changing the durable
+// operation state. Long-running build phases use the current state plus a
+// structured detail object so observers can distinguish rendering, payload
+// promotion, pointer publication, normalization, and finalization.
+//
+// Unlike every state transition, progress deliberately does not checkpoint. It
+// advances no state machine and gates no physical decision, so a build must
+// never pay one WAL truncation per rendered Dist, and a busy checkpoint must
+// never be able to fail an otherwise complete build from pure telemetry. The
+// committed event is already durable in the WAL and the next transition folds
+// it back into the database.
+func (s *Store) RecordOperationProgress(ctx context.Context, id, detailJSON string) error {
+	if err := validateOperationPayload(detailJSON); err != nil {
+		return fmt.Errorf("invalid operation progress: %w", err)
+	}
+	var detail map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(detailJSON), &detail); err != nil || detail == nil {
+		return errors.New("operation progress must be a JSON object")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin operation %q progress: %w", id, err)
+	}
+	defer tx.Rollback()
+	var current string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM operations WHERE id = ?`, id).Scan(&current); errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: operation %q", ErrNotFound, id)
+	} else if err != nil {
+		return fmt.Errorf("read operation %q progress state: %w", id, err)
+	}
+	operationState := OperationState(current)
+	if !validOperationState(operationState) || isTerminal(operationState) {
+		return fmt.Errorf("%w: cannot record progress in state %s", ErrTransition, current)
+	}
+	var sequence int
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(max(sequence), -1) + 1 FROM operation_events WHERE operation_id = ?`, id).Scan(&sequence); err != nil {
+		return fmt.Errorf("sequence operation %q progress: %w", id, err)
+	}
+	now := nowText()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO operation_events(operation_id, sequence, state, detail_json, occurred_at) VALUES (?, ?, ?, ?, ?)`, id, sequence, current, detailJSON, now); err != nil {
+		return fmt.Errorf("record operation %q progress: %w", id, err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE operations SET updated_at = ? WHERE id = ?`, now, id); err != nil {
+		return fmt.Errorf("update operation %q progress time: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit operation %q progress: %w", id, err)
+	}
+	return nil
 }
 
 // UpdateOperationPayload durably enriches an operation before its public-file

@@ -46,6 +46,57 @@ func TestOpenMigratesAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestOpenExistingForMigrationAddsReverseMembershipIndexesToV8(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "repo.db")
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=rwc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrations := []struct {
+		schema   string
+		checksum string
+	}{
+		{schemaV1SQL, SchemaV1SHA256},
+		{schemaV2SQL, SchemaV2SHA256},
+		{schemaV3SQL, SchemaV3SHA256},
+		{schemaV4SQL, SchemaV4SHA256},
+		{schemaV5SQL, SchemaV5SHA256},
+		{schemaV6SQL, SchemaV6SHA256},
+		{schemaV7SQL, SchemaV7SHA256},
+		{schemaV8SQL, SchemaV8SHA256},
+	}
+	for index, migration := range migrations {
+		if _, err := db.Exec(migration.schema); err != nil {
+			db.Close()
+			t.Fatalf("apply fixture schema v%d: %v", index+1, err)
+		}
+		if _, err := db.Exec(`INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (?, ?, ?)`, index+1, migration.checksum, "2026-08-01T00:00:00Z"); err != nil {
+			db.Close()
+			t.Fatalf("record fixture schema v%d: %v", index+1, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenExistingForMigration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	assertSchemaV2(t, store.DB())
+	assertMembershipReverseIndexes(t, store.DB())
+}
+
+func TestMembershipReverseIndexesCoverObjectLookup(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	assertMembershipReverseIndexes(t, store.DB())
+}
+
 func TestPruneTerminalOperationsHonorsNanosecondCutoff(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "repo.db"))
@@ -1376,7 +1427,7 @@ func assertSchemaV2(t *testing.T, db *sql.DB) {
 		t.Fatalf("user_version=%d want=%d", version, SchemaVersion)
 	}
 	var migrationCount int
-	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE (version = 1 AND checksum = ?) OR (version = 2 AND checksum = ?) OR (version = 3 AND checksum = ?) OR (version = 4 AND checksum = ?) OR (version = 5 AND checksum = ?) OR (version = 6 AND checksum = ?) OR (version = 7 AND checksum = ?) OR (version = 8 AND checksum = ?)`, SchemaV1SHA256, SchemaV2SHA256, SchemaV3SHA256, SchemaV4SHA256, SchemaV5SHA256, SchemaV6SHA256, SchemaV7SHA256, SchemaV8SHA256).Scan(&migrationCount); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE (version = 1 AND checksum = ?) OR (version = 2 AND checksum = ?) OR (version = 3 AND checksum = ?) OR (version = 4 AND checksum = ?) OR (version = 5 AND checksum = ?) OR (version = 6 AND checksum = ?) OR (version = 7 AND checksum = ?) OR (version = 8 AND checksum = ?) OR (version = 9 AND checksum = ?)`, SchemaV1SHA256, SchemaV2SHA256, SchemaV3SHA256, SchemaV4SHA256, SchemaV5SHA256, SchemaV6SHA256, SchemaV7SHA256, SchemaV8SHA256, SchemaV9SHA256).Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
 	if migrationCount != SchemaVersion {
@@ -1388,5 +1439,38 @@ func assertSchemaV2(t *testing.T, db *sql.DB) {
 	}
 	if foreignKeys != 1 {
 		t.Fatalf("foreign_keys=%d", foreignKeys)
+	}
+}
+
+func assertMembershipReverseIndexes(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, test := range []struct {
+		table string
+		index string
+	}{
+		{"memberships", "memberships_package_sha256_idx"},
+		{"built_memberships", "built_memberships_package_sha256_idx"},
+		{"prior_built_memberships", "prior_built_memberships_package_sha256_idx"},
+	} {
+		rows, err := db.Query(`EXPLAIN QUERY PLAN SELECT dist_name FROM `+test.table+` WHERE package_sha256 = ?`, strings.Repeat("a", 64))
+		if err != nil {
+			t.Fatalf("explain reverse lookup on %s: %v", test.table, err)
+		}
+		used := false
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			used = used || strings.Contains(detail, test.index)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			t.Fatal(err)
+		}
+		if !used {
+			t.Errorf("reverse lookup on %s did not use %s", test.table, test.index)
+		}
 	}
 }

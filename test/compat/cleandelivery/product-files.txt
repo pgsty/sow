@@ -550,6 +550,9 @@ internal/v2/state/generation_id.go
 internal/v2/state/generation_id_test.go
 internal/v2/state/generations.go
 internal/v2/state/objects.go
+internal/v2/state/objects_benchmark_test.go
+internal/v2/state/objects_bulk_test.go
+internal/v2/state/operation_progress_test.go
 internal/v2/state/publication.go
 internal/v2/state/publication_gc.go
 internal/v2/state/publication_plan.go
@@ -565,6 +568,7 @@ internal/v2/state/schema_v5.sql
 internal/v2/state/schema_v6.sql
 internal/v2/state/schema_v7.sql
 internal/v2/state/schema_v8.sql
+internal/v2/state/schema_v9.sql
 internal/v2/state/signing_keys.go
 internal/v2/state/signing_keys_test.go
 internal/v2/state/state.go

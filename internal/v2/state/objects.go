@@ -353,6 +353,9 @@ func (s *Store) ListPriorBuiltPackageObjects(ctx context.Context, distNames []st
 }
 
 func (s *Store) listPackageObjectsByMembershipTable(ctx context.Context, distNames []string, table string) ([]PackageObject, error) {
+	if !validPackageMembershipTable(table) {
+		return nil, errors.New("list package objects: invalid membership table")
+	}
 	query := `SELECT DISTINCT p.sha256, p.format, p.coordinate, p.architecture, p.canonical_arch,
        p.pool_path, p.filename, p.size, p.name, p.source, p.version, p.epoch,
        p.release, p.kind, p.payload_sha256, p.signature_key, p.warning, p.storage,
@@ -387,15 +390,45 @@ FROM package_objects AS p`
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list package objects: %w", err)
 	}
+	dists, err := s.packageDistsForObjects(ctx, objects, "memberships")
+	if err != nil {
+		return nil, err
+	}
+	builtDists, err := s.packageDistsForObjects(ctx, objects, "built_memberships")
+	if err != nil {
+		return nil, err
+	}
 	for index := range objects {
-		objects[index].Dists, err = s.packageDists(ctx, objects[index].SHA256, false)
+		objects[index].Dists = dists[objects[index].SHA256]
+		objects[index].BuiltDists = builtDists[objects[index].SHA256]
+	}
+	return objects, nil
+}
+
+// ListPendingPackageObjects returns immutable pending object facts without
+// expanding Desired and Built Membership projections. Mutation recovery and
+// payload promotion need exactly this repository-wide set; querying it once
+// avoids a point lookup for every digest in a persisted build plan.
+//
+// The returned objects therefore carry nil Dists and nil BuiltDists rather than
+// their real membership. Callers that need either projection must use
+// ListPackageObjects instead; do not group these objects by Dist.
+func (s *Store) ListPendingPackageObjects(ctx context.Context) ([]PackageObject, error) {
+	rows, err := s.db.QueryContext(ctx, packageObjectSelect+` WHERE storage = 'pending' ORDER BY sha256`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending package objects: %w", err)
+	}
+	defer rows.Close()
+	objects := []PackageObject{}
+	for rows.Next() {
+		object, err := scanPackageObject(rows)
 		if err != nil {
 			return nil, err
 		}
-		objects[index].BuiltDists, err = s.packageDists(ctx, objects[index].SHA256, true)
-		if err != nil {
-			return nil, err
-		}
+		objects = append(objects, object)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list pending package objects: %w", err)
 	}
 	return objects, nil
 }
@@ -583,6 +616,50 @@ func (s *Store) packageDists(ctx context.Context, digest string, built bool) ([]
 		result = append(result, name)
 	}
 	return result, rows.Err()
+}
+
+func validPackageMembershipTable(table string) bool {
+	switch table {
+	case "memberships", "built_memberships", "prior_built_memberships":
+		return true
+	default:
+		return false
+	}
+}
+
+// packageDistsForObjects expands one membership projection with one ordered
+// table scan. The membership primary key is (dist_name, package_sha256), so the
+// former per-object WHERE package_sha256 = ? query could not use its leading
+// key and became quadratic for large repositories.
+func (s *Store) packageDistsForObjects(ctx context.Context, objects []PackageObject, table string) (map[string][]string, error) {
+	if !validPackageMembershipTable(table) {
+		return nil, errors.New("list package memberships: invalid membership table")
+	}
+	result := make(map[string][]string, len(objects))
+	for _, object := range objects {
+		result[object.SHA256] = []string{}
+	}
+	if len(result) == 0 {
+		return result, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT package_sha256, dist_name FROM `+table+` ORDER BY package_sha256, dist_name`)
+	if err != nil {
+		return nil, fmt.Errorf("list package memberships: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var digest, distName string
+		if err := rows.Scan(&digest, &distName); err != nil {
+			return nil, err
+		}
+		if dists, selected := result[digest]; selected {
+			result[digest] = append(dists, distName)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list package memberships: %w", err)
+	}
+	return result, nil
 }
 
 func unreferencedPendingTx(ctx context.Context, tx *sql.Tx) ([]PackageObject, error) {
