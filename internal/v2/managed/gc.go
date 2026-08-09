@@ -64,9 +64,10 @@ type LocalGCResult struct {
 }
 
 type localGCEntry struct {
-	Path   string `json:"path"`
-	Size   int64  `json:"size"`
-	SHA256 string `json:"sha256"`
+	Path       string `json:"path"`
+	ObjectPath string `json:"object_path,omitempty"`
+	Size       int64  `json:"size"`
+	SHA256     string `json:"sha256"`
 }
 
 type localGCPlan struct {
@@ -200,6 +201,16 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 	if err != nil {
 		return result, err
 	}
+	for _, entry := range plan.Entries {
+		public := filepath.Join(repoName, filepath.FromSlash(entry.Path))
+		ok, err := exactLocalGCFile(ctx, ws.Root, public, entry.Size, entry.SHA256)
+		if err != nil {
+			return result, err
+		}
+		if !ok {
+			return result, fmt.Errorf("%w: local GC Generation path %q is absent", ErrIntegrity, entry.Path)
+		}
+	}
 	payload := localGCOperationPayload{
 		Schema: localGCSchema, Repository: repoName, RepositoryID: inventory.RepositoryID, OperationID: plan.OperationID,
 		Base: plan.BaseGeneration, Generation: plan.Generation, PlanSHA256: bytesSHA(planBytes),
@@ -244,35 +255,20 @@ func buildLocalGCPlan(repoName string, inventory state.LocalGCInventory, candida
 	if err != nil || len(baseBytes) == 0 {
 		return localGCPlan{}, nil, errors.Join(errors.New("local GC has no canonical base manifest"), err)
 	}
-	byPath := make(map[string]state.PackageObject, len(candidates))
-	for _, object := range candidates {
-		if object.Storage != "pool" || object.PoolPath == "" || object.Size < 0 || !lowercaseSHA256.MatchString(object.SHA256) {
-			return localGCPlan{}, nil, errors.New("local GC candidate identity is invalid")
-		}
-		if _, duplicate := byPath[object.PoolPath]; duplicate {
-			return localGCPlan{}, nil, errors.New("local GC candidates repeat a Pool path")
-		}
-		byPath[object.PoolPath] = object
+	target, removals, err := state.SubtractLocalGCObjects(base, candidates)
+	if err != nil {
+		return localGCPlan{}, nil, fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
-	target := make([]state.GenerationFile, 0, len(base)-len(candidates))
-	entries := make([]localGCEntry, 0, len(candidates))
-	for _, file := range base {
-		object, remove := byPath[file.Path]
-		if !remove {
-			target = append(target, file)
-			continue
+	entries := make([]localGCEntry, 0, len(removals))
+	objects := make([]state.PackageObject, 0, len(removals))
+	for _, removal := range removals {
+		entry := localGCEntry{Path: removal.File.Path, Size: removal.File.Size, SHA256: removal.File.SHA256}
+		if removal.File.Path != removal.Object.PoolPath {
+			entry.ObjectPath = removal.Object.PoolPath
 		}
-		if file.Phase != "payload" || file.Size != object.Size || file.SHA256 != object.SHA256 {
-			return localGCPlan{}, nil, fmt.Errorf("%w: candidate %q differs from current Generation", ErrIntegrity, file.Path)
-		}
-		entries = append(entries, localGCEntry{Path: file.Path, Size: file.Size, SHA256: file.SHA256})
-		delete(byPath, file.Path)
+		entries = append(entries, entry)
+		objects = append(objects, removal.Object)
 	}
-	if len(byPath) != 0 {
-		return localGCPlan{}, nil, fmt.Errorf("%w: a candidate is absent from current Generation", ErrIntegrity)
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].PoolPath < candidates[j].PoolPath })
 	_, targetSHA, err := state.ManifestBytes(target)
 	if err != nil {
 		return localGCPlan{}, nil, err
@@ -280,7 +276,7 @@ func buildLocalGCPlan(repoName string, inventory state.LocalGCInventory, candida
 	plan := localGCPlan{
 		Schema: localGCSchema, Repository: repoName, RepositoryID: inventory.RepositoryID, OperationID: id,
 		BaseGeneration: inventory.Generation, Generation: next, BaseManifestSHA256: baseSHA, ManifestSHA256: targetSHA,
-		Entries: entries, Objects: candidates, Manifest: target, Changes: state.DiffManifests(base, target),
+		Entries: entries, Objects: objects, Manifest: target, Changes: state.DiffManifests(base, target),
 	}
 	planBytes, err := json.Marshal(plan)
 	if err != nil || len(planBytes) > maxLocalGCPlanBytes {
@@ -331,13 +327,23 @@ func validateLocalGCPlan(plan localGCPlan) error {
 	if err != nil || targetSHA != plan.ManifestSHA256 {
 		return errors.Join(errors.New("local GC target manifest differs from plan"), err)
 	}
+	entryPaths := make(map[string]struct{}, len(plan.Entries))
 	for index, entry := range plan.Entries {
 		object := plan.Objects[index]
+		objectPath := entry.Path
+		if entry.ObjectPath != "" {
+			objectPath = entry.ObjectPath
+		}
 		if entry.Path == "" || filepath.ToSlash(filepath.Clean(filepath.FromSlash(entry.Path))) != entry.Path || !strings.HasPrefix(entry.Path, "pool/") ||
-			entry.Size < 0 || !lowercaseSHA256.MatchString(entry.SHA256) || index > 0 && plan.Entries[index-1].Path >= entry.Path ||
-			object.PoolPath != entry.Path || object.Size != entry.Size || object.SHA256 != entry.SHA256 || object.Storage != "pool" {
+			entry.ObjectPath != "" && (entry.ObjectPath == entry.Path || !strings.EqualFold(entry.ObjectPath, entry.Path) || filepath.ToSlash(filepath.Clean(filepath.FromSlash(entry.ObjectPath))) != entry.ObjectPath || !strings.HasPrefix(entry.ObjectPath, "pool/")) ||
+			entry.Size < 0 || !lowercaseSHA256.MatchString(entry.SHA256) || index > 0 && plan.Objects[index-1].PoolPath >= object.PoolPath ||
+			object.PoolPath != objectPath || object.Size != entry.Size || object.SHA256 != entry.SHA256 || object.Storage != "pool" {
 			return fmt.Errorf("invalid local GC entry %d", index)
 		}
+		if _, duplicate := entryPaths[entry.Path]; duplicate {
+			return fmt.Errorf("invalid local GC entry %d", index)
+		}
+		entryPaths[entry.Path] = struct{}{}
 	}
 	return nil
 }

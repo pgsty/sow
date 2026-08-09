@@ -2,9 +2,11 @@ package managed
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -25,6 +27,54 @@ type localGCFixture struct {
 	options    WorkspaceOptions
 	object     state.PackageObject
 	generation state.GenerationID
+}
+
+func TestBuildLocalGCPlanRecordsCaseFoldedGenerationPath(t *testing.T) {
+	object := state.PackageObject{
+		SHA256: strings.Repeat("a", 64), Format: "deb", Coordinate: "deb:pgformatter=1:all",
+		Architecture: "all", CanonicalArch: "neutral", PoolPath: "pool/p/pgformatter/package.deb",
+		Filename: "package.deb", Size: 7, Name: "pgformatter", Source: "pgformatter", Version: "1",
+		Kind: "main", Storage: "pool",
+	}
+	actual := state.GenerationFile{Path: "pool/p/pgFormatter/package.deb", Phase: "payload", Size: object.Size, SHA256: object.SHA256}
+	inventory := state.LocalGCInventory{RepositoryID: "12345678-1234-4123-8123-123456789abc", Generation: 11, Candidates: []state.PackageObject{object}}
+	plan, data, err := buildLocalGCPlan("repo", inventory, inventory.Candidates, []state.GenerationFile{actual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseLocalGCPlan(data)
+	if err != nil || len(plan.Entries) != 1 || plan.Entries[0].Path != actual.Path || plan.Entries[0].ObjectPath != object.PoolPath ||
+		len(plan.Objects) != 1 || plan.Objects[0].PoolPath != object.PoolPath || len(plan.Manifest) != 0 || len(plan.Changes) != 1 ||
+		plan.Changes[0].Path != actual.Path || !reflect.DeepEqual(plan, parsed) {
+		t.Fatalf("plan=%#v parsed=%#v err=%v", plan, parsed, err)
+	}
+}
+
+func TestParseLocalGCPlanRejectsUnrelatedObjectPath(t *testing.T) {
+	object := state.PackageObject{
+		SHA256: strings.Repeat("a", 64), Format: "deb", Coordinate: "deb:pgformatter=1:all",
+		Architecture: "all", CanonicalArch: "neutral", PoolPath: "pool/p/pgformatter/package.deb",
+		Filename: "package.deb", Size: 7, Name: "pgformatter", Source: "pgformatter", Version: "1",
+		Kind: "main", Storage: "pool",
+	}
+	actual := state.GenerationFile{Path: "pool/p/pgFormatter/package.deb", Phase: "payload", Size: object.Size, SHA256: object.SHA256}
+	inventory := state.LocalGCInventory{RepositoryID: "12345678-1234-4123-8123-123456789abc", Generation: 11, Candidates: []state.PackageObject{object}}
+	plan, _, err := buildLocalGCPlan("repo", inventory, inventory.Candidates, []state.GenerationFile{actual})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Entries[0].ObjectPath = "pool/o/other/package.deb"
+	plan.Objects[0].PoolPath = plan.Entries[0].ObjectPath
+	plan.Objects[0].Coordinate = "deb:other=1:all"
+	plan.Objects[0].Name = "other"
+	plan.Objects[0].Source = "other"
+	data, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseLocalGCPlan(data); err == nil {
+		t.Fatal("non-case-folded local GC object path was accepted")
+	}
 }
 
 func bindLocalGCPublicationTarget(t *testing.T, fixture localGCFixture) (state.PublicationTargetBinding, *state.Store) {

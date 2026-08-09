@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // LocalGCInventory is a settled snapshot of package rows which have no
@@ -81,6 +82,81 @@ type FinalizeLocalGCInput struct {
 	Changes        []FileChange
 }
 
+// LocalGCManifestRemoval binds one immutable package object to the exact path
+// recorded by the current Generation. The paths normally match byte-for-byte.
+// A unique case-folded alias is also legal when a case-insensitive filesystem
+// preserved the object bytes but collapsed the spelling of a sibling Pool
+// directory. Size and digest identity remain mandatory in both cases.
+type LocalGCManifestRemoval struct {
+	Object PackageObject
+	File   GenerationFile
+}
+
+// SubtractLocalGCObjects removes the exact Generation files belonging to the
+// supplied package objects. Exact paths win. A case-folded fallback is accepted
+// only when both candidate and Generation paths are unique and the immutable
+// payload identity is unchanged; ambiguity and drift fail closed.
+func SubtractLocalGCObjects(base []GenerationFile, objects []PackageObject) ([]GenerationFile, []LocalGCManifestRemoval, error) {
+	exact := make(map[string]PackageObject, len(objects))
+	folded := make(map[string]PackageObject, len(objects))
+	for _, object := range objects {
+		if err := validatePackageObject(object); err != nil || object.Storage != "pool" {
+			return nil, nil, errors.Join(errors.New("invalid local GC package inventory"), err)
+		}
+		if _, duplicate := exact[object.PoolPath]; duplicate {
+			return nil, nil, fmt.Errorf("local GC package inventory repeats path %q", object.PoolPath)
+		}
+		fold := strings.ToLower(object.PoolPath)
+		if prior, duplicate := folded[fold]; duplicate && prior.PoolPath != object.PoolPath {
+			return nil, nil, fmt.Errorf("local GC package paths %q and %q collide under case folding", prior.PoolPath, object.PoolPath)
+		}
+		exact[object.PoolPath] = object
+		folded[fold] = object
+	}
+
+	targetCapacity := len(base) - len(objects)
+	if targetCapacity < 0 {
+		targetCapacity = 0
+	}
+	target := make([]GenerationFile, 0, targetCapacity)
+	matched := make(map[string]GenerationFile, len(objects))
+	for _, file := range base {
+		object, remove := exact[file.Path]
+		if !remove {
+			object, remove = folded[strings.ToLower(file.Path)]
+			remove = remove && strings.EqualFold(object.PoolPath, file.Path)
+		}
+		if !remove {
+			target = append(target, file)
+			continue
+		}
+		if prior, duplicate := matched[object.PoolPath]; duplicate {
+			return nil, nil, fmt.Errorf("local GC package %q ambiguously matches Generation paths %q and %q", object.PoolPath, prior.Path, file.Path)
+		}
+		if file.Phase != "payload" || file.Size != object.Size || file.SHA256 != object.SHA256 {
+			return nil, nil, fmt.Errorf("local GC package %q differs from Generation path %q", object.PoolPath, file.Path)
+		}
+		matched[object.PoolPath] = file
+	}
+	if len(matched) != len(objects) {
+		paths := make([]string, 0, len(objects)-len(matched))
+		for _, object := range objects {
+			if _, ok := matched[object.PoolPath]; !ok {
+				paths = append(paths, object.PoolPath)
+			}
+		}
+		sort.Strings(paths)
+		return nil, nil, fmt.Errorf("local GC package %q is absent from current Generation", paths[0])
+	}
+
+	removals := make([]LocalGCManifestRemoval, 0, len(objects))
+	for _, object := range objects {
+		removals = append(removals, LocalGCManifestRemoval{Object: object, File: matched[object.PoolPath]})
+	}
+	sort.Slice(removals, func(i, j int) bool { return removals[i].Object.PoolPath < removals[j].Object.PoolPath })
+	return target, removals, nil
+}
+
 // FinalizeLocalGC atomically records the maintenance Generation and removes
 // its package-object rows. Payload bytes remain in the managed tombstone until
 // this transaction is durable, so a crash can never leave SQLite referencing
@@ -145,23 +221,11 @@ func (s *Store) FinalizeLocalGC(ctx context.Context, input FinalizeLocalGCInput)
 	if err != nil {
 		return err
 	}
-	removed := make(map[string]PackageObject, len(objects))
-	for _, object := range objects {
-		removed[object.PoolPath] = object
+	target, _, err := SubtractLocalGCObjects(baseManifest, objects)
+	if err != nil {
+		return fmt.Errorf("%w: local GC base subtraction failed: %v", ErrConflict, err)
 	}
-	target := make([]GenerationFile, 0, len(baseManifest)-len(objects))
-	for _, file := range baseManifest {
-		object, remove := removed[file.Path]
-		if remove {
-			if file.Phase != "payload" || file.Size != object.Size || file.SHA256 != object.SHA256 {
-				return fmt.Errorf("%w: local GC manifest identity differs for %q", ErrConflict, file.Path)
-			}
-			delete(removed, file.Path)
-			continue
-		}
-		target = append(target, file)
-	}
-	if len(removed) != 0 || !sameGenerationFiles(target, input.Manifest) || !equalFileChanges(DiffManifests(baseManifest, target), input.Changes) {
+	if !sameGenerationFiles(target, input.Manifest) || !equalFileChanges(DiffManifests(baseManifest, target), input.Changes) {
 		return fmt.Errorf("%w: local GC target manifest or changes differ from exact base subtraction", ErrConflict)
 	}
 	baseInfo, err := generationInfoTx(ctx, tx, input.BaseGeneration)
