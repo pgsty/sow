@@ -1,6 +1,6 @@
 # SOW
 
-SOW is a local RPM/DEB repository manager written in Go. SOW 0.2 supports two
+SOW is a local RPM/DEB repository manager written in Go. SOW 0.3 supports two
 workflows:
 
 - `sow create` turns a directory of RPM or DEB packages into a simple
@@ -32,7 +32,7 @@ make test          # all Go packages plus the patched RPM module
 make check         # format, module, vet, staticcheck, deadcode, focused tests
 ```
 
-The binary is written to `bin/sow`. Its default version is `0.2.0`; release
+The binary is written to `bin/sow`. Its default version is `0.3.0`; release
 builds also inject that version at link time.
 
 ## Simple repositories
@@ -107,8 +107,8 @@ make release-local
 `make release-local` uses GoReleaser to build a local snapshot under `dist/`.
 It creates Linux/macOS archives for amd64/arm64 plus RPM and DEB packages for
 both Linux architectures. Linux package revisions use the project suffix
-`1PGSTY`, for example `sow-0.2.0-1PGSTY.x86_64.rpm` and
-`sow_0.2.0-1PGSTY_amd64.deb`.
+`1PGSTY`, for example `sow-0.3.0-1PGSTY.x86_64.rpm` and
+`sow_0.3.0-1PGSTY_amd64.deb`.
 
 GitHub Actions runs regular checks in `CI` and real Docker-backed client/S3
 coverage in `Integration`. Pushing an exact semantic-version tag creates a
@@ -121,8 +121,8 @@ the common `SOW_REAL_R2_` prefix. The fixture must be immutable and carry the
 matching `sow-sha256` object metadata; the test never writes or deletes it.
 
 ```bash
-git tag -a v0.2.0 -m "SOW v0.2.0"
-git push origin v0.2.0
+git tag -a v0.3.0 -m "SOW v0.3.0"
+git push origin v0.3.0
 ```
 
 The tag workflow verifies that the tag points into `main`, agrees with the

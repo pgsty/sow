@@ -2,8 +2,14 @@
 
 All notable changes to SOW are recorded here.
 
-## Unreleased
+## 0.3.0 - 2026-08-10
 
+- Removed the retired V1 CLI/runtime, cloud/CDN publication saga, Edge worker,
+  completed migration program, stale V1 examples, and their obsolete test
+  harnesses. The active binary now depends only on V2 packages; R2 publication
+  uses a focused storage-only transport, default `go test ./...` covers the
+  whole current tree, and historical implementation remains available from Git
+  history and the v0.2.0 tag.
 - Added repository schema v10 with a rebuildable package-facts cache keyed by
   immutable package SHA-256. Ingest now authenticates each new RPM/DEB in one
   complete pass and retains its view-independent render facts; builds bulk-load
