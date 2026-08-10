@@ -5,6 +5,7 @@
 .gitignore
 .goreleaser.yml
 CHANGELOG.md
+LICENSE
 Makefile
 cmd/sow/main.go
 edge/README.md

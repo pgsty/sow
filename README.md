@@ -127,3 +127,8 @@ a Docker image.
 
 Documentation ownership and the repository boundary are described in
 [`design/README.md`](design/README.md).
+
+## License
+
+SOW is licensed under the [Apache License, Version 2.0](LICENSE). Bundled
+third-party components remain under their respective licenses.
