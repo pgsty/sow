@@ -4,6 +4,7 @@ SHELL := /bin/bash
 
 GO ?= go
 GORELEASER ?= goreleaser
+DEADCODE_VERSION ?= v0.45.0
 VERSION ?= 0.2.0
 TEST_TIMEOUT ?= 60m
 CORE_TEST_TIMEOUT ?= 20m
@@ -16,11 +17,11 @@ DIST_DIR := $(ROOT_DIR)/dist
 BINARY := $(BIN_DIR)/sow
 CLEAN_DELIVERY_OUT ?= $(if $(TMPDIR),$(TMPDIR),/tmp)/sow-clean-delivery
 LDFLAGS := -s -w -X github.com/pgsty/sow/internal/v2cli.Version=$(VERSION)
-CORE_PACKAGES := ./internal/v2/... ./internal/v2cli ./internal/aptrepo ./internal/yumrepo
+CORE_PACKAGES := ./internal/v2/... ./internal/v2cli ./internal/aptrepo ./internal/r2 ./internal/yumrepo
 
-.PHONY: all help version build run install fmt fmt-check tidy tidy-check vet lint \
-	test test-go test-rpm test-edge test-core test-v2 race check clean-delivery \
-	goreleaser-check release-local release clean clean-bin clean-dist
+.PHONY: all help version deadcode-version build run install fmt fmt-check tidy tidy-check vet lint deadcode \
+	test test-go test-rpm test-core test-v2 test-perf-contract race check clean-delivery \
+	test-r2-live goreleaser-check release-local release clean clean-bin clean-dist
 
 all: build
 
@@ -31,10 +32,12 @@ help:
 		'  make build           Fast local go build to bin/sow' \
 		'  make run ARGS=...    Run the CLI from source (example: ARGS=version)' \
 		'  make install         Install sow with the release version embedded' \
-		'  make test            Run all Go modules and edge contract tests' \
+		'  make test            Run all Go packages and the patched RPM module' \
 		'  make test-core       Run the focused repository-manager tests' \
+		'  make test-perf-contract  Compile perf-tagged tests and verify their fixture' \
+		'  make test-r2-live    Run the opt-in read-only Cloudflare R2 fixture gate' \
 		'  make race            Race-test the core repository packages' \
-		'  make check           Run format, module, vet, lint, and focused tests' \
+		'  make check           Run format, module, vet, lint, deadcode, and focused tests' \
 		'  make clean-delivery  Rebuild and verify the deterministic source archive' \
 		'  make release-local   Build local archives and Linux packages with GoReleaser' \
 		'  make release         Run all local gates, then build the GoReleaser snapshot' \
@@ -42,6 +45,9 @@ help:
 
 version:
 	@printf '%s\n' '$(VERSION)'
+
+deadcode-version:
+	@printf '%s\n' '$(DEADCODE_VERSION)'
 
 build:
 	@mkdir -p '$(BIN_DIR)'
@@ -78,29 +84,48 @@ lint:
 	}
 	staticcheck ./...
 
-test: test-go test-rpm test-edge
+deadcode:
+	@command -v deadcode >/dev/null 2>&1 || { \
+		printf '%s\n' 'deadcode is required: go install golang.org/x/tools/cmd/deadcode@$(DEADCODE_VERSION)' >&2; \
+		exit 1; \
+	}
+	@deadcode_path="$$(command -v deadcode)"; \
+		actual="$$( $(GO) version -m "$$deadcode_path" | awk '$$1 == "mod" && $$2 == "golang.org/x/tools" { print $$3 }')"; \
+		test "$$actual" = '$(DEADCODE_VERSION)' || { \
+			printf 'deadcode %s is required, found %s: go install golang.org/x/tools/cmd/deadcode@%s\n' '$(DEADCODE_VERSION)' "$${actual:-unknown}" '$(DEADCODE_VERSION)' >&2; \
+			exit 1; \
+		}
+	@output="$$(deadcode -test ./...)" || { status=$$?; printf '%s\n' "$$output" >&2; exit $$status; }; \
+		test -z "$$output" || { printf 'unreachable declarations:\n%s\n' "$$output" >&2; exit 1; }
 
-# Keep active compatibility packages gated; exclude only the retired V1 harness.
+test: test-go test-rpm
+
 test-go:
-	@packages="$$( $(GO) list ./... | grep -Ev '/internal/cli$$' )"; \
-		$(GO) test -timeout '$(TEST_TIMEOUT)' -count=1 $$packages
+	$(GO) test -timeout '$(TEST_TIMEOUT)' -count=1 ./...
 
 test-rpm:
 	cd third_party/cavaliergopher-rpm && $(GO) test -count=1 ./...
-
-test-edge:
-	@command -v npm >/dev/null 2>&1 || { printf '%s\n' 'npm is required for edge tests' >&2; exit 1; }
-	cd edge && npm run build && npm test
 
 test-core:
 	$(GO) test -timeout '$(CORE_TEST_TIMEOUT)' -count=1 $(CORE_PACKAGES)
 
 test-v2: test-core
 
+test-perf-contract:
+	@output="$$( $(GO) test -v -tags perf -count=1 ./test/perf -run '^TestYUMPerformanceFixtureAvailable$$' )" || { status=$$?; printf '%s\n' "$$output" >&2; exit $$status; }; \
+		printf '%s\n' "$$output"; \
+		printf '%s\n' "$$output" | grep -F -- '--- PASS: TestYUMPerformanceFixtureAvailable ' >/dev/null || { \
+			printf '%s\n' 'performance fixture contract test did not execute' >&2; \
+			exit 1; \
+		}
+
+test-r2-live:
+	SOW_REAL_R2_TEST=1 $(GO) test -timeout '10m' -count=1 -v ./internal/r2 -run '^TestCloudflareR2ReadOnlyCompatibility$$'
+
 race:
 	$(GO) test -race -timeout '$(RACE_TIMEOUT)' -count=1 $(CORE_PACKAGES)
 
-check: fmt-check tidy-check vet lint test-core
+check: fmt-check tidy-check vet lint deadcode test-perf-contract test-core
 
 clean-delivery:
 	test/compat/test-clean-delivery.sh '$(CLEAN_DELIVERY_OUT)'

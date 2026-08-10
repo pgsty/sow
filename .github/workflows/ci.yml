@@ -14,13 +14,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-# Normal CI must remain local and secret-free. Networked client and S3 tests
-# live in integration.yml; production cloud tests require explicit local
-# authority and are never enabled by repository secrets.
+# Normal CI remains local and secret-free. Networked client and S3 tests live
+# in integration.yml.
 env:
-  SOW_RUN_REAL_CLOUD: "0"
-  SOW_RUN_REAL_EDGE_EVIDENCE: "0"
-  SOW_RUN_REAL_UPSTREAM: "0"
   AWS_EC2_METADATA_DISABLED: "true"
 
 jobs:
@@ -49,6 +45,15 @@ jobs:
           go install honnef.co/go/tools/cmd/staticcheck@v0.6.1
           "$(go env GOPATH)/bin/staticcheck" ./...
 
+      - name: Dead code reachability
+        run: |
+          deadcode_version="$(make --no-print-directory deadcode-version)"
+          go install "golang.org/x/tools/cmd/deadcode@${deadcode_version}"
+          PATH="$(go env GOPATH)/bin:${PATH}" make deadcode DEADCODE_VERSION="${deadcode_version}"
+
+      - name: Compile performance contracts and verify fixtures
+        run: make test-perf-contract
+
       - name: Check GoReleaser configuration
         uses: goreleaser/goreleaser-action@v7
         with:
@@ -70,27 +75,44 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Test Go packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          # internal/cli is the retired V1 harness and test/compat also contains
-          # explicit provider/history gates. Both still pass vet/staticcheck;
-          # integration.yml owns the current always-on compatibility subset.
-          mapfile -t packages < <(go list ./... | grep -Ev '/(internal/cli|test/compat)$')
-          go test -timeout 30m -count=1 "${packages[@]}"
+        run: go test -timeout 30m -count=1 ./...
 
       - name: Test patched RPM parser module
         run: (cd third_party/cavaliergopher-rpm && go test -count=1 ./...)
 
-      - name: Set up Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
-        with:
-          node-version: "24"
-          package-manager-cache: false
+  race:
+    name: Core Race Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - name: Test edge contracts
-        working-directory: edge
-        run: npm test
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Race-test core repository packages
+        run: make race
+
+  clean-delivery:
+    name: Clean Source Delivery
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify clean source delivery
+        run: make clean-delivery
 
   package:
     name: Archives, RPM, DEB

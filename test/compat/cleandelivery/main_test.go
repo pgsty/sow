@@ -61,17 +61,72 @@ func TestAuditSourceRejectsExtraRegularSymlinkAndNamedCache(t *testing.T) {
 	}
 }
 
-func TestAuditSourceIgnoresOnlyManagedEdgeNodeModules(t *testing.T) {
+func TestAuditSourceRejectsGeneratedDependenciesInManagedRoots(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
-	writeFixture(t, root, "edge/worker.mjs", "export default {}\n", 0o644)
-	writeFixture(t, root, "edge/node_modules/dependency/index.js", "generated\n", 0o644)
-	if err := auditSource(root, []string{"edge"}, []string{"edge/worker.mjs"}); err != nil {
-		t.Fatalf("managed edge/node_modules was not ignored: %v", err)
+	writeFixture(t, root, "src/worker.go", "package src\n", 0o644)
+	writeFixture(t, root, "src/node_modules/dependency/index.js", "generated\n", 0o644)
+	if err := auditSource(root, []string{"src"}, []string{"src/worker.go"}); err == nil {
+		t.Fatal("auditSource accepted generated dependencies")
 	}
-	writeFixture(t, root, "edge/.cache/object", "generated\n", 0o644)
-	if err := auditSource(root, []string{"edge"}, []string{"edge/worker.mjs"}); err == nil {
-		t.Fatal("auditSource ignored an unapproved edge cache")
+}
+
+func TestAuditRepositoryRootEntriesRejectsUnlistedAndUnsafeEntries(t *testing.T) {
+	for name, create := range map[string]func(t *testing.T, root string){
+		"unlisted regular": func(t *testing.T, root string) {
+			writeFixture(t, root, "staticcheck.conf", `checks = ["all"]`, 0o644)
+		},
+		"unlisted directory": func(t *testing.T, root string) {
+			if err := os.Mkdir(filepath.Join(root, "scripts"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"ignored file name as directory": func(t *testing.T, root string) {
+			if err := os.Mkdir(filepath.Join(root, "sow"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"symlink": func(t *testing.T, root string) {
+			if runtime.GOOS == "windows" {
+				t.Skip("symlink fixture requires Unix permissions")
+			}
+			if err := os.Symlink("Makefile", filepath.Join(root, ".DS_Store")); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			writeFixture(t, root, "Makefile", "all:\n", 0o644)
+			if err := os.Mkdir(filepath.Join(root, "src"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			create(t, root)
+			if err := auditRepositoryRootEntries(root, []string{"src"}, []string{"Makefile", "src/allowed.go"}); err == nil {
+				t.Fatal("auditRepositoryRootEntries accepted an unlisted or unsafe entry")
+			}
+		})
+	}
+
+	root := t.TempDir()
+	writeFixture(t, root, "Makefile", "all:\n", 0o644)
+	writeFixture(t, root, "staticcheck.conf", `checks = ["all"]`, 0o644)
+	if err := os.Mkdir(filepath.Join(root, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "tmp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, mode := range map[string]os.FileMode{
+		".DS_Store": 0o644, "coverage.out": 0o644, "sow": 0o755, "project.iml": 0o644, "package.test": 0o755,
+	} {
+		writeFixture(t, root, name, "ignored developer output\n", mode)
+	}
+	if err := auditRepositoryRootEntries(root, []string{"src"}, []string{"Makefile", "src/allowed.go", "staticcheck.conf"}); err != nil {
+		t.Fatalf("auditRepositoryRootEntries rejected explicit root inputs: %v", err)
 	}
 }
 
@@ -236,7 +291,6 @@ func TestAuditAllowedContentAcceptsDocumentationPatterns(t *testing.T) {
 		"CLOUDFLARE_API_TOKEN=replace-with-cloudflare-token-value",
 		`{"secret_access_key":"fixture-secret-access-key-value"}`,
 		`{"basic_password":"cf-private-password"}`,
-		"SOW_REAL_EDGE_PRO_TOKEN_A=contract-test-edge-token-value",
 	}, "\n") + "\n"
 	writeFixture(t, root, "allowed.txt", contents, 0o644)
 	if err := auditAllowedContent(root, []string{"allowed.txt"}); err != nil {
@@ -350,6 +404,8 @@ func TestManifestBytesAreStable(t *testing.T) {
 func TestIsolatedGoEnvironmentPinsVerificationAndAllowsExplicitMirrors(t *testing.T) {
 	t.Setenv("SOW_CLEAN_GOPROXY", "https://goproxy.example,direct")
 	t.Setenv("SOW_CLEAN_GOSUMDB", "sum.golang.google.cn")
+	t.Setenv("HTTPS_PROXY", "http://proxy.example:8080")
+	t.Setenv("NO_PROXY", "localhost,127.0.0.1")
 	env, err := isolatedGoEnvironment(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -361,11 +417,18 @@ func TestIsolatedGoEnvironmentPinsVerificationAndAllowsExplicitMirrors(t *testin
 		"\nGOPRIVATE=\n",
 		"\nGONOPROXY=\n",
 		"\nGONOSUMDB=\n",
+		"\nHTTPS_PROXY=http://proxy.example:8080\n",
+		"\nNO_PROXY=localhost,127.0.0.1\n",
 	} {
 		if !strings.Contains(joined, wanted) {
 			t.Fatalf("isolated environment omitted %q: %v", wanted, env)
 		}
 	}
+	t.Setenv("HTTPS_PROXY", "http://proxy.example\nINJECTED=value")
+	if _, err := isolatedGoEnvironment(t.TempDir()); err == nil {
+		t.Fatal("isolatedGoEnvironment accepted an injected HTTPS proxy environment line")
+	}
+	t.Setenv("HTTPS_PROXY", "http://proxy.example:8080")
 	t.Setenv("SOW_CLEAN_GOPROXY", "https://proxy.invalid\nGOSUMDB=off")
 	if _, err := isolatedGoEnvironment(t.TempDir()); err == nil {
 		t.Fatal("isolatedGoEnvironment accepted an injected proxy environment line")

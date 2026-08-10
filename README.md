@@ -13,24 +13,23 @@ workflows:
 The authoritative user and design documentation lives at
 [sow.pgsty.com](https://sow.pgsty.com/docs/). The
 [design section](https://sow.pgsty.com/docs/design/) describes the current
-Repository-scoped single-payload model. Historical PRDs, review material, and
-dated evidence remain available from Git history and version tags; they are
-not a second documentation authority. The remaining [`docs/`](docs/) tree
-contains only code-adjacent test and migration assets.
+Repository-scoped single-payload model. Historical PRDs, review material,
+migration programs, and dated evidence remain available from Git history and
+version tags; they are not a second documentation authority. The remaining
+[`docs/`](docs/) tree only records this ownership boundary.
 
 ## Build and test
 
 Go 1.26.5 or newer is required. Repository signing additionally requires a
-usable GPG installation and key. The complete test target also runs the legacy
-edge contract and therefore requires Node.js/npm.
+usable GPG installation and key.
 
 ```bash
 make help
 make build
 make run ARGS=version
 make test-core     # focused repository-manager tests
-make test          # all Go modules plus edge contracts
-make check         # format, module, vet, staticcheck, focused tests
+make test          # all Go packages plus the patched RPM module
+make check         # format, module, vet, staticcheck, deadcode, focused tests
 ```
 
 The binary is written to `bin/sow`. Its default version is `0.2.0`; release
@@ -114,6 +113,12 @@ both Linux architectures. Linux package revisions use the project suffix
 GitHub Actions runs regular checks in `CI` and real Docker-backed client/S3
 coverage in `Integration`. Pushing an exact semantic-version tag creates a
 draft release:
+
+Maintainers can additionally run a read-only hosted Cloudflare R2 check with
+`make test-r2-live`. It requires `SOW_REAL_R2_ENDPOINT`, `BUCKET`, `PREFIX`,
+`OBJECT_KEY`, `OBJECT_SHA256`, `ACCESS_KEY_ID`, and `SECRET_ACCESS_KEY` using
+the common `SOW_REAL_R2_` prefix. The fixture must be immutable and carry the
+matching `sow-sha256` object metadata; the test never writes or deletes it.
 
 ```bash
 git tag -a v0.2.0 -m "SOW v0.2.0"

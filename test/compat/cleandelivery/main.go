@@ -38,11 +38,17 @@ const (
 )
 
 var (
-	productRoots          = []string{".github", "cmd", "edge", "internal", "test", "third_party"}
-	deliveryRoots         = append(append([]string{}, productRoots...), "design", "docs")
-	markdownInlineLink    = regexp.MustCompile(`!?\[[^\]]*\]\(([^)]+)\)`)
-	markdownReference     = regexp.MustCompile(`(?m)^\s*\[[^\]]+\]:\s*(\S+)`)
-	highConfidenceSecrets = []struct {
+	productRoots           = []string{".github", "cmd", "internal", "test", "testdata", "third_party"}
+	deliveryRoots          = append(append([]string{}, productRoots...), "design", "docs")
+	ignoredRootDirectories = []string{
+		".agents", ".bmad-loop", ".claude", ".codex", ".git", ".idea", ".pool", ".sow", ".tmp",
+		"_bmad", "_bmad-output", "bin", "dist", "tmp",
+	}
+	ignoredRootFileNames    = map[string]struct{}{".DS_Store": {}, "coverage.out": {}, "sow": {}}
+	ignoredRootFileSuffixes = []string{".iml", ".test"}
+	markdownInlineLink      = regexp.MustCompile(`!?\[[^\]]*\]\(([^)]+)\)`)
+	markdownReference       = regexp.MustCompile(`(?m)^\s*\[[^\]]+\]:\s*(\S+)`)
+	highConfidenceSecrets   = []struct {
 		name    string
 		pattern *regexp.Regexp
 	}{
@@ -219,6 +225,9 @@ func build(root, out string) (buildResult, error) {
 	if err != nil {
 		return buildResult{}, err
 	}
+	if err := auditRepositoryRootEntries(root, deliveryRoots, p.delivery); err != nil {
+		return buildResult{}, fmt.Errorf("repository root allowlist: %w", err)
+	}
 	if err := auditSource(root, productRoots, p.product); err != nil {
 		return buildResult{}, fmt.Errorf("product allowlist: %w", err)
 	}
@@ -308,7 +317,7 @@ func build(root, out string) (buildResult, error) {
 			{"go", "mod", "verify"},
 			{"bash", "third_party/cavaliergopher-rpm/verify-upstream.sh"},
 			{"go", "test", "-count=1", "./test/compat/cleandelivery"},
-			{"go", "test", "-count=1", "./internal/config", "-run", "TestExampleConfigMatchesSchema|TestShippedPGDGUpstreamExampleMatchesSchema"},
+			{"go", "test", "-count=1", "./internal/v2/config", "-run", "^TestShippedExampleUsesCurrentSchema$"},
 			{"go", "test", "-timeout", "15m", "-count=1", "./test/compat", "-run", "^TestShippedExampleSupportsCleanRoomLocalMVP$"},
 			{"go", "build", "-trimpath", "-o", binary, "./cmd/sow"},
 		}
@@ -356,6 +365,80 @@ func build(root, out string) (buildResult, error) {
 	}, nil
 }
 
+// auditRepositoryRootEntries closes the gap around the strict managed-directory
+// allowlists. Every root file must be shipped, and every root directory must be
+// either audited by auditSource or an explicitly named developer/build output.
+func auditRepositoryRootEntries(root string, managedRoots, allowed []string) error {
+	if _, err := validateRepositoryRoot(root); err != nil {
+		return err
+	}
+	allowedSet := make(map[string]struct{})
+	for _, item := range allowed {
+		if !strings.Contains(item, "/") {
+			allowedSet[item] = struct{}{}
+		}
+	}
+	allowedDirectories := make(map[string]struct{}, len(managedRoots))
+	for _, item := range managedRoots {
+		allowedDirectories[item] = struct{}{}
+	}
+	ignoredDirectories := make(map[string]struct{}, len(ignoredRootDirectories))
+	for _, item := range ignoredRootDirectories {
+		ignoredDirectories[item] = struct{}{}
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		info, err := os.Lstat(filepath.Join(root, name))
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("root symlink is forbidden: %s", name)
+		}
+		if info.IsDir() {
+			if _, ok := ignoredDirectories[name]; ok {
+				continue
+			}
+			if suspiciousReleaseName(name) {
+				return fmt.Errorf("secret/cache-like root path found: %s", name)
+			}
+			if _, ok := allowedDirectories[name]; !ok {
+				return fmt.Errorf("unexpected root directory: %s", name)
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("root non-regular path is forbidden: %s", name)
+		}
+		if ignoredRootFile(name) {
+			continue
+		}
+		if suspiciousReleaseName(name) {
+			return fmt.Errorf("secret/cache-like root path found: %s", name)
+		}
+		if _, ok := allowedSet[name]; !ok {
+			return fmt.Errorf("unexpected root regular file: %s", name)
+		}
+	}
+	return nil
+}
+
+func ignoredRootFile(name string) bool {
+	if _, ok := ignoredRootFileNames[name]; ok {
+		return true
+	}
+	for _, suffix := range ignoredRootFileSuffixes {
+		if strings.HasSuffix(name, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 func auditSource(root string, managedRoots, allowed []string) error {
 	resolvedRoot, err := validateRepositoryRoot(root)
 	if err != nil {
@@ -380,12 +463,6 @@ func auditSource(root string, managedRoots, allowed []string) error {
 			rel = filepath.ToSlash(rel)
 			if rel == managed {
 				return nil
-			}
-			// The edge dependency tree is a managed build input, never a release
-			// input. This is the only ignored directory; every other cache-like
-			// name remains a hard failure below.
-			if entry.IsDir() && rel == "edge/node_modules" {
-				return filepath.SkipDir
 			}
 			if suspiciousReleaseName(rel) {
 				return fmt.Errorf("secret/cache-like path found: %s", rel)
@@ -904,6 +981,16 @@ func isolatedGoEnvironment(work string) ([]string, error) {
 		return nil, errors.New("SOW_CLEAN_GOSUMDB cannot disable checksum verification")
 	}
 	env = append(env, "GOSUMDB="+goSumDB)
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy"} {
+		value := os.Getenv(key)
+		if value == "" {
+			continue
+		}
+		if strings.ContainsAny(value, "\x00\r\n") {
+			return nil, fmt.Errorf("%s contains a control character", key)
+		}
+		env = append(env, key+"="+value)
+	}
 	keys := make([]string, 0, len(directories))
 	for key := range directories {
 		keys = append(keys, key)
