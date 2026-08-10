@@ -41,33 +41,10 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 	result.Dir = root
 	result.Kept = []string{}
 	result.Removed = []string{}
-	markerPath := filepath.Join(root, "repo_complete")
-
-	if journal, err := loadJournal(root); err != nil {
+	if err := cleanupStalePlainState(root); err != nil {
 		return Result{}, err
-	} else if journal != nil {
-		if !journal.Pigsty {
-			if _, err := os.Lstat(markerPath); err == nil {
-				return Result{}, &Error{Kind: KindRejected, Op: "recover marker gate", Path: markerPath, Err: errors.New("repo_complete appeared while a default create journal is pending; refusing replay")}
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return Result{}, &Error{Kind: KindRuntime, Op: "recover marker gate", Path: markerPath, Err: err}
-			}
-		}
-		if journal.Pigsty && !opts.Pigsty {
-			return Result{}, &Error{Kind: KindRejected, Op: "recover", Path: root, Err: errors.New("an interrupted --pigsty operation exists; rerun create with --pigsty to authorize recovery")}
-		}
-		if !journal.Pigsty && opts.Pigsty {
-			return Result{}, &Error{Kind: KindRejected, Op: "recover", Path: root, Err: errors.New("an interrupted default create operation exists; rerun create without --pigsty before starting compatibility cleanup")}
-		}
-		if journal.SignWith != opts.SignWith || journal.Overwrite != opts.Overwrite {
-			return Result{}, &Error{Kind: KindRejected, Op: "recover", Path: root, Err: errors.New("an interrupted create operation has different --sign-with/--overwrite authorization; rerun with the original signing options")}
-		}
-		changed, err := executeJournal(ctx, root, journal, nil)
-		if err != nil {
-			return Result{}, err
-		}
-		return resultFromJournal(root, *journal, changed), nil
 	}
+	markerPath := filepath.Join(root, "repo_complete")
 
 	if !opts.Pigsty {
 		if _, err := os.Lstat(markerPath); err == nil {
@@ -84,11 +61,18 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 	if err := lock.Validate(); err != nil {
 		return Result{}, err
 	}
+	if err := inject(opts.Fault, FaultAfterContentScan, "", -1); err != nil {
+		return Result{}, err
+	}
 	staged, scan, err := renderStage(ctx, root, scan, opts)
 	if err != nil {
 		return Result{}, err
 	}
-	if err := verifyStableInputs(ctx, scan); err != nil {
+	if err := inject(opts.Fault, FaultBeforeStatValidation, "", -1); err != nil {
+		_ = os.RemoveAll(staged.dir)
+		return Result{}, err
+	}
+	if err := verifyStableInputs(ctx, root, scan); err != nil {
 		_ = os.RemoveAll(staged.dir)
 		return Result{}, err
 	}
@@ -96,47 +80,19 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 		_ = os.RemoveAll(staged.dir)
 		return Result{}, err
 	}
-	journal, err := buildJournal(ctx, root, staged, scan, opts)
+	plan, err := preparePublication(ctx, root, staged, scan, opts)
 	if err != nil {
 		_ = os.RemoveAll(staged.dir)
-		return Result{}, err
-	}
-	changesPublicState, err := journalChangesPublicState(ctx, root, journal)
-	if err != nil {
-		_ = os.RemoveAll(staged.dir)
-		_ = os.RemoveAll(filepath.Join(root, journal.Trash))
-		return Result{}, err
-	}
-	if !changesPublicState {
-		if err := discardUnpublishedJournal(root, journal); err != nil {
-			return Result{}, err
-		}
-		populateResult(&result, scan, staged, opts, false)
-		return result, nil
-	}
-	if err := persistJournal(root, journal); err != nil {
-		// Once the journal rename succeeds it may be the only durable recovery
-		// evidence, even when the following parent-directory fsync reports an
-		// error. Keep both dependencies in that state so the next create can
-		// replay or roll back the visible journal safely.
-		if !journalWasInstalled(err) {
-			_ = os.RemoveAll(staged.dir)
-			_ = os.RemoveAll(filepath.Join(root, journal.Trash))
-		}
 		return Result{}, err
 	}
 	if err := lock.Validate(); err != nil {
+		_ = os.RemoveAll(staged.dir)
 		return Result{}, err
 	}
-	if err := inject(opts.Fault, FaultAfterJournal, "", -1); err != nil {
+	if err := publishStage(ctx, root, staged, scan, opts, plan); err != nil {
 		return Result{}, err
 	}
-	changed, err := executeJournal(ctx, root, &journal, opts.Fault)
-	if err != nil {
-		return Result{}, err
-	}
-
-	populateResult(&result, scan, staged, opts, changed)
+	populateResult(&result, scan, staged, opts, plan.changed)
 	return result, nil
 }
 
@@ -158,17 +114,28 @@ func populateResult(result *Result, scan scanResult, staged stagedBuild, opts Op
 	result.Marker = opts.Pigsty
 	result.Signer = opts.SignWith
 	result.MarkerSHA256 = staged.markerSHA
-	result.Noop = !changed && len(scan.removed) == 0 && !result.Recovered
+	result.Noop = !changed && len(scan.removed) == 0
 }
 
-func verifyStableInputs(ctx context.Context, scan scanResult) error {
-	for _, fact := range scan.all {
-		digest, err := hashFile(ctx, fact.originalPath)
-		if err != nil {
-			return err
+func verifyStableInputs(ctx context.Context, root string, scan scanResult) error {
+	candidates, err := listPackageCandidates(root)
+	if err != nil {
+		return err
+	}
+	if len(candidates) != len(scan.all) {
+		return &Error{Kind: KindIntegrity, Op: "verify input stats", Path: root, Err: fmt.Errorf("package set changed after inspection: got %d files, want %d", len(candidates), len(scan.all))}
+	}
+	for index, fact := range scan.all {
+		if err := ctx.Err(); err != nil {
+			return &Error{Kind: KindRuntime, Op: "verify input stats", Path: root, Err: err}
 		}
-		if digest != fact.originalSHA256 {
-			return &Error{Kind: KindIntegrity, Op: "verify input", Path: fact.originalPath, Err: fmt.Errorf("package changed after inspection: got %s, want %s", digest, fact.originalSHA256)}
+		candidate := candidates[index]
+		if candidate.base != fact.base || candidate.format != fact.format {
+			return &Error{Kind: KindIntegrity, Op: "verify input stats", Path: root, Err: errors.New("package set changed after inspection")}
+		}
+		before, after := fact.sourceInfo, candidate.info
+		if before == nil || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || before.Mode() != after.Mode() {
+			return &Error{Kind: KindIntegrity, Op: "verify input stats", Path: fact.originalPath, Err: errors.New("package stat changed after inspection")}
 		}
 	}
 	return nil

@@ -83,13 +83,13 @@ func applyFileMetadata(file *os.File, source os.FileInfo) error {
 
 // stageSignedRPMs applies the explicit signing policy only to private copies.
 // The returned facts point at those final bytes so metadata and markers bind
-// the exact packages that the journal will later install.
+// the exact packages that publication will later install.
 func stageSignedRPMs(ctx context.Context, stage string, scan scanResult, opts Options) (scanResult, error) {
 	if opts.SignWith == "" {
 		return scan, nil
 	}
-	if !scan.hadRPM {
-		return scanResult{}, &Error{Kind: KindRejected, Op: "sign rpm", Err: errors.New("--sign-with requires at least one top-level RPM package")}
+	if !scan.hasRPM {
+		return scanResult{}, &Error{Kind: KindRejected, Op: "sign rpm", Err: errors.New("--sign-with requires at least one retained top-level RPM package")}
 	}
 
 	type group struct {
@@ -173,7 +173,7 @@ func stageSignedRPMs(ctx context.Context, stage string, scan scanResult, opts Op
 					return scanResult{}, err
 				}
 			}
-			final, err := inspectPackageFact(ctx, path, original.base, formatRPM)
+			final, err := inspectPackageFact(ctx, path, original.base, formatRPM, nil)
 			if err != nil {
 				return scanResult{}, &Error{Kind: KindRuntime, Op: "parse signed rpm", Path: original.base, Err: err}
 			}
@@ -182,6 +182,7 @@ func stageSignedRPMs(ctx context.Context, stage string, scan scanResult, opts Op
 			}
 			final.originalPath = original.originalPath
 			final.originalSHA256 = original.originalSHA256
+			final.sourceInfo = original.sourceInfo
 			final.signed = true
 			updates[original.base] = final
 		}

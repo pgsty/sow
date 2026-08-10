@@ -202,7 +202,7 @@ func TestCreateSignFailurePreservesPackagesAndExistingMetadata(t *testing.T) {
 	if fileSHA(rpmPath) != packageBefore || !bytes.Equal(mustRead(t, filepath.Join(dir, "repodata", "repomd.xml")), pointerBefore) {
 		t.Fatal("stage signing failure changed live package or metadata")
 	}
-	if _, err := os.Lstat(filepath.Join(dir, journalFilename)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(filepath.Join(dir, legacyPlainJournal)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stage signing failure persisted journal: %v", err)
 	}
 	for _, pattern := range []string{".sow-plain-stage-*", ".sow-plain-recovery-*"} {

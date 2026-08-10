@@ -78,11 +78,22 @@ func InspectPackage(ctx context.Context, filePath, component string) (Package, e
 	return InspectPackageAs(ctx, filePath, component, filepath.Base(filePath))
 }
 
+// InspectFlatPackage performs the single full-file hash used by Plain create.
+// It parses control metadata from the same descriptor and relies on the
+// caller's final stat snapshot check instead of rehashing the entire payload.
+func InspectFlatPackage(ctx context.Context, filePath, component string) (Package, error) {
+	return inspectPackagePath(ctx, filePath, component, filepath.Base(filePath), true)
+}
+
 // InspectPackageAs parses an existing .deb while using originalBasename as
 // its externally visible pool filename. CAS objects are named by digest, so a
 // rebuildable derived catalog must be able to inspect those immutable bytes
 // without first materializing or copying them back to their public filename.
 func InspectPackageAs(ctx context.Context, filePath, component, originalBasename string) (Package, error) {
+	return inspectPackagePath(ctx, filePath, component, originalBasename, false)
+}
+
+func inspectPackagePath(ctx context.Context, filePath, component, originalBasename string, singlePass bool) (Package, error) {
 	if ctx == nil {
 		return Package{}, errors.New("aptrepo: nil context")
 	}
@@ -117,7 +128,12 @@ func InspectPackageAs(ctx context.Context, filePath, component, originalBasename
 	if !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
 		return Package{}, errors.New("aptrepo: deb changed while opening")
 	}
-	pkg, err := InspectPackageReaderAs(ctx, f, component, originalBasename)
+	var pkg Package
+	if singlePass {
+		pkg, err = inspectPackageReaderAs(ctx, f, component, originalBasename, false)
+	} else {
+		pkg, err = InspectPackageReaderAs(ctx, f, component, originalBasename)
+	}
 	if err != nil {
 		return Package{}, err
 	}
@@ -152,6 +168,10 @@ type PackageReader interface {
 // rewound and hashed both before and after control parsing so the returned
 // identity and digest always describe the same bytes.
 func InspectPackageReaderAs(ctx context.Context, reader PackageReader, component, originalBasename string) (Package, error) {
+	return inspectPackageReaderAs(ctx, reader, component, originalBasename, true)
+}
+
+func inspectPackageReaderAs(ctx context.Context, reader PackageReader, component, originalBasename string, rehash bool) (Package, error) {
 	if ctx == nil {
 		return Package{}, errors.New("aptrepo: nil context")
 	}
@@ -202,15 +222,18 @@ func InspectPackageReaderAs(ctx context.Context, reader PackageReader, component
 	if err != nil {
 		return Package{}, err
 	}
-	if _, err := reader.Seek(0, io.SeekStart); err != nil {
-		return Package{}, fmt.Errorf("aptrepo: rewind deb for hashing: %w", err)
-	}
-	digest, size, err := hashReader(ctx, reader)
-	if err != nil {
-		return Package{}, fmt.Errorf("aptrepo: hash deb: %w", err)
-	}
-	if initialDigest != digest || initialSize != size {
-		return Package{}, errors.New("aptrepo: deb changed while being inspected")
+	digest, size := initialDigest, initialSize
+	if rehash {
+		if _, err := reader.Seek(0, io.SeekStart); err != nil {
+			return Package{}, fmt.Errorf("aptrepo: rewind deb for hashing: %w", err)
+		}
+		digest, size, err = hashReader(ctx, reader)
+		if err != nil {
+			return Package{}, fmt.Errorf("aptrepo: hash deb: %w", err)
+		}
+		if initialDigest != digest || initialSize != size {
+			return Package{}, errors.New("aptrepo: deb changed while being inspected")
+		}
 	}
 
 	return Package{

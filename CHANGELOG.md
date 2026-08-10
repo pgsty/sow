@@ -4,6 +4,13 @@ All notable changes to SOW are recorded here.
 
 ## Unreleased
 
+- Simplified Plain `sow create` into a rebuildable one-pass projection. The
+  default unsigned path now hashes and parses each package once with `--jobs`,
+  renders from retained parsed metadata, and performs only a final package-set
+  and `stat` snapshot check before publication. Plain no longer writes an
+  operation journal, recovery trash, rollback pre-images, or repeated package
+  hashes; an interrupted run is handled by rerunning `create` to overwrite
+  derived metadata. Managed repository transactions and recovery are unchanged.
 - Added repository schema v9, which indexes every membership table by
   `package_sha256`. Managed builds and checks now expand Desired and Built
   Membership with one bulk projection instead of one query per object: listing

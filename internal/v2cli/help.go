@@ -96,8 +96,8 @@ Use "sow help COMMAND" for command help.
   sow create [DIR] [-j N] [--pigsty] [-S KEY [--overwrite]] [-T DUR | -N] [--json]
 
 Options:
-  -j, --jobs N          Parallel workers; defaults to logical CPU count
-      --pigsty          Enable the atomic Pigsty compatibility operation
+  -j, --jobs N          Workers for the single content pass; defaults to CPU count
+      --pigsty          Enable Pigsty cleanup and the repo_complete gate
   -S, --sign-with KEY   Sign unsigned RPMs with a 16/40/64-hex GPG key ID
       --overwrite       Re-sign every RPM; requires --sign-with
   -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely

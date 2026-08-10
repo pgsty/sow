@@ -133,6 +133,17 @@ func WritePackages(w io.Writer, packages []Package) error {
 // Package sources are rehashed before their paragraphs are emitted so callers
 // cannot publish metadata for bytes that changed after inspection.
 func WriteFlatPackages(ctx context.Context, w io.Writer, packages []Package) error {
+	return writeFlatPackages(ctx, w, packages, true)
+}
+
+// WriteInspectedFlatPackages renders packages already returned by
+// InspectFlatPackage without reopening their payloads. Plain create performs
+// one directory-wide stat validation after all RPM and DEB metadata is staged.
+func WriteInspectedFlatPackages(ctx context.Context, w io.Writer, packages []Package) error {
+	return writeFlatPackages(ctx, w, packages, false)
+}
+
+func writeFlatPackages(ctx context.Context, w io.Writer, packages []Package, verifySource bool) error {
 	if ctx == nil {
 		return errors.New("aptrepo: nil context")
 	}
@@ -156,8 +167,10 @@ func WriteFlatPackages(ctx context.Context, w io.Writer, packages []Package) err
 		if previous != nil && previous.Name == pkg.Name && version.Compare(previous.debianVersion, pkg.debianVersion) == 0 && previous.Architecture == pkg.Architecture {
 			return ErrDuplicatePackageIdentity
 		}
-		if err := verifyPackageSource(ctx, pkg); err != nil {
-			return err
+		if verifySource {
+			if err := verifyPackageSource(ctx, pkg); err != nil {
+				return err
+			}
 		}
 		base := filepath.Base(pkg.SourcePath)
 		if !safeDebBasename(base) || filepath.Join(filepath.Dir(pkg.SourcePath), base) != filepath.Clean(pkg.SourcePath) {

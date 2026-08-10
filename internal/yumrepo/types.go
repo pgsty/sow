@@ -125,6 +125,14 @@ type PackageInfo struct {
 	Location  string
 }
 
+// FlatPackage is one RPM that has already been fully hashed and parsed for a
+// flat repository. Its metadata is intentionally opaque: Plain create can
+// retain it between the concurrent scan and deterministic rendering without
+// opening the RPM a second time.
+type FlatPackage struct {
+	metadata *packageMetadata
+}
+
 // PackageIterator supplies RPMs without requiring the generator to retain a
 // repository-wide package collection. Inputs must be ordered by the derived
 // Packages/<bucket>/<basename> location; the generator validates that contract.

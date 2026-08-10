@@ -189,12 +189,50 @@ func InspectPackage(ctx context.Context, in PackageInput) (PackageInfo, error) {
 	if err != nil {
 		return PackageInfo{}, err
 	}
+	return packageInfo(metadata), nil
+}
+
+// InspectFlatPackage performs the one content pass used by Plain create and
+// retains the complete parsed rpm-md projection for later rendering. The
+// returned FlatPackage never opens the source again.
+func InspectFlatPackage(ctx context.Context, in PackageInput) (*FlatPackage, PackageInfo, error) {
+	if ctx == nil {
+		return nil, PackageInfo{}, fmt.Errorf("yumrepo: nil context")
+	}
+	metadata, err := readFlatPackage(ctx, in)
+	if err != nil {
+		return nil, PackageInfo{}, err
+	}
+	return &FlatPackage{metadata: metadata}, packageInfo(metadata), nil
+}
+
+func packageInfo(metadata *packageMetadata) PackageInfo {
 	source := sourceNameFromRPM(metadata.SourceRPM, metadata.Name, metadata.Version, metadata.Release)
 	return PackageInfo{
 		Name: metadata.Name, Source: source, SourceRPM: metadata.SourceRPM, Version: metadata.Version, Release: metadata.Release,
 		Epoch: metadata.Epoch, Arch: metadata.Arch, SHA256: metadata.Checksum,
 		Size: metadata.PackageSize, Location: metadata.Location,
-	}, nil
+	}
+}
+
+func readFlatPackage(ctx context.Context, in PackageInput) (*packageMetadata, error) {
+	if in.PoolPath != "" || in.ViewPath.String() != "" || in.Location != "" {
+		return nil, fmt.Errorf("%w: flat package input carries managed placement", ErrUnsafeLocation)
+	}
+	in.FileTime = unixEpoch
+	metadata, err := readPackage(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	base := in.Basename
+	if base == "" {
+		base = filepath.Base(in.Path)
+	}
+	if _, err := PackageLocation(metadata.Name, base); err != nil {
+		return nil, err
+	}
+	metadata.Location = base
+	return metadata, nil
 }
 
 // InspectPackageReader parses and hashes one RPM through a caller-owned
@@ -328,7 +366,12 @@ func readPackageWithManagedBasename(ctx context.Context, in PackageInput, allowM
 		return nil, fmt.Errorf("%w: parse %q: %v", ErrInvalidPackage, in.Path, err)
 	}
 	afterInfo, err := f.Stat()
-	if err != nil || afterInfo.Size() != info.Size() || !afterInfo.ModTime().Equal(info.ModTime()) {
+	if err != nil || !afterInfo.Mode().IsRegular() || afterInfo.Size() != info.Size() ||
+		!afterInfo.ModTime().Equal(info.ModTime()) || afterInfo.Mode() != info.Mode() {
+		return nil, fmt.Errorf("%w: %q changed while hashing/parsing", ErrInvalidPackage, in.Path)
+	}
+	pathAfter, err := os.Lstat(in.Path)
+	if err != nil || !pathAfter.Mode().IsRegular() || pathAfter.Mode()&os.ModeSymlink != 0 || !os.SameFile(pathInfo, pathAfter) {
 		return nil, fmt.Errorf("%w: %q changed while hashing/parsing", ErrInvalidPackage, in.Path)
 	}
 

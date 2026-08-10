@@ -34,7 +34,9 @@ type packageFact struct {
 	arch           string
 	signed         bool
 	rpm            yumrepo.PackageInfo
+	parsedRPM      *yumrepo.FlatPackage
 	deb            aptrepo.Package
+	sourceInfo     os.FileInfo
 }
 
 type scanResult struct {
@@ -42,22 +44,24 @@ type scanResult struct {
 	index      []packageFact
 	kept       []packageFact
 	removed    []packageFact
-	hadRPM     bool
-	hadDEB     bool
+	hasRPM     bool
+	hasDEB     bool
 	duplicates int
 }
 
-func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanResult, error) {
+type packageCandidate struct {
+	base   string
+	path   string
+	format packageFormat
+	info   os.FileInfo
+}
+
+func listPackageCandidates(dir string) ([]packageCandidate, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return scanResult{}, &Error{Kind: KindRuntime, Op: "scan", Path: dir, Err: err}
+		return nil, &Error{Kind: KindRuntime, Op: "scan", Path: dir, Err: err}
 	}
-	type candidate struct {
-		base   string
-		path   string
-		format packageFormat
-	}
-	var candidates []candidate
+	var candidates []packageCandidate
 	for _, entry := range entries {
 		base := entry.Name()
 		format := packageFormat("")
@@ -72,18 +76,28 @@ func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanR
 		path := filepath.Join(dir, base)
 		info, err := os.Lstat(path)
 		if err != nil {
-			return scanResult{}, &Error{Kind: KindRuntime, Op: "lstat", Path: path, Err: err}
+			return nil, &Error{Kind: KindRuntime, Op: "lstat", Path: path, Err: err}
 		}
-		if !info.Mode().IsRegular() {
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			continue
 		}
-		candidates = append(candidates, candidate{base: base, path: path, format: format})
-	}
-	if len(candidates) == 0 {
-		return scanResult{}, &Error{Kind: KindRejected, Op: "scan", Path: dir, Err: errors.New("no supported top-level regular RPM or DEB packages")}
+		candidates = append(candidates, packageCandidate{base: base, path: path, format: format, info: info})
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].base < candidates[j].base })
+	return candidates, nil
+}
 
+func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanResult, error) {
+	candidates, err := listPackageCandidates(dir)
+	if err != nil {
+		return scanResult{}, err
+	}
+	if len(candidates) == 0 {
+		if pigsty {
+			return scanResult{}, nil
+		}
+		return scanResult{}, &Error{Kind: KindRejected, Op: "scan", Path: dir, Err: errors.New("no supported top-level regular RPM or DEB packages")}
+	}
 	type parsed struct {
 		index int
 		fact  packageFact
@@ -104,7 +118,7 @@ func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanR
 			defer group.Done()
 			for i := range work {
 				candidate := candidates[i]
-				fact, err := inspectPackageFact(workerCtx, candidate.path, candidate.base, candidate.format)
+				fact, err := inspectPackageFact(workerCtx, candidate.path, candidate.base, candidate.format, candidate.info)
 				if err != nil {
 					op := "parse deb"
 					if candidate.format == formatRPM {
@@ -156,11 +170,6 @@ func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanR
 	result := scanResult{all: facts}
 	coordinates := make(map[string]packageFact, len(facts))
 	for _, fact := range facts {
-		if fact.format == formatRPM {
-			result.hadRPM = true
-		} else {
-			result.hadDEB = true
-		}
 		if previous, exists := coordinates[fact.coordinate]; exists {
 			if previous.sha256 != fact.sha256 {
 				return scanResult{}, &Error{Kind: KindRejected, Op: "coordinate conflict", Path: fact.base, Err: fmt.Errorf("%s and %s have the same logical coordinate but different SHA-256", previous.base, fact.base)}
@@ -182,22 +191,37 @@ func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanR
 		}
 		indexed[fact.coordinate] = struct{}{}
 		result.index = append(result.index, fact)
+		if fact.format == formatRPM {
+			result.hasRPM = true
+		} else {
+			result.hasDEB = true
+		}
 	}
 	return result, nil
 }
 
-func inspectPackageFact(ctx context.Context, path, base string, format packageFormat) (packageFact, error) {
+func inspectPackageFact(ctx context.Context, path, base string, format packageFormat, before os.FileInfo) (packageFact, error) {
+	if before == nil {
+		var err error
+		before, err = os.Lstat(path)
+		if err != nil {
+			return packageFact{}, errors.Join(err, errors.New("package changed before inspection"))
+		}
+	}
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 {
+		return packageFact{}, errors.New("package changed before inspection")
+	}
 	fact := packageFact{format: format, base: base, path: path, originalPath: path}
 	switch format {
 	case formatRPM:
-		pkg, err := yumrepo.InspectPackage(ctx, yumrepo.PackageInput{Path: path, Basename: base})
+		parsed, pkg, err := yumrepo.InspectFlatPackage(ctx, yumrepo.PackageInput{Path: path, Basename: base})
 		if err != nil {
 			return packageFact{}, err
 		}
-		fact.rpm, fact.name, fact.version, fact.arch, fact.sha256 = pkg, pkg.Name, pkg.Version, pkg.Arch, pkg.SHA256
+		fact.parsedRPM, fact.rpm, fact.name, fact.version, fact.arch, fact.sha256 = parsed, pkg, pkg.Name, pkg.Version, pkg.Arch, pkg.SHA256
 		fact.coordinate = fmt.Sprintf("rpm:%s\x00%d\x00%s\x00%s\x00%s", pkg.Name, pkg.Epoch, pkg.Version, pkg.Release, pkg.Arch)
 	case formatDEB:
-		pkg, err := aptrepo.InspectPackage(ctx, path, "main")
+		pkg, err := aptrepo.InspectFlatPackage(ctx, path, "main")
 		if err != nil {
 			return packageFact{}, err
 		}
@@ -206,8 +230,23 @@ func inspectPackageFact(ctx context.Context, path, base string, format packageFo
 	default:
 		return packageFact{}, fmt.Errorf("unsupported package format %q", format)
 	}
+	info, err := os.Lstat(path)
+	if err != nil || !samePackageStat(before, info) {
+		return packageFact{}, errors.Join(err, errors.New("package changed after inspection"))
+	}
+	fact.sourceInfo = info
 	fact.originalSHA256 = fact.sha256
 	return fact, nil
+}
+
+func samePackageStat(before, after os.FileInfo) bool {
+	return before != nil && after != nil &&
+		before.Mode().IsRegular() && after.Mode().IsRegular() &&
+		before.Mode()&os.ModeSymlink == 0 && after.Mode()&os.ModeSymlink == 0 &&
+		os.SameFile(before, after) &&
+		before.Size() == after.Size() &&
+		before.ModTime().Equal(after.ModTime()) &&
+		before.Mode() == after.Mode()
 }
 
 func isSourceRPMArch(arch string) bool {

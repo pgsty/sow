@@ -61,7 +61,8 @@ func KindOf(err error) ErrorKind {
 type FaultPoint string
 
 const (
-	FaultAfterJournal         FaultPoint = "after-journal"
+	FaultAfterContentScan     FaultPoint = "after-content-scan"
+	FaultBeforeStatValidation FaultPoint = "before-stat-validation"
 	FaultAfterMarkerWithdrawn FaultPoint = "after-marker-withdrawn"
 	FaultBeforeRPMPackage     FaultPoint = "before-rpm-package-replace"
 	FaultAfterRPMPackage      FaultPoint = "after-rpm-package-replace"
@@ -102,8 +103,7 @@ type Options struct {
 	NoWait    bool
 	SignRPM   RPMSignFunc
 
-	// Fault is an internal verification hook. Production callers leave it nil;
-	// subprocess tests use it to terminate at durable transaction boundaries.
+	// Fault is an internal verification hook. Production callers leave it nil.
 	Fault func(Fault) error
 }
 

@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"time"
 
 	"github.com/pgsty/sow/internal/aptrepo"
@@ -40,20 +39,19 @@ func renderStage(ctx context.Context, dir string, scan scanResult, opts Options)
 		return stagedBuild{}, scanResult{}, err
 	}
 
-	if scan.hadRPM {
-		var inputs []yumrepo.PackageInput
+	if scan.hasRPM {
+		var packages []*yumrepo.FlatPackage
 		for _, fact := range scan.index {
 			if fact.format == formatRPM {
-				inputs = append(inputs, yumrepo.PackageInput{Path: fact.path, Basename: fact.base, FileTime: time.Unix(0, 0).UTC()})
+				packages = append(packages, fact.parsedRPM)
 			}
 		}
-		sort.Slice(inputs, func(i, j int) bool { return inputs[i].Basename < inputs[j].Basename })
-		if _, err := yumrepo.GenerateFlatUnsigned(ctx, filepath.Join(stage, "repodata"), 0, &yumrepo.SliceIterator{Inputs: inputs}); err != nil {
+		if _, err := yumrepo.GenerateFlatUnsignedParsed(ctx, filepath.Join(stage, "repodata"), 0, packages); err != nil {
 			return stagedBuild{}, scanResult{}, &Error{Kind: KindRuntime, Op: "render rpm", Path: dir, Err: err}
 		}
 	}
 
-	if scan.hadDEB {
+	if scan.hasDEB {
 		var packages []aptrepo.Package
 		for _, fact := range scan.index {
 			if fact.format == formatDEB {
@@ -69,7 +67,7 @@ func renderStage(ctx context.Context, dir string, scan scanResult, opts Options)
 			_ = packagesFile.Close()
 			return stagedBuild{}, scanResult{}, &Error{Kind: KindRuntime, Op: "chmod Packages", Path: packagesPath, Err: err}
 		}
-		writeErr := aptrepo.WriteFlatPackages(ctx, packagesFile, packages)
+		writeErr := aptrepo.WriteInspectedFlatPackages(ctx, packagesFile, packages)
 		syncErr := error(nil)
 		if writeErr == nil {
 			syncErr = packagesFile.Sync()
@@ -81,7 +79,7 @@ func renderStage(ctx context.Context, dir string, scan scanResult, opts Options)
 		if err := writeDeterministicGzip(ctx, packagesPath, filepath.Join(stage, "Packages.gz")); err != nil {
 			return stagedBuild{}, scanResult{}, &Error{Kind: KindRuntime, Op: "compress deb", Path: packagesPath, Err: err}
 		}
-		if err := aptrepo.ValidateFlatPackages(ctx, packagesPath, filepath.Join(stage, "Packages.gz"), packages); err != nil {
+		if err := aptrepo.ValidateInspectedFlatPackages(ctx, packagesPath, filepath.Join(stage, "Packages.gz"), packages); err != nil {
 			return stagedBuild{}, scanResult{}, &Error{Kind: KindRuntime, Op: "validate deb", Path: packagesPath, Err: err}
 		}
 	}
@@ -115,7 +113,7 @@ func renderStage(ctx context.Context, dir string, scan scanResult, opts Options)
 		return stagedBuild{}, scanResult{}, &Error{Kind: KindRuntime, Op: "sync stage", Path: stage, Err: err}
 	}
 	keep = true
-	return stagedBuild{dir: stage, markerSHA: markerSHA, rpmPresent: scan.hadRPM, debPresent: scan.hadDEB}, scan, nil
+	return stagedBuild{dir: stage, markerSHA: markerSHA, rpmPresent: scan.hasRPM, debPresent: scan.hasDEB}, scan, nil
 }
 
 func writeDeterministicGzip(ctx context.Context, source, target string) error {

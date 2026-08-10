@@ -22,6 +22,37 @@ func GenerateFlatUnsigned(ctx context.Context, dest string, revision uint64, pac
 	if packages == nil {
 		return nil, errors.New("yumrepo: nil package iterator")
 	}
+	return generateFlatUnsigned(ctx, dest, revision, func() (*packageMetadata, error) {
+		input, err := packages.Next(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return readFlatPackage(ctx, input)
+	})
+}
+
+// GenerateFlatUnsignedParsed renders RPM metadata from packages returned by
+// InspectFlatPackage. It performs no package I/O; results are consumed in the
+// provided basename order and validated exactly like GenerateFlatUnsigned.
+func GenerateFlatUnsignedParsed(ctx context.Context, dest string, revision uint64, packages []*FlatPackage) (*Generation, error) {
+	if ctx == nil {
+		return nil, errors.New("yumrepo: nil context")
+	}
+	next := 0
+	return generateFlatUnsigned(ctx, dest, revision, func() (*packageMetadata, error) {
+		if next >= len(packages) {
+			return nil, io.EOF
+		}
+		pkg := packages[next]
+		next++
+		if pkg == nil || pkg.metadata == nil {
+			return nil, fmt.Errorf("%w: nil parsed flat package", ErrInvalidPackage)
+		}
+		return pkg.metadata, nil
+	})
+}
+
+func generateFlatUnsigned(ctx context.Context, dest string, revision uint64, next func() (*packageMetadata, error)) (*Generation, error) {
 	dest = filepath.Clean(dest)
 	if dest == "." || dest == string(filepath.Separator) {
 		return nil, errors.New("yumrepo: unsafe flat generation destination")
@@ -65,7 +96,7 @@ func GenerateFlatUnsigned(ctx context.Context, dest string, revision uint64, pac
 			bodies.closeDiscard()
 			return nil, err
 		}
-		input, nextErr := packages.Next(ctx)
+		metadata, nextErr := next()
 		if errors.Is(nextErr, io.EOF) {
 			break
 		}
@@ -73,21 +104,6 @@ func GenerateFlatUnsigned(ctx context.Context, dest string, revision uint64, pac
 			bodies.closeDiscard()
 			return nil, fmt.Errorf("yumrepo: read flat package input: %w", nextErr)
 		}
-		input.FileTime = unixEpoch
-		metadata, readErr := readPackage(ctx, input)
-		if readErr != nil {
-			bodies.closeDiscard()
-			return nil, readErr
-		}
-		base := input.Basename
-		if base == "" {
-			base = filepath.Base(input.Path)
-		}
-		if _, err := PackageLocation(metadata.Name, base); err != nil {
-			bodies.closeDiscard()
-			return nil, err
-		}
-		metadata.Location = base
 		if previous != "" && metadata.Location <= previous {
 			bodies.closeDiscard()
 			return nil, fmt.Errorf("%w: %q follows %q", ErrUnsortedInput, metadata.Location, previous)
