@@ -20,9 +20,5 @@ coverage.out
 
 /docs/*
 !/docs/README.md
-!/docs/examples/
-!/docs/examples/**
-!/docs/migration/
-!/docs/migration/**
 bin/
 dist/

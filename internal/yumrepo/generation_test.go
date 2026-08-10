@@ -466,7 +466,7 @@ func TestChangelogsMatchCreaterepoLimitOrderAndTimestampProjection(t *testing.T)
 }
 
 func TestGenerateCheckedInExternalRPMEL10(t *testing.T) {
-	encoded, err := os.ReadFile("../cli/testdata/pgdg-redhat-nonfree-repo.rpm.b64")
+	encoded, err := os.ReadFile("../../testdata/pgdg-redhat-nonfree-repo.rpm.b64")
 	if err != nil {
 		t.Fatalf("read checked-in RPM fixture: %v", err)
 	}

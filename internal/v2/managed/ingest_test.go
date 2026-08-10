@@ -123,7 +123,7 @@ func TestAddPostCommitCheckpointFailureRetainsCommittedProjection(t *testing.T) 
 		if err := os.Mkdir(inputs, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		input := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+		input := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 		return root, input
 	}
 	run := func(t *testing.T, root, input string, skip bool, before state.RepositorySummary, wantDirty bool) {
@@ -204,7 +204,7 @@ func TestPostTerminalCleanupFailureRetainsCommittedProjection(t *testing.T) {
 		if err := os.Mkdir(inputs, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		input := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+		input := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 		return root, input
 	}
 	fault := func(t *testing.T, root, point string) (func(string) error, func()) {
@@ -281,7 +281,7 @@ func TestAddRecoveryConvergesAtEveryDurablePhase(t *testing.T) {
 			if err := os.Mkdir(inputs, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+			rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 			injected := errors.New("injected")
 			_, err := Add(ctx, AddOptions{
 				WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1,
@@ -335,7 +335,7 @@ func TestAddRPMAndDEBBuildsManagedRepository(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "pgdg-redhat-nonfree-repo.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "pgdg-redhat-nonfree-repo.rpm"))
 	deb := decodeManagedFixture(t, filepath.Join("..", "..", "aptrepo", "testdata", "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64"), filepath.Join(inputs, "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb"))
 	result, err := Add(ctx, AddOptions{
 		WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo",
@@ -410,7 +410,7 @@ func TestAddMixedBatchCommitsAcceptedPackagesAndReturnsPartial(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	valid := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "valid.rpm"))
+	valid := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "valid.rpm"))
 	invalid := filepath.Join(inputs, "invalid.rpm")
 	if err := os.WriteFile(invalid, []byte("not an rpm\n"), 0o444); err != nil {
 		t.Fatal(err)
@@ -457,7 +457,7 @@ func TestPreApplyFailuresBecomeFailedButInjectedCrashesRemainRecoverable(t *test
 		if err := os.Mkdir(inputs, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		input := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+		input := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 		options := AddOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Dists: []string{"el9"}, Paths: []string{input}, Jobs: 1}
 		return root, input, options
 	}
@@ -560,7 +560,7 @@ func TestPackageSignerFailureIsAuditedWithoutSecretMaterial(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	input := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	input := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 	privateKey, fingerprint := managedTestPrivateKey(t, "package-failure")
 	const keyEnv = "SOW_TEST_PACKAGE_FAILURE_KEY"
 	t.Setenv(keyEnv, string(privateKey))
@@ -745,7 +745,7 @@ func TestAllFailedAddCannotReconcileUnrelatedPolicyChange(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	valid := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "valid.rpm"))
+	valid := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "valid.rpm"))
 	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{valid}, Jobs: 1}); err != nil {
 		t.Fatal(err)
 	}
@@ -830,7 +830,7 @@ func TestDistRemovalRecoversFinalPendingObjectCleanup(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "pending.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "pending.rpm"))
 	added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Skip: true, Jobs: 1})
 	if err != nil || added.Accepted != 1 {
 		t.Fatalf("skipped add=%#v err=%v", added, err)

@@ -72,7 +72,7 @@ type VerifiedEmbeddedRPMSignature struct {
 	PayloadDigest            string
 }
 
-// Compression is the only metadata compression policy supported by sow/v1.
+// Compression is the metadata compression policy used by managed RPM dists.
 type Compression string
 
 const (
@@ -138,16 +138,6 @@ type FlatPackage struct {
 // Packages/<bucket>/<basename> location; the generator validates that contract.
 type PackageIterator interface {
 	Next(context.Context) (PackageInput, error)
-}
-
-// IteratorFunc adapts a function to PackageIterator. It returns io.EOF at end.
-type IteratorFunc func(context.Context) (PackageInput, error)
-
-func (f IteratorFunc) Next(ctx context.Context) (PackageInput, error) {
-	if f == nil {
-		return PackageInput{}, errors.New("yumrepo: nil iterator function")
-	}
-	return f(ctx)
 }
 
 // SliceIterator is a small convenience adapter. The caller remains responsible

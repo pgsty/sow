@@ -41,7 +41,7 @@ func TestPendingObjectsAreIngestedPromotionReady(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 	injected := errors.New("injected")
 	_, err := Add(ctx, AddOptions{
 		WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1,
@@ -557,7 +557,7 @@ func TestManagedBuildRecordsPhaseProgress(t *testing.T) {
 	if err := os.Mkdir(inputRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputRoot, "package.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputRoot, "package.rpm"))
 	result, err := Add(ctx, AddOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 2})
 	if err != nil {
 		t.Fatal(err)

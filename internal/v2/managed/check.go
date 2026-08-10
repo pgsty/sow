@@ -444,7 +444,7 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 				for _, architecture := range validationArchitectures {
 					signatureChecked++
 					repodata := filepath.Join(ws.Root, repoName, "dists", distName, architecture.Family, "repodata")
-					if aliasErr := validateLegacyRPMViewAliases(ctx, repositoryRoot, distName, architecture.Family, aliasObjects); aliasErr != nil {
+					if aliasErr := validateC2RPMViewAliases(ctx, repositoryRoot, distName, architecture.Family, aliasObjects); aliasErr != nil {
 						indexIssues = append(indexIssues, aliasErr.Error())
 					}
 					if verifierErr == nil {
@@ -840,7 +840,7 @@ func validateRPMViewContainsNoPayload(ctx context.Context, repositoryRoot, distN
 	}, nil)
 }
 
-func validateLegacyRPMViewAliases(ctx context.Context, repositoryRoot, distName, family string, objects []state.PackageObject) error {
+func validateC2RPMViewAliases(ctx context.Context, repositoryRoot, distName, family string, objects []state.PackageObject) error {
 	expected := make(map[string]state.PackageObject)
 	for _, object := range objects {
 		if object.Format != "rpm" || object.Storage != "pool" || object.CanonicalArch != "neutral" && object.CanonicalArch != family {

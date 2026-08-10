@@ -191,10 +191,6 @@ func (s *Store) ListOperations(ctx context.Context, limit int, dist string) ([]O
 	return s.listOperations(ctx, limit, dist, false)
 }
 
-func (s *Store) ListTerminalOperations(ctx context.Context, limit int, dist string) ([]Operation, error) {
-	return s.listOperations(ctx, limit, dist, true)
-}
-
 // ListTerminalOperationPage returns a stable oldest-first page strictly after
 // the supplied cursor. It lets audit export cover an unbounded history without
 // silently truncating or retaining every Operation in memory.

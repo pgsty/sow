@@ -30,7 +30,7 @@ func TestLogDetailExportAndSafePrune(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 	added, err := Add(ctx, AddOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Skip: true, Jobs: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +99,7 @@ func TestLogAuditsPerDistAddAndBuildPolicyOutcomes(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 	added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9", "el10"}, Paths: []string{rpm}, Skip: true, Jobs: 1})
 	if err != nil || added.Accepted != 1 || len(added.Items) != 1 || !reflect.DeepEqual(added.Items[0].Dists, map[string]string{"el9": "accepted", "el10": "excluded"}) {
 		t.Fatalf("add=%#v err=%v", added, err)
@@ -248,7 +248,7 @@ func TestLogPruneRecoversFirstAndPreservesCurrentGeneration(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 	options := WorkspaceOptions{Workdir: root, CWD: root}
 	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Skip: true, Jobs: 1}); err != nil {
 		t.Fatal(err)
@@ -335,7 +335,7 @@ func TestLogPruneCrashPhasesRecoverWithoutLosingGenerationOrChanges(t *testing.T
 			if err := os.Mkdir(inputs, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+			rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 			added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Skip: true, Jobs: 1})
 			if err != nil {
 				t.Fatal(err)

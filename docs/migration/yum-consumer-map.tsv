@@ -1,6 +1,0 @@
-# schema=sow-pigsty-yum-consumer-map/v2
-# pigsty_name	x86_64_repo_os_arch	aarch64_repo_os_arch	expected_definitions
-pigsty-infra	infra-legacy-x86-64/cross-el/x86_64	infra-legacy-aarch64/cross-el/aarch64	9
-pigsty-pgsql	yum-pgsql-el$releasever/el$releasever/x86_64	yum-pgsql-el$releasever/el$releasever/aarch64	9
-percona	yum-percona-el$releasever/el$releasever/x86_64	yum-percona-el$releasever/el$releasever/aarch64	2
-wiltondb	yum-mssql-el$releasever/el$releasever/x86_64	yum-mssql-el$releasever/el$releasever/aarch64	2

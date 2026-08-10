@@ -122,7 +122,7 @@ func TestRetainedGenerationCopiesMetadataButReferencesPayload(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 	if _, err := Add(ctx, AddOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1}); err != nil {
 		t.Fatal(err)
 	}

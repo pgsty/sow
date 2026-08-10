@@ -26,7 +26,7 @@ func TestSkippedMutationsCanReturnExactlyToBuiltProjection(t *testing.T) {
 			if err := os.Mkdir(inputs, 0o755); err != nil {
 				t.Fatal(err)
 			}
-			rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+			rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 			if scenario == "built remove then add" {
 				if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1}); err != nil {
 					t.Fatal(err)
@@ -79,7 +79,7 @@ func TestSkippedRevertKeepsRepositoryDirtyWhenAnotherDistDiffers(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9", "el10"}, Paths: []string{rpm}, Skip: true, Jobs: 1}); err != nil {
 		t.Fatal(err)
 	}

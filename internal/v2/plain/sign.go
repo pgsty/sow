@@ -30,34 +30,6 @@ func preservedFileMode(mode os.FileMode) os.FileMode {
 	return mode.Perm() | mode&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky)
 }
 
-func encodePreservedFileMode(mode os.FileMode) uint32 {
-	encoded := uint32(mode.Perm())
-	if mode&os.ModeSetuid != 0 {
-		encoded |= 0o4000
-	}
-	if mode&os.ModeSetgid != 0 {
-		encoded |= 0o2000
-	}
-	if mode&os.ModeSticky != 0 {
-		encoded |= 0o1000
-	}
-	return encoded
-}
-
-func decodePreservedFileMode(encoded uint32) os.FileMode {
-	mode := os.FileMode(encoded & 0o777)
-	if encoded&0o4000 != 0 {
-		mode |= os.ModeSetuid
-	}
-	if encoded&0o2000 != 0 {
-		mode |= os.ModeSetgid
-	}
-	if encoded&0o1000 != 0 {
-		mode |= os.ModeSticky
-	}
-	return mode
-}
-
 // applyFileMetadata restores ownership before mode because chown may clear the
 // setuid and setgid bits on POSIX filesystems.
 func applyFileMetadata(file *os.File, source os.FileInfo) error {

@@ -60,7 +60,7 @@ func TestAddFailsClosedWhenWorkspaceRootIsReboundMidCommand(t *testing.T) {
 	if err := os.Mkdir(inputRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputRoot, "package.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputRoot, "package.rpm"))
 	moved := filepath.Join(parent, "workspace-moved")
 	rebound := false
 	_, err := Add(ctx, AddOptions{

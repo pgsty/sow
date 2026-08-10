@@ -193,13 +193,13 @@ func TestAddAndRemoveRejectOversizedSignerProjectionBeforeDesiredWrites(t *testi
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 
 	keysDir := filepath.Join(root, "keys")
 	if err := os.Mkdir(keysDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	currentPublic, err := os.ReadFile(filepath.Join("..", "..", "..", "test", "compat", "testdata", "PGDG-RPM-GPG-KEY-RHEL-nonfree.asc"))
+	currentPublic, err := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "PGDG-RPM-GPG-KEY-RHEL-nonfree.asc"))
 	if err != nil {
 		t.Fatal(err)
 	}

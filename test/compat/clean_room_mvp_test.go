@@ -34,7 +34,7 @@ func TestShippedExampleSupportsCleanRoomLocalMVP(t *testing.T) {
 		t.Fatal(err)
 	}
 	decodeBase64Fixture(t,
-		filepath.Join(moduleRoot, "internal", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"),
+		filepath.Join(moduleRoot, "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"),
 		filepath.Join(plainRoot, "pgdg-redhat-nonfree-repo-42.0-20PGDG.noarch.rpm"),
 	)
 	decodeBase64Fixture(t,

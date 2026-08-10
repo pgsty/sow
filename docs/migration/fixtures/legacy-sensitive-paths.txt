@@ -1,6 +1,0 @@
-# Reviewed legacy files that are never serving bytes and must never be opened,
-# hashed, adopted, materialized, or copied into migration evidence.
-bin/fileauth.txt
-docker/private.asc
-docker/yum-syncer/private.asc
-key

@@ -192,67 +192,6 @@ func ValidateDirectory(ctx context.Context, dir string, compression Compression,
 	return validateDirectory(ctx, dir, compression, verifier, false)
 }
 
-// ValidateRoot validates an already-retained repodata directory capability.
-// The caller owns root and must keep it open while consuming the returned
-// artifact paths. This prevents a public pathname swap between signed
-// generation validation and higher-layer metadata parsing.
-func ValidateRoot(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier) (*Generation, error) {
-	generation, _, err := validateRootWithProof(ctx, root, diagnostic, compression, verifier, false)
-	return generation, err
-}
-
-// ValidatedRootProof retains the identities and content hashes of the complete
-// signed generation (repomd, detached signature, and all three artifacts).
-// The caller must keep the os.Root supplied to ValidateRootWithProof open.
-type ValidatedRootProof struct {
-	root       *os.Root
-	identity   os.FileInfo
-	generation Generation
-	entries    []validatedRegularEntry
-	signed     bool
-	retained   bool
-}
-
-// ValidateRootWithProof is ValidateRoot plus a proof that higher verification
-// layers can recheck after consuming metadata. This closes the gap where the
-// directory inode remains stable but repomd.xml or its signature is replaced.
-func ValidateRootWithProof(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier) (*Generation, *ValidatedRootProof, error) {
-	return validateRootWithProof(ctx, root, diagnostic, compression, verifier, false)
-}
-
-func (proof *ValidatedRootProof) Check(ctx context.Context) error {
-	if ctx == nil || proof == nil || proof.root == nil || proof.identity == nil || len(proof.entries) == 0 {
-		return fmt.Errorf("%w: validated root proof is unavailable", ErrInvalidRepodata)
-	}
-	current, err := proof.root.Stat(".")
-	if err != nil || !current.IsDir() || !os.SameFile(proof.identity, current) {
-		return fmt.Errorf("%w: retained repodata root changed after validation: %v", ErrInvalidRepodata, err)
-	}
-	if err := rejectExtraGenerationFilesRootMode(ctx, proof.root, &proof.generation, proof.signed, proof.retained); err != nil {
-		return err
-	}
-	if err := verifyValidatedGenerationEntriesRoot(ctx, proof.root, proof.entries); err != nil {
-		return err
-	}
-	if err := rejectExtraGenerationFilesRootMode(ctx, proof.root, &proof.generation, proof.signed, proof.retained); err != nil {
-		return err
-	}
-	current, err = proof.root.Stat(".")
-	if err != nil || !current.IsDir() || !os.SameFile(proof.identity, current) {
-		return fmt.Errorf("%w: retained repodata root changed during proof check: %v", ErrInvalidRepodata, err)
-	}
-	return nil
-}
-
-// ValidateFlatCompatibilityDirectory applies the same signed, exact-generation
-// validation as ValidateDirectory, but requires every primary location href to
-// be a single flat RPM basename. This mode exists only for admitting the frozen
-// yum/infra/{arch} legacy URL contract; canonical SOW YUM repositories must
-// continue to use ValidateDirectory and Packages/<bucket>/<basename> hrefs.
-func ValidateFlatCompatibilityDirectory(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier) (*Generation, error) {
-	return validateDirectory(ctx, dir, compression, verifier, true)
-}
-
 // ValidateFlatUnsignedDirectory validates the unsigned flat rpm-md shape used
 // by sow create. Package hrefs must be single RPM basenames and no detached
 // repomd signature is accepted or required.
@@ -346,15 +285,6 @@ func ValidateLegacyC2RPMViewDirectory(ctx context.Context, dir string, compressi
 	return generation, nil
 }
 
-// ValidateFlatEmptyUnsignedDirectory validates the empty unsigned rpm-md
-// shape used by the P1 control plane without creating identity scratch files.
-// It is intentionally closed to zero-package generations; non-empty metadata
-// must use the full validator, which may spill bounded identity runs to a
-// private system temporary directory.
-func ValidateFlatEmptyUnsignedDirectory(ctx context.Context, dir string, compression Compression) (*Generation, error) {
-	return validateDirectoryMode(ctx, dir, compression, nil, true, false, true)
-}
-
 func validateDirectory(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, flatCompatibility bool) (*Generation, error) {
 	return validateDirectoryMode(ctx, dir, compression, verifier, flatCompatibility, true, false)
 }
@@ -387,7 +317,7 @@ func validateDirectoryModeRetained(ctx context.Context, dir string, compression 
 		!current.IsDir() || !os.SameFile(info, opened) || !os.SameFile(info, current) {
 		return nil, fmt.Errorf("%w: generation directory changed while binding: %v", ErrInvalidRepodata, errors.Join(openErr, pathErr))
 	}
-	generation, _, err := validateRootWithProofMode(ctx, root, dir, compression, verifier, flatCompatibility, managed, signed, requireEmpty, retained, viewValidation)
+	generation, err := validateRootMode(ctx, root, dir, compression, verifier, flatCompatibility, managed, signed, requireEmpty, retained, viewValidation)
 	if err != nil {
 		return nil, err
 	}
@@ -400,29 +330,25 @@ func validateDirectoryModeRetained(ctx context.Context, dir string, compression 
 	return generation, nil
 }
 
-func validateRootWithProof(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier, flatCompatibility bool) (*Generation, *ValidatedRootProof, error) {
-	return validateRootWithProofMode(ctx, root, diagnostic, compression, verifier, flatCompatibility, false, true, false, false, nil)
-}
-
-func validateRootWithProofMode(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier, flatCompatibility, managed, signed, requireEmpty, retained bool, viewValidation rpmViewValidation) (*Generation, *ValidatedRootProof, error) {
+func validateRootMode(ctx context.Context, root *os.Root, diagnostic string, compression Compression, verifier DetachedVerifier, flatCompatibility, managed, signed, requireEmpty, retained bool, viewValidation rpmViewValidation) (*Generation, error) {
 	if ctx == nil {
-		return nil, nil, fmt.Errorf("%w: nil context", ErrInvalidRepodata)
+		return nil, fmt.Errorf("%w: nil context", ErrInvalidRepodata)
 	}
 	if root == nil {
-		return nil, nil, fmt.Errorf("%w: nil repodata root", ErrInvalidRepodata)
+		return nil, fmt.Errorf("%w: nil repodata root", ErrInvalidRepodata)
 	}
 	if signed && verifier == nil {
-		return nil, nil, fmt.Errorf("%w: detached verifier is required", ErrInvalidRepodata)
+		return nil, fmt.Errorf("%w: detached verifier is required", ErrInvalidRepodata)
 	}
 	if compression != CompressionGzip && compression != CompressionZstd {
-		return nil, nil, fmt.Errorf("%w: unsupported compression %q", ErrInvalidRepodata, compression)
+		return nil, fmt.Errorf("%w: unsupported compression %q", ErrInvalidRepodata, compression)
 	}
 	if diagnostic == "" {
 		diagnostic = "."
 	}
 	boundIdentity, err := root.Stat(".")
 	if err != nil || !boundIdentity.IsDir() {
-		return nil, nil, fmt.Errorf("%w: retained repodata root is not a directory: %v", ErrInvalidRepodata, err)
+		return nil, fmt.Errorf("%w: retained repodata root is not a directory: %v", ErrInvalidRepodata, err)
 	}
 	var repomdBytes []byte
 	var validatedEntries []validatedRegularEntry
@@ -432,34 +358,34 @@ func validateRootWithProofMode(ctx context.Context, root *os.Root, diagnostic st
 		repomdBytes, validatedEntries, err = readUnsignedRepomdRoot(root)
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if bytesContainsDirective(repomdBytes) {
-		return nil, nil, fmt.Errorf("%w: XML directives are forbidden", ErrInvalidRepodata)
+		return nil, fmt.Errorf("%w: XML directives are forbidden", ErrInvalidRepodata)
 	}
 	var document repomdDocument
 	decoder := xml.NewDecoder(strings.NewReader(string(repomdBytes)))
 	decoder.Strict = true
 	if err := decoder.Decode(&document); err != nil {
-		return nil, nil, fmt.Errorf("%w: decode repomd.xml: %v", ErrInvalidRepodata, err)
+		return nil, fmt.Errorf("%w: decode repomd.xml: %v", ErrInvalidRepodata, err)
 	}
 	if document.XMLName.Space != repoNS || document.XMLName.Local != "repomd" {
-		return nil, nil, fmt.Errorf("%w: repomd root is {%s}%s", ErrInvalidRepodata, document.XMLName.Space, document.XMLName.Local)
+		return nil, fmt.Errorf("%w: repomd root is {%s}%s", ErrInvalidRepodata, document.XMLName.Space, document.XMLName.Local)
 	}
 	revisionText := strings.TrimSpace(document.Revision)
 	revision, err := strconv.ParseUint(revisionText, 10, 64)
 	if err != nil || strconv.FormatUint(revision, 10) != revisionText {
-		return nil, nil, fmt.Errorf("%w: invalid revision %q", ErrInvalidRepodata, document.Revision)
+		return nil, fmt.Errorf("%w: invalid revision %q", ErrInvalidRepodata, document.Revision)
 	}
 	if len(document.Data) != 3 {
-		return nil, nil, fmt.Errorf("%w: expected exactly primary, filelists, and other; got %d records", ErrInvalidRepodata, len(document.Data))
+		return nil, fmt.Errorf("%w: expected exactly primary, filelists, and other; got %d records", ErrInvalidRepodata, len(document.Data))
 	}
 
 	wantedOrder := []string{"primary", "filelists", "other"}
 	byType := make(map[string]repomdRecord, 3)
 	for _, record := range document.Data {
 		if _, exists := byType[record.Type]; exists {
-			return nil, nil, fmt.Errorf("%w: duplicate %q record", ErrInvalidRepodata, record.Type)
+			return nil, fmt.Errorf("%w: duplicate %q record", ErrInvalidRepodata, record.Type)
 		}
 		byType[record.Type] = record
 	}
@@ -474,17 +400,17 @@ func validateRootWithProofMode(ctx context.Context, root *os.Root, diagnostic st
 	for i, kind := range wantedOrder {
 		record, ok := byType[kind]
 		if !ok {
-			return nil, nil, fmt.Errorf("%w: missing %q record", ErrInvalidRepodata, kind)
+			return nil, fmt.Errorf("%w: missing %q record", ErrInvalidRepodata, kind)
 		}
 		artifact, count, identities, validatedEntry, err := validateArtifactRoot(ctx, root, kind, record, compression, flatCompatibility, managed, identityTemp, requireEmpty, viewValidation)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		validatedEntries = append(validatedEntries, validatedEntry)
 		currentIdentitySHA := digestBytes(nil)
 		if requireEmpty {
 			if count != 0 {
-				return nil, nil, fmt.Errorf("%w: %s metadata is not empty", ErrInvalidRepodata, kind)
+				return nil, fmt.Errorf("%w: %s metadata is not empty", ErrInvalidRepodata, kind)
 			}
 		} else {
 			currentIdentitySHA = identities
@@ -492,37 +418,33 @@ func validateRootWithProofMode(ctx context.Context, root *os.Root, diagnostic st
 		if identitySHA == "" {
 			identitySHA = currentIdentitySHA
 		} else if currentIdentitySHA != identitySHA {
-			return nil, nil, fmt.Errorf("%w: %s package identity set differs from primary", ErrInvalidRepodata, kind)
+			return nil, fmt.Errorf("%w: %s package identity set differs from primary", ErrInvalidRepodata, kind)
 		}
 		if packageCount == -1 {
 			packageCount = count
 		} else if count != packageCount {
-			return nil, nil, fmt.Errorf("%w: %s package count %d differs from %d", ErrInvalidRepodata, kind, count, packageCount)
+			return nil, fmt.Errorf("%w: %s package count %d differs from %d", ErrInvalidRepodata, kind, count, packageCount)
 		}
 		generation.Artifacts[i] = artifact
 	}
 	generation.IdentitySHA256 = identitySHA
 	generation.Packages = packageCount
 	if err := rejectExtraGenerationFilesRootMode(ctx, root, generation, signed, retained); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if err := verifyValidatedGenerationEntriesRoot(ctx, root, validatedEntries); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	// Re-list after the final content/identity proofs so an entry added while
 	// those proofs were running cannot hide behind a previously exact listing.
 	if err := rejectExtraGenerationFilesRootMode(ctx, root, generation, signed, retained); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	currentIdentity, err := root.Stat(".")
 	if err != nil || !currentIdentity.IsDir() || !os.SameFile(boundIdentity, currentIdentity) {
-		return nil, nil, fmt.Errorf("%w: retained repodata root changed during validation: %v", ErrInvalidRepodata, err)
+		return nil, fmt.Errorf("%w: retained repodata root changed during validation: %v", ErrInvalidRepodata, err)
 	}
-	proof := &ValidatedRootProof{
-		root: root, identity: boundIdentity, generation: *generation,
-		entries: append([]validatedRegularEntry(nil), validatedEntries...), signed: signed, retained: retained,
-	}
-	return generation, proof, nil
+	return generation, nil
 }
 
 func verifyRepomdSignatureRoot(ctx context.Context, root *os.Root, verifier DetachedVerifier) ([]byte, []validatedRegularEntry, error) {

@@ -148,22 +148,6 @@ func parse(data []byte, allowLegacy bool) (Config, error) {
 	return cfg, nil
 }
 
-// LoadDocumentForMigration preserves the descriptor-bound source bytes while
-// allowing only the one frozen predecessor schema. It is shared by explicit
-// migration and mutation-free compatibility reads; callers must use the
-// returned legacy bit to keep those authority domains separate.
-func LoadDocumentForMigration(filename string) (Config, []byte, string, bool, error) {
-	data, digest, err := readConfigFile(filename)
-	if err != nil {
-		return Config{}, nil, "", false, err
-	}
-	cfg, legacy, err := ParseForMigration(data)
-	if err != nil {
-		return Config{}, nil, "", false, fmt.Errorf("load config %q: %w", filename, err)
-	}
-	return cfg, data, digest, legacy, nil
-}
-
 // LoadWorkspaceDocumentForMigration is the root-bound compatibility/migration
 // counterpart of LoadWorkspaceDocument. Ordinary writers continue to use the
 // strict loader and therefore cannot cross the schema boundary implicitly.

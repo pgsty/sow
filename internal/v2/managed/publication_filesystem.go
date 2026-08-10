@@ -349,7 +349,7 @@ func (b *filesystemPublicationBackend) DeleteConditional(ctx context.Context, ca
 			return fmt.Errorf("%w: conditional delete %q: %v", ErrIntegrity, candidate.Path, err)
 		}
 	}
-	if current, exists, err = b.Head(ctx, candidate.Path); err != nil || exists {
+	if _, exists, err = b.Head(ctx, candidate.Path); err != nil || exists {
 		return errors.Join(fmt.Errorf("%w: filesystem object %q is not absent after conditional delete", ErrIntegrity, candidate.Path), err)
 	}
 	return nil

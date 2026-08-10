@@ -10,6 +10,20 @@ import (
 	"testing"
 )
 
+func TestShippedExampleUsesCurrentSchema(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "..", "sow.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Parse(body)
+	if err != nil {
+		t.Fatalf("parse shipped example: %v", err)
+	}
+	if cfg.Schema != Schema || len(cfg.Repositories) == 0 {
+		t.Fatalf("shipped example is not a current managed-workspace config: %#v", cfg)
+	}
+}
+
 func FuzzParseCanonicalRoundTrip(f *testing.F) {
 	for _, seed := range [][]byte{
 		[]byte("schema: sow/v3\n"),

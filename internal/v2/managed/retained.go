@@ -778,11 +778,6 @@ func listRetainedGenerationsResult(ctx context.Context, opts RetainListOptions) 
 	return result, nil
 }
 
-func ListRetainedGenerations(ctx context.Context, opts RetainListOptions) ([]RetainedGeneration, error) {
-	result, err := listRetainedGenerationsResult(ctx, opts)
-	return result.Generations, err
-}
-
 // verifyAllRetainedGenerationsLocked is the repository-wide retained closure
 // predicate used by ordinary check.  It intentionally rejects every
 // non-generation entry instead of silently skipping a damaged or attacker-

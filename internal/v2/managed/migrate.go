@@ -645,6 +645,9 @@ func planC2Transition(ctx context.Context, root, repoName string, cfg config.Con
 				if !oldExists || !newExists {
 					return nil, fmt.Errorf("%w: migration pointer %q is not a complete old/new pair", ErrIntegrity, pointerPath)
 				}
+				if oldFile.SHA256 == newFile.SHA256 {
+					return nil, fmt.Errorf("%w: migration pointer %q does not change between old and new layouts", ErrIntegrity, pointerPath)
+				}
 				pointers = append(pointers, TransitionPointer{ViewID: viewID, Kind: pointerSpec.kind, Path: pointerPath, OldSHA256: oldFile.SHA256, NewSHA256: newFile.SHA256, State: "old"})
 			}
 		}
@@ -771,54 +774,6 @@ func validateC2MigrationSource(ctx context.Context, root, repoName string, store
 				return fmt.Errorf("Dist %s/%s legacy C2 rpm-md differs: %v", dist.Name, architecture.Family, err)
 			}
 		}
-	}
-	return nil
-}
-
-func validateC2RPMViewAliases(ctx context.Context, repositoryRoot, distName, family string, objects []state.PackageObject) error {
-	expected := make(map[string]state.PackageObject)
-	for _, object := range objects {
-		if object.Format != "rpm" || object.Storage != "pool" || object.CanonicalArch != "neutral" && object.CanonicalArch != family {
-			continue
-		}
-		expected[object.PoolPath] = object
-		canonical, canonicalErr := openRootedRegular(repositoryRoot, object.PoolPath)
-		aliasRelative := filepath.ToSlash(filepath.Join("dists", distName, family, filepath.FromSlash(object.PoolPath)))
-		alias, aliasErr := openRootedRegular(repositoryRoot, aliasRelative)
-		if canonicalErr != nil || aliasErr != nil {
-			if canonical != nil {
-				_ = canonical.CloseVerified()
-			}
-			if alias != nil {
-				_ = alias.CloseVerified()
-			}
-			return fmt.Errorf("Dist %s/%s C2 alias for %s is missing or unsafe", distName, family, object.SHA256)
-		}
-		same := os.SameFile(canonical.before, alias.before)
-		verifyErr := errors.Join(canonical.CloseVerified(), alias.CloseVerified())
-		if !same || verifyErr != nil {
-			return fmt.Errorf("Dist %s/%s C2 alias for %s is not the canonical Pool hardlink", distName, family, object.SHA256)
-		}
-	}
-	viewPool := filepath.Join(repositoryRoot, "dists", distName, family, "pool")
-	info, err := os.Lstat(viewPool)
-	if errors.Is(err, os.ErrNotExist) && len(expected) == 0 {
-		return nil
-	}
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("Dist %s/%s C2 Pool root is missing or unsafe", distName, family)
-	}
-	seen := make(map[string]struct{}, len(expected))
-	err = walkRootedTree(ctx, viewPool, func(relative string, _ *os.File, _ os.FileInfo) error {
-		relative = path.Join("pool", relative)
-		if _, exists := expected[relative]; !exists {
-			return fmt.Errorf("view Pool contains unexpected C2 alias %s", relative)
-		}
-		seen[relative] = struct{}{}
-		return nil
-	}, nil)
-	if err != nil || len(seen) != len(expected) {
-		return fmt.Errorf("Dist %s/%s C2 alias projection differs: %v", distName, family, err)
 	}
 	return nil
 }

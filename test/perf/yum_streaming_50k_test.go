@@ -36,6 +36,26 @@ func moduleRoot(t *testing.T) string {
 	return root
 }
 
+func loadYUMPerformanceFixture(t *testing.T) []byte {
+	t.Helper()
+	encoded, err := os.ReadFile(filepath.Join(moduleRoot(t), "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(encoded)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded) == 0 {
+		t.Fatal("decoded YUM performance fixture is empty")
+	}
+	return decoded
+}
+
+func TestYUMPerformanceFixtureAvailable(t *testing.T) {
+	_ = loadYUMPerformanceFixture(t)
+}
+
 type distinctRPMIterator struct {
 	path  string
 	body  []byte
@@ -71,16 +91,8 @@ func (iterator *distinctRPMIterator) Next(ctx context.Context) (yumrepo.PackageI
 // retaining 50,000 complete RPM header parses and 50,000 distinct
 // primary/filelists/other records.
 func TestYUMStreamingFiftyThousand(t *testing.T) {
-	root := moduleRoot(t)
-	encoded, err := os.ReadFile(filepath.Join(root, "internal", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	rpmPath := filepath.Join(t.TempDir(), "fixture.rpm")
-	decoded, err := io.ReadAll(base64.NewDecoder(base64.StdEncoding, bytes.NewReader(encoded)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	decoded := loadYUMPerformanceFixture(t)
 	fixtureBody := append(append([]byte(nil), decoded...), []byte("SOWPERF0\x00\x00\x00\x00\x00\x00\x00\x00")...)
 
 	now := time.Unix(1_783_800_000, 0).UTC()

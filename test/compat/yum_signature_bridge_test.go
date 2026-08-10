@@ -36,7 +36,7 @@ func TestYUMDetachedSignatureBridgeCompatibility(t *testing.T) {
 	work := t.TempDir()
 	privateKey, publicKey := writeSigningKey(t, work)
 	rpmPath := decodeBase64Fixture(t,
-		filepath.Join(moduleRoot, "internal", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"),
+		filepath.Join(moduleRoot, "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"),
 		filepath.Join(work, "pgdg-redhat-nonfree-repo-42.0-20PGDG.noarch.rpm"),
 	)
 	base := filepath.Join(work, "base")

@@ -64,7 +64,7 @@ func listPackageCandidates(dir string) ([]packageCandidate, error) {
 	var candidates []packageCandidate
 	for _, entry := range entries {
 		base := entry.Name()
-		format := packageFormat("")
+		var format packageFormat
 		switch {
 		case strings.HasSuffix(base, ".rpm"):
 			format = formatRPM

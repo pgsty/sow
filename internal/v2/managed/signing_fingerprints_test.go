@@ -252,7 +252,7 @@ func TestRPMPackageSigningModeTransitionsSeparateHistoricalIdentityFromCurrentAu
 	if err := os.Mkdir(keysDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	pgdgPublic, err := os.ReadFile(filepath.Join("..", "..", "..", "test", "compat", "testdata", "PGDG-RPM-GPG-KEY-RHEL-nonfree.asc"))
+	pgdgPublic, err := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "PGDG-RPM-GPG-KEY-RHEL-nonfree.asc"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +286,7 @@ func TestRPMPackageSigningModeTransitionsSeparateHistoricalIdentityFromCurrentAu
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1}); err != nil {
 		t.Fatal(err)
 	}

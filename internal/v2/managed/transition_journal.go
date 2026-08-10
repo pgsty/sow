@@ -240,7 +240,8 @@ func validateTransitionJournal(journal C2ToSingleTransition) error {
 		if _, ok := kindRank[pointer.Kind]; !ok || pointer.State != "old" && pointer.State != "new" ||
 			!canonicalRepositoryPath(pointer.ViewID) || len(viewParts) != 3 || viewParts[0] != "dists" ||
 			!canonicalRepositoryPath(pointer.Path) ||
-			!lowercaseSHA256.MatchString(pointer.OldSHA256) || !lowercaseSHA256.MatchString(pointer.NewSHA256) {
+			!lowercaseSHA256.MatchString(pointer.OldSHA256) || !lowercaseSHA256.MatchString(pointer.NewSHA256) ||
+			pointer.OldSHA256 == pointer.NewSHA256 {
 			return fmt.Errorf("invalid transition pointer at index %d", index)
 		}
 		if pointer.Kind == "signature_companion" && pointer.Path != pointer.ViewID+"/repodata/repomd.xml.asc" ||

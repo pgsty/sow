@@ -256,8 +256,7 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 		if err := callFault(fault, "build.staged"); err != nil {
 			return 0, err
 		}
-		_, _, manifest, err = loadMutationOperation(ctx, store, root, repoName, operationID)
-		if err != nil {
+		if _, _, _, err := loadMutationOperation(ctx, store, root, repoName, operationID); err != nil {
 			return 0, err
 		}
 	} else {

@@ -119,7 +119,7 @@ func TestMainP2P3PackageWorkflowEndToEnd(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeCLIFixture(t, filepath.Join("..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "pgdg-redhat-nonfree-repo.rpm"))
+	rpm := decodeCLIFixture(t, filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "pgdg-redhat-nonfree-repo.rpm"))
 	deb := decodeCLIFixture(t, filepath.Join("..", "aptrepo", "testdata", "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64"), filepath.Join(inputs, "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb"))
 
 	assertCLISuccess(t, []string{"init", root, "--json"}, `"command":"init"`)
@@ -169,7 +169,7 @@ func TestMainExportRPMLeafCopyDefault(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeCLIFixture(t, filepath.Join("..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	rpm := decodeCLIFixture(t, filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 	assertCLISuccess(t, []string{"init", root, "--json"}, `"command":"init"`)
 	assertCLISuccess(t, []string{"repo", "new", "repo", "-C", root, "--json"}, `"repository":"repo"`)
 	assertCLISuccess(t, []string{"dist", "new", "el9", "--format", "rpm", "-C", root, "-r", "repo", "--json"}, `"format":"rpm"`)
@@ -190,7 +190,7 @@ func TestMainCheckNotReadyUsesIntegrityExit(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rpm := decodeCLIFixture(t, filepath.Join("..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	rpm := decodeCLIFixture(t, filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
 	assertCLISuccess(t, []string{"init", root, "--json"}, `"command":"init"`)
 	assertCLISuccess(t, []string{"repo", "new", "repo", "-C", root, "--json"}, `"name":"repo"`)
 	assertCLISuccess(t, []string{"dist", "new", "el9", "--format", "rpm", "-C", root, "-r", "repo", "--json"}, `"format":"rpm"`)
@@ -204,7 +204,7 @@ func TestMainAddPartialSuccessReturnsExit3WithCommittedResult(t *testing.T) {
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	valid := decodeCLIFixture(t, filepath.Join("..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "valid.rpm"))
+	valid := decodeCLIFixture(t, filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "valid.rpm"))
 	invalid := filepath.Join(inputs, "invalid.rpm")
 	if err := os.WriteFile(invalid, []byte("not an rpm\n"), 0o444); err != nil {
 		t.Fatal(err)
@@ -232,7 +232,7 @@ func TestMainAddPartialSuccessHumanReportsCommittedAndFailedItems(t *testing.T) 
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	valid := decodeCLIFixture(t, filepath.Join("..", "cli", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "valid.rpm"))
+	valid := decodeCLIFixture(t, filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "valid.rpm"))
 	invalid := filepath.Join(inputs, "invalid.rpm")
 	if err := os.WriteFile(invalid, []byte("not an rpm\n"), 0o444); err != nil {
 		t.Fatal(err)
@@ -495,9 +495,12 @@ repos:
 	if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), configData, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	publicKey, err := filepath.Abs(filepath.Join("..", "..", "test", "compat", "testdata", "PGDG-RPM-GPG-KEY-RHEL-nonfree.asc"))
+	publicKey, err := filepath.Abs(filepath.Join("..", "..", "testdata", "PGDG-RPM-GPG-KEY-RHEL-nonfree.asc"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if info, err := os.Stat(publicKey); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("agent-key export fixture is unavailable: path=%q info=%v err=%v", publicKey, info, err)
 	}
 	control := t.TempDir()
 	ready := filepath.Join(control, "ready")
@@ -547,7 +550,8 @@ repos:
 	select {
 	case got := <-result:
 		if got.code != ExitIntegrity || !strings.Contains(got.stdout, `"ok":false`) ||
-			!strings.Contains(got.stdout, `"class":"integrity"`) || !strings.Contains(got.stderr, "workspace root identity changed") {
+			!strings.Contains(got.stdout, `"class":"integrity"`) || !strings.Contains(got.stderr, "workspace root identity changed") ||
+			strings.Contains(got.stderr, "gpg public-key export failed") || strings.Contains(got.stderr, `repository "repo" signing`) {
 			t.Fatalf("renamed config show: code=%d stdout=%q stderr=%q", got.code, got.stdout, got.stderr)
 		}
 	case <-time.After(5 * time.Second):

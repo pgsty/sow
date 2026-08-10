@@ -1,99 +1,18 @@
-schema: sow/v1
-
-state:
-  snapshot_materialization_months: 6
-  # Keep the live APT by-hash generation plus enough recent complete
-  # generations to retain this many total generations.
-  apt_by_hash_retention: 2
-  # Per target/repo/OS/arch YUM channel, retain this many previous immutable
-  # generations in addition to the current generation. Incomplete journals
-  # always pin their desired and parent generations independently.
-  yum_generation_retention: 2
-  # CAS roots include this bounded canonical rollback window. Older bytes are
-  # collectible only when no current view/snapshot/provenance root references them.
-  cas_history_commits: 32
-
-gpg:
-  public_key: keys/pigsty.asc
-  private_key: env://SOW_GPG_PRIVATE_KEY
-  passphrase: env://SOW_GPG_PASSPHRASE
-
-pools:
-  public: {}
-  gated: {}
+schema: sow/v3
+architectures:
+  - x86_64
+  - aarch64
 
 repos:
-  - id: assets-bin
-    type: asset
-    path: bin
-    default_pool: public
-    include: ["**"]
-    asset:
-      kind: bin
-      # Only these legacy aliases may be overwritten; all other asset keys are immutable.
-      mutable_paths: [get, pig, pkg]
+  pgsql:
+    dists:
+      el9:
+        format: rpm
+        exclude:
+          - kind: [debug]
+      noble:
+        format: deb
 
-  - id: pgsql-el9-x86-64
-    type: yum
-    path: yum/pgsql/el9.x86_64
-    default_pool: public
-    arches: [x86_64]
-    os: {family: el, major: 9, lifecycle: active}
-    # A public-only bundle may contain old and new trusted package-signing
-    # keys during rotation. Keep old keys while append-only history references
-    # packages signed by them.
-    yum: {compression: zstd, package_keyring: keys/pigsty.asc}
-
-  - id: pgsql-trixie-amd64
-    type: apt
-    path: apt/pgsql/trixie
-    default_pool: public
-    arches: [amd64]
-    os: {family: debian, major: 13, suite: trixie, lifecycle: active}
-    apt:
-      suites: [trixie]
-      components: [main]
-
-upstreams: []
-
-views:
-  beta:
-    access: public
-    debuginfo: drop
-    allowed_pools: [public]
-    append_only: false
-  latest:
-    access: public
-    debuginfo: drop
-    allowed_pools: [public]
-    append_only: false
-  stable:
-    access: pro
-    debuginfo: keep
-    allowed_pools: [public, gated]
-    append_only: true
-
-# Mutable YUM clients consume an immutable generation selected through one
-# atomically replaced mirrorlist file. These URLs are deliberately independent
-# of cloud target configuration: local materialize must never guess which
-# provider hostname an operator intends to serve.
-serving:
-  latest: {base_url: "https://repo.pigsty.io"}
-  beta: {base_url: "https://beta.pigsty.io"}
-  # Basic Auth credentials stay in the client configuration or secret
-  # provider; they must never appear in this URL or in generated mirrorlists.
-  stable: {base_url: "https://repo.pigsty.io/pro/v1/basic"}
-
-# Local commands do not require cloud targets. See README.md for the complete
-# provider-specific cf/cos production blocks and strict JSON secret formats.
-# storage.delete_mode defaults to conditional. Use checkpoint-fenced only after
-# every legacy writer/credential is revoked; Cloudflare R2 does not enforce
-# DeleteObject If-Match. See https://sow.pgsty.com/docs/design/publication/.
+# Publication targets are optional. Add a validated filesystem or R2 target
+# only when this workspace is ready to publish.
 targets: {}
-
-edge:
-  pro_prefix: /pro/v1/{token}/
-  # Closed non-secret reference. Deploy the same literal as
-  # SOW_TOKEN_VERIFIER. provider:// uses the vendor verifier adapter;
-  # env://NAME reads strict entitlement JSON from the named platform secret.
-  token_verifier: provider://pigsty-entitlements

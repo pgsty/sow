@@ -147,6 +147,11 @@ func TestTransitionJournalRejectsRecursiveUnknownDuplicateAndNonCanonicalJSON(t 
 	if _, err := canonicalTransitionJournal(journal); err == nil {
 		t.Fatal("accepted duplicate commit pointer for one view")
 	}
+	journal = testTransitionJournal(1)
+	journal.Pointers[0].NewSHA256 = journal.Pointers[0].OldSHA256
+	if _, err := canonicalTransitionJournal(journal); err == nil {
+		t.Fatal("accepted transition pointer with identical old and new digests")
+	}
 }
 
 func TestCanonicalJSONStringDoesNotApplyHTMLEscapingAndTransitionPathsAreStrictASCII(t *testing.T) {
