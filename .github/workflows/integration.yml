@@ -29,10 +29,8 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Install Nginx and pull client images
+      - name: Pull client images
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes nginx
           docker pull ubuntu:22.04
           docker pull almalinux:10
           docker pull almalinux:9
@@ -41,14 +39,13 @@ jobs:
       - name: Run current CLI and repository-client integration tests
         env:
           SOW_RUN_DOCKER_COMPAT: "1"
-          SOW_COMPAT_NGINX: "1"
           SOW_COMPAT_APT_IMAGE: ubuntu:22.04
           SOW_COMPAT_DNF_IMAGE: almalinux:10
           SOW_COMPAT_EL9_IMAGE: almalinux:9
           SOW_COMPAT_EL8_IMAGE: almalinux:8
         run: >-
           go test -timeout 20m -count=1 -v ./test/compat
-          -run '^(TestShippedExampleSupportsCleanRoomLocalMVP|TestV2APTClientCompatibility|TestYUMDetachedSignatureBridgeCompatibility|TestProductGeneratedNginxIncludeLoopbackContract)$'
+          -run '^(TestShippedExampleSupportsCleanRoomLocalMVP|TestV2APTClientCompatibility|TestYUMDetachedSignatureBridgeCompatibility)$'
 
   s3-compatible:
     name: S3-Compatible Publication
@@ -67,7 +64,7 @@ jobs:
       - name: Pull pinned MinIO fixture
         run: docker pull minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
 
-      - name: Run publication and recovery integration tests
+      - name: Run R2 transport integration test
         env:
           SOW_MINIO_TEST: "1"
-        run: go test -timeout 10m -count=1 -v ./internal/publish -run '^TestMinIOS3Compatibility$'
+        run: go test -timeout 10m -count=1 -v ./internal/r2 -run '^TestMinIOS3Compatibility$'

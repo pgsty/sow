@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	legacyPublish "github.com/pgsty/sow/internal/publish"
+	"github.com/pgsty/sow/internal/r2"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
 )
@@ -30,10 +30,10 @@ type r2CredentialDocument struct {
 }
 
 type r2PublicationObjectClient interface {
-	R2ListObjectsV2Prefix(context.Context, string, string) (legacyPublish.ObjectListPage, error)
-	R2Head(context.Context, string) (legacyPublish.ObjectInfo, error)
-	R2OpenObject(context.Context, string) (legacyPublish.ObjectContent, error)
-	R2Put(context.Context, string, io.Reader, int64, string, legacyPublish.R2PutCondition) (string, error)
+	ListObjectsV2Prefix(context.Context, string, string) (r2.ObjectListPage, error)
+	Head(context.Context, string) (r2.ObjectInfo, error)
+	OpenObject(context.Context, string) (r2.ObjectContent, error)
+	Put(context.Context, string, io.Reader, int64, string, r2.PutCondition) (string, error)
 }
 
 type r2PublicationBackend struct {
@@ -51,7 +51,7 @@ func newR2PublicationBackend(target config.TargetConfig) (*r2PublicationBackend,
 	// stores the canonical account endpoint and bucket separately, so use path
 	// style here; no public control key is created by this adapter.
 	objectBase := strings.TrimSuffix(target.Endpoint, "/") + "/" + target.Bucket
-	client, err := legacyPublish.NewR2CloudflareControlHTTP(legacyPublish.R2CloudflareControlHTTPConfig{
+	client, err := r2.NewClient(r2.Config{
 		Bucket: target.Bucket, ObjectBaseURL: objectBase, Credentials: credentials,
 	})
 	if err != nil {
@@ -64,7 +64,7 @@ func newR2PublicationBackend(target config.TargetConfig) (*r2PublicationBackend,
 	return &r2PublicationBackend{objects: client, prefix: target.Prefix, publicBase: publicBase}, nil
 }
 
-func resolveR2Credentials(reference, region string) (legacyPublish.S3Credentials, error) {
+func resolveR2Credentials(reference, region string) (r2.S3Credentials, error) {
 	var body []byte
 	var err error
 	switch {
@@ -72,40 +72,40 @@ func resolveR2Credentials(reference, region string) (legacyPublish.S3Credentials
 		name := strings.TrimPrefix(reference, "env://")
 		value, ok := os.LookupEnv(name)
 		if !ok || value == "" {
-			return legacyPublish.S3Credentials{}, fmt.Errorf("%w: R2 credential environment reference is unset", ErrNotReady)
+			return r2.S3Credentials{}, fmt.Errorf("%w: R2 credential environment reference is unset", ErrNotReady)
 		}
 		if len(value) > maxR2CredentialBytes {
-			return legacyPublish.S3Credentials{}, fmt.Errorf("%w: R2 credential document exceeds safety limit", ErrRejected)
+			return r2.S3Credentials{}, fmt.Errorf("%w: R2 credential document exceeds safety limit", ErrRejected)
 		}
 		body = []byte(value)
 	case strings.HasPrefix(reference, "file://"):
 		filename := strings.TrimPrefix(reference, "file://")
 		file, openErr := os.Open(filename)
 		if openErr != nil {
-			return legacyPublish.S3Credentials{}, fmt.Errorf("%w: open R2 credential reference: %v", ErrNotReady, openErr)
+			return r2.S3Credentials{}, fmt.Errorf("%w: open R2 credential reference: %v", ErrNotReady, openErr)
 		}
 		body, err = io.ReadAll(io.LimitReader(file, maxR2CredentialBytes+1))
 		closeErr := file.Close()
 		if err != nil || closeErr != nil {
-			return legacyPublish.S3Credentials{}, errors.Join(fmt.Errorf("%w: read R2 credential reference", ErrNotReady), err, closeErr)
+			return r2.S3Credentials{}, errors.Join(fmt.Errorf("%w: read R2 credential reference", ErrNotReady), err, closeErr)
 		}
 		if len(body) > maxR2CredentialBytes {
-			return legacyPublish.S3Credentials{}, fmt.Errorf("%w: R2 credential document exceeds safety limit", ErrRejected)
+			return r2.S3Credentials{}, fmt.Errorf("%w: R2 credential document exceeds safety limit", ErrRejected)
 		}
 	default:
-		return legacyPublish.S3Credentials{}, fmt.Errorf("%w: unsupported R2 credential reference", ErrRejected)
+		return r2.S3Credentials{}, fmt.Errorf("%w: unsupported R2 credential reference", ErrRejected)
 	}
 	var document r2CredentialDocument
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&document); err != nil {
-		return legacyPublish.S3Credentials{}, fmt.Errorf("%w: decode R2 credential document", ErrRejected)
+		return r2.S3Credentials{}, fmt.Errorf("%w: decode R2 credential document", ErrRejected)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return legacyPublish.S3Credentials{}, fmt.Errorf("%w: R2 credential document has trailing data", ErrRejected)
+		return r2.S3Credentials{}, fmt.Errorf("%w: R2 credential document has trailing data", ErrRejected)
 	}
-	return legacyPublish.S3Credentials{
+	return r2.S3Credentials{
 		AccessKeyID: document.AccessKeyID, SecretAccessKey: document.SecretAccessKey,
 		SessionToken: document.SessionToken, Region: region,
 	}, nil
@@ -147,7 +147,7 @@ func (b *r2PublicationBackend) List(ctx context.Context, _ map[string]struct{}) 
 	seenTokens := map[string]struct{}{}
 	previousKey := ""
 	for {
-		page, err := b.objects.R2ListObjectsV2Prefix(ctx, listPrefix, continuation)
+		page, err := b.objects.ListObjectsV2Prefix(ctx, listPrefix, continuation)
 		if err != nil {
 			return nil, err
 		}
@@ -160,7 +160,7 @@ func (b *r2PublicationBackend) List(ctx context.Context, _ map[string]struct{}) 
 			if err != nil {
 				return nil, err
 			}
-			info, err := b.objects.R2Head(ctx, listed.Key)
+			info, err := b.objects.Head(ctx, listed.Key)
 			if err != nil || !info.Exists || info.Size != listed.Size || info.ETag == "" || info.ETag != listed.ETag || !lowercaseSHA256.MatchString(info.SHA256) {
 				return nil, errors.Join(fmt.Errorf("%w: R2 listed object %q lacks exact HEAD evidence", ErrIntegrity, relative), err)
 			}
@@ -184,7 +184,7 @@ func (b *r2PublicationBackend) Head(ctx context.Context, objectPath string) (pub
 	if err != nil {
 		return publicationRemoteObject{}, false, err
 	}
-	info, err := b.objects.R2Head(ctx, key)
+	info, err := b.objects.Head(ctx, key)
 	if err != nil {
 		return publicationRemoteObject{}, false, err
 	}
@@ -212,7 +212,7 @@ func (b *r2PublicationBackend) Put(ctx context.Context, sourceRoot string, opera
 	if exists && current.Size == operation.Size && current.SHA256 == operation.SHA256 {
 		return current.RemoteIdentity, nil
 	}
-	condition := legacyPublish.R2PutCondition{}
+	condition := r2.PutCondition{}
 	if operation.Operation == "add" {
 		if exists {
 			return "", fmt.Errorf("%w: create-only R2 object %q already exists with different identity", ErrIntegrity, operation.Path)
@@ -228,7 +228,7 @@ func (b *r2PublicationBackend) Put(ctx context.Context, sourceRoot string, opera
 	if err != nil {
 		return "", fmt.Errorf("%w: publication source %q is missing or unsafe: %v", ErrIntegrity, operation.Path, err)
 	}
-	etag, putErr := b.objects.R2Put(ctx, key, &managedContextReader{ctx: ctx, reader: source.file}, operation.Size, operation.SHA256, condition)
+	etag, putErr := b.objects.Put(ctx, key, &managedContextReader{ctx: ctx, reader: source.file}, operation.Size, operation.SHA256, condition)
 	closeErr := source.CloseVerified()
 	if putErr != nil || closeErr != nil {
 		if putErr != nil {

@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	legacyPublish "github.com/pgsty/sow/internal/publish"
+	"github.com/pgsty/sow/internal/r2"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
 )
@@ -34,9 +34,9 @@ type fakeR2PublicationClient struct {
 	next    int
 }
 
-func (f *fakeR2PublicationClient) R2ListObjectsV2Prefix(_ context.Context, prefix, continuation string) (legacyPublish.ObjectListPage, error) {
+func (f *fakeR2PublicationClient) ListObjectsV2Prefix(_ context.Context, prefix, continuation string) (r2.ObjectListPage, error) {
 	if continuation != "" {
-		return legacyPublish.ObjectListPage{}, errors.New("unexpected continuation")
+		return r2.ObjectListPage{}, errors.New("unexpected continuation")
 	}
 	keys := []string{}
 	for key := range f.objects {
@@ -45,37 +45,37 @@ func (f *fakeR2PublicationClient) R2ListObjectsV2Prefix(_ context.Context, prefi
 		}
 	}
 	sort.Strings(keys)
-	page := legacyPublish.ObjectListPage{}
+	page := r2.ObjectListPage{}
 	for _, key := range keys {
 		object := f.objects[key]
-		page.Objects = append(page.Objects, legacyPublish.ListedObject{Key: key, Size: int64(len(object.body)), ETag: object.etag})
+		page.Objects = append(page.Objects, r2.ListedObject{Key: key, Size: int64(len(object.body)), ETag: object.etag})
 	}
 	return page, nil
 }
 
-func (f *fakeR2PublicationClient) R2Head(_ context.Context, key string) (legacyPublish.ObjectInfo, error) {
+func (f *fakeR2PublicationClient) Head(_ context.Context, key string) (r2.ObjectInfo, error) {
 	object, ok := f.objects[key]
 	if !ok {
-		return legacyPublish.ObjectInfo{}, nil
+		return r2.ObjectInfo{}, nil
 	}
-	return legacyPublish.ObjectInfo{Exists: true, Size: int64(len(object.body)), SHA256: object.sha, ETag: object.etag}, nil
+	return r2.ObjectInfo{Exists: true, Size: int64(len(object.body)), SHA256: object.sha, ETag: object.etag}, nil
 }
 
-func (f *fakeR2PublicationClient) R2OpenObject(_ context.Context, key string) (legacyPublish.ObjectContent, error) {
-	info, _ := f.R2Head(context.Background(), key)
+func (f *fakeR2PublicationClient) OpenObject(_ context.Context, key string) (r2.ObjectContent, error) {
+	info, _ := f.Head(context.Background(), key)
 	if !info.Exists {
-		return legacyPublish.ObjectContent{}, legacyPublish.ErrNotFound
+		return r2.ObjectContent{}, r2.ErrNotFound
 	}
-	return legacyPublish.ObjectContent{Info: info, Body: io.NopCloser(bytes.NewReader(f.objects[key].body))}, nil
+	return r2.ObjectContent{Info: info, Body: io.NopCloser(bytes.NewReader(f.objects[key].body))}, nil
 }
 
-func (f *fakeR2PublicationClient) R2Put(_ context.Context, key string, body io.Reader, size int64, sha string, condition legacyPublish.R2PutCondition) (string, error) {
+func (f *fakeR2PublicationClient) Put(_ context.Context, key string, body io.Reader, size int64, sha string, condition r2.PutCondition) (string, error) {
 	current, exists := f.objects[key]
 	if condition.IfNoneMatch && exists {
-		return "", legacyPublish.ErrAlreadyExists
+		return "", r2.ErrAlreadyExists
 	}
 	if condition.IfMatch != "" && (!exists || current.etag != condition.IfMatch) {
-		return "", legacyPublish.ErrConflict
+		return "", r2.ErrConflict
 	}
 	data, err := io.ReadAll(io.LimitReader(body, size+1))
 	if err != nil || int64(len(data)) != size {
