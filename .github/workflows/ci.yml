@@ -159,22 +159,17 @@ jobs:
             rpm -qpl "${package}" | grep -Fx '/usr/bin/sow'
             rpm -qpl "${package}" | grep -Fx '/usr/share/licenses/sow/LICENSE'
             rpm -qp --queryformat '%{LICENSE}\n' "${package}" | grep -Fx 'Apache-2.0'
-            packaged_license_sha256="$(
-              rpm2cpio "${package}" |
-                cpio -i --quiet --to-stdout './usr/share/licenses/sow/LICENSE' |
-                sha256sum |
-                awk '{print $1}'
-            )"
+            extract_dir="$(mktemp -d)"
+            rpm2cpio "${package}" |
+              (cd "${extract_dir}" && cpio -id --quiet './usr/share/licenses/sow/LICENSE')
+            packaged_license_sha256="$(sha256sum "${extract_dir}/usr/share/licenses/sow/LICENSE" | awk '{print $1}')"
             test "${packaged_license_sha256}" = "${license_sha256}"
           done
           for package in "${debs[@]}"; do
             dpkg-deb --contents "${package}" | grep -E 'usr/bin/sow$'
             dpkg-deb --contents "${package}" | grep -E 'usr/share/doc/sow/copyright$'
-            packaged_license_sha256="$(
-              dpkg-deb --fsys-tarfile "${package}" |
-                tar -xOf - './usr/share/doc/sow/copyright' |
-                sha256sum |
-                awk '{print $1}'
-            )"
+            extract_dir="$(mktemp -d)"
+            dpkg-deb --extract "${package}" "${extract_dir}"
+            packaged_license_sha256="$(sha256sum "${extract_dir}/usr/share/doc/sow/copyright" | awk '{print $1}')"
             test "${packaged_license_sha256}" = "${license_sha256}"
           done
