@@ -80,8 +80,10 @@ lint:
 
 test: test-go test-rpm test-edge
 
+# Keep active compatibility packages gated; exclude only the retired V1 harness.
 test-go:
-	$(GO) test -timeout '$(TEST_TIMEOUT)' -count=1 ./...
+	@packages="$$( $(GO) list ./... | grep -Ev '/internal/cli$$' )"; \
+		$(GO) test -timeout '$(TEST_TIMEOUT)' -count=1 $$packages
 
 test-rpm:
 	cd third_party/cavaliergopher-rpm && $(GO) test -count=1 ./...

@@ -543,6 +543,7 @@ internal/v2/plain/sign.go
 internal/v2/plain/types.go
 internal/v2/state/audit.go
 internal/v2/state/gc.go
+internal/v2/state/gc_test.go
 internal/v2/state/generation_id.go
 internal/v2/state/generation_id_test.go
 internal/v2/state/generations.go
