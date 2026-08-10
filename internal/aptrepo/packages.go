@@ -195,6 +195,12 @@ func SortPackages(packages []Package) {
 	})
 }
 
+// ComparePackages applies the canonical Packages ordering without allocating
+// or sorting a temporary slice. Managed renderers use it in their outer sort.
+func ComparePackages(a, b Package) int {
+	return comparePackages(a, b)
+}
+
 func comparePackages(a, b Package) int {
 	if c := strings.Compare(a.Name, b.Name); c != 0 {
 		return c

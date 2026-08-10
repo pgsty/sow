@@ -84,6 +84,41 @@ func TestInspectPackageAndReadablePoolPath(t *testing.T) {
 	}
 }
 
+func TestPackageFactsRoundTripPreservesManagedParagraphBytes(t *testing.T) {
+	debPath := writeMinimalDeb(t, t.TempDir(), "libfoo-bin_1.2.3-1_amd64.deb", fixtureControl)
+	pkg, err := InspectPackage(context.Background(), debPath, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := MarshalPackageFacts(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := PackageFromFacts(facts, debPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedPath := "pool/libf/libfoo/" + filepath.Base(debPath)
+	var originalBytes, cachedBytes bytes.Buffer
+	originalWriter, err := NewPackagesWriter(&originalBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachedWriter, err := NewPackagesWriter(&cachedBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := originalWriter.WriteManaged(pkg, managedPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := cachedWriter.WriteManaged(decoded, managedPath); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(originalBytes.Bytes(), cachedBytes.Bytes()) {
+		t.Fatalf("fact round-trip changed Packages paragraph:\noriginal:\n%s\ncached:\n%s", originalBytes.Bytes(), cachedBytes.Bytes())
+	}
+}
+
 func TestInspectPackageDoesNotOpenDataArchive(t *testing.T) {
 	debPath := writeDebWithDataMember(
 		t,

@@ -314,7 +314,7 @@ func TestNoopBuildJournalRepairsLegacyPublicModesAndRecoversMidTree(t *testing.T
 	}
 }
 
-func TestBuildRejectsTamperedRPMBeforeCreatingOperation(t *testing.T) {
+func TestBuildRejectsTamperedRPMWithRestoredMTimeBeforeCreatingOperation(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	options := WorkspaceOptions{Workdir: root, CWD: root}
@@ -348,6 +348,13 @@ func TestBuildRejectsTamperedRPMBeforeCreatingOperation(t *testing.T) {
 		t.Fatal(err)
 	}
 	pool := filepath.Join(root, "repo", filepath.FromSlash(objects[0].PoolPath))
+	originalInfo, err := os.Stat(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Ensure ctime advances independently of the restored mtime on ordinary
+	// nanosecond-resolution filesystems.
+	time.Sleep(2 * time.Millisecond)
 	file, err := os.OpenFile(pool, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -364,6 +371,16 @@ func TestBuildRejectsTamperedRPMBeforeCreatingOperation(t *testing.T) {
 	}
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.Chtimes(pool, originalInfo.ModTime(), originalInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	tamperedInfo, err := os.Stat(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tamperedInfo.Size() != originalInfo.Size() || !tamperedInfo.ModTime().Equal(originalInfo.ModTime()) {
+		t.Fatalf("tamper fixture did not preserve cheap stat fields: before=%#v after=%#v", originalInfo, tamperedInfo)
 	}
 	publicBefore, err := publicTreeSnapshot(root, "repo")
 	if err != nil {

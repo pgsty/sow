@@ -15,6 +15,7 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
 
@@ -664,7 +665,8 @@ func initializeDeclaredDists(ctx context.Context, root, repoName string, fault f
 }
 
 func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Config, distName string, oldData, newData []byte, kind string, fault func(string) error, store *state.Store) (result DistInfo, resultErr error) {
-	if err := validateCurrentPublicGeneration(ctx, root, repoName, store); err != nil {
+	currentSnapshot, err := validateCurrentPublicGenerationSnapshot(ctx, root, repoName, store)
+	if err != nil {
 		return DistInfo{}, err
 	}
 	repo := cfg.Repositories[repoName]
@@ -791,8 +793,15 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 	if err := installStagedDist(ctx, root, repoName, distName, id, payload.TreeSHA256); err != nil {
 		return DistInfo{}, err
 	}
-	_, normalizedModes, err := normalizeManagedPublicTree(ctx, filepath.Join(root, repoName), fault, kind+".mode")
+	authenticatedPayloads, err := buildAuthenticatedPayloads(currentSnapshot, nil, nil)
 	if err != nil {
+		return DistInfo{}, err
+	}
+	publicSnapshot, normalizedModes, err := normalizeManagedPublicTreeSnapshotWithPayloads(ctx, filepath.Join(root, repoName), fault, kind+".mode", authenticatedPayloads)
+	if err != nil {
+		return DistInfo{}, err
+	}
+	if err := persistPublicPackageFingerprints(ctx, publicSnapshot, store); err != nil {
 		return DistInfo{}, err
 	}
 	if err := recordNormalizedPublicModes(ctx, store, id, normalizedModes); err != nil {
@@ -847,7 +856,8 @@ func executeDistRemove(ctx context.Context, root, repoName, distName string, old
 	if force {
 		ignoredDist = distName
 	}
-	if err := validateCurrentPublicGenerationExceptDist(ctx, root, repoName, store, ignoredDist); err != nil {
+	currentSnapshot, err := validateCurrentPublicGenerationSnapshotExceptDist(ctx, root, repoName, store, ignoredDist)
+	if err != nil {
 		return err
 	}
 	summary, err := store.Summary(ctx)
@@ -905,8 +915,15 @@ func executeDistRemove(ctx context.Context, root, repoName, distName string, old
 	if err := moveDistToRecovery(ctx, root, repoName, distName, id, payload.TreeSHA256); err != nil {
 		return err
 	}
-	_, normalizedModes, err := normalizeManagedPublicTree(ctx, filepath.Join(root, repoName), fault, "dist.rm.mode")
+	authenticatedPayloads, err := buildAuthenticatedPayloads(currentSnapshot, nil, nil)
 	if err != nil {
+		return err
+	}
+	publicSnapshot, normalizedModes, err := normalizeManagedPublicTreeSnapshotWithPayloads(ctx, filepath.Join(root, repoName), fault, "dist.rm.mode", authenticatedPayloads)
+	if err != nil {
+		return err
+	}
+	if err := persistPublicPackageFingerprints(ctx, publicSnapshot, store); err != nil {
 		return err
 	}
 	if err := recordNormalizedPublicModes(ctx, store, id, normalizedModes); err != nil {
@@ -1107,8 +1124,11 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 			operation.State = state.OperationBuilt
 		}
 		if operation.State == state.OperationBuilt {
-			_, normalizedModes, err := normalizeManagedPublicTree(ctx, filepath.Join(root, repoName), nil, "")
+			publicSnapshot, normalizedModes, err := normalizeManagedPublicTreeSnapshotWithPayloads(ctx, filepath.Join(root, repoName), nil, "", nil)
 			if err != nil {
+				return err
+			}
+			if err := persistPublicPackageFingerprints(ctx, publicSnapshot, store); err != nil {
 				return err
 			}
 			if err := recordNormalizedPublicModes(ctx, store, operation.ID, normalizedModes); err != nil {
@@ -1173,7 +1193,12 @@ func requireNoWriteActivePublication(ctx context.Context, store *state.Store) er
 }
 
 func validateCurrentPublicGeneration(ctx context.Context, root, repoName string, store *state.Store) error {
-	return validateCurrentPublicGenerationExceptDist(ctx, root, repoName, store, "")
+	_, err := validateCurrentPublicGenerationSnapshot(ctx, root, repoName, store)
+	return err
+}
+
+func validateCurrentPublicGenerationSnapshot(ctx context.Context, root, repoName string, store *state.Store) (*publicGenerationSnapshot, error) {
+	return validateCurrentPublicGenerationSnapshotExceptDist(ctx, root, repoName, store, "")
 }
 
 // validateCurrentPublicGenerationExceptDist binds an ordinary write to the
@@ -1181,45 +1206,61 @@ func validateCurrentPublicGeneration(ctx context.Context, root, repoName string,
 // forced Dist removal: its target subtree may contain corrupt bytes precisely
 // so the operator can remove it, while every other public path must still
 // match the retained Generation exactly.
-func validateCurrentPublicGenerationExceptDist(ctx context.Context, root, repoName string, store *state.Store, ignoredDist string) error {
+func validateCurrentPublicGenerationSnapshotExceptDist(ctx context.Context, root, repoName string, store *state.Store, ignoredDist string) (*publicGenerationSnapshot, error) {
 	// Recovery is complete before ordinary writers reach this predicate.  At
 	// that point every semantic cross-table relation is part of the retained
 	// Generation contract, not merely the ledger and public bytes.  Refuse to
 	// append even a no-op audit record to corrupt state: doing so would both
 	// obscure the original defect and make later recovery reasoning ambiguous.
 	if err := store.Check(ctx); err != nil {
-		return fmt.Errorf("%w: current repository state is invalid: %v", ErrIntegrity, err)
+		return nil, fmt.Errorf("%w: current repository state is invalid: %v", ErrIntegrity, err)
 	}
 	if err := store.ValidateGenerationLedger(ctx); err != nil {
-		return fmt.Errorf("%w: current Generation ledger is invalid: %v", ErrIntegrity, err)
+		return nil, fmt.Errorf("%w: current Generation ledger is invalid: %v", ErrIntegrity, err)
 	}
 	summary, err := store.Summary(ctx)
 	if err != nil {
-		return err
-	}
-	physical, err := scanPublicManifest(ctx, filepath.Join(root, repoName))
-	if err != nil {
-		return fmt.Errorf("%w: current public delivery tree cannot be scanned: %v", ErrIntegrity, err)
+		return nil, err
 	}
 	if summary.BuiltGeneration == 0 {
-		if len(physical) != 0 {
-			return fmt.Errorf("%w: Generation 0 public delivery tree is not empty", ErrIntegrity)
+		snapshot, err := scanPublicGenerationSnapshot(workmetrics.WithPhase(ctx, "current_public_generation"), filepath.Join(root, repoName))
+		if err != nil {
+			return nil, fmt.Errorf("%w: current public delivery tree cannot be scanned: %v", ErrIntegrity, err)
 		}
-		return nil
+		physical := snapshot.Manifest
+		if len(physical) != 0 {
+			return nil, fmt.Errorf("%w: Generation 0 public delivery tree is not empty", ErrIntegrity)
+		}
+		return snapshot, nil
 	}
 	retained, err := store.GenerationManifest(ctx, summary.BuiltGeneration)
 	if err != nil {
-		return fmt.Errorf("%w: current Generation manifest is unavailable: %v", ErrIntegrity, err)
+		return nil, fmt.Errorf("%w: current Generation manifest is unavailable: %v", ErrIntegrity, err)
 	}
+	if ignoredDist == "" {
+		snapshot, err := scanCurrentPublicGenerationFast(workmetrics.WithPhase(ctx, "current_public_generation"), filepath.Join(root, repoName), retained, store)
+		if err != nil {
+			return nil, fmt.Errorf("%w: current public delivery tree cannot be validated: %v", ErrIntegrity, err)
+		}
+		return snapshot, nil
+	}
+	// Forced Dist withdrawal is an exceptional repair path: its ignored
+	// subtree cannot be matched against the retained manifest, so keep the
+	// conservative full scan used by that operation.
+	snapshot, err := scanPublicGenerationSnapshot(workmetrics.WithPhase(ctx, "current_public_generation"), filepath.Join(root, repoName))
+	if err != nil {
+		return nil, fmt.Errorf("%w: current public delivery tree cannot be scanned: %v", ErrIntegrity, err)
+	}
+	physical := snapshot.Manifest
 	if ignoredDist != "" {
 		prefix := "dists/" + ignoredDist + "/"
 		retained = filterGenerationManifestPrefix(retained, prefix)
 		physical = filterGenerationManifestPrefix(physical, prefix)
 	}
 	if !sameGenerationManifest(retained, physical) {
-		return fmt.Errorf("%w: current public delivery tree differs from Generation %d", ErrIntegrity, summary.BuiltGeneration)
+		return nil, fmt.Errorf("%w: current public delivery tree differs from Generation %d", ErrIntegrity, summary.BuiltGeneration)
 	}
-	return nil
+	return snapshot, nil
 }
 
 func filterGenerationManifestPrefix(manifest []state.GenerationFile, prefix string) []state.GenerationFile {

@@ -487,6 +487,9 @@ func TestDistLifecycleConvergesLegacyPublicModes(t *testing.T) {
 	if checked, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1}); err != nil || !checked.ReadyToCopy {
 		t.Fatalf("post-dist.rm check=%#v err=%v", checked, err)
 	}
+	if built, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1}); err != nil || !built.Noop {
+		t.Fatalf("post-dist mode repair left a stale fingerprint: build=%#v err=%v", built, err)
+	}
 }
 
 func TestArchitectureReorderingDoesNotDirtyBuiltDist(t *testing.T) {
@@ -2337,7 +2340,7 @@ func runManagedCrashOperation(ctx context.Context, root, operation string, fault
 	return fmt.Errorf("unknown crash operation %q", operation)
 }
 
-func writeManagedConfig(t *testing.T, root string, cfg config.Config) {
+func writeManagedConfig(t testing.TB, root string, cfg config.Config) {
 	t.Helper()
 	data, err := config.Marshal(cfg)
 	if err != nil {

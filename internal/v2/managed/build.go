@@ -18,6 +18,7 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
 
@@ -43,6 +44,7 @@ type mutationBuildPreflight struct {
 	generation       state.GenerationID
 	publicationTime  time.Time
 	baseManifest     []state.GenerationFile
+	baseSnapshot     *publicGenerationSnapshot
 	metadataSnapshot metadataSignerSnapshot
 	rpmPolicy        rpmSigningPolicy
 	projectedDists   []mutationBuildDist
@@ -53,7 +55,7 @@ type mutationBuildPreflight struct {
 // recovery artifacts fit the same bounds enforced by their readers. Pooled is
 // conservatively projected as every Desired digest; the real build can only be
 // smaller because already-public objects are omitted.
-func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, manifest mutationManifest, store *state.Store, preparedRPMPolicy *rpmSigningPolicy) (*mutationBuildPreflight, error) {
+func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, manifest mutationManifest, store *state.Store, preparedRPMPolicy *rpmSigningPolicy, current *publicGenerationSnapshot) (*mutationBuildPreflight, error) {
 	if len(distNames) == 0 {
 		return nil, nil
 	}
@@ -65,9 +67,17 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrRejected, err)
 	}
-	baseManifest, err := scanPublicManifest(ctx, filepath.Join(root, repoName))
-	if err != nil {
-		return nil, err
+	var baseSnapshot *publicGenerationSnapshot
+	var baseManifest []state.GenerationFile
+	if current != nil {
+		baseSnapshot = current.clone()
+		baseManifest = append([]state.GenerationFile(nil), baseSnapshot.Manifest...)
+	} else {
+		baseSnapshot, err = scanPublicGenerationSnapshot(workmetrics.WithPhase(ctx, "build_preflight"), filepath.Join(root, repoName))
+		if err != nil {
+			return nil, err
+		}
+		baseManifest = append([]state.GenerationFile(nil), baseSnapshot.Manifest...)
 	}
 	baseData, err := marshalMutationBaseManifest(baseManifest)
 	if err != nil {
@@ -147,7 +157,7 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 	}
 	return &mutationBuildPreflight{
 		distNames: append([]string(nil), distNames...), generation: generation, publicationTime: publicationTime,
-		baseManifest: append([]state.GenerationFile(nil), baseManifest...), metadataSnapshot: metadataSnapshot,
+		baseManifest: append([]state.GenerationFile(nil), baseManifest...), baseSnapshot: baseSnapshot, metadataSnapshot: metadataSnapshot,
 		rpmPolicy: rpmPolicy, projectedDists: projectedDists,
 	}, nil
 }
@@ -283,7 +293,8 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	if err != nil {
 		return 0, err
 	}
-	if err := promotePendingObjects(ctx, root, repoName, pooledObjects, fault); err != nil {
+	promotedIdentities, err := promotePendingObjectsWithIdentities(ctx, root, repoName, pooledObjects, fault)
+	if err != nil {
 		return 0, err
 	}
 	if err := recordBuildProgress(ctx, store, operationID, "promoting_payload", len(pooled), len(pooled), 1); err != nil {
@@ -329,14 +340,25 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	if err := recordBuildProgress(ctx, store, operationID, "normalizing_public_tree", 0, 1, jobs); err != nil {
 		return 0, err
 	}
-	targetManifest, normalizedModes, err := normalizeManagedPublicTree(ctx, filepath.Join(root, repoName), fault, "build.mode")
+	var authenticatedPayloads map[string]authenticatedPayload
+	if preflight != nil && preflight.baseSnapshot != nil {
+		authenticatedPayloads, err = buildAuthenticatedPayloads(preflight.baseSnapshot, pooledObjects, promotedIdentities)
+		if err != nil {
+			return 0, err
+		}
+	}
+	targetSnapshot, normalizedModes, err := normalizeManagedPublicTreeSnapshotWithPayloads(ctx, filepath.Join(root, repoName), fault, "build.mode", authenticatedPayloads)
 	if err != nil {
 		return 0, err
 	}
+	targetManifest := targetSnapshot.Manifest
 	if err := recordNormalizedPublicModes(ctx, store, operationID, normalizedModes); err != nil {
 		return 0, err
 	}
 	if err := callFault(fault, "build.modes"); err != nil {
+		return 0, err
+	}
+	if err := persistPublicPackageFingerprints(ctx, targetSnapshot, store); err != nil {
 		return 0, err
 	}
 	if err := recordBuildProgress(ctx, store, operationID, "normalizing_public_tree", 1, 1, jobs); err != nil {
@@ -351,6 +373,9 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 		return 0, err
 	}
 	if err := recordBuildProgress(ctx, store, operationID, "finalizing", 0, 1, jobs); err != nil {
+		return 0, err
+	}
+	if err := recordBuildMetrics(ctx, store, operationID); err != nil {
 		return 0, err
 	}
 	changes := state.DiffManifests(baseManifest, targetManifest)
@@ -426,6 +451,9 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 		} else {
 			wantDEB = true
 		}
+	}
+	if err := loadManagedPackageFacts(ctx, allSourcesBySHA, store, jobs); err != nil {
+		return nil, nil, nil, err
 	}
 	var metadataSnapshot metadataSignerSnapshot
 	rpmPolicy := rpmSigningPolicy{mode: "never"}
@@ -577,6 +605,22 @@ func recordBuildProgress(ctx context.Context, store *state.Store, operationID, p
 		"version": 1, "kind": "build_progress", "phase": phase,
 		"completed": completed, "total": total, "jobs": jobs,
 	})
+	if err != nil {
+		return err
+	}
+	return store.RecordOperationProgress(ctx, operationID, string(detail))
+}
+
+func recordBuildMetrics(ctx context.Context, store *state.Store, operationID string) error {
+	collector := workmetrics.FromContext(ctx)
+	if collector == nil {
+		return nil
+	}
+	detail, err := json.Marshal(struct {
+		Version int    `json:"version"`
+		Kind    string `json:"kind"`
+		workmetrics.Snapshot
+	}{Version: 1, Kind: "build_metrics", Snapshot: collector.Snapshot()})
 	if err != nil {
 		return err
 	}
@@ -1014,17 +1058,27 @@ func pendingObjectsForBuildPlan(ctx context.Context, store *state.Store, digests
 // leaves pending-only, exact dual-link, or Pool-only state, all bound to the
 // operation journal; it can never durably lose both names.
 func promotePendingObjects(ctx context.Context, root, repoName string, objects []state.PackageObject, fault func(string) error) error {
+	_, err := promotePendingObjectsWithIdentities(ctx, root, repoName, objects, fault)
+	return err
+}
+
+func promotePendingObjectsWithIdentities(ctx context.Context, root, repoName string, objects []state.PackageObject, fault func(string) error) (map[string]rootedRegularIdentity, error) {
 	if ctx == nil {
-		return errors.New("managed: nil payload promotion context")
+		return nil, errors.New("managed: nil payload promotion context")
 	}
+	identities := make(map[string]rootedRegularIdentity, len(objects))
 	for start := 0; start < len(objects); {
 		end := pendingPromotionBatchEnd(objects, start)
-		if err := promotePendingBatch(ctx, root, repoName, objects[start:end], fault); err != nil {
-			return err
+		batch, err := promotePendingBatchWithIdentities(ctx, root, repoName, objects[start:end], fault)
+		if err != nil {
+			return nil, err
+		}
+		for path, identity := range batch {
+			identities[path] = identity
 		}
 		start = end
 	}
-	return ctx.Err()
+	return identities, ctx.Err()
 }
 
 func pendingPromotionBatchEnd(objects []state.PackageObject, start int) int {
@@ -1051,7 +1105,7 @@ func pendingPromotionBatchEnd(objects []state.PackageObject, start int) int {
 	return end
 }
 
-func promotePendingBatch(ctx context.Context, root, repoName string, objects []state.PackageObject, fault func(string) error) error {
+func promotePendingBatchWithIdentities(ctx context.Context, root, repoName string, objects []state.PackageObject, fault func(string) error) (map[string]rootedRegularIdentity, error) {
 	targetParents := make(map[string]struct{}, len(objects))
 	preparations := make([]pendingObjectPreparation, 0, len(objects))
 	var prepareErr error
@@ -1078,13 +1132,13 @@ func promotePendingBatch(ctx context.Context, root, repoName string, objects []s
 	if prepareErr != nil || targetSyncErr != nil {
 		// No pending name has been removed, so even a failed target barrier leaves
 		// every object recoverable from its already-durable source.
-		return errors.Join(prepareErr, targetSyncErr)
+		return nil, errors.Join(prepareErr, targetSyncErr)
 	}
 	if err := callFault(fault, "build.payload-targets"); err != nil {
-		return err
+		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	pendingParent := filepath.Join(".sow", repoName, "pending")
 	var cleanupErr error
@@ -1110,7 +1164,24 @@ func promotePendingBatch(ctx context.Context, root, repoName string, objects []s
 			break
 		}
 	}
-	return errors.Join(cleanupErr, syncRootedDirectory(root, pendingParent))
+	if err := errors.Join(cleanupErr, syncRootedDirectory(root, pendingParent)); err != nil {
+		return nil, err
+	}
+	identities := make(map[string]rootedRegularIdentity, len(objects))
+	for index, object := range objects {
+		targetRelative := filepath.Join(repoName, filepath.FromSlash(object.PoolPath))
+		opened, err := openRootedRegular(root, targetRelative)
+		if err != nil {
+			return nil, err
+		}
+		identity, identityErr := snapshotRootedRegularIdentity(opened)
+		closeErr := opened.CloseVerified()
+		if err := errors.Join(identityErr, closeErr); err != nil || !identity.valid(object.Size) || !identity.sameInode(preparations[index].targetIdentity) {
+			return nil, errors.Join(fmt.Errorf("%w: promoted payload identity changed at %s", ErrIntegrity, object.PoolPath), err)
+		}
+		identities[object.PoolPath] = identity
+	}
+	return identities, nil
 }
 
 func syncPromotionTargetParents(root string, parents map[string]struct{}) error {
@@ -1157,15 +1228,63 @@ func rootedDirectoryDepth(relative string) int {
 	return len(strings.Split(clean, string(filepath.Separator)))
 }
 
+type authenticatedPayload struct {
+	File     state.GenerationFile
+	Identity rootedRegularIdentity
+}
+
+func buildAuthenticatedPayloads(base *publicGenerationSnapshot, promoted []state.PackageObject, promotedIdentities map[string]rootedRegularIdentity) (map[string]authenticatedPayload, error) {
+	if base == nil {
+		return nil, nil
+	}
+	result := make(map[string]authenticatedPayload)
+	for _, file := range base.Manifest {
+		if file.Phase != "payload" {
+			continue
+		}
+		identity, exists := base.Identities[file.Path]
+		if !exists || !identity.valid(file.Size) {
+			return nil, fmt.Errorf("%w: authenticated payload identity is unavailable for %s", ErrIntegrity, file.Path)
+		}
+		result[file.Path] = authenticatedPayload{File: file, Identity: identity}
+	}
+	for _, object := range promoted {
+		identity, exists := promotedIdentities[object.PoolPath]
+		if !exists || !identity.valid(object.Size) {
+			return nil, fmt.Errorf("%w: promoted payload identity is unavailable for %s", ErrIntegrity, object.PoolPath)
+		}
+		file := state.GenerationFile{Path: object.PoolPath, Phase: "payload", Size: object.Size, SHA256: object.SHA256}
+		if prior, exists := result[object.PoolPath]; exists && prior.File != file {
+			return nil, fmt.Errorf("%w: promoted payload conflicts with retained path %s", ErrIntegrity, object.PoolPath)
+		}
+		result[object.PoolPath] = authenticatedPayload{File: file, Identity: identity}
+	}
+	return result, nil
+}
+
 // normalizeManagedPublicTree authenticates the complete public byte tree while
-// converging its delivery modes.  Mode changes are not Generation changes, so
-// this step is journal-replayed before an operation can be finalized.  Every
-// entry is descriptor-bound and every file is hashed before its mode is
-// changed; a fault after any individual repair leaves an idempotently
-// recoverable operation.
-func normalizeManagedPublicTree(ctx context.Context, repositoryRoot string, fault func(string) error, modeFaultPoint string) ([]state.GenerationFile, int, error) {
+// converging its delivery modes. Mode changes are not Generation changes, so
+// this step is journal-replayed before an operation can be finalized. Every
+// entry remains descriptor-bound. Ordinary in-process builds may reuse a
+// payload checksum only when its post-authentication descriptor identity still
+// matches; recovery and callers without such evidence retain the full hash.
+func normalizeManagedPublicTreeWithPayloads(ctx context.Context, repositoryRoot string, fault func(string) error, modeFaultPoint string, authenticated map[string]authenticatedPayload) ([]state.GenerationFile, int, error) {
+	snapshot, normalized, err := normalizeManagedPublicTreeSnapshotWithPayloads(ctx, repositoryRoot, fault, modeFaultPoint, authenticated)
+	if err != nil {
+		return nil, normalized, err
+	}
+	return snapshot.Manifest, normalized, nil
+}
+
+func normalizeManagedPublicTreeSnapshotWithPayloads(ctx context.Context, repositoryRoot string, fault func(string) error, modeFaultPoint string, authenticated map[string]authenticatedPayload) (*publicGenerationSnapshot, int, error) {
+	ctx = workmetrics.WithPhase(ctx, "public_normalization")
 	files := []state.GenerationFile{}
+	identities := map[string]rootedRegularIdentity{}
 	normalized := 0
+	remaining := make(map[string]authenticatedPayload, len(authenticated))
+	for path, payload := range authenticated {
+		remaining[path] = payload
+	}
 	err := walkRootedTree(ctx, repositoryRoot, func(relative string, file *os.File, info os.FileInfo) error {
 		if !strings.HasPrefix(relative, "pool/") && !strings.HasPrefix(relative, "dists/") {
 			return fmt.Errorf("%w: public Repository contains an unmanaged root entry", ErrIntegrity)
@@ -1174,19 +1293,43 @@ func normalizeManagedPublicTree(ctx context.Context, repositoryRoot string, faul
 		if phase == "" {
 			return fmt.Errorf("%w: dists contains package payload %s", ErrIntegrity, relative)
 		}
-		hash := sha256.New()
-		if _, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file}); err != nil {
+		if phase == "payload" && authenticated != nil {
+			expected, exists := remaining[relative]
+			if !exists || expected.File.Path != relative || expected.File.Phase != "payload" || expected.File.Size != info.Size() {
+				return fmt.Errorf("%w: public payload set changed during build at %s", ErrIntegrity, relative)
+			}
+			identity, err := snapshotRegularDescriptorIdentity(file)
+			if err != nil || !expected.Identity.sameContentStat(identity) {
+				return errors.Join(fmt.Errorf("%w: public payload identity changed during build at %s", ErrIntegrity, relative), err)
+			}
+			files = append(files, expected.File)
+			delete(remaining, relative)
+		} else {
+			hash := sha256.New()
+			read, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
+			if err != nil {
+				return err
+			}
+			if phase == "payload" {
+				workmetrics.RecordFullPackageRead(ctx, read)
+			}
+			files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
+		}
+		if info.Mode().Perm() != 0o644 {
+			if err := errors.Join(file.Chmod(0o644), file.Sync()); err != nil {
+				return err
+			}
+			normalized++
+			if err := callFault(fault, modeFaultPoint); err != nil {
+				return err
+			}
+		}
+		identity, err := snapshotRegularDescriptorIdentity(file)
+		if err != nil {
 			return err
 		}
-		files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
-		if info.Mode().Perm() == 0o644 {
-			return nil
-		}
-		if err := errors.Join(file.Chmod(0o644), file.Sync()); err != nil {
-			return err
-		}
-		normalized++
-		return callFault(fault, modeFaultPoint)
+		identities[relative] = identity
+		return nil
 	}, func(relative string, directory *os.File, info os.FileInfo) error {
 		if relative != "" && !strings.HasPrefix(filepath.ToSlash(relative)+"/", "pool/") && !strings.HasPrefix(filepath.ToSlash(relative)+"/", "dists/") {
 			return fmt.Errorf("%w: public Repository contains an unmanaged root directory", ErrIntegrity)
@@ -1203,15 +1346,32 @@ func normalizeManagedPublicTree(ctx context.Context, repositoryRoot string, faul
 	if err != nil {
 		return nil, normalized, err
 	}
+	if len(remaining) != 0 {
+		missing := make([]string, 0, len(remaining))
+		for path := range remaining {
+			missing = append(missing, path)
+		}
+		sort.Strings(missing)
+		return nil, normalized, fmt.Errorf("%w: authenticated public payload is missing after build: %s", ErrIntegrity, missing[0])
+	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	return files, normalized, nil
+	return &publicGenerationSnapshot{Manifest: files, Identities: identities}, normalized, nil
 }
 
 func normalizeCurrentPublicTree(ctx context.Context, root, repoName, operationID string, store *state.Store, fault func(string) error) (int, error) {
-	physical, normalized, err := normalizeManagedPublicTree(ctx, filepath.Join(root, repoName), fault, "build.mode")
+	return normalizeCurrentPublicTreeWithSnapshot(ctx, root, repoName, operationID, store, fault, nil)
+}
+
+func normalizeCurrentPublicTreeWithSnapshot(ctx context.Context, root, repoName, operationID string, store *state.Store, fault func(string) error, snapshot *publicGenerationSnapshot) (int, error) {
+	authenticated, err := buildAuthenticatedPayloads(snapshot, nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	physicalSnapshot, normalized, err := normalizeManagedPublicTreeSnapshotWithPayloads(ctx, filepath.Join(root, repoName), fault, "build.mode", authenticated)
 	if err != nil {
 		return normalized, err
 	}
+	physical := physicalSnapshot.Manifest
 	summary, err := store.Summary(ctx)
 	if err != nil {
 		return normalized, err
@@ -1230,6 +1390,9 @@ func normalizeCurrentPublicTree(ctx context.Context, root, repoName, operationID
 		return normalized, err
 	}
 	if err := callFault(fault, "build.modes"); err != nil {
+		return normalized, err
+	}
+	if err := persistPublicPackageFingerprints(ctx, physicalSnapshot, store); err != nil {
 		return normalized, err
 	}
 	return normalized, nil
@@ -1262,12 +1425,48 @@ func recordNormalizedPublicModes(ctx context.Context, store *state.Store, operat
 	return store.UpdateOperationResult(ctx, operationID, string(data))
 }
 
+type publicGenerationSnapshot struct {
+	Manifest   []state.GenerationFile
+	Identities map[string]rootedRegularIdentity
+}
+
+func (snapshot *publicGenerationSnapshot) clone() *publicGenerationSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	cloned := &publicGenerationSnapshot{
+		Manifest:   append([]state.GenerationFile(nil), snapshot.Manifest...),
+		Identities: make(map[string]rootedRegularIdentity, len(snapshot.Identities)),
+	}
+	for path, identity := range snapshot.Identities {
+		cloned.Identities[path] = identity
+	}
+	return cloned
+}
+
 func scanPublicManifest(ctx context.Context, repositoryRoot string) ([]state.GenerationFile, error) {
-	return scanPublicManifestForLayout(ctx, repositoryRoot, state.LayoutSinglePayloadV1)
+	snapshot, err := scanPublicGenerationSnapshot(ctx, repositoryRoot)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Manifest, nil
 }
 
 func scanPublicManifestForLayout(ctx context.Context, repositoryRoot, layout string) ([]state.GenerationFile, error) {
+	snapshot, err := scanPublicGenerationSnapshotForLayout(ctx, repositoryRoot, layout)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Manifest, nil
+}
+
+func scanPublicGenerationSnapshot(ctx context.Context, repositoryRoot string) (*publicGenerationSnapshot, error) {
+	return scanPublicGenerationSnapshotForLayout(ctx, repositoryRoot, state.LayoutSinglePayloadV1)
+}
+
+func scanPublicGenerationSnapshotForLayout(ctx context.Context, repositoryRoot, layout string) (*publicGenerationSnapshot, error) {
 	files := []state.GenerationFile{}
+	identities := map[string]rootedRegularIdentity{}
 	err := walkRootedTree(ctx, repositoryRoot, func(relative string, file *os.File, info os.FileInfo) error {
 		if !strings.HasPrefix(relative, "pool/") && !strings.HasPrefix(relative, "dists/") {
 			return fmt.Errorf("%w: public Repository contains an unmanaged root entry", ErrIntegrity)
@@ -1277,17 +1476,26 @@ func scanPublicManifestForLayout(ctx context.Context, repositoryRoot, layout str
 			return fmt.Errorf("%w: dists contains package payload %s", ErrIntegrity, relative)
 		}
 		hash := sha256.New()
-		if _, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file}); err != nil {
+		read, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
+		if err != nil {
+			return err
+		}
+		if phase == "payload" {
+			workmetrics.RecordFullPackageRead(ctx, read)
+		}
+		identity, err := snapshotRegularDescriptorIdentity(file)
+		if err != nil {
 			return err
 		}
 		files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
+		identities[relative] = identity
 		return nil
 	}, nil)
 	if err != nil {
 		return nil, err
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	return files, nil
+	return &publicGenerationSnapshot{Manifest: files, Identities: identities}, nil
 }
 
 func publicFilePhase(path string) string {

@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	SchemaVersion            = 9
+	SchemaVersion            = 10
 	SchemaV1SHA256           = "9953cdc1f655fb03814da8b4c7a45a4a92a74e03facf03c2a45709cc860b9bc7"
 	SchemaV2SHA256           = "aea5b37365510221ab36c4f0fc9e6bc77ba825354649e1e06336b64551c14e25"
 	SchemaV3SHA256           = "9ae957e0e8d9eac21eda3929386f11d001608df5ee7feb75c44194f624f0a177"
@@ -33,6 +33,7 @@ const (
 	SchemaV7SHA256           = "b3869aafea84722652738f2ebb352aaa10e13659ae61448f32efafc064c23ac3"
 	SchemaV8SHA256           = "79e1d22b7884dd8cf4f2bcf26d14a973c84264259e85ace0125685c8440788f5"
 	SchemaV9SHA256           = "dcbe4aa8dff14151879b48c069f161261a2f30cb6d2b7668fe0ccac2aff298ce"
+	SchemaV10SHA256          = "9a6a64d7276ca7eb3a7579ddb55e1e9e6073baf235e0e1d1a909684783cb38dd"
 	MaxOperationPayloadBytes = 16 << 20
 )
 
@@ -63,6 +64,9 @@ var schemaV8SQL string
 //go:embed schema_v9.sql
 var schemaV9SQL string
 
+//go:embed schema_v10.sql
+var schemaV10SQL string
+
 var (
 	ErrSchema     = errors.New("unsupported or corrupt repository schema")
 	ErrNotFound   = errors.New("state object not found")
@@ -70,33 +74,36 @@ var (
 	ErrConflict   = errors.New("state object conflicts with existing identity")
 	ErrTransition = errors.New("invalid operation transition")
 
-	schemaV1ContractOnce    sync.Once
-	schemaV1ContractObjects []schemaObject
-	schemaV1ContractErr     error
-	schemaV2ContractOnce    sync.Once
-	schemaV2ContractObjects []schemaObject
-	schemaV2ContractErr     error
-	schemaV3ContractOnce    sync.Once
-	schemaV3ContractObjects []schemaObject
-	schemaV3ContractErr     error
-	schemaV4ContractOnce    sync.Once
-	schemaV4ContractObjects []schemaObject
-	schemaV4ContractErr     error
-	schemaV5ContractOnce    sync.Once
-	schemaV5ContractObjects []schemaObject
-	schemaV5ContractErr     error
-	schemaV6ContractOnce    sync.Once
-	schemaV6ContractObjects []schemaObject
-	schemaV6ContractErr     error
-	schemaV7ContractOnce    sync.Once
-	schemaV7ContractObjects []schemaObject
-	schemaV7ContractErr     error
-	schemaV8ContractOnce    sync.Once
-	schemaV8ContractObjects []schemaObject
-	schemaV8ContractErr     error
-	schemaV9ContractOnce    sync.Once
-	schemaV9ContractObjects []schemaObject
-	schemaV9ContractErr     error
+	schemaV1ContractOnce     sync.Once
+	schemaV1ContractObjects  []schemaObject
+	schemaV1ContractErr      error
+	schemaV2ContractOnce     sync.Once
+	schemaV2ContractObjects  []schemaObject
+	schemaV2ContractErr      error
+	schemaV3ContractOnce     sync.Once
+	schemaV3ContractObjects  []schemaObject
+	schemaV3ContractErr      error
+	schemaV4ContractOnce     sync.Once
+	schemaV4ContractObjects  []schemaObject
+	schemaV4ContractErr      error
+	schemaV5ContractOnce     sync.Once
+	schemaV5ContractObjects  []schemaObject
+	schemaV5ContractErr      error
+	schemaV6ContractOnce     sync.Once
+	schemaV6ContractObjects  []schemaObject
+	schemaV6ContractErr      error
+	schemaV7ContractOnce     sync.Once
+	schemaV7ContractObjects  []schemaObject
+	schemaV7ContractErr      error
+	schemaV8ContractOnce     sync.Once
+	schemaV8ContractObjects  []schemaObject
+	schemaV8ContractErr      error
+	schemaV9ContractOnce     sync.Once
+	schemaV9ContractObjects  []schemaObject
+	schemaV9ContractErr      error
+	schemaV10ContractOnce    sync.Once
+	schemaV10ContractObjects []schemaObject
+	schemaV10ContractErr     error
 )
 
 // Legacy lowercase hexadecimal IDs remain readable so interrupted development
@@ -108,6 +115,7 @@ type Store struct {
 	path          string
 	db            *sql.DB
 	schemaVersion int
+	readOnly      bool
 }
 
 type Architecture struct {
@@ -308,7 +316,7 @@ func OpenReadOnly(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("%w: read-only database version %d is neither frozen v0.2 nor current", ErrSchema, version)
 	}
-	store := &Store{path: absolute, db: db, schemaVersion: version}
+	store := &Store{path: absolute, db: db, schemaVersion: version, readOnly: true}
 	if err := store.validateSchemaVersion(context.Background(), version); err != nil {
 		db.Close()
 		return nil, err
@@ -360,6 +368,11 @@ func (s *Store) Path() string { return s.path }
 // Store was opened. Version 6 is the frozen v0.2 C2 read-only compatibility
 // surface; writable Stores are always current.
 func (s *Store) SchemaVersion() int { return s.schemaVersion }
+
+// ReadOnly reports whether the Store was opened through OpenReadOnly. Cache
+// users can still rebuild derived facts in memory while skipping persistence
+// on status and preview surfaces.
+func (s *Store) ReadOnly() bool { return s != nil && s.readOnly }
 
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
@@ -587,7 +600,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		return s.validateSchema(ctx)
 	case version > SchemaVersion:
 		return fmt.Errorf("%w: database version %d is newer than supported version %d", ErrSchema, version, SchemaVersion)
-	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 && version != 8:
+	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 && version != 8 && version != 9:
 		return fmt.Errorf("%w: cannot migrate version %d", ErrSchema, version)
 	}
 	if version == 0 {
@@ -626,6 +639,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := validateEmbeddedSchema("v9", schemaV9SQL, SchemaV9SHA256); err != nil {
+		return err
+	}
+	if err := validateEmbeddedSchema("v10", schemaV10SQL, SchemaV10SHA256); err != nil {
 		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -721,8 +737,16 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("record schema v9: %w", err)
 		}
 	}
+	if version <= 9 {
+		if _, err := tx.ExecContext(ctx, schemaV10SQL); err != nil {
+			return fmt.Errorf("apply schema v10: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (10, ?, ?)`, SchemaV10SHA256, nowText()); err != nil {
+			return fmt.Errorf("record schema v10: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit schema v9: %w", err)
+		return fmt.Errorf("commit schema v10: %w", err)
 	}
 	return s.validateSchema(ctx)
 }
@@ -773,7 +797,7 @@ func (s *Store) validateUpgradeableSchema(ctx context.Context) error {
 		return fmt.Errorf("%w: read user_version: %v", ErrSchema, err)
 	}
 	switch version {
-	case 1, 2, 3, 4, 5, 6, 7, 8, SchemaVersion:
+	case 1, 2, 3, 4, 5, 6, 7, 8, 9, SchemaVersion:
 		return s.validateSchemaVersion(ctx, version)
 	case 0:
 		return fmt.Errorf("%w: uninitialized database cannot be adopted", ErrSchema)
@@ -868,6 +892,12 @@ func (s *Store) validateSchemaVersion(ctx context.Context, expectedVersion int) 
 			version  int
 			checksum string
 		}{9, SchemaV9SHA256})
+	}
+	if expectedVersion >= 10 {
+		expectedMigrations = append(expectedMigrations, struct {
+			version  int
+			checksum string
+		}{10, SchemaV10SHA256})
 	}
 	if !reflectMigrations(migrations, expectedMigrations) {
 		return fmt.Errorf("%w: migration ledger does not exactly match schema v%d", ErrSchema, expectedVersion)
@@ -974,6 +1004,12 @@ func expectedSchemaObjects(version int) ([]schemaObject, error) {
 			schemaV9ContractObjects, schemaV9ContractErr = buildExpectedSchemaObjects(schemaV1SQL, schemaV2SQL, schemaV3SQL, schemaV4SQL, schemaV5SQL, schemaV6SQL, schemaV7SQL, schemaV8SQL, schemaV9SQL)
 		})
 		return append([]schemaObject(nil), schemaV9ContractObjects...), schemaV9ContractErr
+	}
+	if version == 10 {
+		schemaV10ContractOnce.Do(func() {
+			schemaV10ContractObjects, schemaV10ContractErr = buildExpectedSchemaObjects(schemaV1SQL, schemaV2SQL, schemaV3SQL, schemaV4SQL, schemaV5SQL, schemaV6SQL, schemaV7SQL, schemaV8SQL, schemaV9SQL, schemaV10SQL)
+		})
+		return append([]schemaObject(nil), schemaV10ContractObjects...), schemaV10ContractErr
 	}
 	return nil, fmt.Errorf("unsupported schema contract version %d", version)
 }

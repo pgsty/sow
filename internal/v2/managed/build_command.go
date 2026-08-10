@@ -10,12 +10,14 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 )
 
 func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultErr error) {
 	if ctx == nil {
 		return result, errors.New("managed: nil context")
 	}
+	ctx, _ = workmetrics.Ensure(ctx)
 	if opts.Jobs < 1 {
 		return result, fmt.Errorf("%w: build jobs must be at least 1", ErrRejected)
 	}
@@ -50,7 +52,8 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 	if _, err := checkConfigAtRootForLockedRepository(ctx, ws.Root, cfg, repoName, selectedFormats); err != nil {
 		return result, err
 	}
-	if err := validateCurrentPublicGeneration(ctx, ws.Root, repoName, store); err != nil {
+	currentSnapshot, err := validateCurrentPublicGenerationSnapshot(ctx, ws.Root, repoName, store)
+	if err != nil {
 		return result, err
 	}
 	result.Dists = distNames
@@ -98,7 +101,7 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 	manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"dists": len(distNames)}, Outcomes: outcomes}
 	var preflight *mutationBuildPreflight
 	if physicalChange {
-		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, affectedDists, manifest, store, nil)
+		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, affectedDists, manifest, store, nil, currentSnapshot)
 		if err != nil {
 			return result, err
 		}
@@ -168,13 +171,16 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 		if err := recordBuildProgress(ctx, store, id, "normalizing_public_tree", 0, 1, opts.Jobs); err != nil {
 			return result, err
 		}
-		if _, err := normalizeCurrentPublicTree(ctx, ws.Root, repoName, id, store, opts.Fault); err != nil {
+		if _, err := normalizeCurrentPublicTreeWithSnapshot(ctx, ws.Root, repoName, id, store, opts.Fault, currentSnapshot); err != nil {
 			return result, err
 		}
 		if err := recordBuildProgress(ctx, store, id, "normalizing_public_tree", 1, 1, opts.Jobs); err != nil {
 			return result, err
 		}
 		if err := recordBuildProgress(ctx, store, id, "finalizing", 0, 1, opts.Jobs); err != nil {
+			return result, err
+		}
+		if err := recordBuildMetrics(ctx, store, id); err != nil {
 			return result, err
 		}
 		if err := store.FinalizeNoopBuild(ctx, id); err != nil {

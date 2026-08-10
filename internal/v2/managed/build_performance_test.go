@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 	"golang.org/x/sys/unix"
 )
 
@@ -573,6 +575,7 @@ func TestManagedBuildRecordsPhaseProgress(t *testing.T) {
 		"rendering": false, "promoting_payload": false, "publishing_dists": false,
 		"normalizing_public_tree": false, "finalizing": false,
 	}
+	metricsObserved := false
 	for _, event := range detail.Events {
 		var progress struct {
 			Version   int    `json:"version"`
@@ -590,11 +593,460 @@ func TestManagedBuildRecordsPhaseProgress(t *testing.T) {
 				want[progress.Phase] = true
 			}
 		}
+		var metrics struct {
+			Version int    `json:"version"`
+			Kind    string `json:"kind"`
+			workmetrics.Snapshot
+		}
+		if err := jsonUnmarshalStrict(event.DetailJSON, &metrics); err == nil && metrics.Kind == "build_metrics" {
+			metricsObserved = true
+			if metrics.Version != 1 || metrics.PayloadBytesRead <= 0 || metrics.FullPackageReads <= 0 {
+				t.Fatalf("invalid build metrics: %#v", metrics)
+			}
+			if metrics.PayloadByPhase["ingest"].Full == 0 {
+				t.Fatalf("build metrics omit ingest payload reads: %#v", metrics)
+			}
+			for _, phase := range []string{"render_rpm", "public_normalization"} {
+				if metrics.PayloadByPhase[phase].Full != 0 {
+					t.Fatalf("build %s re-read cached payloads: %#v", phase, metrics)
+				}
+			}
+			if metrics.FactCacheHits == 0 || metrics.FactCacheMisses != 0 {
+				t.Fatalf("fresh add did not render from its cached facts: %#v", metrics)
+			}
+			if metrics.PayloadByPhase["ingest"].Full != 1 {
+				t.Fatalf("fresh RPM ingest used %d full reads, want one snapshot pass: %#v", metrics.PayloadByPhase["ingest"].Full, metrics)
+			}
+		}
 	}
 	for phase, observed := range want {
 		if !observed {
 			t.Fatalf("missing %s progress: events=%#v", phase, detail.Events)
 		}
+	}
+	if !metricsObserved {
+		t.Fatalf("missing build_metrics event: events=%#v", detail.Events)
+	}
+}
+
+func TestWarmManagedBuildUsesFactsAndStatWithoutPayloadReads(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"noble": {Format: "deb"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputRoot := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, err := managedBenchmarkDEBBytesWithPayload("sow-warm-stat", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := filepath.Join(inputRoot, "sow-warm-stat_1.0-1_amd64.deb")
+	if err := os.WriteFile(input, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Paths: []string{input}, Jobs: 2}); err != nil {
+		t.Fatal(err)
+	}
+	repository := cfg.Repositories["repo"]
+	dist := repository.Dists["noble"]
+	dist.Exclude = []config.ExcludeRule{{Name: []string{"__no_match__"}}}
+	repository.Dists["noble"] = dist
+	cfg.Repositories["repo"] = repository
+	writeManagedConfig(t, root, cfg)
+	result, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Jobs: 2})
+	if err != nil || result.Noop {
+		t.Fatalf("warm build=%#v err=%v", result, err)
+	}
+	store, err := state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail, detailErr := store.GetOperation(ctx, result.Operation)
+	closeErr := store.Close()
+	if err := errors.Join(detailErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range detail.Events {
+		var metrics struct {
+			Version int    `json:"version"`
+			Kind    string `json:"kind"`
+			workmetrics.Snapshot
+		}
+		if err := jsonUnmarshalStrict(event.DetailJSON, &metrics); err != nil || metrics.Kind != "build_metrics" {
+			continue
+		}
+		if metrics.PayloadBytesRead != 0 || metrics.FullPackageReads != 0 {
+			t.Fatalf("warm build re-read package bodies: %#v", metrics)
+		}
+		if metrics.StatHits != 1 || metrics.StatMisses != 0 || metrics.FactCacheHits != 1 || metrics.FactCacheMisses != 0 {
+			t.Fatalf("warm build did not use one stat/fact cache hit: %#v", metrics)
+		}
+		return
+	}
+	t.Fatalf("warm build omitted build_metrics: events=%#v", detail.Events)
+}
+
+func TestAuthenticatedPayloadSnapshotRejectsRestoredMTimeRewrite(t *testing.T) {
+	ctx := context.Background()
+	repositoryRoot := t.TempDir()
+	payload := filepath.Join(repositoryRoot, "pool", "p", "pkg.rpm")
+	if err := os.MkdirAll(filepath.Dir(payload), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("authenticated payload snapshot")
+	if err := os.WriteFile(payload, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := scanPublicGenerationSnapshot(ctx, repositoryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalInfo, err := os.Stat(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	rewritten := append([]byte(nil), body...)
+	rewritten[len(rewritten)-1] ^= 1
+	if err := os.WriteFile(payload, rewritten, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(payload, originalInfo.ModTime(), originalInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	authenticated, err := buildAuthenticatedPayloads(snapshot, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := normalizeManagedPublicTreeWithPayloads(ctx, repositoryRoot, nil, "", authenticated); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("restored-mtime rewrite passed authenticated snapshot: %v", err)
+	}
+}
+
+func TestManagedFingerprintDriftRehashesOnceAndSelfHeals(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"noble": {Format: "deb"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputRoot := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, err := managedBenchmarkDEBBytes("sow-ctime-self-heal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := filepath.Join(inputRoot, "sow-ctime-self-heal_1.0-1_amd64.deb")
+	if err := os.WriteFile(input, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Paths: []string{input}, Jobs: 2}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, objectErr := store.ListPackageObjects(ctx, nil, false)
+	closeErr := store.Close()
+	if err := errors.Join(objectErr, closeErr); err != nil || len(objects) != 1 {
+		t.Fatalf("objects=%#v err=%v", objects, err)
+	}
+	pool := filepath.Join(root, "repo", filepath.FromSlash(objects[0].PoolPath))
+	opened, err := openRootedRegular(filepath.Dir(pool), filepath.Base(pool))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, identityErr := snapshotRootedRegularIdentity(opened)
+	if err := errors.Join(identityErr, opened.CloseVerified()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	link := filepath.Join(root, "ctime-only-link.deb")
+	if err := os.Link(pool, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	opened, err = openRootedRegular(filepath.Dir(pool), filepath.Base(pool))
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, identityErr := snapshotRootedRegularIdentity(opened)
+	if err := errors.Join(identityErr, opened.CloseVerified()); err != nil {
+		t.Fatal(err)
+	}
+	if !before.sameInode(after) || before.size != after.size || before.modUnixNano != after.modUnixNano || before.changeUnixNano == after.changeUnixNano {
+		t.Fatalf("ctime-only fixture before=%#v after=%#v", before, after)
+	}
+	if preview, err := Remove(ctx, RemoveOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Packages: []string{"sha256:" + objects[0].SHA256}, Check: true, Jobs: 2}); err != nil || !preview.Check {
+		t.Fatalf("read-only preview could not validate stale fingerprint: preview=%#v err=%v", preview, err)
+	}
+	store, err = state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprints, fingerprintErr := store.ListPackageFingerprints(ctx)
+	closeErr = store.Close()
+	wantFingerprint := packageFingerprint(before)
+	if err := errors.Join(fingerprintErr, closeErr); err != nil || len(fingerprints) != 1 || fingerprints[0].Fingerprint == nil || *fingerprints[0].Fingerprint != *wantFingerprint {
+		t.Fatalf("read-only preview changed the persisted fingerprint: fingerprints=%#v err=%v", fingerprints, err)
+	}
+	setManagedBenchmarkExclude(t, root, &cfg, "__ctime_rehash__")
+	first, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := managedBuildMetrics(t, root, first.Operation)
+	if metrics.StatMisses != 1 || metrics.StatHits != 0 || metrics.PayloadByPhase["current_public_generation"].Full != 1 || metrics.FactCacheHits != 1 {
+		t.Fatalf("ctime drift did not use one hash fallback: %#v", metrics)
+	}
+	setManagedBenchmarkExclude(t, root, &cfg, "__ctime_healed__")
+	second, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics = managedBuildMetrics(t, root, second.Operation)
+	if metrics.StatHits != 1 || metrics.StatMisses != 0 || metrics.FullPackageReads != 0 {
+		t.Fatalf("healed fingerprint missed the next warm build: %#v", metrics)
+	}
+}
+
+func TestManagedMissingAndPoisonedFactsLazilyRebuild(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"noble": {Format: "deb"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputRoot := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, err := managedBenchmarkDEBBytes("sow-facts-rebuild")
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := filepath.Join(inputRoot, "sow-facts-rebuild_1.0-1_amd64.deb")
+	if err := os.WriteFile(input, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Paths: []string{input}, Jobs: 2}); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, ".sow", "repo.db")
+	store, err := state.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, err := store.ListPackageObjects(ctx, nil, false)
+	if err != nil || len(objects) != 1 {
+		store.Close()
+		t.Fatalf("objects=%#v err=%v", objects, err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `DELETE FROM package_facts WHERE package_sha256 = ?`, objects[0].SHA256); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if preview, err := Remove(ctx, RemoveOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Packages: []string{"sha256:" + objects[0].SHA256}, Check: true, Jobs: 2}); err != nil || !preview.Check {
+		t.Fatalf("read-only preview could not rebuild missing facts in memory: preview=%#v err=%v", preview, err)
+	}
+	store, err = state.OpenReadOnly(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var factCount int
+	countErr := store.DB().QueryRowContext(ctx, `SELECT count(*) FROM package_facts WHERE package_sha256 = ?`, objects[0].SHA256).Scan(&factCount)
+	closeErr := store.Close()
+	if err := errors.Join(countErr, closeErr); err != nil || factCount != 0 {
+		t.Fatalf("read-only preview persisted cache rows: count=%d err=%v", factCount, err)
+	}
+	setManagedBenchmarkExclude(t, root, &cfg, "__missing_facts__")
+	missing, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := managedBuildMetrics(t, root, missing.Operation)
+	if metrics.FactCacheMisses != 1 || metrics.PayloadByPhase["facts_backfill"].Full != 1 {
+		t.Fatalf("missing facts were not lazily rebuilt: %#v", metrics)
+	}
+	store, err = state.Open(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := store.ListPackageFacts(ctx)
+	if err != nil || len(facts) != 1 {
+		store.Close()
+		t.Fatalf("rebuilt facts=%#v err=%v", facts, err)
+	}
+	var poisoned map[string]any
+	if err := json.Unmarshal(facts[0].Facts, &poisoned); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	values, ok := poisoned["control_values"].(map[string]any)
+	if !ok {
+		store.Close()
+		t.Fatalf("facts lack control values: %#v", poisoned)
+	}
+	poolPath, err := managedPoolPath("evil", objects[0].Filename)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	poisoned["name"], poisoned["source"], poisoned["pool_path"] = "evil", "evil", poolPath
+	values["Package"] = "evil"
+	poisonedBytes, err := json.Marshal(poisoned)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE package_facts SET facts = ?, facts_sha256 = ? WHERE package_sha256 = ?`, poisonedBytes, bytesSHA(poisonedBytes), objects[0].SHA256); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	setManagedBenchmarkExclude(t, root, &cfg, "__poisoned_facts__")
+	poisonedBuild, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics = managedBuildMetrics(t, root, poisonedBuild.Operation)
+	if metrics.StatHits != 1 || metrics.FactCacheMisses != 1 || metrics.PayloadByPhase["facts_backfill"].Full != 1 {
+		t.Fatalf("coherently poisoned facts were not rebuilt: %#v", metrics)
+	}
+	store, err = state.OpenReadOnly(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, factErr := store.ListPackageFacts(ctx)
+	closeErr = store.Close()
+	if err := errors.Join(factErr, closeErr); err != nil || len(facts) != 1 || bytes.Equal(facts[0].Facts, poisonedBytes) {
+		t.Fatalf("poisoned facts survived rebuild: facts=%#v err=%v", facts, err)
+	}
+}
+
+func setManagedBenchmarkExclude(t testing.TB, root string, cfg *config.Config, marker string) {
+	t.Helper()
+	repository := cfg.Repositories["repo"]
+	dist := repository.Dists["noble"]
+	dist.Exclude = []config.ExcludeRule{{Name: []string{marker}}}
+	repository.Dists["noble"] = dist
+	cfg.Repositories["repo"] = repository
+	writeManagedConfig(t, root, *cfg)
+}
+
+func managedBuildMetrics(t testing.TB, root, operationID string) workmetrics.Snapshot {
+	t.Helper()
+	ctx := context.Background()
+	store, err := state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail, detailErr := store.GetOperation(ctx, operationID)
+	closeErr := store.Close()
+	if err := errors.Join(detailErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range detail.Events {
+		var metrics struct {
+			Version int    `json:"version"`
+			Kind    string `json:"kind"`
+			workmetrics.Snapshot
+		}
+		if err := jsonUnmarshalStrict(event.DetailJSON, &metrics); err == nil && metrics.Kind == "build_metrics" {
+			return metrics.Snapshot
+		}
+	}
+	t.Fatalf("operation %s omitted build_metrics", operationID)
+	return workmetrics.Snapshot{}
+}
+
+// BenchmarkManagedBuildPayloadAmplification complements the 50K object-count
+// gate with one realistically large package. It measures the warm rebuild path
+// after a policy-only config change and reports actual package bytes read, so a
+// hot filesystem cache cannot hide read amplification. The payload defaults to
+// 64 MiB and can be adjusted with SOW_MANAGED_BENCH_PAYLOAD_MIB.
+func BenchmarkManagedBuildPayloadAmplification(b *testing.B) {
+	payloadMiB := 64
+	if raw := os.Getenv("SOW_MANAGED_BENCH_PAYLOAD_MIB"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 1024 {
+			b.Fatalf("SOW_MANAGED_BENCH_PAYLOAD_MIB=%q is outside 1..1024", raw)
+		}
+		payloadMiB = parsed
+	}
+	payloadBytes := payloadMiB << 20
+	b.ReportMetric(float64(payloadBytes), "package_bytes/op")
+	ctx := context.Background()
+	for range b.N {
+		b.StopTimer()
+		root := b.TempDir()
+		cfg := config.Default()
+		cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"noble": {Format: "deb"}}}
+		writeManagedConfig(b, root, cfg)
+		if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+			b.Fatal(err)
+		}
+		inputRoot := filepath.Join(root, "inputs")
+		if err := os.Mkdir(inputRoot, 0o755); err != nil {
+			b.Fatal(err)
+		}
+		body, err := managedBenchmarkDEBBytesWithPayload("sow-payload-amplification", payloadBytes)
+		if err != nil {
+			b.Fatal(err)
+		}
+		input := filepath.Join(inputRoot, "sow-payload-amplification_1.0-1_amd64.deb")
+		if err := os.WriteFile(input, body, 0o644); err != nil {
+			b.Fatal(err)
+		}
+		options := WorkspaceOptions{Workdir: root, CWD: root}
+		if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Paths: []string{input}, Jobs: 4}); err != nil {
+			b.Fatal(err)
+		}
+		repository := cfg.Repositories["repo"]
+		dist := repository.Dists["noble"]
+		dist.Exclude = []config.ExcludeRule{{Name: []string{"__sow_payload_benchmark_no_match__"}}}
+		repository.Dists["noble"] = dist
+		cfg.Repositories["repo"] = repository
+		writeManagedConfig(b, root, cfg)
+		b.StartTimer()
+		result, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Jobs: 4})
+		b.StopTimer()
+		if err != nil || result.Noop || result.Generation < 2 {
+			b.Fatalf("build=%#v err=%v", result, err)
+		}
+		store, err := state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+		if err != nil {
+			b.Fatal(err)
+		}
+		detail, detailErr := store.GetOperation(ctx, result.Operation)
+		closeErr := store.Close()
+		if err := errors.Join(detailErr, closeErr); err != nil {
+			b.Fatal(err)
+		}
+		reportManagedBuildProgressMetrics(b, detail)
 	}
 }
 
@@ -757,21 +1209,37 @@ func reportManagedBuildProgressMetrics(b *testing.B, detail state.OperationDetai
 	started := map[string]time.Time{}
 	for _, event := range detail.Events {
 		var progress progressEvent
-		if err := jsonUnmarshalStrict(event.DetailJSON, &progress); err != nil || progress.Kind != "build_progress" {
-			continue
+		if err := jsonUnmarshalStrict(event.DetailJSON, &progress); err == nil && progress.Kind == "build_progress" {
+			if progress.Completed == 0 {
+				started[progress.Phase] = event.OccurredAt
+			}
+			if start, exists := started[progress.Phase]; exists && progress.Total > 0 && progress.Completed == progress.Total {
+				milliseconds := float64(event.OccurredAt.Sub(start).Microseconds()) / 1_000
+				b.ReportMetric(milliseconds, progress.Phase+"_ms/op")
+			}
 		}
-		if progress.Completed == 0 {
-			started[progress.Phase] = event.OccurredAt
+		var metrics struct {
+			Version int    `json:"version"`
+			Kind    string `json:"kind"`
+			workmetrics.Snapshot
 		}
-		if start, exists := started[progress.Phase]; exists && progress.Total > 0 && progress.Completed == progress.Total {
-			milliseconds := float64(event.OccurredAt.Sub(start).Microseconds()) / 1_000
-			b.ReportMetric(milliseconds, progress.Phase+"_ms/op")
+		if err := jsonUnmarshalStrict(event.DetailJSON, &metrics); err == nil && metrics.Kind == "build_metrics" {
+			b.ReportMetric(float64(metrics.PayloadBytesRead), "payload_bytes/op")
+			b.ReportMetric(float64(metrics.FullPackageReads), "package_reads/op")
+			b.ReportMetric(float64(metrics.StatHits), "stat_hits/op")
+			b.ReportMetric(float64(metrics.StatMisses), "stat_misses/op")
+			b.ReportMetric(float64(metrics.FactCacheHits), "fact_hits/op")
+			b.ReportMetric(float64(metrics.FactCacheMisses), "fact_misses/op")
 		}
 	}
 	b.ReportMetric(float64(detail.DurationMS), "operation_ms/op")
 }
 
 func managedBenchmarkDEBBytes(packageName string) ([]byte, error) {
+	return managedBenchmarkDEBBytesWithPayload(packageName, 0)
+}
+
+func managedBenchmarkDEBBytesWithPayload(packageName string, payloadBytes int) ([]byte, error) {
 	control := []byte(fmt.Sprintf("Package: %s\nVersion: 1.0-1\nArchitecture: amd64\nMaintainer: SOW Performance <sow@example.invalid>\nSection: utils\nPriority: optional\nDescription: managed build performance fixture\n", packageName))
 	var controlTar bytes.Buffer
 	tw := tar.NewWriter(&controlTar)
@@ -788,7 +1256,11 @@ func managedBenchmarkDEBBytes(packageName string) ([]byte, error) {
 	archive.WriteString("!<arch>\n")
 	writeManagedBenchmarkARMember(&archive, "debian-binary", []byte("2.0\n"))
 	writeManagedBenchmarkARMember(&archive, "control.tar", controlTar.Bytes())
-	writeManagedBenchmarkARMember(&archive, "data.tar.zst", []byte("payload is intentionally not opened"))
+	payload := []byte("payload is intentionally not opened")
+	if payloadBytes > 0 {
+		payload = make([]byte, payloadBytes)
+	}
+	writeManagedBenchmarkARMember(&archive, "data.tar.zst", payload)
 	return archive.Bytes(), nil
 }
 

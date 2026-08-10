@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
 	"strings"
@@ -130,6 +131,40 @@ func TestFinalizeGenerationAboveMaxInt64DoesNotMutateDesiredRevision(t *testing.
 	storedDist, err := store.GetDist(ctx, dist.Name)
 	if err != nil || storedDist.BuiltGeneration != next {
 		t.Fatalf("stored Dist=%#v err=%v", storedDist, err)
+	}
+}
+
+func TestLegacyBootstrapBatchesLargeManifestAndChangeset(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const count = sqliteManifestInsertBatchSize*2 + 17
+	manifest := make([]GenerationFile, count)
+	for index := range manifest {
+		manifest[index] = GenerationFile{
+			Path: fmt.Sprintf("dists/test/metadata-%04d", index), Phase: "metadata",
+			Size: int64(index), SHA256: fmt.Sprintf("%064x", index+1),
+		}
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE repository_state SET built_generation = ? WHERE singleton = 1`, GenerationID(1)); err != nil {
+		t.Fatal(err)
+	}
+	operationID := strings.Repeat("a", 64)
+	if err := store.BootstrapLegacyGeneration(ctx, operationID, 1, manifest); err != nil {
+		t.Fatal(err)
+	}
+	var files, changes int
+	if err := store.DB().QueryRowContext(ctx, `SELECT count(*) FROM generation_files WHERE generation = ?`, GenerationID(1)).Scan(&files); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DB().QueryRowContext(ctx, `SELECT count(*) FROM operation_files WHERE operation_id = ?`, operationID).Scan(&changes); err != nil {
+		t.Fatal(err)
+	}
+	if files != count || changes != count {
+		t.Fatalf("batched files=%d changes=%d want=%d", files, changes, count)
 	}
 }
 

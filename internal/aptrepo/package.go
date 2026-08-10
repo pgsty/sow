@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/kjk/lzma"
 	"github.com/klauspost/compress/zstd"
+	"github.com/pgsty/sow/internal/workmetrics"
 	"github.com/xi2/xz"
 	"pault.ag/go/debian/control"
 	"pault.ag/go/debian/deb"
@@ -32,7 +34,10 @@ var (
 	debianNamePattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
 	componentPattern    = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]*$`)
 	architecturePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+	sha256Pattern       = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
+
+const PackageFactsSchema = "aptrepo/package-facts/v1"
 
 const (
 	maxDebArMembers         = 128
@@ -171,7 +176,47 @@ func InspectPackageReaderAs(ctx context.Context, reader PackageReader, component
 	return inspectPackageReaderAs(ctx, reader, component, originalBasename, true)
 }
 
+// InspectPackageReaderKnown parses control metadata after the caller has
+// already copied and SHA-256-authenticated the complete descriptor. Only the
+// bounded ar/control members are read; the package payload is not rehashed.
+func InspectPackageReaderKnown(ctx context.Context, reader PackageReader, component, originalBasename, digest string, size int64) (Package, error) {
+	if !sha256Pattern.MatchString(digest) || size < 0 {
+		return Package{}, errors.New("aptrepo: invalid known deb identity")
+	}
+	return parsePackageReaderAs(ctx, reader, component, originalBasename, digest, size)
+}
+
 func inspectPackageReaderAs(ctx context.Context, reader PackageReader, component, originalBasename string, rehash bool) (Package, error) {
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		return Package{}, fmt.Errorf("aptrepo: rewind deb before hashing: %w", err)
+	}
+	initialDigest, initialSize, err := hashReader(ctx, reader)
+	if err != nil {
+		return Package{}, fmt.Errorf("aptrepo: hash deb before parsing: %w", err)
+	}
+	workmetrics.RecordFullPackageRead(ctx, initialSize)
+	pkg, err := parsePackageReaderAs(ctx, reader, component, originalBasename, initialDigest, initialSize)
+	if err != nil {
+		return Package{}, err
+	}
+	if rehash {
+		if _, err := reader.Seek(0, io.SeekStart); err != nil {
+			return Package{}, fmt.Errorf("aptrepo: rewind deb for hashing: %w", err)
+		}
+		digest, size, err := hashReader(ctx, reader)
+		if err != nil {
+			return Package{}, fmt.Errorf("aptrepo: hash deb: %w", err)
+		}
+		workmetrics.RecordFullPackageRead(ctx, size)
+		if initialDigest != digest || initialSize != size {
+			return Package{}, errors.New("aptrepo: deb changed while being inspected")
+		}
+	}
+
+	return pkg, nil
+}
+
+func parsePackageReaderAs(ctx context.Context, reader PackageReader, component, originalBasename, digest string, size int64) (Package, error) {
 	if ctx == nil {
 		return Package{}, errors.New("aptrepo: nil context")
 	}
@@ -184,27 +229,17 @@ func inspectPackageReaderAs(ctx context.Context, reader PackageReader, component
 	if err := validateComponent(component); err != nil {
 		return Package{}, err
 	}
-
 	base := originalBasename
 	if filepath.Base(base) != base || !safeDebBasename(base) {
 		return Package{}, fmt.Errorf("aptrepo: unsafe deb filename %q", base)
 	}
 	if _, err := reader.Seek(0, io.SeekStart); err != nil {
-		return Package{}, fmt.Errorf("aptrepo: rewind deb before hashing: %w", err)
-	}
-	initialDigest, initialSize, err := hashReader(ctx, reader)
-	if err != nil {
-		return Package{}, fmt.Errorf("aptrepo: hash deb before parsing: %w", err)
-	}
-	if _, err := reader.Seek(0, io.SeekStart); err != nil {
 		return Package{}, fmt.Errorf("aptrepo: rewind deb for parsing: %w", err)
 	}
-
-	debianControl, err := loadDebControl(ctx, reader, initialSize)
+	debianControl, err := loadDebControl(ctx, reader, size)
 	if err != nil {
 		return Package{}, fmt.Errorf("aptrepo: parse deb control: %w", err)
 	}
-
 	name := strings.TrimSpace(debianControl.Package)
 	source := sourcePackageName(debianControl.Source, name)
 	arch := debianControl.Architecture.String()
@@ -217,25 +252,10 @@ func inspectPackageReaderAs(ctx context.Context, reader PackageReader, component
 	if !architecturePattern.MatchString(arch) {
 		return Package{}, fmt.Errorf("aptrepo: unsafe architecture %q", arch)
 	}
-
 	poolPath, err := PoolPath(component, source, base)
 	if err != nil {
 		return Package{}, err
 	}
-	digest, size := initialDigest, initialSize
-	if rehash {
-		if _, err := reader.Seek(0, io.SeekStart); err != nil {
-			return Package{}, fmt.Errorf("aptrepo: rewind deb for hashing: %w", err)
-		}
-		digest, size, err = hashReader(ctx, reader)
-		if err != nil {
-			return Package{}, fmt.Errorf("aptrepo: hash deb: %w", err)
-		}
-		if initialDigest != digest || initialSize != size {
-			return Package{}, errors.New("aptrepo: deb changed while being inspected")
-		}
-	}
-
 	return Package{
 		Name:          name,
 		Source:        source,
@@ -249,6 +269,69 @@ func inspectPackageReaderAs(ctx context.Context, reader PackageReader, component
 		debianVersion: debianControl.Version,
 		paragraph:     cloneParagraph(debianControl.Paragraph),
 	}, nil
+}
+
+type packageFactsEnvelope struct {
+	Schema       string            `json:"schema"`
+	Name         string            `json:"name"`
+	Source       string            `json:"source"`
+	Version      string            `json:"version"`
+	Architecture string            `json:"architecture"`
+	Component    string            `json:"component"`
+	PoolPath     string            `json:"pool_path"`
+	Size         int64             `json:"size"`
+	SHA256       string            `json:"sha256"`
+	Order        []string          `json:"control_order"`
+	Values       map[string]string `json:"control_values"`
+}
+
+func MarshalPackageFacts(pkg Package) ([]byte, error) {
+	validated := pkg
+	if validated.SourcePath == "" {
+		validated.SourcePath = "facts"
+	}
+	if err := validatePackageMetadata(validated); err != nil {
+		return nil, err
+	}
+	facts := packageFactsEnvelope{
+		Schema: PackageFactsSchema, Name: pkg.Name, Source: pkg.Source, Version: pkg.Version,
+		Architecture: pkg.Architecture, Component: pkg.Component, PoolPath: pkg.PoolPath,
+		Size: pkg.Size, SHA256: pkg.SHA256, Order: append([]string(nil), pkg.paragraph.Order...),
+		Values: cloneParagraph(pkg.paragraph).Values,
+	}
+	return json.Marshal(facts)
+}
+
+func PackageFromFacts(data []byte, sourcePath string) (Package, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var facts packageFactsEnvelope
+	if err := decoder.Decode(&facts); err != nil {
+		return Package{}, fmt.Errorf("aptrepo: decode package facts: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return Package{}, errors.New("aptrepo: package facts contain trailing data")
+	}
+	if facts.Schema != PackageFactsSchema || sourcePath == "" {
+		return Package{}, errors.New("aptrepo: unsupported package facts")
+	}
+	parsedVersion, err := version.Parse(facts.Version)
+	if err != nil {
+		return Package{}, fmt.Errorf("aptrepo: invalid package facts version: %w", err)
+	}
+	pkg := Package{
+		Name: facts.Name, Source: facts.Source, Version: facts.Version, Architecture: facts.Architecture,
+		Component: facts.Component, SourcePath: sourcePath, PoolPath: facts.PoolPath, Size: facts.Size, SHA256: facts.SHA256,
+		debianVersion: parsedVersion,
+		paragraph:     control.Paragraph{Order: append([]string(nil), facts.Order...), Values: make(map[string]string, len(facts.Values))},
+	}
+	for key, value := range facts.Values {
+		pkg.paragraph.Values[key] = value
+	}
+	if err := validatePackageMetadata(pkg); err != nil {
+		return Package{}, fmt.Errorf("aptrepo: invalid package facts: %w", err)
+	}
+	return pkg, nil
 }
 
 func loadDebControl(ctx context.Context, reader io.ReaderAt, size int64) (deb.Control, error) {
@@ -644,6 +727,7 @@ func hashPackage(ctx context.Context, filePath string) (string, int64, error) {
 	if err != nil {
 		return "", 0, fmt.Errorf("aptrepo: hash deb: %w", err)
 	}
+	workmetrics.RecordFullPackageRead(ctx, size)
 	return digest, size, nil
 }
 

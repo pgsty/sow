@@ -16,6 +16,7 @@ import (
 
 	"github.com/pgsty/sow/internal/aptrepo"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 	"github.com/pgsty/sow/internal/yumrepo"
 	"golang.org/x/sys/unix"
 )
@@ -27,12 +28,15 @@ type inputFile struct {
 }
 
 type inspectedInput struct {
-	SHA256 string
-	Object state.PackageObject
-	Err    error
+	SHA256     string
+	Object     state.PackageObject
+	FactSchema string
+	Facts      []byte
+	Err        error
 }
 
 func inspectInputs(ctx context.Context, inputsRoot string, files []inputFile, workers int) []inspectedInput {
+	ctx = workmetrics.WithPhase(ctx, "ingest")
 	results := make([]inspectedInput, len(files))
 	if len(files) == 0 {
 		return results
@@ -52,13 +56,13 @@ func inspectInputs(ctx context.Context, inputsRoot string, files []inputFile, wo
 			for sequence := range jobs {
 				input := files[sequence]
 				snapshot := filepath.Join(inputsRoot, fmt.Sprintf("%08d-%s", sequence, input.Base))
-				inputSHA, err := snapshotInput(ctx, input.Path, snapshot)
+				digests, err := snapshotInput(ctx, input.Path, snapshot, strings.HasSuffix(input.Base, ".rpm"))
 				if err != nil {
 					results[sequence].Err = err
 					continue
 				}
-				object, err := inspectSnapshot(ctx, snapshot, input.Base)
-				results[sequence] = inspectedInput{SHA256: inputSHA, Object: object, Err: err}
+				object, factSchema, facts, err := inspectSnapshotWithFacts(ctx, snapshot, input.Base, digests.SHA256, digests.RPMNeutralSHA256)
+				results[sequence] = inspectedInput{SHA256: digests.SHA256, Object: object, FactSchema: factSchema, Facts: facts, Err: err}
 			}
 		}()
 	}
@@ -68,6 +72,49 @@ func inspectInputs(ctx context.Context, inputsRoot string, files []inputFile, wo
 	close(jobs)
 	group.Wait()
 	return results
+}
+
+func inspectSnapshotWithFacts(ctx context.Context, filename, originalBasename, knownSHA, knownRPMNeutralSHA string) (state.PackageObject, string, []byte, error) {
+	switch {
+	case strings.HasSuffix(originalBasename, ".rpm"):
+		opened, err := openRootedRegular(filepath.Dir(filename), filepath.Base(filename))
+		if err != nil {
+			return state.PackageObject{}, "", nil, err
+		}
+		facts, info, inspectErr := yumrepo.InspectManagedPackageFactsReaderKnown(ctx, opened.file, originalBasename, knownSHA, opened.before.Size())
+		closeErr := opened.CloseVerified()
+		if err := errors.Join(inspectErr, closeErr); err != nil {
+			return state.PackageObject{}, "", nil, err
+		}
+		if info.SHA256 != knownSHA || knownRPMNeutralSHA == "" {
+			return state.PackageObject{}, "", nil, errors.New("managed: RPM snapshot digest differs from copied input")
+		}
+		object, err := rpmObjectFromInfo(info, originalBasename, knownRPMNeutralSHA)
+		if err != nil {
+			return state.PackageObject{}, "", nil, err
+		}
+		blob, err := facts.MarshalBinary()
+		return object, yumrepo.PackageFactsSchema, blob, err
+	case strings.HasSuffix(originalBasename, ".deb"):
+		opened, err := openRootedRegular(filepath.Dir(filename), filepath.Base(filename))
+		if err != nil {
+			return state.PackageObject{}, "", nil, err
+		}
+		info, inspectErr := aptrepo.InspectPackageReaderKnown(ctx, opened.file, "main", originalBasename, knownSHA, opened.before.Size())
+		info.SourcePath = filename
+		closeErr := opened.CloseVerified()
+		if err := errors.Join(inspectErr, closeErr); err != nil {
+			return state.PackageObject{}, "", nil, err
+		}
+		object, err := debObjectFromInfo(info, originalBasename)
+		if err != nil {
+			return state.PackageObject{}, "", nil, err
+		}
+		blob, err := aptrepo.MarshalPackageFacts(info)
+		return object, aptrepo.PackageFactsSchema, blob, err
+	default:
+		return state.PackageObject{}, "", nil, errors.New("managed: unsupported package suffix")
+	}
 }
 
 func collectInputFiles(ctx context.Context, inputs []string, recursive bool) ([]inputFile, []MutationItem) {
@@ -169,38 +216,78 @@ func collectInputFiles(ctx context.Context, inputs []string, recursive bool) ([]
 	return files, failures
 }
 
-func snapshotInput(ctx context.Context, source, target string) (_ string, resultErr error) {
+type packageSnapshotDigests struct {
+	SHA256           string
+	RPMNeutralSHA256 string
+}
+
+type suffixHashWriter struct {
+	skip    int64
+	written int64
+	target  io.Writer
+}
+
+func (writer *suffixHashWriter) Write(buffer []byte) (int, error) {
+	original := len(buffer)
+	start := int64(0)
+	if writer.written < writer.skip {
+		start = writer.skip - writer.written
+		if start > int64(len(buffer)) {
+			start = int64(len(buffer))
+		}
+	}
+	writer.written += int64(len(buffer))
+	if start < int64(len(buffer)) {
+		if _, err := writer.target.Write(buffer[start:]); err != nil {
+			return 0, err
+		}
+	}
+	return original, nil
+}
+
+func snapshotInput(ctx context.Context, source, target string, rpm bool) (_ packageSnapshotDigests, resultErr error) {
 	opened, err := openRootedRegular(filepath.Dir(source), filepath.Base(source))
 	if err != nil {
-		return "", fmt.Errorf("managed: package input is not a safely rooted regular file: %w", err)
+		return packageSnapshotDigests{}, fmt.Errorf("managed: package input is not a safely rooted regular file: %w", err)
+	}
+	neutralOffset := int64(0)
+	if rpm {
+		neutralOffset, err = yumrepo.RPMSignatureNeutralOffset(ctx, opened.file)
+		if err != nil {
+			return packageSnapshotDigests{}, errors.Join(err, opened.CloseVerified())
+		}
+		if _, err := opened.file.Seek(0, io.SeekStart); err != nil {
+			return packageSnapshotDigests{}, errors.Join(err, opened.CloseVerified())
+		}
 	}
 	created, err := createRootedRegular(filepath.Dir(target), filepath.Base(target), 0o600)
 	if err != nil {
-		return "", errors.Join(fmt.Errorf("managed: create immutable package snapshot: %w", err), opened.CloseVerified())
+		return packageSnapshotDigests{}, errors.Join(fmt.Errorf("managed: create immutable package snapshot: %w", err), opened.CloseVerified())
 	}
 	hasher := sha256.New()
-	written, copyErr := io.Copy(io.MultiWriter(created.file, hasher), &managedContextReader{ctx: ctx, reader: opened.file})
+	writers := []io.Writer{created.file, hasher}
+	neutralHasher := sha256.New()
+	if rpm {
+		writers = append(writers, &suffixHashWriter{skip: neutralOffset, target: neutralHasher})
+	}
+	written, copyErr := io.Copy(io.MultiWriter(writers...), &managedContextReader{ctx: ctx, reader: opened.file})
 	if copyErr != nil || written != opened.before.Size() {
 		err := errors.Join(copyErr, created.Abort(), opened.CloseVerified())
-		return "", fmt.Errorf("managed: copy immutable package snapshot: %w", err)
+		return packageSnapshotDigests{}, fmt.Errorf("managed: copy immutable package snapshot: %w", err)
 	}
+	workmetrics.RecordFullPackageRead(ctx, written)
 	if err := created.Commit(); err != nil {
-		return "", errors.Join(fmt.Errorf("managed: commit immutable package snapshot: %w", err), opened.CloseVerified())
+		return packageSnapshotDigests{}, errors.Join(fmt.Errorf("managed: commit immutable package snapshot: %w", err), opened.CloseVerified())
 	}
 	if err := opened.CloseVerified(); err != nil {
 		_ = removeRootedRegular(filepath.Dir(target), filepath.Base(target), written)
-		return "", errors.New("managed: package input changed while snapshotting")
+		return packageSnapshotDigests{}, errors.New("managed: package input changed while snapshotting")
 	}
-	return hex.EncodeToString(hasher.Sum(nil)), nil
-}
-
-func inspectSnapshot(ctx context.Context, filename, originalBasename string) (state.PackageObject, error) {
-	opened, err := openRootedRegular(filepath.Dir(filename), filepath.Base(filename))
-	if err != nil {
-		return state.PackageObject{}, err
+	result := packageSnapshotDigests{SHA256: hex.EncodeToString(hasher.Sum(nil))}
+	if rpm {
+		result.RPMNeutralSHA256 = hex.EncodeToString(neutralHasher.Sum(nil))
 	}
-	object, inspectErr := inspectSnapshotReader(ctx, opened.file, originalBasename)
-	return object, errors.Join(inspectErr, opened.CloseVerified())
+	return result, nil
 }
 
 func inspectSnapshotReader(ctx context.Context, file *os.File, originalBasename string) (state.PackageObject, error) {
@@ -234,19 +321,23 @@ func inspectRPMSnapshotReader(ctx context.Context, file *os.File, originalBasena
 	if err != nil {
 		return state.PackageObject{}, err
 	}
-	canonical, neutral, err := canonicalStateArchitecture("rpm", info.Arch)
-	if err != nil {
-		return state.PackageObject{}, fmt.Errorf("%w: %v", ErrRejected, err)
-	}
-	if neutral {
-		canonical = "neutral"
-	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return state.PackageObject{}, err
 	}
 	payloadSHA, err := yumrepo.RPMSignatureNeutralDigest(ctx, file)
 	if err != nil {
 		return state.PackageObject{}, err
+	}
+	return rpmObjectFromInfo(info, originalBasename, payloadSHA)
+}
+
+func rpmObjectFromInfo(info yumrepo.PackageInfo, originalBasename, payloadSHA string) (state.PackageObject, error) {
+	canonical, neutral, err := canonicalStateArchitecture("rpm", info.Arch)
+	if err != nil {
+		return state.PackageObject{}, fmt.Errorf("%w: %v", ErrRejected, err)
+	}
+	if neutral {
+		canonical = "neutral"
 	}
 	poolPath, err := managedPoolPath(info.Source, originalBasename)
 	if err != nil {
@@ -274,6 +365,10 @@ func inspectDEBSnapshotReader(ctx context.Context, file *os.File, originalBasena
 	if err != nil {
 		return state.PackageObject{}, err
 	}
+	return debObjectFromInfo(info, originalBasename)
+}
+
+func debObjectFromInfo(info aptrepo.Package, originalBasename string) (state.PackageObject, error) {
 	canonical, neutral, err := canonicalStateArchitecture("deb", info.Architecture)
 	if err != nil {
 		return state.PackageObject{}, fmt.Errorf("%w: %v", ErrRejected, err)

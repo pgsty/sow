@@ -305,10 +305,8 @@ func (s *Store) CompleteLayoutTransition(ctx context.Context, operationID string
 	if _, err := tx.ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES (?, ?, ?, ?, ?, ?)`, next, base, operationID, manifestSHA, DefaultRendererIdentity, now); err != nil {
 		return 0, err
 	}
-	for _, file := range manifest {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO generation_files(generation, path, phase, size, sha256) VALUES (?, ?, ?, ?, ?)`, next, file.Path, file.Phase, file.Size, file.SHA256); err != nil {
-			return 0, err
-		}
+	if err := insertGenerationFilesTx(ctx, tx, next, manifest); err != nil {
+		return 0, err
 	}
 	signerRows, err := tx.QueryContext(ctx, `
 SELECT d.name, a.family, COALESCE(s.fingerprint, ''), COALESCE(s.public_key, X'')
@@ -352,14 +350,8 @@ ORDER BY d.name, a.family`)
 			return 0, err
 		}
 	}
-	for sequence, change := range changes {
-		var size, digest any
-		if change.Operation != "delete" {
-			size, digest = change.Size, change.SHA256
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO operation_files(operation_id, sequence, action, phase, path, size, sha256) VALUES (?, ?, ?, ?, ?, ?, ?)`, operationID, sequence, change.Operation, change.Phase, change.Path, size, digest); err != nil {
-			return 0, err
-		}
+	if err := insertOperationFilesTx(ctx, tx, operationID, changes); err != nil {
+		return 0, err
 	}
 	// Only RPM views are rewritten by the C2-to-single transition.  APT
 	// Release files retain their existing generation bytes, so their Dist and

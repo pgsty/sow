@@ -5,14 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
 
@@ -21,6 +22,7 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	if ctx == nil {
 		return result, errors.New("managed: nil context")
 	}
+	ctx, _ = workmetrics.Ensure(ctx)
 	if len(opts.Packages) == 0 || opts.Jobs < 1 || opts.Check && opts.Skip {
 		return result, fmt.Errorf("%w: invalid remove options", ErrRejected)
 	}
@@ -63,7 +65,8 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	if _, err := checkConfigAtRootForLockedRepository(ctx, ws.Root, cfg, repoName, signingFormatMask{}); err != nil {
 		return result, err
 	}
-	if err := validateCurrentPublicGeneration(ctx, ws.Root, repoName, store); err != nil {
+	currentSnapshot, err := validateCurrentPublicGenerationSnapshot(ctx, ws.Root, repoName, store)
+	if err != nil {
 		return result, err
 	}
 	objects, err := resolvePackageReferences(ctx, store, opts.Packages, distNames, true)
@@ -82,7 +85,7 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"removed": len(removed)}}
 	var preflight *mutationBuildPreflight
 	if !opts.Skip && len(buildDists) != 0 {
-		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, nil)
+		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, nil, currentSnapshot)
 		if err != nil {
 			return result, err
 		}
@@ -334,6 +337,26 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 		return nil, err
 	}
 	rpmSigner, debSigner := metadataSnapshot.RPMSigner, metadataSnapshot.APTSigner
+	allSources := make(map[string]ManagedPackageSource)
+	for _, distName := range distNames {
+		for _, digest := range desired[distName] {
+			if _, exists := allSources[digest]; exists {
+				continue
+			}
+			object, err := store.GetPackageObject(ctx, digest)
+			if err != nil {
+				return nil, err
+			}
+			source, err := availableManagedPackageSource(root, repoName, object)
+			if err != nil {
+				return nil, err
+			}
+			allSources[digest] = source
+		}
+	}
+	if err := loadManagedPackageFacts(ctx, allSources, store, jobs); err != nil {
+		return nil, err
+	}
 	for _, distName := range distNames {
 		dist, err := store.GetDist(ctx, distName)
 		if err != nil {
@@ -345,15 +368,7 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 		}
 		sources := make([]ManagedPackageSource, 0, len(desired[distName]))
 		for _, digest := range desired[distName] {
-			object, err := store.GetPackageObject(ctx, digest)
-			if err != nil {
-				return nil, err
-			}
-			source, err := availableManagedPackageSource(root, repoName, object)
-			if err != nil {
-				return nil, err
-			}
-			sources = append(sources, source)
+			sources = append(sources, allSources[digest])
 		}
 		distPrefix := "dists/" + distName + "/"
 		for path := range target {
@@ -362,7 +377,7 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 			}
 		}
 		if dist.Format == "rpm" {
-			if err := previewRPMDist(ctx, filepath.Join(root, repoName), previewRoot, distName, nextGeneration, architectures, sources, rpmSigner, jobs, base, target); err != nil {
+			if err := previewRPMDist(ctx, filepath.Join(root, repoName), previewRoot, distName, nextGeneration, publicationTime, architectures, sources, rpmSigner, jobs, base, target); err != nil {
 				return nil, err
 			}
 			continue
@@ -391,7 +406,7 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 	return state.DiffManifests(base, targetManifest), nil
 }
 
-func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName string, generation state.GenerationID, architectures []state.Architecture, sources []ManagedPackageSource, signer yumrepo.DetachedSigner, jobs int, base []state.GenerationFile, target map[string]state.GenerationFile) error {
+func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName string, generation state.GenerationID, publicationTime time.Time, architectures []state.Architecture, sources []ManagedPackageSource, signer yumrepo.DetachedSigner, jobs int, base []state.GenerationFile, target map[string]state.GenerationFile) error {
 	baseByPath := make(map[string]state.GenerationFile, len(base))
 	for _, file := range base {
 		baseByPath[file.Path] = file
@@ -419,35 +434,11 @@ func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName s
 			target[path] = file
 		}
 	}
-	repositoryBase := &url.URL{Scheme: "file", Path: filepath.ToSlash(repositoryRoot) + "/"}
-	for _, architecture := range architectures {
-		viewPath, err := yumrepo.ParseManagedRPMViewPath(filepath.ToSlash(filepath.Join("dists", distName, architecture.Family)))
-		if err != nil {
-			return err
-		}
-		inputs := []yumrepo.PackageInput{}
-		for _, source := range sources {
-			if source.Object.CanonicalArch != "neutral" && source.Object.CanonicalArch != architecture.Family {
-				continue
-			}
-			poolPath, err := yumrepo.ParseManagedPoolPath(source.Object.PoolPath)
-			if err != nil {
-				return err
-			}
-			href, err := yumrepo.RPMParentRelativeHref(viewPath, poolPath)
-			if err != nil {
-				return err
-			}
-			if err := yumrepo.ValidateRPMHrefRoundTrip(repositoryBase, viewPath, poolPath, href.String()); err != nil {
-				return err
-			}
-			inputs = append(inputs, yumrepo.PackageInput{Path: source.Path, Basename: source.Object.Filename, PoolPath: source.Object.PoolPath, ViewPath: viewPath, Location: href.String()})
-		}
-		sort.Slice(inputs, func(i, j int) bool { return inputs[i].Location < inputs[j].Location })
-		dest := filepath.Join(previewRoot, "dists", distName, architecture.Family, "repodata")
-		if _, err := yumrepo.GenerateManagedConcurrent(ctx, dest, uint64(generation), &yumrepo.SliceIterator{Inputs: inputs}, signer, jobs); err != nil {
-			return err
-		}
+	if _, err := RenderManagedDist(ctx, previewRoot, ManagedDistSpec{
+		Name: distName, Format: "rpm", Architectures: architectures, Generation: generation,
+		Jobs: jobs, PublishedAt: publicationTime, Packages: sources, RPMSigner: signer,
+	}); err != nil {
+		return err
 	}
 	files, err := scanPreviewFiles(ctx, filepath.Join(previewRoot, "dists", distName), "dists/"+distName+"/")
 	if err != nil {

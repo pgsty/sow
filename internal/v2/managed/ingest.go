@@ -14,6 +14,7 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 )
 
 // Version 2 binds the exact affected Build Dist set. A pre-release v1 pending
@@ -129,6 +130,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	if ctx == nil {
 		return result, errors.New("managed: nil context")
 	}
+	ctx, _ = workmetrics.Ensure(ctx)
 	if len(opts.Paths) == 0 {
 		return result, fmt.Errorf("%w: add requires at least one input path", ErrRejected)
 	}
@@ -168,7 +170,8 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	if _, err := checkConfigAtRootForLockedRepository(ctx, ws.Root, cfg, repoName, signingFormatMask{}); err != nil {
 		return result, err
 	}
-	if err := validateCurrentPublicGeneration(ctx, ws.Root, repoName, store); err != nil {
+	currentSnapshot, err := validateCurrentPublicGenerationSnapshot(ctx, ws.Root, repoName, store)
+	if err != nil {
 		return result, err
 	}
 	id, err := operationID()
@@ -212,6 +215,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	result.Failed += len(scanFailures)
 	accepted := make([]state.PackageObject, 0, len(files))
 	newObjects := make(map[string]state.PackageObject)
+	newObjectFacts := make(map[string]state.PackageFact)
 	newObjectStage := make(map[string]string)
 	byCoordinate := make(map[string]batchCoordinate)
 	itemObjects := make(map[int]state.PackageObject)
@@ -242,6 +246,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 			continue
 		}
 		inputSHA, object := inspection.SHA256, inspection.Object
+		factSchema, factBlob := inspection.FactSchema, inspection.Facts
 		item.Format, item.Coordinate = object.Format, object.Coordinate
 		compatible := compatibleDists(object, distNames, effectiveDists)
 		if len(compatible) == 0 {
@@ -301,12 +306,23 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 				byCoordinate[coordinateKey] = batchCoordinate{inputSHA: inputSHA, payload: object.PayloadSHA256, object: object}
 			case errors.Is(lookupErr, state.ErrNotFound):
 				if object.Format == "rpm" {
+					unsignedSHA := object.SHA256
 					object, err = rpmPolicy.prepare(ctx, snapshot, input.Base, object)
 					if err != nil {
 						item.Error = err.Error()
 						result.Failed++
 						result.Items = append(result.Items, item)
 						continue
+					}
+					if object.SHA256 != unsignedSHA {
+						parsed, refreshedSchema, refreshedFacts, refreshErr := inspectSnapshotWithFacts(ctx, snapshot, input.Base, object.SHA256, object.PayloadSHA256)
+						if refreshErr != nil || !sameManagedPackageFacts(object, parsed) {
+							item.Error = errors.Join(errors.New("managed: signed RPM facts differ from prepared object"), refreshErr).Error()
+							result.Failed++
+							result.Items = append(result.Items, item)
+							continue
+						}
+						factSchema, factBlob = refreshedSchema, refreshedFacts
 					}
 				}
 				objectStage := filepath.Join(objectsRoot, object.SHA256)
@@ -320,6 +336,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 					continue
 				} else {
 					newObjects[object.SHA256] = object
+					newObjectFacts[object.SHA256] = state.PackageFact{PackageSHA256: object.SHA256, FactSchema: factSchema, Facts: append([]byte(nil), factBlob...)}
 					newObjectStage[object.SHA256] = objectStage
 				}
 				byCoordinate[coordinateKey] = batchCoordinate{inputSHA: inputSHA, payload: object.PayloadSHA256, object: object, new: true}
@@ -451,7 +468,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 		if needsRPMPolicy {
 			preparedPolicy = &rpmPolicy
 		}
-		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, payload.BuildDists, manifest, store, preparedPolicy)
+		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, payload.BuildDists, manifest, store, preparedPolicy, currentSnapshot)
 		if err != nil {
 			return result, err
 		}
@@ -488,6 +505,17 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 		if mutationResult.Revision != 0 {
 			retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
 		}
+		return result, err
+	}
+	facts := make([]state.PackageFact, 0, len(referencedNew))
+	for _, object := range referencedNew {
+		fact, exists := newObjectFacts[object.SHA256]
+		if !exists {
+			return result, fmt.Errorf("%w: package facts are unavailable for new object %s", ErrIntegrity, object.SHA256)
+		}
+		facts = append(facts, fact)
+	}
+	if err := store.UpsertPackageFacts(ctx, facts); err != nil {
 		return result, err
 	}
 	if !sameStringSet(mutationResult.ChangedDists, payload.BuildDists) {
@@ -980,7 +1008,7 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 		if err != nil {
 			return err
 		}
-		preflight, err = prepareMutationBuildPreflight(ctx, root, repoName, cfg, payload.BuildDists, manifest, store, nil)
+		preflight, err = prepareMutationBuildPreflight(ctx, root, repoName, cfg, payload.BuildDists, manifest, store, nil, nil)
 		if err != nil {
 			return err
 		}

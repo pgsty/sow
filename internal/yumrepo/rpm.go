@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	crpm "github.com/cavaliergopher/rpm"
+	"github.com/pgsty/sow/internal/workmetrics"
 )
 
 var (
@@ -264,6 +265,7 @@ func InspectPackageReader(ctx context.Context, input io.ReadSeeker, originalBase
 		if err != nil {
 			return "", 0, err
 		}
+		workmetrics.RecordFullPackageRead(ctx, size)
 		return hex.EncodeToString(hasher.Sum(nil)), size, nil
 	}
 	firstHash, firstSize, err := hashRPM()
@@ -348,9 +350,11 @@ func readPackageWithManagedBasename(ctx context.Context, in PackageInput, allowM
 	h := sha256.New()
 	buffer := rpmHashBufferPool.Get().(*[]byte)
 	defer rpmHashBufferPool.Put(buffer)
-	if _, err := io.CopyBuffer(h, &contextReader{ctx: ctx, r: f}, *buffer); err != nil {
+	read, err := io.CopyBuffer(h, &contextReader{ctx: ctx, r: f}, *buffer)
+	if err != nil {
 		return nil, fmt.Errorf("%w: hash %q: %v", ErrInvalidPackage, in.Path, err)
 	}
+	workmetrics.RecordFullPackageRead(ctx, read)
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("%w: rewind %q: %v", ErrInvalidPackage, in.Path, err)
 	}
@@ -379,6 +383,10 @@ func readPackageWithManagedBasename(ctx context.Context, in PackageInput, allowM
 	if basename == "" {
 		basename = filepath.Base(in.Path)
 	}
+	return packageMetadataFromParsedRPM(pkg, in, basename, hex.EncodeToString(h.Sum(nil)), info.Size(), info.ModTime().Unix(), allowManagedBasename)
+}
+
+func packageMetadataFromParsedRPM(pkg *crpm.Package, in PackageInput, basename, checksum string, packageSize, fileTime int64, allowManagedBasename bool) (*packageMetadata, error) {
 	name := tagString(&pkg.Header, tagName)
 	managedInput := in.PoolPath != "" || in.ViewPath.String() != "" || in.Location != ""
 	location, err := packageLocation(name, basename, managedInput || allowManagedBasename)
@@ -418,15 +426,15 @@ func readPackageWithManagedBasename(ctx context.Context, in PackageInput, allowM
 		Release:       tagString(&pkg.Header, tagRelease),
 		Arch:          architecture,
 		Epoch:         tagInt(&pkg.Header, tagEpoch),
-		Checksum:      hex.EncodeToString(h.Sum(nil)),
+		Checksum:      checksum,
 		Location:      location,
 		Summary:       joinTag(&pkg.Header, tagSummary),
 		Description:   joinTag(&pkg.Header, tagDescription),
 		Packager:      tagString(&pkg.Header, tagPackager),
 		URL:           tagString(&pkg.Header, tagURL),
-		FileTime:      info.ModTime().Unix(),
+		FileTime:      fileTime,
 		BuildTime:     tagInt(&pkg.Header, tagBuildTime),
-		PackageSize:   info.Size(),
+		PackageSize:   packageSize,
 		InstalledSize: pkg.Size(),
 		ArchiveSize:   pkg.ArchiveSize(),
 		License:       tagString(&pkg.Header, tagLicense),

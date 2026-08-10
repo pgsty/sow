@@ -560,6 +560,8 @@ func planC2Transition(ctx context.Context, root, repoName string, cfg config.Con
 	if err != nil {
 		return nil, err
 	}
+	rpmSourceDigests := make(map[string][]string)
+	allRPMSources := make(map[string]ManagedPackageSource)
 	for _, dist := range dists {
 		if dist.Format != "rpm" {
 			continue
@@ -569,13 +571,27 @@ func planC2Transition(ctx context.Context, root, repoName string, cfg config.Con
 		if err != nil {
 			return nil, err
 		}
-		sources := make([]ManagedPackageSource, 0, len(objects))
 		for _, object := range objects {
-			source, err := availableManagedPackageSource(root, repoName, object)
-			if err != nil {
-				return nil, err
+			rpmSourceDigests[dist.Name] = append(rpmSourceDigests[dist.Name], object.SHA256)
+			if _, exists := allRPMSources[object.SHA256]; !exists {
+				source, err := availableManagedPackageSource(root, repoName, object)
+				if err != nil {
+					return nil, err
+				}
+				allRPMSources[object.SHA256] = source
 			}
-			sources = append(sources, source)
+		}
+	}
+	if err := loadManagedPackageFacts(ctx, allRPMSources, store, jobs); err != nil {
+		return nil, err
+	}
+	for _, dist := range dists {
+		if dist.Format != "rpm" {
+			continue
+		}
+		sources := make([]ManagedPackageSource, 0, len(rpmSourceDigests[dist.Name]))
+		for _, digest := range rpmSourceDigests[dist.Name] {
+			sources = append(sources, allRPMSources[digest])
 		}
 		if _, err := RenderManagedDist(ctx, stage, ManagedDistSpec{Name: dist.Name, Format: "rpm", Architectures: dist.Architectures, Generation: next, Jobs: jobs, PublishedAt: at, Packages: sources, RPMSigner: metadataSnapshot.RPMSigner}); err != nil {
 			return nil, err

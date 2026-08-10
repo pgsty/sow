@@ -30,6 +30,56 @@ type FileChange struct {
 	SHA256    string `json:"sha256,omitempty"`
 }
 
+// Keep bulk INSERTs below SQLite's conservative 999-bind compatibility
+// ceiling. generation_files uses five binds per row and operation_files uses
+// seven, so 128 rows fits both while collapsing a large manifest from one SQL
+// statement per path to one statement per small batch.
+const sqliteManifestInsertBatchSize = 128
+
+func insertGenerationFilesTx(ctx context.Context, tx *sql.Tx, generation GenerationID, files []GenerationFile) error {
+	for start := 0; start < len(files); start += sqliteManifestInsertBatchSize {
+		end := min(start+sqliteManifestInsertBatchSize, len(files))
+		var query strings.Builder
+		query.WriteString(`INSERT INTO generation_files(generation, path, phase, size, sha256) VALUES `)
+		args := make([]any, 0, (end-start)*5)
+		for index, file := range files[start:end] {
+			if index != 0 {
+				query.WriteByte(',')
+			}
+			query.WriteString(`(?, ?, ?, ?, ?)`)
+			args = append(args, generation, file.Path, file.Phase, file.Size, file.SHA256)
+		}
+		if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
+			return fmt.Errorf("record generation files starting at %q: %w", files[start].Path, err)
+		}
+	}
+	return nil
+}
+
+func insertOperationFilesTx(ctx context.Context, tx *sql.Tx, operationID string, changes []FileChange) error {
+	for start := 0; start < len(changes); start += sqliteManifestInsertBatchSize {
+		end := min(start+sqliteManifestInsertBatchSize, len(changes))
+		var query strings.Builder
+		query.WriteString(`INSERT INTO operation_files(operation_id, sequence, action, phase, path, size, sha256) VALUES `)
+		args := make([]any, 0, (end-start)*7)
+		for offset, change := range changes[start:end] {
+			if offset != 0 {
+				query.WriteByte(',')
+			}
+			var size, digest any
+			if change.Operation != "delete" {
+				size, digest = change.Size, change.SHA256
+			}
+			query.WriteString(`(?, ?, ?, ?, ?, ?, ?)`)
+			args = append(args, operationID, start+offset, change.Operation, change.Phase, change.Path, size, digest)
+		}
+		if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
+			return fmt.Errorf("record operation files starting at %q: %w", changes[start].Path, err)
+		}
+	}
+	return nil
+}
+
 // MarshalJSON keeps zero-byte add/update entries lossless on the public wire
 // while preserving the absence of size for deletions, whose target no longer
 // exists. A scalar `omitempty` would incorrectly erase a legitimate size 0.
@@ -222,15 +272,11 @@ func (s *Store) BootstrapLegacyGeneration(ctx context.Context, operationID strin
 	if _, err := tx.ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES (?, ?, ?, ?, ?, ?)`, generation, ZeroGeneration, operationID, manifestSHA, strings.Repeat("0", 64), now); err != nil {
 		return fmt.Errorf("anchor legacy generation %d: %w", generation, err)
 	}
-	for _, file := range manifest {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO generation_files(generation, path, phase, size, sha256) VALUES (?, ?, ?, ?, ?)`, generation, file.Path, file.Phase, file.Size, file.SHA256); err != nil {
-			return fmt.Errorf("record legacy generation file %q: %w", file.Path, err)
-		}
+	if err := insertGenerationFilesTx(ctx, tx, generation, manifest); err != nil {
+		return err
 	}
-	for sequence, change := range changes {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO operation_files(operation_id, sequence, action, phase, path, size, sha256) VALUES (?, ?, ?, ?, ?, ?, ?)`, operationID, sequence, change.Operation, change.Phase, change.Path, change.Size, change.SHA256); err != nil {
-			return fmt.Errorf("record legacy generation file action: %w", err)
-		}
+	if err := insertOperationFilesTx(ctx, tx, operationID, changes); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit legacy generation bootstrap: %w", err)
@@ -590,16 +636,7 @@ func replaceGenerationChangesTx(ctx context.Context, tx *sql.Tx, operationID str
 	if _, err := tx.ExecContext(ctx, `DELETE FROM operation_files WHERE operation_id = ?`, operationID); err != nil {
 		return err
 	}
-	for sequence, change := range changes {
-		var size, digest any
-		if change.Operation != "delete" {
-			size, digest = change.Size, change.SHA256
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO operation_files(operation_id, sequence, action, phase, path, size, sha256) VALUES (?, ?, ?, ?, ?, ?, ?)`, operationID, sequence, change.Operation, change.Phase, change.Path, size, digest); err != nil {
-			return err
-		}
-	}
-	return nil
+	return insertOperationFilesTx(ctx, tx, operationID, changes)
 }
 
 func DiffManifests(base, target []GenerationFile) []FileChange {
@@ -673,21 +710,10 @@ func recordGenerationTx(ctx context.Context, tx *sql.Tx, operationID string, gen
 	if _, err := tx.ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES (?, ?, ?, ?, ?, ?)`, generation, previous, operationID, manifestSHA, renderer, nowText()); err != nil {
 		return fmt.Errorf("record generation %d: %w", generation, err)
 	}
-	for _, file := range manifest {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO generation_files(generation, path, phase, size, sha256) VALUES (?, ?, ?, ?, ?)`, generation, file.Path, file.Phase, file.Size, file.SHA256); err != nil {
-			return fmt.Errorf("record generation file %q: %w", file.Path, err)
-		}
+	if err := insertGenerationFilesTx(ctx, tx, generation, manifest); err != nil {
+		return err
 	}
-	for sequence, change := range changes {
-		var size, digest any
-		if change.Operation != "delete" {
-			size, digest = change.Size, change.SHA256
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO operation_files(operation_id, sequence, action, phase, path, size, sha256) VALUES (?, ?, ?, ?, ?, ?, ?)`, operationID, sequence, change.Operation, change.Phase, change.Path, size, digest); err != nil {
-			return fmt.Errorf("record generation file action: %w", err)
-		}
-	}
-	return nil
+	return insertOperationFilesTx(ctx, tx, operationID, changes)
 }
 
 func generationManifestTx(ctx context.Context, tx *sql.Tx, generation GenerationID) ([]GenerationFile, error) {

@@ -42,11 +42,12 @@ type rootedCreatedRegular struct {
 // content has been authenticated. It lets a later namespace step reject path
 // replacement without re-hashing large immutable payloads.
 type rootedRegularIdentity struct {
-	device      uint64
-	inode       uint64
-	size        int64
-	modUnixNano int64
-	mode        os.FileMode
+	device         uint64
+	inode          uint64
+	size           int64
+	modUnixNano    int64
+	changeUnixNano int64
+	mode           os.FileMode
 }
 
 func newRootedRegularIdentity(info os.FileInfo, raw unix.Stat_t) rootedRegularIdentity {
@@ -55,7 +56,7 @@ func newRootedRegularIdentity(info os.FileInfo, raw unix.Stat_t) rootedRegularId
 	}
 	return rootedRegularIdentity{
 		device: uint64(raw.Dev), inode: uint64(raw.Ino), size: raw.Size,
-		modUnixNano: info.ModTime().UnixNano(), mode: info.Mode().Perm(),
+		modUnixNano: info.ModTime().UnixNano(), changeUnixNano: statChangeTimeNano(raw), mode: info.Mode().Perm(),
 	}
 }
 
@@ -75,17 +76,33 @@ func (identity rootedRegularIdentity) sameInode(other rootedRegularIdentity) boo
 	return identity.device == other.device && identity.inode == other.inode
 }
 
+// sameContentStat deliberately ignores the permission bits. Public-tree
+// normalization is allowed to repair those bits without changing Generation
+// content; every other cheap identity field must remain exact.
+func (identity rootedRegularIdentity) sameContentStat(other rootedRegularIdentity) bool {
+	return identity.device == other.device && identity.inode == other.inode &&
+		identity.size == other.size && identity.modUnixNano == other.modUnixNano &&
+		identity.changeUnixNano == other.changeUnixNano
+}
+
+func snapshotRegularDescriptorIdentity(file *os.File) (rootedRegularIdentity, error) {
+	if file == nil {
+		return rootedRegularIdentity{}, errors.New("managed: invalid regular identity source")
+	}
+	info, infoErr := file.Stat()
+	var raw unix.Stat_t
+	statErr := unix.Fstat(int(file.Fd()), &raw)
+	if infoErr != nil || statErr != nil || info == nil || !info.Mode().IsRegular() || uint32(raw.Mode)&unix.S_IFMT != unix.S_IFREG {
+		return rootedRegularIdentity{}, errors.Join(errors.New("managed: regular identity source is not regular"), infoErr, statErr)
+	}
+	return newRootedRegularIdentity(info, raw), nil
+}
+
 func snapshotRootedRegularIdentity(opened *rootedRegularFile) (rootedRegularIdentity, error) {
 	if opened == nil || opened.file == nil {
 		return rootedRegularIdentity{}, errors.New("managed: invalid rooted identity source")
 	}
-	info, infoErr := opened.file.Stat()
-	var raw unix.Stat_t
-	statErr := unix.Fstat(int(opened.file.Fd()), &raw)
-	if infoErr != nil || statErr != nil || info == nil || !info.Mode().IsRegular() || uint32(raw.Mode)&unix.S_IFMT != unix.S_IFREG {
-		return rootedRegularIdentity{}, errors.Join(errors.New("managed: rooted identity source is not regular"), infoErr, statErr)
-	}
-	return newRootedRegularIdentity(info, raw), nil
+	return snapshotRegularDescriptorIdentity(opened.file)
 }
 
 type rootedDirectoryBinding struct {

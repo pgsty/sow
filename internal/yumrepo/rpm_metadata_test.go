@@ -80,7 +80,32 @@ func TestGenerateManagedConcurrentIsWorkerDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if one.Packages != four.Packages || one.Revision != four.Revision || one.RepomdSHA256 != four.RepomdSHA256 || one.IdentitySHA256 != four.IdentitySHA256 || !reflect.DeepEqual(one.Artifacts, four.Artifacts) {
+	cachedDir := filepath.Join(t.TempDir(), "repodata")
+	cachedPackages := make([]*ParsedManagedPackage, 0, len(inputs))
+	for _, input := range inputs {
+		facts, _, err := InspectManagedPackageFacts(context.Background(), PackageInput{Path: input.Path, Basename: input.Basename})
+		if err != nil {
+			t.Fatal(err)
+		}
+		blob, err := facts.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := ParsePackageFacts(blob)
+		if err != nil {
+			t.Fatal(err)
+		}
+		projected, err := ProjectManagedPackageFacts(decoded, input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cachedPackages = append(cachedPackages, projected)
+	}
+	cached, err := GenerateManagedParsed(context.Background(), cachedDir, 7, cachedPackages, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.Packages != four.Packages || one.Revision != four.Revision || one.RepomdSHA256 != four.RepomdSHA256 || one.IdentitySHA256 != four.IdentitySHA256 || !reflect.DeepEqual(one.Artifacts, four.Artifacts) || !reflect.DeepEqual(one.Artifacts, cached.Artifacts) || one.RepomdSHA256 != cached.RepomdSHA256 {
 		t.Fatalf("worker count changed generation: one=%#v four=%#v", one, four)
 	}
 	paths := []string{"repomd.xml"}
@@ -92,6 +117,10 @@ func TestGenerateManagedConcurrentIsWorkerDeterministic(t *testing.T) {
 		rightBytes, rightErr := os.ReadFile(filepath.Join(right, filepath.FromSlash(relative)))
 		if leftErr != nil || rightErr != nil || !bytes.Equal(leftBytes, rightBytes) {
 			t.Fatalf("worker count changed %s: left=%v right=%v equal=%t", relative, leftErr, rightErr, bytes.Equal(leftBytes, rightBytes))
+		}
+		cachedBytes, cachedErr := os.ReadFile(filepath.Join(cachedDir, filepath.FromSlash(relative)))
+		if cachedErr != nil || !bytes.Equal(leftBytes, cachedBytes) {
+			t.Fatalf("cached facts changed %s: err=%v equal=%t", relative, cachedErr, bytes.Equal(leftBytes, cachedBytes))
 		}
 	}
 	if _, err := GenerateManagedConcurrent(context.Background(), filepath.Join(t.TempDir(), "repodata"), 7, &SliceIterator{Inputs: inputs}, nil, 0); err == nil {

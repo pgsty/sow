@@ -4,6 +4,22 @@ All notable changes to SOW are recorded here.
 
 ## Unreleased
 
+- Added repository schema v10 with a rebuildable package-facts cache keyed by
+  immutable package SHA-256. Ingest now authenticates each new RPM/DEB in one
+  complete pass and retains its view-independent render facts; builds bulk-load
+  those facts once, match them in memory, and lazily rebuild missing or corrupt
+  entries from authenticated package bytes. Ordinary warm builds exhaustively
+  traverse the public namespace but validate unchanged Pool payloads from their
+  device/inode/size/mtime/ctime fingerprint, reducing package-body reads to
+  zero; fingerprint drift falls back to one authoritative SHA-256 pass and
+  self-heals instead of blocking future writes. Fingerprint-only checks do not
+  load or hash the cached facts BLOB, and final normalization reuses its own
+  descriptor snapshot rather than starting a third Pool scan. `sow check`
+  remains the explicit full cryptographic audit. RPM metadata artifacts and DEB
+  architecture indexes now use bounded `--jobs` concurrency, and Generation
+  manifest/changeset rows are inserted in batches. The v10
+  migration goes directly to the current schema; there is no old/new runtime
+  dual-read or dual-write path before 1.0.0.
 - Simplified Plain `sow create` into a rebuildable one-pass projection. The
   default unsigned path now hashes and parses each package once with `--jobs`,
   renders from retained parsed metadata, and performs only a final package-set

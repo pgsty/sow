@@ -20,6 +20,7 @@ import (
 
 	"github.com/pgsty/sow/internal/aptrepo"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 	"github.com/pgsty/sow/internal/yumrepo"
 	"golang.org/x/sys/unix"
 )
@@ -58,6 +59,8 @@ type ManagedPackageSource struct {
 	Path     string
 	Owner    string
 	Relative string
+	RPMFacts *yumrepo.PackageFacts
+	DEBFacts *aptrepo.Package
 }
 
 func (source ManagedPackageSource) open() (*rootedRegularFile, error) {
@@ -165,6 +168,7 @@ func RenderManagedDist(ctx context.Context, repositoryStage string, spec Managed
 	if spec.Format != "rpm" && spec.Format != "deb" {
 		return RenderedDist{}, fmt.Errorf("managed: unsupported Dist format %q", spec.Format)
 	}
+	ctx = workmetrics.WithPhase(ctx, "render_"+spec.Format)
 	if spec.Jobs < 1 {
 		spec.Jobs = 1
 	}
@@ -242,7 +246,11 @@ func renderManagedRPMDist(ctx context.Context, repositoryRoot, distRoot string, 
 		if err != nil {
 			return fmt.Errorf("managed: invalid RPM view %s: %w", architecture.Family, err)
 		}
-		inputs := []yumrepo.PackageInput{}
+		type parsedInput struct {
+			location string
+			pkg      *yumrepo.ParsedManagedPackage
+		}
+		parsed := []parsedInput{}
 		for _, source := range spec.Packages {
 			object := source.Object
 			if object.CanonicalArch != "neutral" && object.CanonicalArch != architecture.Family {
@@ -259,10 +267,21 @@ func renderManagedRPMDist(ctx context.Context, repositoryRoot, distRoot string, 
 			if err := yumrepo.ValidateRPMHrefRoundTrip(repositoryBase, viewPath, poolPath, href.String()); err != nil {
 				return fmt.Errorf("managed: render RPM href for %s: %w", object.SHA256, err)
 			}
-			inputs = append(inputs, yumrepo.PackageInput{Path: source.Path, Basename: object.Filename, PoolPath: object.PoolPath, ViewPath: viewPath, Location: href.String()})
+			if source.RPMFacts == nil {
+				return fmt.Errorf("%w: RPM facts are unavailable for %s", ErrIntegrity, object.SHA256)
+			}
+			projected, err := yumrepo.ProjectManagedPackageFacts(source.RPMFacts, yumrepo.PackageInput{Path: source.Path, Basename: object.Filename, PoolPath: object.PoolPath, ViewPath: viewPath, Location: href.String()})
+			if err != nil {
+				return fmt.Errorf("%w: project RPM facts for %s: %v", ErrIntegrity, object.SHA256, err)
+			}
+			parsed = append(parsed, parsedInput{location: href.String(), pkg: projected})
 		}
-		sort.Slice(inputs, func(i, j int) bool { return inputs[i].Location < inputs[j].Location })
-		if _, err := yumrepo.GenerateManagedConcurrent(ctx, filepath.Join(view, "repodata"), uint64(spec.Generation), &yumrepo.SliceIterator{Inputs: inputs}, spec.RPMSigner, spec.Jobs); err != nil {
+		sort.Slice(parsed, func(i, j int) bool { return parsed[i].location < parsed[j].location })
+		packages := make([]*yumrepo.ParsedManagedPackage, len(parsed))
+		for index := range parsed {
+			packages[index] = parsed[index].pkg
+		}
+		if _, err := yumrepo.GenerateManagedParsedConcurrent(ctx, filepath.Join(view, "repodata"), uint64(spec.Generation), packages, spec.RPMSigner, spec.Jobs); err != nil {
 			return fmt.Errorf("managed: render RPM view %s: %w", architecture.Family, err)
 		}
 	}
@@ -270,116 +289,50 @@ func renderManagedRPMDist(ctx context.Context, repositoryRoot, distRoot string, 
 }
 
 func renderManagedDEBDist(ctx context.Context, distRoot string, spec ManagedDistSpec) error {
-	type inspectedPackage struct {
-		pkg aptrepo.Package
-		err error
-	}
-	inspected := make([]inspectedPackage, len(spec.Packages))
-	workers := spec.Jobs
-	if workers > len(spec.Packages) {
-		workers = len(spec.Packages)
-	}
-	if workers > 0 {
-		jobs := make(chan int)
-		var group sync.WaitGroup
-		group.Add(workers)
-		for range workers {
-			go func() {
-				defer group.Done()
-				for index := range jobs {
-					source := spec.Packages[index]
-					opened, err := source.open()
-					if err == nil {
-						inspected[index].pkg, err = aptrepo.InspectPackageReaderAs(ctx, opened.file, "main", source.Object.Filename)
-						inspected[index].pkg.SourcePath = source.Path
-					}
-					if opened != nil {
-						err = errors.Join(err, opened.CloseVerified())
-					}
-					inspected[index].err = err
-				}
-			}()
-		}
-		for index := range spec.Packages {
-			jobs <- index
-		}
-		close(jobs)
-		group.Wait()
-	}
 	parsed := make(map[string]aptrepo.Package, len(spec.Packages))
-	for index, source := range spec.Packages {
+	for _, source := range spec.Packages {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		pkg, err := inspected[index].pkg, inspected[index].err
-		if err != nil {
-			return fmt.Errorf("managed: inspect DEB pool object %s: %w", source.Object.SHA256, err)
+		if source.DEBFacts == nil {
+			return fmt.Errorf("%w: DEB facts are unavailable for %s", ErrIntegrity, source.Object.SHA256)
 		}
+		pkg := *source.DEBFacts
 		if pkg.SHA256 != source.Object.SHA256 || pkg.Name != source.Object.Name || pkg.Version != source.Object.Version || pkg.Architecture != source.Object.Architecture {
 			return fmt.Errorf("%w: DEB pool object %s differs from state", ErrIntegrity, source.Object.SHA256)
 		}
 		parsed[source.Object.SHA256] = pkg
 	}
-	artifacts := []releaseArtifact{}
-	for _, architecture := range spec.Architectures {
-		binaryRoot := filepath.Join(distRoot, "main", "binary-"+architecture.EcosystemArch)
-		if err := durableEnsureDirectoryTree(distRoot, binaryRoot, 0o755); err != nil {
-			return err
-		}
-		packages := make([]state.PackageObject, 0)
-		for _, source := range spec.Packages {
-			if source.Object.CanonicalArch == "neutral" || source.Object.CanonicalArch == architecture.Family {
-				packages = append(packages, source.Object)
-			}
-		}
-		sort.Slice(packages, func(i, j int) bool {
-			left, right := parsed[packages[i].SHA256], parsed[packages[j].SHA256]
-			copy := []aptrepo.Package{left, right}
-			aptrepo.SortPackages(copy)
-			return copy[0].SHA256 == left.SHA256 && left.SHA256 != right.SHA256
-		})
-		packagesPath := filepath.Join(binaryRoot, "Packages")
-		created, err := createRootedRegular(binaryRoot, "Packages", 0o644)
-		if err != nil {
-			return err
-		}
-		writer, err := aptrepo.NewPackagesWriter(created.file)
-		if err == nil {
-			for _, object := range packages {
-				if err = writer.WriteManaged(parsed[object.SHA256], object.PoolPath); err != nil {
-					break
+	workers := spec.Jobs
+	if workers > len(spec.Architectures) {
+		workers = len(spec.Architectures)
+	}
+	results := make([][]releaseArtifact, len(spec.Architectures))
+	issues := make([]error, len(spec.Architectures))
+	if workers > 0 {
+		indices := make(chan int)
+		var group sync.WaitGroup
+		group.Add(workers)
+		for range workers {
+			go func() {
+				defer group.Done()
+				for index := range indices {
+					results[index], issues[index] = renderManagedDEBArchitecture(ctx, distRoot, spec, spec.Architectures[index], parsed)
 				}
-			}
+			}()
 		}
-		if err != nil {
-			return errors.Join(err, created.Abort())
+		for index := range spec.Architectures {
+			indices <- index
 		}
-		if err := created.Commit(); err != nil {
-			return err
+		close(indices)
+		group.Wait()
+	}
+	artifacts := []releaseArtifact{}
+	for index := range spec.Architectures {
+		if issues[index] != nil {
+			return issues[index]
 		}
-		plainArtifact, err := inspectReleaseArtifact(packagesPath, filepath.ToSlash(filepath.Join("main", "binary-"+architecture.EcosystemArch, "Packages")))
-		if err != nil {
-			return err
-		}
-		gzipPath := packagesPath + ".gz"
-		if err := writeDeterministicGzip(packagesPath, gzipPath); err != nil {
-			return err
-		}
-		gzipArtifact, err := inspectReleaseArtifact(gzipPath, plainArtifact.Path+".gz")
-		if err != nil {
-			return err
-		}
-		artifacts = append(artifacts, plainArtifact, gzipArtifact)
-		for _, artifact := range []releaseArtifact{plainArtifact, gzipArtifact} {
-			byHash := filepath.Join(binaryRoot, "by-hash", "SHA256", artifact.SHA256)
-			source := packagesPath
-			if strings.HasSuffix(artifact.Path, ".gz") {
-				source = gzipPath
-			}
-			if err := ensureHardlinkAlias(ctx, binaryRoot, source, byHash, artifact.Size, artifact.SHA256); err != nil {
-				return err
-			}
-		}
+		artifacts = append(artifacts, results[index]...)
 	}
 	releaseTime := spec.PublishedAt
 	release := renderManagedRelease(spec, releaseTime, artifacts)
@@ -410,6 +363,66 @@ func renderManagedDEBDist(ctx context.Context, distRoot string, spec ManagedDist
 		}
 	}
 	return nil
+}
+
+func renderManagedDEBArchitecture(ctx context.Context, distRoot string, spec ManagedDistSpec, architecture state.Architecture, parsed map[string]aptrepo.Package) ([]releaseArtifact, error) {
+	binaryRoot := filepath.Join(distRoot, "main", "binary-"+architecture.EcosystemArch)
+	if err := durableEnsureDirectoryTree(distRoot, binaryRoot, 0o755); err != nil {
+		return nil, err
+	}
+	packages := make([]state.PackageObject, 0)
+	for _, source := range spec.Packages {
+		if source.Object.CanonicalArch == "neutral" || source.Object.CanonicalArch == architecture.Family {
+			packages = append(packages, source.Object)
+		}
+	}
+	sort.Slice(packages, func(i, j int) bool {
+		left, right := parsed[packages[i].SHA256], parsed[packages[j].SHA256]
+		return aptrepo.ComparePackages(left, right) < 0
+	})
+	packagesPath := filepath.Join(binaryRoot, "Packages")
+	created, err := createRootedRegular(binaryRoot, "Packages", 0o644)
+	if err != nil {
+		return nil, err
+	}
+	writer, err := aptrepo.NewPackagesWriter(created.file)
+	if err == nil {
+		for _, object := range packages {
+			if err = writer.WriteManaged(parsed[object.SHA256], object.PoolPath); err != nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		return nil, errors.Join(err, created.Abort())
+	}
+	if err := created.Commit(); err != nil {
+		return nil, err
+	}
+	plainArtifact, err := inspectReleaseArtifact(packagesPath, filepath.ToSlash(filepath.Join("main", "binary-"+architecture.EcosystemArch, "Packages")))
+	if err != nil {
+		return nil, err
+	}
+	gzipPath := packagesPath + ".gz"
+	if err := writeDeterministicGzip(packagesPath, gzipPath); err != nil {
+		return nil, err
+	}
+	gzipArtifact, err := inspectReleaseArtifact(gzipPath, plainArtifact.Path+".gz")
+	if err != nil {
+		return nil, err
+	}
+	artifacts := []releaseArtifact{plainArtifact, gzipArtifact}
+	for _, artifact := range []releaseArtifact{plainArtifact, gzipArtifact} {
+		byHash := filepath.Join(binaryRoot, "by-hash", "SHA256", artifact.SHA256)
+		source := packagesPath
+		if strings.HasSuffix(artifact.Path, ".gz") {
+			source = gzipPath
+		}
+		if err := ensureHardlinkAlias(ctx, binaryRoot, source, byHash, artifact.Size, artifact.SHA256); err != nil {
+			return nil, err
+		}
+	}
+	return artifacts, nil
 }
 
 type releaseArtifact struct {

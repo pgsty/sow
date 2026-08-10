@@ -26,6 +26,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	crpm "github.com/cavaliergopher/rpm"
+	"github.com/pgsty/sow/internal/workmetrics"
 )
 
 const maxEmbeddedRPMSignatureBytes = 1 << 20
@@ -139,6 +140,32 @@ func inspectEmbeddedRPMSignaturePackets(ctx context.Context, r io.Reader) ([]emb
 // RPMSignatureNeutralDigest hashes the immutable main header and payload while
 // excluding the mutable RPM signature header. It lets callers prove that an
 // external signing helper changed only signature material.
+func RPMSignatureNeutralOffset(ctx context.Context, r io.ReadSeeker) (_ int64, resultErr error) {
+	if ctx == nil || r == nil {
+		return 0, fmt.Errorf("%w: invalid RPM reader", ErrInvalidPackage)
+	}
+	original, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, fmt.Errorf("%w: read RPM offset: %v", ErrInvalidPackage, err)
+	}
+	defer func() {
+		if _, err := r.Seek(original, io.SeekStart); err != nil && resultErr == nil {
+			resultErr = fmt.Errorf("%w: restore RPM offset: %v", ErrInvalidPackage, err)
+		}
+	}()
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return 0, fmt.Errorf("%w: seek RPM start: %v", ErrInvalidPackage, err)
+	}
+	if _, err := crpm.ReadSignatureHeader(&contextReader{ctx: ctx, r: r}); err != nil {
+		return 0, fmt.Errorf("%w: parse RPM signature header: %v", ErrInvalidPackage, err)
+	}
+	offset, err := r.Seek(0, io.SeekCurrent)
+	if err != nil || offset <= 0 {
+		return 0, fmt.Errorf("%w: locate RPM signature-neutral bytes: %v", ErrInvalidPackage, err)
+	}
+	return offset, nil
+}
+
 func RPMSignatureNeutralDigest(ctx context.Context, r io.ReadSeeker) (_ string, resultErr error) {
 	if ctx == nil {
 		return "", errors.New("yumrepo: nil context")
@@ -165,9 +192,11 @@ func RPMSignatureNeutralDigest(ctx context.Context, r io.ReadSeeker) (_ string, 
 		return "", fmt.Errorf("%w: parse RPM signature header: %v", ErrInvalidPackage, err)
 	}
 	h := sha256.New()
-	if _, err := io.Copy(h, &contextReader{ctx: ctx, r: r}); err != nil {
+	read, err := io.Copy(h, &contextReader{ctx: ctx, r: r})
+	if err != nil {
 		return "", fmt.Errorf("%w: hash RPM signature-neutral bytes: %v", ErrInvalidPackage, err)
 	}
+	workmetrics.RecordFullPackageRead(ctx, read)
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
