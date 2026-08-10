@@ -141,7 +141,7 @@ jobs:
       - name: Install package inspection tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes cpio rpm
+          sudo apt-get install --no-install-recommends --yes rpm
 
       - name: Verify archives and Linux packages
         shell: bash
@@ -159,10 +159,12 @@ jobs:
             rpm -qpl "${package}" | grep -Fx '/usr/bin/sow'
             rpm -qpl "${package}" | grep -Fx '/usr/share/licenses/sow/LICENSE'
             rpm -qp --queryformat '%{LICENSE}\n' "${package}" | grep -Fx 'Apache-2.0'
-            extract_dir="$(mktemp -d)"
-            rpm2cpio "${package}" |
-              (cd "${extract_dir}" && cpio -id --quiet './usr/share/licenses/sow/LICENSE')
-            packaged_license_sha256="$(sha256sum "${extract_dir}/usr/share/licenses/sow/LICENSE" | awk '{print $1}')"
+            rpm -qp --queryformat '%{FILEDIGESTALGO}\n' "${package}" | grep -Fx '8'
+            packaged_license_sha256="$(
+              rpm -qp --queryformat '[%{FILENAMES}\t%{FILEDIGESTS}\n]' "${package}" |
+                awk -F '\t' '$1 == "/usr/share/licenses/sow/LICENSE" { print $2 }'
+            )"
+            test -n "${packaged_license_sha256}"
             test "${packaged_license_sha256}" = "${license_sha256}"
           done
           for package in "${debs[@]}"; do
