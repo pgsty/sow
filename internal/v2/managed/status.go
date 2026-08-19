@@ -33,7 +33,7 @@ func Status(ctx context.Context, opts StatusOptions) (result StatusResult, resul
 	defer func() { resultErr = errors.Join(resultErr, rootGuard.Close()) }()
 	cfg, _, configSHA, _, err := config.LoadWorkspaceDocumentForMigration(ws)
 	if err != nil {
-		return result, fmt.Errorf("%w: %v", ErrWorkspaceInput, err)
+		return result, fmt.Errorf("%w: %v", ErrConfigInput, err)
 	}
 	repoName, err := selectRepo(ws, cfg, opts.Repository)
 	if err != nil {

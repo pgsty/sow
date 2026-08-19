@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
@@ -21,6 +22,216 @@ import (
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
 )
+
+func TestRepositorySchemaMigrationRepairsV10DirtyProjection(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	opts := WorkspaceOptions{Workdir: root, CWD: root}
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	if added, err := Add(ctx, AddOptions{WorkspaceOptions: opts, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Skip: true, Jobs: 1}); err != nil || !added.Dirty {
+		t.Fatalf("skipped add=%#v err=%v", added, err)
+	}
+	if _, err := NewDist(ctx, DistNewOptions{WorkspaceOptions: opts, Repository: "repo", Name: "el10", Format: "rpm"}); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE repository_state SET status = 'clean', dirty_reason = NULL WHERE singleton = 1`); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `DELETE FROM generation_view_signers
+WHERE (generation < (SELECT built_generation FROM repository_state WHERE singleton = 1) AND view_id = 'dists/el9/x86_64')
+   OR (generation = (SELECT built_generation FROM repository_state WHERE singleton = 1) AND view_id = 'dists/el10/x86_64')`); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	downgradeManagedV11FixtureToV10(t, store.DB())
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Build(ctx, BuildOptions{WorkspaceOptions: opts, Repository: "repo", Jobs: 1}); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("ordinary build crossed v10 migration boundary: %v", err)
+	}
+	migrated, err := MigrateRepository(ctx, RepositoryMigrationOptions{WorkspaceOptions: opts, Repository: "repo", Jobs: 1})
+	if err != nil || !migrated.Complete || migrated.Phase != "done" {
+		t.Fatalf("schema migration=%#v err=%v", migrated, err)
+	}
+	status, err := Status(ctx, StatusOptions{WorkspaceOptions: opts, Repository: "repo"})
+	if err != nil || status.Status != "dirty" || len(status.DirtyDists) != 1 || status.DirtyDists[0] != "el9" {
+		t.Fatalf("migrated status=%#v err=%v", status, err)
+	}
+	store, err = state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledgerErr := store.ValidateGenerationLedger(ctx)
+	closeErr := store.Close()
+	if err := errors.Join(ledgerErr, closeErr); err != nil {
+		t.Fatalf("migrated signer ledger is invalid: %v", err)
+	}
+	built, err := Build(ctx, BuildOptions{WorkspaceOptions: opts, Repository: "repo", Jobs: 1})
+	if err != nil || built.Dirty || built.Noop {
+		t.Fatalf("post-migration build=%#v err=%v", built, err)
+	}
+}
+
+func TestRepositorySchemaMigrationMarksUnprovableSignedV10History(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	opts := WorkspaceOptions{Workdir: root, CWD: root}
+	keyA, _ := managedTestPrivateKey(t, "v10-history-a")
+	keyB, _ := managedTestPrivateKey(t, "v10-history-b")
+	t.Setenv("SOW_TEST_V10_HISTORY_KEY", string(keyA))
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{
+		Signing: config.SigningConfig{RPM: config.RPMSigningConfig{Metadata: config.MetadataSigningConfig{Key: "env://SOW_TEST_V10_HISTORY_KEY"}}},
+		Dists:   map[string]config.DistConfig{"el9": {Format: "rpm", Architectures: []string{"x86_64"}}},
+	}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := store.Summary(ctx)
+	if closeErr := store.Close(); err != nil || closeErr != nil || initial.BuiltGeneration == 0 {
+		t.Fatalf("initial summary=%#v err=%v close=%v", initial, err, closeErr)
+	}
+
+	// The v10 init Generation was signed by A but FinalizeDistAdd did not
+	// retain a signer row. Rotate to B before the first build so assigning the
+	// current Dist key to that historical view would be provably wrong.
+	t.Setenv("SOW_TEST_V10_HISTORY_KEY", string(keyB))
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	added, err := Add(ctx, AddOptions{WorkspaceOptions: opts, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1})
+	if err != nil || added.Generation == initial.BuiltGeneration {
+		t.Fatalf("first rotated build=%#v err=%v", added, err)
+	}
+
+	store, err = state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `DELETE FROM generation_view_signers WHERE generation = ?`, initial.BuiltGeneration); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	downgradeManagedV11FixtureToV10(t, store.DB())
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	migrated, err := MigrateRepository(ctx, RepositoryMigrationOptions{WorkspaceOptions: opts, Repository: "repo", Jobs: 1})
+	if err != nil || !migrated.Complete || migrated.Phase != "done" {
+		t.Fatalf("signed v10 migration=%#v err=%v", migrated, err)
+	}
+	store, err = state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	historical, historicalErr := store.GenerationViewSigner(ctx, initial.BuiltGeneration, "dists/el9/x86_64")
+	_, _, retentionErr := store.GenerationRetentionIdentity(ctx, initial.BuiltGeneration)
+	head, headErr := store.GenerationViewSigner(ctx, added.Generation, "dists/el9/x86_64")
+	_, retainedHead, retainedHeadErr := store.GenerationRetentionIdentity(ctx, added.Generation)
+	ledgerErr := store.ValidateGenerationLedger(ctx)
+	closeErr := store.Close()
+	if err := errors.Join(historicalErr, headErr, retainedHeadErr, ledgerErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if historical.SignerIdentity != state.GenerationSignerUnverified || len(historical.TrustedPublicKey) != 0 || !errors.Is(retentionErr, state.ErrConflict) {
+		t.Fatalf("historical signer=%#v retentionErr=%v", historical, retentionErr)
+	}
+	if head.SignerIdentity == "none" || head.SignerIdentity == state.GenerationSignerUnverified || len(head.TrustedPublicKey) == 0 || retainedHead != head.SignerIdentity {
+		t.Fatalf("proven head signer=%#v retained=%q", head, retainedHead)
+	}
+
+	// A post-migration rotation creates another fully proven head; the unknown
+	// historical identity must neither propagate nor block ordinary builds.
+	t.Setenv("SOW_TEST_V10_HISTORY_KEY", string(keyA))
+	rebuilt, err := Build(ctx, BuildOptions{WorkspaceOptions: opts, Repository: "repo", Jobs: 1})
+	if err != nil || rebuilt.Noop || rebuilt.Dirty || rebuilt.Generation == added.Generation {
+		t.Fatalf("post-migration rotation=%#v err=%v", rebuilt, err)
+	}
+	store, err = state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuiltSigner, signerErr := store.GenerationViewSigner(ctx, rebuilt.Generation, "dists/el9/x86_64")
+	_, rebuiltRetained, retainedErr := store.GenerationRetentionIdentity(ctx, rebuilt.Generation)
+	ledgerErr = store.ValidateGenerationLedger(ctx)
+	if err := errors.Join(signerErr, retainedErr, ledgerErr); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if rebuiltSigner.SignerIdentity == state.GenerationSignerUnverified || rebuiltRetained != rebuiltSigner.SignerIdentity {
+		store.Close()
+		t.Fatalf("rebuilt signer=%#v retained=%q", rebuiltSigner, rebuiltRetained)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE generation_view_signers SET signer_identity = ?, trusted_public_key = NULL WHERE generation = ?`, state.GenerationSignerUnverified, rebuilt.Generation); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	ledgerErr = store.ValidateGenerationLedger(ctx)
+	closeErr = store.Close()
+	if !errors.Is(ledgerErr, state.ErrConflict) || closeErr != nil {
+		t.Fatalf("unverified head ledgerErr=%v close=%v", ledgerErr, closeErr)
+	}
+}
+
+func downgradeManagedV11FixtureToV10(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.Exec(`
+PRAGMA foreign_keys = OFF;
+CREATE TEMP TABLE generation_view_signers_fixture AS
+SELECT generation, view_id, signer_identity, trusted_public_key FROM generation_view_signers;
+DROP TABLE generation_view_signers;
+CREATE TABLE generation_view_signers (
+    generation TEXT NOT NULL REFERENCES "generations"(generation) ON DELETE CASCADE,
+    view_id TEXT NOT NULL,
+    signer_identity TEXT NOT NULL CHECK (
+        signer_identity = 'none' OR (
+            length(signer_identity) = 64
+            AND signer_identity = lower(signer_identity)
+            AND signer_identity NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    trusted_public_key BLOB CHECK (
+        (signer_identity = 'none' AND trusted_public_key IS NULL)
+        OR (signer_identity != 'none' AND length(trusted_public_key) BETWEEN 1 AND 16777216)
+    ),
+    PRIMARY KEY (generation, view_id)
+) WITHOUT ROWID;
+INSERT INTO generation_view_signers(generation, view_id, signer_identity, trusted_public_key)
+SELECT generation, view_id, signer_identity, trusted_public_key FROM generation_view_signers_fixture;
+DROP TABLE generation_view_signers_fixture;
+DELETE FROM schema_migrations WHERE version = 11;
+PRAGMA user_version = 10;
+PRAGMA foreign_keys = ON;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestMigrateEmptyLegacyRepositoryReusesIdentityAcrossRestart(t *testing.T) {
 	ctx := context.Background()

@@ -108,9 +108,7 @@ func validateManagedPoolPath(source, basename, filename string) error {
 	return nil
 }
 
-// WritePackages sorts a copy of packages and streams the resulting paragraphs
-// to w. For very large indexes, callers can sort externally and use
-// PackagesWriter directly to avoid retaining the full index in memory.
+// WritePackages is the conventional component-bearing compatibility writer.
 func WritePackages(w io.Writer, packages []Package) error {
 	sorted := append([]Package(nil), packages...)
 	SortPackages(sorted)
@@ -126,12 +124,9 @@ func WritePackages(w io.Writer, packages []Package) error {
 	return nil
 }
 
-// WriteFlatPackages emits a Packages index for a directory where package
-// files live beside the index. It is intentionally narrower than the managed
-// archive renderer: every Filename is exactly ./<source basename>, while all
-// control metadata and checksums still come from a successfully parsed .deb.
-// Package sources are rehashed before their paragraphs are emitted so callers
-// cannot publish metadata for bytes that changed after inspection.
+// WriteFlatPackages reauthenticates package sources before writing a flat
+// compatibility index. Plain create uses WriteInspectedFlatPackages after its
+// own directory-wide stable-input check.
 func WriteFlatPackages(ctx context.Context, w io.Writer, packages []Package) error {
 	return writeFlatPackages(ctx, w, packages, true)
 }
@@ -158,6 +153,11 @@ func writeFlatPackages(ctx context.Context, w io.Writer, packages []Package, ver
 	}
 	var previous *Package
 	for _, pkg := range sorted {
+		if verifySource {
+			if err := verifyPackageSource(ctx, pkg); err != nil {
+				return err
+			}
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -166,11 +166,6 @@ func writeFlatPackages(ctx context.Context, w io.Writer, packages []Package, ver
 		}
 		if previous != nil && previous.Name == pkg.Name && version.Compare(previous.debianVersion, pkg.debianVersion) == 0 && previous.Architecture == pkg.Architecture {
 			return ErrDuplicatePackageIdentity
-		}
-		if verifySource {
-			if err := verifyPackageSource(ctx, pkg); err != nil {
-				return err
-			}
 		}
 		base := filepath.Base(pkg.SourcePath)
 		if !safeDebBasename(base) || filepath.Join(filepath.Dir(pkg.SourcePath), base) != filepath.Clean(pkg.SourcePath) {
@@ -183,6 +178,17 @@ func writeFlatPackages(ctx context.Context, w io.Writer, packages []Package, ver
 		}
 		copyForOrder := pkg
 		previous = &copyForOrder
+	}
+	return nil
+}
+
+func verifyPackageSource(ctx context.Context, pkg Package) error {
+	digest, size, err := hashPackage(ctx, pkg.SourcePath)
+	if err != nil {
+		return fmt.Errorf("aptrepo: verify package source %q: %w", pkg.PoolPath, err)
+	}
+	if size != pkg.Size || digest != pkg.SHA256 {
+		return fmt.Errorf("aptrepo: package source changed for %q", pkg.PoolPath)
 	}
 	return nil
 }

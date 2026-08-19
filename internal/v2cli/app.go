@@ -62,17 +62,21 @@ func MainContext(ctx context.Context, args []string, stdout, stderr io.Writer) i
 				classified = WithExitCode(ExitPartial, classified)
 			}
 		}
-		if ExitCode(classified) == ExitPartial && !inv.Global.JSON && output.human != "" {
+		if ExitCode(classified) == ExitPartial && output.preserveFailureResult && !inv.Global.JSON && output.human != "" {
 			if code := writeHuman(stdout, stderr, output.human); code != ExitOK {
 				return code
 			}
 		}
-		if command == "check" && !inv.Global.JSON && output.human != "" {
+		if command == "check" && output.preserveFailureResult && !inv.Global.JSON && output.human != "" {
 			if code := writeHuman(stdout, stderr, output.human); code != ExitOK {
 				return code
 			}
 		}
-		return writeFailure(command, inv.Global.JSON, classified, output.repository, output.operation, output.result, stdout, stderr)
+		var failureResult any
+		if output.preserveFailureResult {
+			failureResult = output.result
+		}
+		return writeFailure(command, inv.Global.JSON, classified, output.repository, output.operation, failureResult, stdout, stderr)
 	}
 	if inv.Global.JSON {
 		if err := WriteJSON(stdout, NewEnvelope(command, output.repository, output.operation, output.result)); err != nil {
@@ -89,6 +93,10 @@ type managedOutput struct {
 	operation  any
 	result     any
 	human      string
+	// preserveFailureResult is set only after a command has produced a
+	// committed, partial, or diagnostic result that remains meaningful despite
+	// its returned error. All pre-result failures serialize result:null.
+	preserveFailureResult bool
 }
 
 var initWorkspace = managed.Init
@@ -106,7 +114,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			return managedOutput{}, err
 		}
 		result, err := initWorkspace(ctx, managed.InitOptions{Dir: directory})
-		return managedOutput{result: result, human: fmt.Sprintf(
+		return managedOutput{result: result, preserveFailureResult: result.HasCommittedChanges(), human: fmt.Sprintf(
 			"initialized %s: config_created=%t repositories_initialized=%d dists_initialized=%d\n",
 			result.Workspace, result.ConfigCreated, result.RepositoriesInitialized, result.DistsInitialized,
 		)}, err
@@ -144,7 +152,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		result, err := managed.NewRepository(ctx, managed.RepositoryNewOptions{
 			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Name: name,
 		})
-		return managedOutput{repository: name, result: result, human: repositoryHuman("created", result)}, err
+		return managedOutput{repository: name, result: result, preserveFailureResult: result.Name != "", human: repositoryHuman("created", result)}, err
 
 	case "repo show":
 		name := inv.Global.Repo
@@ -186,12 +194,12 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		}
 		if inv.Abort {
 			result, err := managed.AbandonRepositoryMigration(ctx, migrationOptions)
-			return managedOutput{repository: nullableString(result.Repository), result: result, human: fmt.Sprintf(
+			return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: result.Phase != "", human: fmt.Sprintf(
 				"abandoned repository migration %s: phase=%s complete=%t\n", result.Repository, result.Phase, result.Complete,
 			)}, err
 		}
 		result, err := managed.MigrateRepository(ctx, migrationOptions)
-		return managedOutput{repository: nullableString(result.Repository), result: result, human: fmt.Sprintf(
+		return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: result.Phase != "", human: fmt.Sprintf(
 			"migrated repository %s: %s -> %s generation=%s phase=%s complete=%t\n",
 			result.Repository, result.FromLayout, result.ToLayout, result.Generation, result.Phase, result.Complete,
 		)}, err
@@ -208,7 +216,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		if result.Noop {
 			human = fmt.Sprintf("repository %s already absent (noop)\n", name)
 		}
-		return managedOutput{repository: name, result: map[string]any{"name": name, "removed": result.Removed, "noop": result.Noop}, human: human}, err
+		return managedOutput{repository: name, result: map[string]any{"name": name, "removed": result.Removed, "noop": result.Noop}, preserveFailureResult: result.Removed || result.Noop, human: human}, err
 
 	case "dist ls", "dist new", "dist show", "dist rm":
 		ws, cfg, err := loadWorkspace(workspaceOptions)
@@ -228,7 +236,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 				WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: repository,
 				Name: inv.Positionals[0], Format: inv.Format,
 			})
-			return managedOutput{repository: repository, result: result, human: distHuman("created", result)}, err
+			return managedOutput{repository: repository, result: result, preserveFailureResult: result.Name != "", human: distHuman("created", result)}, err
 		case "dist show":
 			result, err := managed.ShowDist(ctx, managed.DistShowOptions{
 				WorkspaceOptions: workspaceOptions, Repository: repository, Name: inv.Positionals[0],
@@ -244,7 +252,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			if result.Noop {
 				human = fmt.Sprintf("dist %s already absent from %s (noop)\n", name, repository)
 			}
-			return managedOutput{repository: repository, result: map[string]any{"name": name, "removed": result.Removed, "noop": result.Noop}, human: human}, err
+			return managedOutput{repository: repository, result: map[string]any{"name": name, "removed": result.Removed, "noop": result.Noop}, preserveFailureResult: result.Removed || result.Noop, human: human}, err
 		}
 
 	case "add":
@@ -252,14 +260,14 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo,
 			Dists: inv.Global.Dists, Paths: inv.Positionals, Recursive: inv.Recursive, Skip: inv.Skip, Jobs: inv.Jobs,
 		})
-		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, human: mutationHuman("add", result)}, err
+		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, preserveFailureResult: result.Operation != "", human: mutationHuman("add", result)}, err
 
 	case "rm":
 		result, err := managed.Remove(ctx, managed.RemoveOptions{
 			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo,
 			Dists: inv.Global.Dists, Packages: inv.Positionals, Check: inv.Check, Skip: inv.Skip, Jobs: inv.Jobs,
 		})
-		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, human: humanJSON(result) + "\n"}, err
+		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, preserveFailureResult: result.Operation != "", human: removeHuman(result)}, err
 
 	case "ls":
 		result, err := managed.ListPackages(ctx, managed.PackageListOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo, Dists: inv.Global.Dists})
@@ -267,23 +275,27 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 
 	case "show":
 		result, err := managed.ShowPackage(ctx, managed.PackageShowOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo, Dists: inv.Global.Dists, Reference: inv.Positionals[0]})
-		return managedOutput{repository: nullableString(result.Repository), result: result, human: humanJSON(result) + "\n"}, err
+		return managedOutput{repository: nullableString(result.Repository), result: result, human: packageShowHuman(result)}, err
 
 	case "where":
 		result, err := managed.WherePackage(ctx, managed.PackageWhereOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo, Dists: inv.Global.Dists, Reference: inv.Positionals[0]})
-		return managedOutput{result: result, human: humanJSON(result) + "\n"}, err
+		return managedOutput{result: result, human: packageWhereHuman(result)}, err
 
 	case "status":
 		result, err := managed.Status(ctx, managed.StatusOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo, Dists: inv.Global.Dists})
-		return managedOutput{repository: nullableString(result.Repository), result: result, human: statusHuman(result)}, err
+		var outputResult any = result
+		if err != nil && result.Repository == "" {
+			outputResult = nil
+		}
+		return managedOutput{repository: nullableString(result.Repository), result: outputResult, preserveFailureResult: err != nil && result.Repository != "", human: statusHuman(result)}, err
 
 	case "build":
 		result, err := managed.Build(ctx, managed.BuildOptions{WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo, Dists: inv.Global.Dists, Jobs: inv.Jobs})
-		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, human: humanJSON(result) + "\n"}, err
+		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, preserveFailureResult: result.Operation != "", human: buildHuman(result)}, err
 
 	case "check":
 		result, err := managed.Check(ctx, managed.CheckOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo, Dists: inv.Global.Dists, Jobs: inv.Jobs})
-		return managedOutput{repository: nullableString(result.Repository), result: result, human: checkHuman(result)}, err
+		return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: err != nil && (result.Repository != "" || len(result.Layers) != 0), human: checkHuman(result)}, err
 
 	case "changes":
 		var base *state.GenerationID
@@ -295,14 +307,14 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			base = &parsed
 		}
 		result, err := managed.Changes(ctx, managed.ChangesOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo, Base: base})
-		return managedOutput{repository: nullableString(result.Repository), result: result, human: changesHuman(result)}, err
+		return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: err != nil && result.Repository != "", human: changesHuman(result)}, err
 
 	case "publish":
 		if inv.Abort {
 			result, err := managed.AbandonPublication(ctx, managed.PublicationAbandonOptions{
 				WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Target: inv.Positionals[0],
 			})
-			return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Attempt), result: result, human: fmt.Sprintf(
+			return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Attempt), result: result, preserveFailureResult: result.Attempt != "", human: fmt.Sprintf(
 				"abandoned publication %s for %s: retained-evidence objects=%d\n", result.Attempt, result.Target, result.Objects,
 			)}, err
 		}
@@ -313,7 +325,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		if result.Noop {
 			human = fmt.Sprintf("publication %s generation=%s to %s is already current (noop)\n", result.Repository, result.Generation, result.Target)
 		}
-		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Attempt), result: result, human: human}, err
+		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Attempt), result: result, preserveFailureResult: result.Attempt != "", human: human}, err
 
 	case "retain add", "retain rm":
 		generation, parseErr := parseGenerationIDArgument(inv.Positionals[0])
@@ -324,14 +336,14 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			result, err := managed.RetainAdd(ctx, managed.RetainAddOptions{
 				WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo, Generation: generation,
 			})
-			return managedOutput{repository: nullableString(result.Repository), result: result, human: fmt.Sprintf(
+			return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: result.Path != "", human: fmt.Sprintf(
 				"retained generation %s: %s\n", result.Record.Generation, result.Path,
 			)}, err
 		}
 		result, err := managed.RetainRemove(ctx, managed.RetainRemoveOptions{
 			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo, Generation: generation,
 		})
-		return managedOutput{repository: nullableString(result.Repository), result: result, human: fmt.Sprintf(
+		return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: result.Path != "", human: fmt.Sprintf(
 			"removed retained generation %s\n", generation,
 		)}, err
 
@@ -348,7 +360,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			if result.Noop {
 				human = fmt.Sprintf("target gc %s/%s: no due maintenance (noop)\n", result.Repository, result.Target)
 			}
-			return managedOutput{repository: nullableString(result.Repository), result: result, human: human}, err
+			return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: result.Phase != "", human: human}, err
 		}
 		result, err := managed.LocalGC(ctx, managed.LocalGCOptions{
 			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo,
@@ -357,7 +369,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		if result.Noop {
 			human = fmt.Sprintf("local gc %s: no unreachable payloads (noop)\n", result.Repository)
 		}
-		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, human: human}, err
+		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, preserveFailureResult: result.Operation != "", human: human}, err
 
 	case "export rpm-leaf":
 		result, err := managed.ExportRPMLeaf(ctx, managed.RPMLeafExportOptions{
@@ -375,7 +387,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			operation = inv.Positionals[0]
 		}
 		result, err := managed.Log(ctx, managed.LogOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo, Dists: inv.Global.Dists, Operation: operation})
-		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(operation), result: result, human: humanJSON(result) + "\n"}, err
+		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(operation), result: result, human: logHuman(result)}, err
 
 	case "log prune":
 		before, err := parseBefore(inv.Positionals[0], time.Local)
@@ -383,7 +395,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			return managedOutput{}, err
 		}
 		result, err := managed.PruneLog(ctx, managed.LogPruneOptions{WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo, Before: before})
-		return managedOutput{repository: nullableString(result.Repository), result: result, human: humanJSON(result) + "\n"}, err
+		return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: result.Operation != "", human: logPruneHuman(result)}, err
 	default:
 		return managedOutput{}, usageError("unknown command %q", invocationCommand(inv))
 	}
@@ -480,6 +492,8 @@ func classifyManagedError(_ string, err error) error {
 		return Errorf(ErrLock, "%v", err)
 	case errors.Is(err, managed.ErrWorkspaceInput):
 		return Errorf(ErrDiscovery, "%v", err)
+	case errors.Is(err, managed.ErrConfigInput):
+		return Errorf(ErrConfig, "%v", err)
 	case errors.Is(err, managed.ErrIntegrity):
 		return Errorf(ErrIntegrity, "%v", err)
 	case errors.Is(err, managed.ErrRejected):

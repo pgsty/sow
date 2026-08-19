@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	SchemaVersion            = 10
+	SchemaVersion            = 11
 	SchemaV1SHA256           = "9953cdc1f655fb03814da8b4c7a45a4a92a74e03facf03c2a45709cc860b9bc7"
 	SchemaV2SHA256           = "aea5b37365510221ab36c4f0fc9e6bc77ba825354649e1e06336b64551c14e25"
 	SchemaV3SHA256           = "9ae957e0e8d9eac21eda3929386f11d001608df5ee7feb75c44194f624f0a177"
@@ -34,6 +34,7 @@ const (
 	SchemaV8SHA256           = "79e1d22b7884dd8cf4f2bcf26d14a973c84264259e85ace0125685c8440788f5"
 	SchemaV9SHA256           = "dcbe4aa8dff14151879b48c069f161261a2f30cb6d2b7668fe0ccac2aff298ce"
 	SchemaV10SHA256          = "9a6a64d7276ca7eb3a7579ddb55e1e9e6073baf235e0e1d1a909684783cb38dd"
+	SchemaV11SHA256          = "bda9cef7bc98d7893529724d3eb6bb87aab51c54a7b3ca5d60cf07c6e7da115c"
 	MaxOperationPayloadBytes = 16 << 20
 )
 
@@ -66,6 +67,9 @@ var schemaV9SQL string
 
 //go:embed schema_v10.sql
 var schemaV10SQL string
+
+//go:embed schema_v11.sql
+var schemaV11SQL string
 
 var (
 	ErrSchema     = errors.New("unsupported or corrupt repository schema")
@@ -104,6 +108,9 @@ var (
 	schemaV10ContractOnce    sync.Once
 	schemaV10ContractObjects []schemaObject
 	schemaV10ContractErr     error
+	schemaV11ContractOnce    sync.Once
+	schemaV11ContractObjects []schemaObject
+	schemaV11ContractErr     error
 )
 
 // Legacy lowercase hexadecimal IDs remain readable so interrupted development
@@ -598,7 +605,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		return s.validateSchema(ctx)
 	case version > SchemaVersion:
 		return fmt.Errorf("%w: database version %d is newer than supported version %d", ErrSchema, version, SchemaVersion)
-	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 && version != 8 && version != 9:
+	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 && version != 8 && version != 9 && version != 10:
 		return fmt.Errorf("%w: cannot migrate version %d", ErrSchema, version)
 	}
 	if version == 0 {
@@ -640,6 +647,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := validateEmbeddedSchema("v10", schemaV10SQL, SchemaV10SHA256); err != nil {
+		return err
+	}
+	if err := validateEmbeddedSchema("v11", schemaV11SQL, SchemaV11SHA256); err != nil {
 		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -743,8 +753,19 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("record schema v10: %w", err)
 		}
 	}
+	if version <= 10 {
+		if _, err := tx.ExecContext(ctx, schemaV11SQL); err != nil {
+			return fmt.Errorf("apply schema v11: %w", err)
+		}
+		if err := repairGenerationViewSignersTx(ctx, tx); err != nil {
+			return fmt.Errorf("%w: repair Generation signer projection: %v", ErrSchema, err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (11, ?, ?)`, SchemaV11SHA256, nowText()); err != nil {
+			return fmt.Errorf("record schema v11: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit schema v10: %w", err)
+		return fmt.Errorf("commit schema v11: %w", err)
 	}
 	return s.validateSchema(ctx)
 }
@@ -795,7 +816,7 @@ func (s *Store) validateUpgradeableSchema(ctx context.Context) error {
 		return fmt.Errorf("%w: read user_version: %v", ErrSchema, err)
 	}
 	switch version {
-	case 1, 2, 3, 4, 5, 6, 7, 8, 9, SchemaVersion:
+	case 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, SchemaVersion:
 		return s.validateSchemaVersion(ctx, version)
 	case 0:
 		return fmt.Errorf("%w: uninitialized database cannot be adopted", ErrSchema)
@@ -896,6 +917,12 @@ func (s *Store) validateSchemaVersion(ctx context.Context, expectedVersion int) 
 			version  int
 			checksum string
 		}{10, SchemaV10SHA256})
+	}
+	if expectedVersion >= 11 {
+		expectedMigrations = append(expectedMigrations, struct {
+			version  int
+			checksum string
+		}{11, SchemaV11SHA256})
 	}
 	if !reflectMigrations(migrations, expectedMigrations) {
 		return fmt.Errorf("%w: migration ledger does not exactly match schema v%d", ErrSchema, expectedVersion)
@@ -1008,6 +1035,12 @@ func expectedSchemaObjects(version int) ([]schemaObject, error) {
 			schemaV10ContractObjects, schemaV10ContractErr = buildExpectedSchemaObjects(schemaV1SQL, schemaV2SQL, schemaV3SQL, schemaV4SQL, schemaV5SQL, schemaV6SQL, schemaV7SQL, schemaV8SQL, schemaV9SQL, schemaV10SQL)
 		})
 		return append([]schemaObject(nil), schemaV10ContractObjects...), schemaV10ContractErr
+	}
+	if version == 11 {
+		schemaV11ContractOnce.Do(func() {
+			schemaV11ContractObjects, schemaV11ContractErr = buildExpectedSchemaObjects(schemaV1SQL, schemaV2SQL, schemaV3SQL, schemaV4SQL, schemaV5SQL, schemaV6SQL, schemaV7SQL, schemaV8SQL, schemaV9SQL, schemaV10SQL, schemaV11SQL)
+		})
+		return append([]schemaObject(nil), schemaV11ContractObjects...), schemaV11ContractErr
 	}
 	return nil, fmt.Errorf("unsupported schema contract version %d", version)
 }
@@ -1164,6 +1197,17 @@ WHERE p.storage = 'pending' AND (
   OR EXISTS (SELECT 1 FROM built_memberships AS b WHERE b.package_sha256 = p.sha256)
   OR EXISTS (SELECT 1 FROM prior_built_memberships AS b WHERE b.package_sha256 = p.sha256))`,
 		},
+	}
+	if s.schemaVersion >= 8 {
+		checks = append(checks, struct {
+			label string
+			query string
+		}{
+			"Abandoned publication evidence is attached to a non-abandoned attempt",
+			`SELECT count(*) FROM publication_abandoned_objects AS o
+JOIN publication_attempts AS a ON a.attempt_identity = o.attempt_identity
+WHERE a.phase != 'abandoned'`,
+		})
 	}
 	issues := []error{}
 	for _, check := range checks {
@@ -1421,8 +1465,8 @@ func (s *Store) AddDist(ctx context.Context, dist Dist) error {
 			return fmt.Errorf("insert architecture %q for dist %q: %w", architecture.Family, dist.Name, err)
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE repository_state SET built_generation = max(built_generation, ?), status = 'clean', dirty_reason = NULL WHERE singleton = 1`, dist.BuiltGeneration); err != nil {
-		return fmt.Errorf("advance repository generation: %w", err)
+	if err := advanceGenerationTx(ctx, tx, dist.BuiltGeneration); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit dist add: %w", err)
@@ -1483,7 +1527,20 @@ func (s *Store) FinalizeDistAdd(ctx context.Context, operationID string, dist Di
 	if err := recordGenerationTx(ctx, tx, operationID, dist.BuiltGeneration, manifest, changes); err != nil {
 		return err
 	}
+	generationInfo, err := generationInfoTx(ctx, tx, dist.BuiltGeneration)
+	if err != nil {
+		return err
+	}
 	if err := insertDistTx(ctx, tx, dist); err != nil {
+		return err
+	}
+	if err := carryGenerationViewSignersTx(ctx, tx, generationInfo.PreviousGeneration, dist.BuiltGeneration, map[string]struct{}{dist.Name: {}}); err != nil {
+		return err
+	}
+	if err := insertGenerationDistViewSignersTx(ctx, tx, dist.BuiltGeneration, dist.Name, dist.Format, dist.Architectures, dist.MetadataSignerFingerprint, dist.MetadataSignerPublicKey, ""); err != nil {
+		return err
+	}
+	if err := validateGenerationViewSignerCoverage(ctx, tx, dist.BuiltGeneration, manifest); err != nil {
 		return err
 	}
 	if err := advanceGenerationTx(ctx, tx, dist.BuiltGeneration); err != nil {
@@ -1533,6 +1590,10 @@ func (s *Store) FinalizeDistRemovalAndCollect(ctx context.Context, operationID, 
 	if err := recordGenerationTx(ctx, tx, operationID, generation, manifest, changes); err != nil {
 		return nil, err
 	}
+	generationInfo, err := generationInfoTx(ctx, tx, generation)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM operation_memberships WHERE operation_id = ?`, operationID); err != nil {
 		return nil, fmt.Errorf("reset dist removal membership audit: %w", err)
 	}
@@ -1559,6 +1620,12 @@ func (s *Store) FinalizeDistRemovalAndCollect(ctx context.Context, operationID, 
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM dists WHERE name = ?`, name); err != nil {
 		return nil, fmt.Errorf("remove dist %q state: %w", name, err)
+	}
+	if err := carryGenerationViewSignersTx(ctx, tx, generationInfo.PreviousGeneration, generation, map[string]struct{}{name: {}}); err != nil {
+		return nil, err
+	}
+	if err := validateGenerationViewSignerCoverage(ctx, tx, generation, manifest); err != nil {
+		return nil, err
 	}
 	droppedPending := []string{}
 	rows, err = tx.QueryContext(ctx, `SELECT sha256 FROM package_objects WHERE storage = 'pending' AND NOT EXISTS (SELECT 1 FROM memberships WHERE memberships.package_sha256 = package_objects.sha256) ORDER BY sha256`)
@@ -1712,7 +1779,11 @@ func replaceDistMetadataSignerTx(ctx context.Context, tx *sql.Tx, dist Dist) err
 }
 
 func advanceGenerationTx(ctx context.Context, tx *sql.Tx, generation GenerationID) error {
-	if _, err := tx.ExecContext(ctx, `UPDATE repository_state SET built_generation = max(built_generation, ?), status = 'clean', dirty_reason = NULL WHERE singleton = 1`, generation); err != nil {
+	status, reason, err := repositoryProjectionStatusTx(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("derive repository projection status: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE repository_state SET built_generation = max(built_generation, ?), status = ?, dirty_reason = ? WHERE singleton = 1`, generation, status, reason); err != nil {
 		return fmt.Errorf("advance repository generation: %w", err)
 	}
 	return nil

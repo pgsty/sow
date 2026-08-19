@@ -35,6 +35,7 @@ type mutationOperationPayload struct {
 	ConfigSHA256   string   `json:"config_sha256"`
 	Skip           bool     `json:"skip"`
 	Noop           bool     `json:"noop,omitempty"`
+	Jobs           int      `json:"jobs,omitempty"`
 	Dists          []string `json:"dists"`
 	BuildDists     []string `json:"build_dists"`
 	ManifestSHA256 string   `json:"manifest_sha256,omitempty"`
@@ -74,6 +75,18 @@ func validateMutationBuildDists(payload mutationOperationPayload) error {
 		seen[name] = struct{}{}
 	}
 	return nil
+}
+
+func mutationRecoveryJobs(payload mutationOperationPayload) (int, error) {
+	if payload.Jobs == 0 {
+		// Active journals written before jobs became durable always recovered
+		// with one worker. Preserve that safe compatibility behavior.
+		return 1, nil
+	}
+	if payload.Jobs < 1 {
+		return 0, fmt.Errorf("%w: mutation recovery jobs must be at least 1", ErrIntegrity)
+	}
+	return payload.Jobs, nil
 }
 
 type mutationManifest struct {
@@ -179,7 +192,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 		return result, err
 	}
 	result.Operation = id
-	payload := mutationOperationPayload{Version: mutationOperationVersion, Repository: repoName, Kind: "add", ConfigSHA256: configSHA, Skip: opts.Skip, Dists: distNames}
+	payload := mutationOperationPayload{Version: mutationOperationVersion, Repository: repoName, Kind: "add", ConfigSHA256: configSHA, Skip: opts.Skip, Jobs: opts.Jobs, Dists: distNames}
 	payloadData, _ := json.Marshal(payload)
 	defer func() {
 		resultErr = finalizePreApplyMutationOperation(ctx, ws.Root, repoName, id, store, resultErr, func() any {
@@ -457,9 +470,16 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	}
 	sort.Slice(referencedNew, func(i, j int) bool { return referencedNew[i].SHA256 < referencedNew[j].SHA256 })
 	manifest := mutationManifest{Version: mutationOperationVersion, Objects: referencedNew, Desired: desired, Result: map[string]int{"accepted": result.Accepted, "failed": result.Failed}, Outcomes: outcomes, RPMSigningKeys: rpmPolicy.retainedKeys}
-	payload.BuildDists, err = changedDesiredDists(ctx, store, desired)
+	desiredChangedDists, err := changedDesiredDists(ctx, store, desired)
 	if err != nil {
 		return result, err
+	}
+	payload.BuildDists = append([]string(nil), desiredChangedDists...)
+	if !opts.Skip {
+		payload.BuildDists, err = distsNeedingBuild(ctx, ws.Root, repoName, cfg, store, desired)
+		if err != nil {
+			return result, err
+		}
 	}
 	payload.Noop = !opts.Skip && len(payload.BuildDists) == 0
 	var preflight *mutationBuildPreflight
@@ -518,8 +538,8 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	if err := store.UpsertPackageFacts(ctx, facts); err != nil {
 		return result, err
 	}
-	if !sameStringSet(mutationResult.ChangedDists, payload.BuildDists) {
-		return result, fmt.Errorf("%w: applied add Dist changes differ from its staged build scope", ErrIntegrity)
+	if !sameStringSet(mutationResult.ChangedDists, desiredChangedDists) {
+		return result, fmt.Errorf("%w: applied add Dist changes differ from its staged Desired change set", ErrIntegrity)
 	}
 	if err := store.RecordOperationMembershipOutcomes(ctx, id, manifest.Outcomes); err != nil {
 		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
@@ -548,7 +568,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 		if err := cleanupMutationStage(ws.Root, repoName, id); err != nil {
 			return result, err
 		}
-	} else if mutationResult.Changed {
+	} else if len(payload.BuildDists) != 0 {
 		generation, err := buildAppliedMutation(ctx, ws.Root, repoName, cfg, payload.BuildDists, id, store, opts.Jobs, opts.Fault, preflight)
 		result.Generation = generation
 		if err != nil {
@@ -1021,6 +1041,9 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 	if err != nil {
 		return err
 	}
+	if !stringSetSubset(mutation.ChangedDists, payload.BuildDists) {
+		return fmt.Errorf("%w: recovered Desired changes exceed the staged build scope", ErrIntegrity)
+	}
 	if err := store.RecordOperationMembershipOutcomes(ctx, operation.ID, manifest.Outcomes); err != nil {
 		return err
 	}
@@ -1058,7 +1081,11 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 			return err
 		}
 	}
-	_, err = buildAppliedMutation(ctx, root, repoName, cfg, payload.BuildDists, operation.ID, store, 1, nil, preflight)
+	jobs, err := mutationRecoveryJobs(payload)
+	if err != nil {
+		return err
+	}
+	_, err = buildAppliedMutation(ctx, root, repoName, cfg, payload.BuildDists, operation.ID, store, jobs, nil, preflight)
 	return err
 }
 
@@ -1103,4 +1130,17 @@ func sameStringSet(left, right []string) bool {
 	sort.Strings(left)
 	sort.Strings(right)
 	return len(left) == len(right) && strings.Join(left, "\x00") == strings.Join(right, "\x00")
+}
+
+func stringSetSubset(subset, superset []string) bool {
+	allowed := make(map[string]struct{}, len(superset))
+	for _, value := range superset {
+		allowed[value] = struct{}{}
+	}
+	for _, value := range subset {
+		if _, ok := allowed[value]; !ok {
+			return false
+		}
+	}
+	return true
 }

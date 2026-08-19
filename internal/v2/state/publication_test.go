@@ -16,6 +16,12 @@ func publicationStoreFixture(t *testing.T) (*Store, PublicationTargetBinding, []
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := store.AddDist(ctx, Dist{
+		Name: "el9", Format: "rpm", EffectiveConfigSHA256: "fixture", BuiltGeneration: 0,
+		Architectures: []Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	manifest := []GenerationFile{
 		{Path: "dists/el9/x86_64/repodata/repomd.xml", Phase: "pointer", Size: 3, SHA256: strings.Repeat("3", 64)},
 		{Path: "pool/p/pkg/pkg.rpm", Phase: "payload", Size: 1, SHA256: strings.Repeat("1", 64)},
@@ -37,7 +43,10 @@ func publicationStoreFixture(t *testing.T) (*Store, PublicationTargetBinding, []
 	if _, err := store.DB().ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES ('00000000000000000001', '00000000000000000000', '1', ?, ?, ?)`, manifestSHA, strings.Repeat("0", 64), nowText()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.DB().ExecContext(ctx, `UPDATE repository_state SET built_generation = '00000000000000000001' WHERE singleton = 1`); err != nil {
+	if _, err := store.DB().ExecContext(ctx, `UPDATE repository_state SET built_generation = '00000000000000000001' WHERE singleton = 1;
+UPDATE dists SET built_generation = '00000000000000000001' WHERE name = 'el9';
+UPDATE dist_architectures SET built_generation = '00000000000000000001' WHERE dist_name = 'el9';
+INSERT INTO generation_view_signers(generation, view_id, signer_identity, trusted_public_key) VALUES ('00000000000000000001', 'dists/el9/x86_64', 'none', NULL);`); err != nil {
 		t.Fatal(err)
 	}
 	for _, file := range manifest {
@@ -349,6 +358,9 @@ func TestPublicationAttemptCanAbandonOnlyBeforeCommitIntent(t *testing.T) {
 	if resumed, err := store.GetActivePublicationAttempt(ctx, binding.TargetIdentity); err != nil || resumed.Phase != "planned" {
 		t.Fatalf("resumed=%#v err=%v", resumed, err)
 	}
+	if listed, err := store.ListPublicationAbandonedObjects(ctx, binding.TargetIdentity); err != nil || len(listed) != 0 {
+		t.Fatalf("resurrected attempt retained abandoned evidence=%#v err=%v", listed, err)
+	}
 	for _, phase := range []string{"payload", "immutable_metadata", "pointer_prepared"} {
 		if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
 			t.Fatal(err)
@@ -362,6 +374,49 @@ func TestPublicationAttemptCanAbandonOnlyBeforeCommitIntent(t *testing.T) {
 	}
 	if err := store.AbandonPublicationAttempt(ctx, attempt.AttemptIdentity, orphans); !errors.Is(err, ErrTransition) {
 		t.Fatalf("post-intent abandon error=%v", err)
+	}
+}
+
+func TestV11MigrationClearsEvidenceFromResurrectedPublication(t *testing.T) {
+	ctx := context.Background()
+	store, binding, manifest := publicationStoreFixture(t)
+	_, manifestSHA, _ := ManifestBytes(manifest)
+	attempt := PublicationAttempt{
+		RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, TargetGeneration: 1,
+		ManifestSHA256: manifestSHA, PlanSHA256: strings.Repeat("a", 64), Phase: "planned", Views: []PublicationAttemptView{},
+	}
+	if err := store.PutPublicationAttempt(ctx, &attempt); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	orphans := []PublicationAbandonedObject{{Path: manifest[1].Path, Phase: manifest[1].Phase, Size: manifest[1].Size, SHA256: manifest[1].SHA256, RemoteIdentity: "etag-orphan"}}
+	if err := store.AbandonPublicationAttempt(ctx, attempt.AttemptIdentity, orphans); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE publication_attempts SET phase = 'planned' WHERE attempt_identity = ?`, attempt.AttemptIdentity); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Check(ctx); !errors.Is(err, ErrConflict) {
+		store.Close()
+		t.Fatalf("semantic check accepted stale active evidence: %v", err)
+	}
+	path := store.path
+	downgradeV11FixtureToV10(t, store.DB())
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := OpenExistingForMigration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	if listed, err := migrated.ListPublicationAbandonedObjects(ctx, binding.TargetIdentity); err != nil || len(listed) != 0 {
+		t.Fatalf("migration retained stale active evidence=%#v err=%v", listed, err)
+	}
+	if err := migrated.Check(ctx); err != nil {
+		t.Fatalf("migrated publication state is invalid: %v", err)
 	}
 }
 

@@ -749,32 +749,76 @@ func retainPriorRPMMetadata(ctx context.Context, liveDist, stagedDist string, ar
 // This gives a bounded two-generation window instead of accumulating every
 // historical index object.
 func retainPriorAPTByHash(ctx context.Context, liveDist, stagedDist string, architectures []state.Architecture) error {
+	objects, err := priorAPTByHashObjects(ctx, liveDist, architectures)
+	if err != nil {
+		return err
+	}
+	touched := map[string]struct{}{}
+	for _, object := range objects {
+		if targetInfo, targetErr := openRootedRegular(stagedDist, object.targetRelative); targetErr == nil {
+			if targetInfo.before.Size() != object.size {
+				_ = targetInfo.CloseVerified()
+				return fmt.Errorf("%w: APT by-hash retention collision for %s", ErrIntegrity, object.indexRelative)
+			}
+			targetHash := sha256.New()
+			_, digestErr := io.Copy(targetHash, &managedContextReader{ctx: ctx, reader: targetInfo.file})
+			verifyErr := targetInfo.CloseVerified()
+			if digestErr != nil || verifyErr != nil || hex.EncodeToString(targetHash.Sum(nil)) != object.digest {
+				return fmt.Errorf("%w: APT by-hash retention collision for %s", ErrIntegrity, object.indexRelative)
+			}
+			continue
+		} else if !errors.Is(targetErr, os.ErrNotExist) {
+			return targetErr
+		}
+		if err := linkRootedRegular(ctx, liveDist, object.sourceRelative, stagedDist, object.targetRelative, object.size, object.digest, 0o755); err != nil {
+			return fmt.Errorf("managed: retain prior APT by-hash object: %w", err)
+		}
+		touched[filepath.Dir(object.targetRelative)] = struct{}{}
+	}
+	for relative := range touched {
+		if err := syncDir(filepath.Join(stagedDist, filepath.FromSlash(relative))); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type priorAPTByHashObject struct {
+	indexRelative  string
+	sourceRelative string
+	targetRelative string
+	size           int64
+	digest         string
+}
+
+func priorAPTByHashObjects(ctx context.Context, liveDist string, architectures []state.Architecture) ([]priorAPTByHashObject, error) {
 	release, err := readRootedRegular(liveDist, "Release", 16<<20, false)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return []priorAPTByHashObject{}, nil
 	}
 	if err != nil {
-		return fmt.Errorf("%w: prior APT Release is missing, unsafe, or unbounded", ErrIntegrity)
+		return nil, fmt.Errorf("%w: prior APT Release is missing, unsafe, or unbounded", ErrIntegrity)
 	}
 	checksums, err := parseReleaseSHA256(release)
 	if err != nil {
-		return fmt.Errorf("%w: prior APT Release is invalid: %v", ErrIntegrity, err)
+		return nil, fmt.Errorf("%w: prior APT Release is invalid: %v", ErrIntegrity, err)
 	}
 	byHashEnabled := bytes.Contains(release, []byte("\nAcquire-By-Hash: yes\n")) || bytes.HasPrefix(release, []byte("Acquire-By-Hash: yes\n"))
+	objects := []priorAPTByHashObject{}
 	for _, architecture := range architectures {
 		binaryRelative := filepath.ToSlash(filepath.Join("main", "binary-"+architecture.EcosystemArch))
 		for _, base := range []string{"Packages", "Packages.gz"} {
 			relative := binaryRelative + "/" + base
 			want, exists := checksums[relative]
 			if !exists {
-				return fmt.Errorf("%w: prior APT Release lacks %s", ErrIntegrity, relative)
+				return nil, fmt.Errorf("%w: prior APT Release lacks %s", ErrIntegrity, relative)
 			}
 			indexedInfo, indexedErr := openRootedRegular(liveDist, relative)
 			if indexedErr != nil || indexedInfo.before.Size() != want.size {
 				if indexedInfo != nil {
 					_ = indexedInfo.CloseVerified()
 				}
-				return fmt.Errorf("%w: prior APT index %s is unsafe or differs in size", ErrIntegrity, relative)
+				return nil, fmt.Errorf("%w: prior APT index %s is unsafe or differs in size", ErrIntegrity, relative)
 			}
 			sourceRelative := filepath.ToSlash(filepath.Join(filepath.Dir(relative), "by-hash", "SHA256", want.digest))
 			sourceInfo, sourceErr := openRootedRegular(liveDist, sourceRelative)
@@ -790,40 +834,22 @@ func retainPriorAPTByHash(ctx context.Context, liveDist, stagedDist string, arch
 				if sourceInfo != nil {
 					_ = sourceInfo.CloseVerified()
 				}
-				return fmt.Errorf("%w: prior APT by-hash object for %s is absent or not its index hardlink", ErrIntegrity, relative)
+				return nil, fmt.Errorf("%w: prior APT by-hash object for %s is absent or not its index hardlink", ErrIntegrity, relative)
 			}
 			hash := sha256.New()
 			_, hashErr := io.Copy(hash, &managedContextReader{ctx: ctx, reader: sourceInfo.file})
 			verifyErr := errors.Join(indexedInfo.CloseVerified(), sourceInfo.CloseVerified())
 			if hashErr != nil || verifyErr != nil || hex.EncodeToString(hash.Sum(nil)) != want.digest {
-				return fmt.Errorf("%w: prior APT by-hash object for %s differs from Release", ErrIntegrity, relative)
+				return nil, fmt.Errorf("%w: prior APT by-hash object for %s differs from Release", ErrIntegrity, relative)
 			}
 			targetRelative := filepath.ToSlash(filepath.Join(binaryRelative, "by-hash", "SHA256", want.digest))
-			if targetInfo, targetErr := openRootedRegular(stagedDist, targetRelative); targetErr == nil {
-				if targetInfo.before.Size() != want.size {
-					_ = targetInfo.CloseVerified()
-					return fmt.Errorf("%w: APT by-hash retention collision for %s", ErrIntegrity, relative)
-				}
-				targetHash := sha256.New()
-				_, digestErr := io.Copy(targetHash, &managedContextReader{ctx: ctx, reader: targetInfo.file})
-				verifyErr := targetInfo.CloseVerified()
-				if digestErr != nil || verifyErr != nil || hex.EncodeToString(targetHash.Sum(nil)) != want.digest {
-					return fmt.Errorf("%w: APT by-hash retention collision for %s", ErrIntegrity, relative)
-				}
-				continue
-			} else if !errors.Is(targetErr, os.ErrNotExist) {
-				return targetErr
-			}
-			if err := linkRootedRegular(ctx, liveDist, sourceRelative, stagedDist, targetRelative, want.size, want.digest, 0o755); err != nil {
-				return fmt.Errorf("managed: retain prior APT by-hash object: %w", err)
-			}
-		}
-		targetRoot := filepath.Join(stagedDist, "main", "binary-"+architecture.EcosystemArch, "by-hash", "SHA256")
-		if err := syncDir(targetRoot); err != nil {
-			return err
+			objects = append(objects, priorAPTByHashObject{
+				indexRelative: relative, sourceRelative: sourceRelative, targetRelative: targetRelative,
+				size: want.size, digest: want.digest,
+			})
 		}
 	}
-	return nil
+	return objects, nil
 }
 
 func persistMutationBuildPlan(ctx context.Context, store *state.Store, root, repoName, operationID string, generation state.GenerationID, dists []mutationBuildDist, pooled []string, retainedRPMKeys []state.RPMSigningKey, base []state.GenerationFile) error {

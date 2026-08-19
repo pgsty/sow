@@ -9,7 +9,8 @@ import (
 )
 
 var (
-	ErrWorkspaceInput = errors.New("managed: workspace discovery or configuration error")
+	ErrWorkspaceInput = errors.New("managed: workspace discovery error")
+	ErrConfigInput    = errors.New("managed: configuration error")
 	ErrRejected       = errors.New("managed: operation rejected")
 	ErrIntegrity      = errors.New("managed: integrity or recovery failure")
 	ErrNotReady       = errors.New("managed: repository is not ready to copy")

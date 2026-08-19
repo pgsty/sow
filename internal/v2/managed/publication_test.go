@@ -1,6 +1,7 @@
 package managed
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/url"
@@ -35,6 +36,16 @@ func filesystemPublishFixture(t *testing.T) (localGCFixture, string, string) {
 	}}
 	writeManagedConfig(t, fixture.root, cfg)
 	return fixture, endpoint, filepath.Join(endpoint, filepath.FromSlash(prefix))
+}
+
+type recordingPublicationBackend struct {
+	publicationBackend
+	verified []string
+}
+
+func (b *recordingPublicationBackend) VerifyPublic(ctx context.Context, file state.GenerationFile) error {
+	b.verified = append(b.verified, file.Path)
+	return b.publicationBackend.VerifyPublic(ctx, file)
 }
 
 func TestFilesystemPublicationInitialPublishNoopAndCrashRollForward(t *testing.T) {
@@ -85,6 +96,205 @@ func TestFilesystemPublicationInitialPublishNoopAndCrashRollForward(t *testing.T
 	}
 }
 
+func TestFilesystemPublicationIncrementalCrashRollForwardMatrix(t *testing.T) {
+	cases := []struct {
+		name       string
+		point      string
+		occurrence int
+		prefix     bool
+	}{
+		{name: "commit-intent", point: "publish.commit_intent", occurrence: 1},
+		{name: "before-first-pointer", point: "publish.pointer.before.", occurrence: 1, prefix: true},
+		{name: "first-pointer-written", point: "publish.pointer.written.", occurrence: 1, prefix: true},
+		{name: "first-pointer-recorded", point: "publish.pointer.recorded.", occurrence: 1, prefix: true},
+		{name: "before-second-pointer", point: "publish.pointer.before.", occurrence: 2, prefix: true},
+		{name: "second-pointer-written", point: "publish.pointer.written.", occurrence: 2, prefix: true},
+		{name: "second-pointer-recorded", point: "publish.pointer.recorded.", occurrence: 2, prefix: true},
+		{name: "verified", point: "publish.verified", occurrence: 1},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture, _, _ := filesystemPublishFixture(t)
+			first, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			maintenanceAt := time.Now().UTC().Add(31 * 24 * time.Hour)
+			settled, err := TargetGC(ctx, TargetGCOptions{
+				WorkspaceOptions: fixture.options, Target: "local",
+				now: func() time.Time { return maintenanceAt },
+			})
+			if err != nil || settled.CompletedAttempts != 1 {
+				t.Fatalf("settle initial publication=%#v err=%v", settled, err)
+			}
+			added, err := Add(ctx, AddOptions{
+				WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"},
+				Paths: []string{filepath.Join(fixture.root, "inputs", "package.rpm")}, Jobs: 1,
+			})
+			if err != nil || added.Generation == first.Generation {
+				t.Fatalf("incremental source generation=%#v first=%#v err=%v", added, first, err)
+			}
+
+			seen, faulted := 0, false
+			injected := errors.New("stop incremental publication")
+			stopped, err := Publish(ctx, PublishOptions{
+				WorkspaceOptions: fixture.options, Target: "local",
+				now: func() time.Time { return maintenanceAt.Add(time.Second) },
+				Fault: func(point string) error {
+					matches := point == test.point
+					if test.prefix {
+						matches = strings.HasPrefix(point, test.point)
+					}
+					if !matches {
+						return nil
+					}
+					seen++
+					if seen == test.occurrence {
+						faulted = true
+						return injected
+					}
+					return nil
+				},
+			})
+			if !errors.Is(err, injected) || !faulted || stopped.Attempt == "" {
+				t.Fatalf("stopped publication=%#v err=%v seen=%d faulted=%t", stopped, err, seen, faulted)
+			}
+			resumed, err := Publish(ctx, PublishOptions{
+				WorkspaceOptions: fixture.options, Target: "local",
+				now: func() time.Time { return maintenanceAt.Add(2 * time.Second) },
+			})
+			if err != nil || resumed.Phase != "grace" || resumed.Attempt != stopped.Attempt || resumed.Generation != added.Generation {
+				t.Fatalf("resumed publication=%#v stopped=%#v err=%v", resumed, stopped, err)
+			}
+		})
+	}
+}
+
+func TestFilesystemPublicationIncrementalRecoveryRejectsThirdPointerIdentity(t *testing.T) {
+	ctx := context.Background()
+	fixture, _, targetRoot := filesystemPublishFixture(t)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	maintenanceAt := time.Now().UTC().Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{
+		WorkspaceOptions: fixture.options, Target: "local",
+		now: func() time.Time { return maintenanceAt },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Add(ctx, AddOptions{
+		WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"},
+		Paths: []string{filepath.Join(fixture.root, "inputs", "package.rpm")}, Jobs: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writtenPath := ""
+	_, err := Publish(ctx, PublishOptions{
+		WorkspaceOptions: fixture.options, Target: "local",
+		now: func() time.Time { return maintenanceAt.Add(time.Second) },
+		Fault: func(point string) error {
+			if writtenPath == "" && strings.HasPrefix(point, "publish.pointer.written.") {
+				writtenPath = strings.TrimPrefix(point, "publish.pointer.written.")
+				return errors.New("stop after pointer write")
+			}
+			return nil
+		},
+	})
+	if err == nil || writtenPath == "" {
+		t.Fatalf("incremental publication did not stop after a pointer write: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetRoot, filepath.FromSlash(writtenPath)), []byte("third pointer identity\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Publish(ctx, PublishOptions{
+		WorkspaceOptions: fixture.options, Target: "local",
+		now: func() time.Time { return maintenanceAt.Add(2 * time.Second) },
+	})
+	if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "outside the recoverable old/new closure") {
+		t.Fatalf("third pointer identity recovery error=%v", err)
+	}
+}
+
+func TestPublicationPublicVerificationScalesWithChangeSetAndCheckpointReplay(t *testing.T) {
+	ctx := context.Background()
+	fixture, _, _ := filesystemPublishFixture(t)
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage, err := newFilesystemPublicationBackend(cfg.Targets["local"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialBackend := &recordingPublicationBackend{publicationBackend: storage}
+	first, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", backend: initialBackend})
+	if err != nil || len(initialBackend.verified) == 0 {
+		t.Fatalf("initial publication=%#v verified=%d err=%v", first, len(initialBackend.verified), err)
+	}
+	noopBackend := &recordingPublicationBackend{publicationBackend: storage}
+	noop, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", backend: noopBackend})
+	if err != nil || !noop.Noop || len(noopBackend.verified) != 0 {
+		t.Fatalf("no-op publication=%#v verified=%v err=%v", noop, noopBackend.verified, err)
+	}
+	maintenanceAt := time.Now().UTC().Add(31 * 24 * time.Hour)
+	gcBackend := &recordingPublicationBackend{publicationBackend: storage}
+	if _, err := TargetGC(ctx, TargetGCOptions{
+		WorkspaceOptions: fixture.options, Target: "local", backend: gcBackend,
+		now: func() time.Time { return maintenanceAt },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(gcBackend.verified) == 0 || len(gcBackend.verified) >= len(initialBackend.verified) {
+		t.Fatalf("target GC verified=%d initial=%d", len(gcBackend.verified), len(initialBackend.verified))
+	}
+	for _, path := range gcBackend.verified {
+		if publicFilePhase(path) != "pointer" {
+			t.Fatalf("target GC streamed non-pointer %q", path)
+		}
+	}
+	added, err := Add(ctx, AddOptions{
+		WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"},
+		Paths: []string{filepath.Join(fixture.root, "inputs", "package.rpm")}, Jobs: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenReadOnly(filepath.Join(fixture.root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, manifestErr := store.GenerationManifest(ctx, added.Generation)
+	closeErr := store.Close()
+	if err := errors.Join(manifestErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	incrementalBackend := &recordingPublicationBackend{publicationBackend: storage}
+	injected := errors.New("stop after applied checkpoint")
+	_, err = Publish(ctx, PublishOptions{
+		WorkspaceOptions: fixture.options, Target: "local", backend: incrementalBackend,
+		now: func() time.Time { return maintenanceAt.Add(time.Second) },
+		Fault: func(point string) error {
+			if point == "publish.checkpoint" {
+				return injected
+			}
+			return nil
+		},
+	})
+	if !errors.Is(err, injected) || len(incrementalBackend.verified) == 0 || len(incrementalBackend.verified) >= len(manifest) {
+		t.Fatalf("incremental verified=%d manifest=%d err=%v", len(incrementalBackend.verified), len(manifest), err)
+	}
+	replayBackend := &recordingPublicationBackend{publicationBackend: storage}
+	resumed, err := Publish(ctx, PublishOptions{
+		WorkspaceOptions: fixture.options, Target: "local", backend: replayBackend,
+		now: func() time.Time { return maintenanceAt.Add(2 * time.Second) },
+	})
+	if err != nil || resumed.Phase != "grace" || len(replayBackend.verified) != 0 {
+		t.Fatalf("applied checkpoint replay=%#v verified=%v err=%v", resumed, replayBackend.verified, err)
+	}
+}
+
 func TestFilesystemPublicationRejectsNonemptyUnownedPrefix(t *testing.T) {
 	ctx := context.Background()
 	fixture, _, targetRoot := filesystemPublishFixture(t)
@@ -132,6 +342,107 @@ func TestFilesystemPublicationPreCommitAbandonUnfreezesMutationAndReusesOrphans(
 	resumed, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local"})
 	if err != nil || resumed.Checkpoint == "" {
 		t.Fatalf("publish over exact abandoned inventory=%#v err=%v", resumed, err)
+	}
+}
+
+func TestFilesystemPublicationReabandonResurrectedAttempt(t *testing.T) {
+	ctx := context.Background()
+	fixture, _, _ := filesystemPublishFixture(t)
+	stopAtPayload := func(point string) error {
+		if point == "publish.payload" {
+			return errors.New("stop after payload")
+		}
+		return nil
+	}
+	first, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", Fault: stopAtPayload})
+	if err == nil || first.Attempt == "" {
+		t.Fatalf("first stopped publication=%#v err=%v", first, err)
+	}
+	firstAbandon, err := AbandonPublication(ctx, PublicationAbandonOptions{WorkspaceOptions: fixture.options, Target: "local"})
+	if err != nil || firstAbandon.Objects == 0 {
+		t.Fatalf("first abandon=%#v err=%v", firstAbandon, err)
+	}
+	second, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", Fault: stopAtPayload})
+	if err == nil || second.Attempt != first.Attempt {
+		t.Fatalf("resurrected publication=%#v first=%#v err=%v", second, first, err)
+	}
+	secondAbandon, err := AbandonPublication(ctx, PublicationAbandonOptions{WorkspaceOptions: fixture.options, Target: "local"})
+	if err != nil || secondAbandon.Attempt != first.Attempt || secondAbandon.Phase != "abandoned" || secondAbandon.Objects != firstAbandon.Objects {
+		t.Fatalf("second abandon=%#v first=%#v err=%v", secondAbandon, firstAbandon, err)
+	}
+	removed, err := RemoveDistResult(ctx, DistRemoveOptions{WorkspaceOptions: fixture.options, Repository: "repo", Name: "el9", Force: true})
+	if err != nil || !removed.Removed {
+		t.Fatalf("post-reabandon mutation=%#v err=%v", removed, err)
+	}
+}
+
+func TestFilesystemTargetGCRecognizesAbandonedObjectEvidence(t *testing.T) {
+	ctx := context.Background()
+	fixture, _, targetRoot := filesystemPublishFixture(t)
+	first, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstRPM := filepath.Join(fixture.root, "inputs", "package.rpm")
+	secondRPM := filepath.Join(fixture.root, "inputs", "package2.rpm")
+	body, err := os.ReadFile(firstRPM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := bytes.ReplaceAll(body, []byte("20PGDG"), []byte("21PGDG"))
+	if bytes.Equal(updated, body) {
+		t.Fatal("RPM fixture release marker was absent")
+	}
+	if err := os.WriteFile(secondRPM, updated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	added, err := Add(ctx, AddOptions{
+		WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{secondRPM}, Jobs: 1,
+	})
+	if err != nil || len(added.Items) != 1 {
+		t.Fatalf("second package add=%#v err=%v", added, err)
+	}
+	store, err := state.OpenReadOnly(filepath.Join(fixture.root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, objectErr := store.GetPackageObject(ctx, added.Items[0].SHA256)
+	closeErr := store.Close()
+	if err := errors.Join(objectErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	stopAtPayload := func(point string) error {
+		if point == "publish.payload" {
+			return errors.New("stop after payload")
+		}
+		return nil
+	}
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", Fault: stopAtPayload}); err == nil {
+		t.Fatal("incremental publication did not stop after payload")
+	}
+	abandoned, err := AbandonPublication(ctx, PublicationAbandonOptions{WorkspaceOptions: fixture.options, Target: "local"})
+	if err != nil || abandoned.Objects == 0 {
+		t.Fatalf("incremental abandon=%#v err=%v", abandoned, err)
+	}
+	orphanPath := filepath.Join(targetRoot, filepath.FromSlash(object.PoolPath))
+	if _, err := os.Stat(orphanPath); err != nil {
+		t.Fatalf("abandoned target object is absent: %v", err)
+	}
+	maintenanceAt := time.Now().UTC().Add(31 * 24 * time.Hour)
+	collected, err := TargetGC(ctx, TargetGCOptions{
+		WorkspaceOptions: fixture.options, Target: "local", now: func() time.Time { return maintenanceAt },
+	})
+	if err != nil || collected.CompletedAttempts != 1 {
+		t.Fatalf("target GC over abandoned evidence=%#v err=%v", collected, err)
+	}
+	if _, err := os.Stat(orphanPath); err != nil {
+		t.Fatalf("target GC removed abandoned evidence: %v", err)
+	}
+	resumed, err := Publish(ctx, PublishOptions{
+		WorkspaceOptions: fixture.options, Target: "local", now: func() time.Time { return maintenanceAt.Add(time.Second) },
+	})
+	if err != nil || resumed.Checkpoint == "" || resumed.Checkpoint == first.Checkpoint {
+		t.Fatalf("publication over retained abandoned evidence=%#v first=%#v err=%v", resumed, first, err)
 	}
 }
 

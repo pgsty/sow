@@ -2,6 +2,7 @@ package v2cli
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 )
 
@@ -58,7 +59,9 @@ func WriteJSON(writer io.Writer, envelope Envelope) error {
 		if envelope.Errors[index].Code == ExitOK || !validExitCode(envelope.Errors[index].Code) {
 			envelope.Errors[index].Code = ExitRuntime
 		}
-		envelope.Errors[index].Class = errorClass(envelope.Errors[index].Code)
+		if envelope.Errors[index].Code != ExitUsage || envelope.Errors[index].Class != "discovery" && envelope.Errors[index].Class != "config" {
+			envelope.Errors[index].Class = errorClass(envelope.Errors[index].Code)
+		}
 	}
 	if len(envelope.Errors) != 0 {
 		envelope.OK = false
@@ -74,5 +77,11 @@ func ClassifyError(err error) CLIError {
 		return CLIError{}
 	}
 	code := ExitCode(err)
-	return CLIError{Code: code, Class: errorClass(code), Message: err.Error()}
+	class := errorClass(code)
+	if errors.Is(err, ErrDiscovery) {
+		class = "discovery"
+	} else if errors.Is(err, ErrConfig) {
+		class = "config"
+	}
+	return CLIError{Code: code, Class: class, Message: err.Error()}
 }

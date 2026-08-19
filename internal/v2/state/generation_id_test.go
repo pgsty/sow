@@ -2,6 +2,8 @@ package state
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -166,6 +168,91 @@ func TestLegacyBootstrapBatchesLargeManifestAndChangeset(t *testing.T) {
 	if files != count || changes != count {
 		t.Fatalf("batched files=%d changes=%d want=%d", files, changes, count)
 	}
+}
+
+func TestLegacyBootstrapAnchorsRPMViewSignerEvidenceAtomically(t *testing.T) {
+	ctx := context.Background()
+	publicKey := []byte("retained legacy metadata signing key")
+	digest := sha256.Sum256(publicKey)
+	wantIdentity := hex.EncodeToString(digest[:])
+	newStore := func(t *testing.T) *Store {
+		t.Helper()
+		store, err := Open(filepath.Join(t.TempDir(), "repo.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dist := Dist{
+			Name: "el9", Format: "rpm", EffectiveConfigSHA256: "cfg", BuiltGeneration: 1,
+			Architectures:             []Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}},
+			MetadataSignerFingerprint: strings.Repeat("A", 40),
+			MetadataSignerPublicKey:   publicKey,
+		}
+		if err := store.AddDist(ctx, dist); err != nil {
+			store.Close()
+			t.Fatal(err)
+		}
+		return store
+	}
+	pointer := GenerationFile{Path: "dists/el9/x86_64/repodata/repomd.xml", Phase: "pointer", Size: 1, SHA256: strings.Repeat("1", 64)}
+	signature := GenerationFile{Path: "dists/el9/x86_64/repodata/repomd.xml.asc", Phase: "pointer", Size: 1, SHA256: strings.Repeat("2", 64)}
+
+	t.Run("signed identity is retained", func(t *testing.T) {
+		store := newStore(t)
+		defer store.Close()
+		if err := store.BootstrapLegacyGeneration(ctx, strings.Repeat("b", 64), 1, []GenerationFile{pointer, signature}); err != nil {
+			t.Fatal(err)
+		}
+		signer, err := store.GenerationViewSigner(ctx, 1, "dists/el9/x86_64")
+		if err != nil || signer.SignerIdentity != wantIdentity || string(signer.TrustedPublicKey) != string(publicKey) {
+			t.Fatalf("bootstrapped signer=%#v err=%v", signer, err)
+		}
+		if err := store.ValidateGenerationLedger(ctx); err != nil {
+			t.Fatalf("bootstrapped Generation ledger: %v", err)
+		}
+	})
+
+	t.Run("signedness mismatch rolls back", func(t *testing.T) {
+		store := newStore(t)
+		defer store.Close()
+		operationID := strings.Repeat("c", 64)
+		if err := store.BootstrapLegacyGeneration(ctx, operationID, 1, []GenerationFile{pointer}); !errors.Is(err, ErrConflict) {
+			t.Fatalf("bootstrap mismatch error=%v", err)
+		}
+		var generations, operations int
+		if err := store.DB().QueryRowContext(ctx, `SELECT count(*) FROM generations`).Scan(&generations); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.DB().QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE id = ?`, operationID).Scan(&operations); err != nil {
+			t.Fatal(err)
+		}
+		if generations != 0 || operations != 0 {
+			t.Fatalf("failed bootstrap committed generations=%d operations=%d", generations, operations)
+		}
+	})
+
+	t.Run("unverified history cannot propagate", func(t *testing.T) {
+		store := newStore(t)
+		defer store.Close()
+		manifest := []GenerationFile{pointer, signature}
+		if err := store.BootstrapLegacyGeneration(ctx, strings.Repeat("d", 64), 1, manifest); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().ExecContext(ctx, `UPDATE generation_view_signers SET signer_identity = ?, trusted_public_key = NULL WHERE generation = ?`, GenerationSignerUnverified, GenerationID(1)); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateGenerationViewSignerCoverage(ctx, store.DB(), 1, manifest); err != nil {
+			t.Fatalf("unverified signed history lost exact coverage: %v", err)
+		}
+		tx, err := store.DB().BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		carryErr := carryGenerationViewSignersTx(ctx, tx, 1, 2, map[string]struct{}{})
+		rollbackErr := tx.Rollback()
+		if !errors.Is(carryErr, ErrConflict) || rollbackErr != nil {
+			t.Fatalf("unverified carry error=%v rollback=%v", carryErr, rollbackErr)
+		}
+	})
 }
 
 func TestFreshRepositoryIdentityIsPersistentCanonicalAndTerminal(t *testing.T) {

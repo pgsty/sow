@@ -350,6 +350,9 @@ ORDER BY d.name, a.family`)
 			return 0, err
 		}
 	}
+	if err := validateGenerationViewSignerCoverage(ctx, tx, next, manifest); err != nil {
+		return 0, err
+	}
 	if err := insertOperationFilesTx(ctx, tx, operationID, changes); err != nil {
 		return 0, err
 	}

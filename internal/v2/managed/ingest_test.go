@@ -319,6 +319,85 @@ func TestAddRecoveryConvergesAtEveryDurablePhase(t *testing.T) {
 	}
 }
 
+func TestAddRecoveryPreservesJournaledJobs(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	injected := errors.New("injected after Desired commit")
+	interrupted, err := Add(ctx, AddOptions{
+		WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 3,
+		Fault: func(point string) error {
+			if point == "add.applied" {
+				return injected
+			}
+			return nil
+		},
+	})
+	if !errors.Is(err, injected) || interrupted.Operation == "" {
+		t.Fatalf("interrupted add=%#v err=%v", interrupted, err)
+	}
+	if _, err := Add(ctx, AddOptions{
+		WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	detail, detailErr := store.GetOperation(ctx, interrupted.Operation)
+	closeErr := store.Close()
+	if err := errors.Join(detailErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range detail.Events {
+		var progress struct {
+			Version   int    `json:"version"`
+			Kind      string `json:"kind"`
+			Phase     string `json:"phase"`
+			Completed int    `json:"completed"`
+			Total     int    `json:"total"`
+			Jobs      int    `json:"jobs"`
+		}
+		if err := jsonUnmarshalStrict(event.DetailJSON, &progress); err == nil && progress.Kind == "build_progress" && progress.Phase == "rendering" {
+			found = true
+			if progress.Jobs != 3 {
+				t.Fatalf("recovered rendering jobs=%d, want journaled 3", progress.Jobs)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("recovered operation lacks rendering progress: %#v", detail.Events)
+	}
+}
+
+func TestMutationRecoveryJobsAcceptsLegacyJournalDefault(t *testing.T) {
+	var legacy mutationOperationPayload
+	if err := jsonUnmarshalStrict(`{"version":2}`, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if jobs, err := mutationRecoveryJobs(legacy); err != nil || jobs != 1 {
+		t.Fatalf("legacy recovery jobs=%d err=%v", jobs, err)
+	}
+	if jobs, err := mutationRecoveryJobs(mutationOperationPayload{Jobs: 4}); err != nil || jobs != 4 {
+		t.Fatalf("journaled recovery jobs=%d err=%v", jobs, err)
+	}
+	if _, err := mutationRecoveryJobs(mutationOperationPayload{Jobs: -1}); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("negative recovery jobs error=%v", err)
+	}
+}
+
 func TestAddRPMAndDEBBuildsManagedRepository(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

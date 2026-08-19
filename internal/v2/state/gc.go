@@ -235,8 +235,14 @@ func (s *Store) FinalizeLocalGC(ctx context.Context, input FinalizeLocalGCInput)
 	if err := recordGenerationTx(ctx, tx, input.OperationID, input.Generation, input.Manifest, input.Changes, baseInfo.RendererIdentity); err != nil {
 		return err
 	}
+	if err := requireVerifiedGenerationSigners(ctx, tx, input.BaseGeneration); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO generation_view_signers(generation, view_id, signer_identity, trusted_public_key)
 SELECT ?, view_id, signer_identity, trusted_public_key FROM generation_view_signers WHERE generation = ?`, input.Generation, input.BaseGeneration); err != nil {
+		return err
+	}
+	if err := validateGenerationViewSignerCoverage(ctx, tx, input.Generation, input.Manifest); err != nil {
 		return err
 	}
 	for _, object := range objects {

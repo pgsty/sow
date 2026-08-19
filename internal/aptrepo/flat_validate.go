@@ -16,10 +16,7 @@ import (
 	"pault.ag/go/debian/control"
 )
 
-// ValidateFlatPackages reads back a staged Packages/Packages.gz pair and
-// proves that both encodings describe exactly the expected parsed packages.
-// It validates entry count, deterministic order, flat locations, sizes and
-// SHA-256 closure against the package sources before a caller publishes them.
+// ValidateFlatPackages also reauthenticates every package source.
 func ValidateFlatPackages(ctx context.Context, packagesPath, gzipPath string, expected []Package) error {
 	return validateFlatPackages(ctx, packagesPath, gzipPath, expected, true)
 }

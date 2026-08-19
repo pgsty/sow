@@ -10,16 +10,8 @@ Makefile
 cmd/sow/main.go
 go.mod
 go.sum
-internal/aptrepo/build.go
-internal/aptrepo/build_test.go
-internal/aptrepo/byhash.go
-internal/aptrepo/byhash_ledger.go
-internal/aptrepo/byhash_ledger_test.go
-internal/aptrepo/byhash_test.go
 internal/aptrepo/catalog.go
-internal/aptrepo/commit_guard_test.go
-internal/aptrepo/empty.go
-internal/aptrepo/empty_test.go
+internal/aptrepo/doc.go
 internal/aptrepo/fixture_test.go
 internal/aptrepo/flat_validate.go
 internal/aptrepo/package.go
@@ -28,9 +20,6 @@ internal/aptrepo/packages.go
 internal/aptrepo/packages_test.go
 internal/aptrepo/sign.go
 internal/aptrepo/sign_test.go
-internal/aptrepo/stream.go
-internal/aptrepo/stream_build.go
-internal/aptrepo/stream_test.go
 internal/aptrepo/testdata/libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64
 internal/r2/client.go
 internal/r2/client_test.go
@@ -45,6 +34,7 @@ internal/v2/config/selection_test.go
 internal/v2/config/targets.go
 internal/v2/config/targets_test.go
 internal/v2/config/testdata/effective.golden.yaml
+internal/v2/managed/add_dirty_convergence_test.go
 internal/v2/managed/build.go
 internal/v2/managed/build_command.go
 internal/v2/managed/build_command_test.go
@@ -57,10 +47,13 @@ internal/v2/managed/check.go
 internal/v2/managed/check_recovery.go
 internal/v2/managed/check_test.go
 internal/v2/managed/dist.go
+internal/v2/managed/dist_dirty_projection_test.go
+internal/v2/managed/doc.go
 internal/v2/managed/exchange_at_darwin.go
 internal/v2/managed/exchange_at_linux.go
 internal/v2/managed/gc.go
 internal/v2/managed/gc_test.go
+internal/v2/managed/generation_signer_projection_test.go
 internal/v2/managed/ingest.go
 internal/v2/managed/ingest_facts.go
 internal/v2/managed/ingest_test.go
@@ -140,6 +133,7 @@ internal/v2/plain/scan.go
 internal/v2/plain/sign.go
 internal/v2/plain/types.go
 internal/v2/state/audit.go
+internal/v2/state/doc.go
 internal/v2/state/facts.go
 internal/v2/state/facts_test.go
 internal/v2/state/gc.go
@@ -160,6 +154,7 @@ internal/v2/state/publication_test.go
 internal/v2/state/repository.go
 internal/v2/state/schema_v1.sql
 internal/v2/state/schema_v10.sql
+internal/v2/state/schema_v11.sql
 internal/v2/state/schema_v2.sql
 internal/v2/state/schema_v3.sql
 internal/v2/state/schema_v4.sql
@@ -177,6 +172,7 @@ internal/v2cli/app.go
 internal/v2cli/app_test.go
 internal/v2cli/create.go
 internal/v2cli/create_test.go
+internal/v2cli/doc.go
 internal/v2cli/errors.go
 internal/v2cli/errors_test.go
 internal/v2cli/help.go
@@ -221,11 +217,13 @@ internal/yumrepo/validate.go
 internal/yumrepo/xml.go
 sow.example.yaml
 staticcheck.conf
+test/compat/check-deadcode-binary.sh
 test/compat/clean_room_mvp_test.go
 test/compat/cleandelivery/delivery-extra-files.txt
 test/compat/cleandelivery/main.go
 test/compat/cleandelivery/main_test.go
 test/compat/cleandelivery/product-files.txt
+test/compat/deadcode-binary-allowlist.txt
 test/compat/helpers_test.go
 test/compat/hostable_temp_test.go
 test/compat/test-clean-delivery.sh

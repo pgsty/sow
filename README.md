@@ -62,12 +62,23 @@ sow init ./lab
 sow repo new local --workdir ./lab
 sow dist new stable --format rpm --workdir ./lab --repo local
 sow add ./packages/example.rpm --workdir ./lab --repo local --dist stable
-sow build --workdir ./lab --repo local
 sow check --workdir ./lab --repo local
 sow status --workdir ./lab --repo local
 sow changes --workdir ./lab --repo local
 sow log --workdir ./lab --repo local
 ```
+
+`sow add` and `sow rm` converge the selected Dist to a Built Generation by
+default. Use `--skip` only when intentionally batching Desired changes, then run
+`sow build` to publish that batch.
+
+Schema upgrades are explicit. After upgrading a v0.3 workspace, run
+`sow repo migrate REPOSITORY --workdir DIR` once for each Repository before
+ordinary reads or writes; schema v11 safely recomputes derived status and
+repairs publication/signer evidence without guessing a historical signer. A
+signed historical view whose v0.3 signer was never recorded remains explicitly
+unverified and cannot be exported as a retained trust assertion; the current
+Built Generation must always retain a fully proven signer identity.
 
 Managed repositories expose only `pool/ + dists/`; package hardlinks are not a
 canonical layout requirement. Configure a `filesystem` or `r2` target in

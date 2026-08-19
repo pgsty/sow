@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -137,6 +138,475 @@ type GenerationViewSigner struct {
 	TrustedPublicKey []byte       `json:"-"`
 }
 
+type generationSignerQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+// GenerationSignerUnverified marks a signed historical RPM view whose exact
+// signer could not be proven during the v10-to-v11 migration. It is coverage
+// evidence only and is never a trust identity or a forward-propagation source.
+const GenerationSignerUnverified = "unverified"
+
+func rpmGenerationViewSigning(manifest []GenerationFile) (map[string]bool, error) {
+	views := map[string]bool{}
+	for _, file := range manifest {
+		parts := strings.Split(file.Path, "/")
+		if len(parts) != 5 || parts[0] != "dists" || parts[3] != "repodata" || parts[4] != "repomd.xml" {
+			continue
+		}
+		if file.Phase != "pointer" || parts[1] == "" || parts[2] == "" {
+			return nil, fmt.Errorf("%w: Generation RPM view pointer %q is invalid", ErrConflict, file.Path)
+		}
+		views[path.Join(parts[:3]...)] = false
+	}
+	for _, file := range manifest {
+		parts := strings.Split(file.Path, "/")
+		if len(parts) != 5 || parts[0] != "dists" || parts[3] != "repodata" || parts[4] != "repomd.xml.asc" {
+			continue
+		}
+		viewID := path.Join(parts[:3]...)
+		if _, exists := views[viewID]; !exists {
+			return nil, fmt.Errorf("%w: Generation RPM signature %q has no repomd pointer", ErrConflict, file.Path)
+		}
+		views[viewID] = true
+	}
+	return views, nil
+}
+
+func generationSignerViewDist(viewID string) (string, error) {
+	parts := strings.Split(viewID, "/")
+	if len(parts) != 3 || parts[0] != "dists" || parts[1] == "" || parts[2] == "" || path.Join(parts...) != viewID {
+		return "", fmt.Errorf("%w: invalid Generation signer view %q", ErrConflict, viewID)
+	}
+	return parts[1], nil
+}
+
+func validateGenerationViewSignerCoverage(ctx context.Context, queryer generationSignerQueryer, generation GenerationID, manifest []GenerationFile) error {
+	expectedSigning, err := rpmGenerationViewSigning(manifest)
+	if err != nil {
+		return err
+	}
+	expected := make([]string, 0, len(expectedSigning))
+	for viewID := range expectedSigning {
+		expected = append(expected, viewID)
+	}
+	sort.Strings(expected)
+	rows, err := queryer.QueryContext(ctx, `SELECT view_id, signer_identity, COALESCE(trusted_public_key, X'') FROM generation_view_signers WHERE generation = ? ORDER BY view_id`, generation)
+	if err != nil {
+		return err
+	}
+	actual := []string{}
+	for rows.Next() {
+		var viewID, identity string
+		var trusted []byte
+		if err := rows.Scan(&viewID, &identity, &trusted); err != nil {
+			rows.Close()
+			return err
+		}
+		if _, err := generationSignerViewDist(viewID); err != nil {
+			rows.Close()
+			return err
+		}
+		if identity == "none" {
+			if len(trusted) != 0 || expectedSigning[viewID] {
+				rows.Close()
+				return fmt.Errorf("%w: Generation view %q signature state differs from signer evidence", ErrConflict, viewID)
+			}
+		} else if identity == GenerationSignerUnverified {
+			if len(trusted) != 0 || !expectedSigning[viewID] {
+				rows.Close()
+				return fmt.Errorf("%w: Generation view %q has invalid unverified signer evidence", ErrConflict, viewID)
+			}
+		} else if !validSHA256Text(identity) || len(trusted) == 0 || !expectedSigning[viewID] {
+			rows.Close()
+			return fmt.Errorf("%w: Generation view %q has invalid signer evidence", ErrConflict, viewID)
+		} else if digest := sha256.Sum256(trusted); hex.EncodeToString(digest[:]) != identity {
+			rows.Close()
+			return fmt.Errorf("%w: Generation view %q signer identity differs from retained key", ErrConflict, viewID)
+		}
+		actual = append(actual, viewID)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	if !slices.Equal(actual, expected) {
+		return fmt.Errorf("%w: Generation %s signer views differ from RPM manifest views: got %v want %v", ErrConflict, generation, actual, expected)
+	}
+	return nil
+}
+
+func generationSignerIdentity(fingerprint string, publicKey []byte, claimed string) (string, any, error) {
+	if fingerprint == "" {
+		if len(publicKey) != 0 || claimed != "" && claimed != "none" {
+			return "", nil, errors.New("unsigned RPM metadata signer state is inconsistent")
+		}
+		return "none", nil, nil
+	}
+	if !metadataFingerprintPattern.MatchString(fingerprint) || len(publicKey) == 0 || len(publicKey) > 16<<20 {
+		return "", nil, errors.New("signed RPM metadata signer state is invalid")
+	}
+	digest := sha256.Sum256(publicKey)
+	identity := hex.EncodeToString(digest[:])
+	if claimed != "" && claimed != identity {
+		return "", nil, errors.New("claimed RPM metadata signer identity differs from retained key")
+	}
+	return identity, publicKey, nil
+}
+
+func insertGenerationDistViewSignersTx(ctx context.Context, tx *sql.Tx, generation GenerationID, name, format string, architectures []Architecture, fingerprint string, publicKey []byte, claimed string) error {
+	if format != "rpm" {
+		return nil
+	}
+	identity, trusted, err := generationSignerIdentity(fingerprint, publicKey, claimed)
+	if err != nil {
+		return fmt.Errorf("Dist %q Generation signer: %w", name, err)
+	}
+	for _, architecture := range architectures {
+		viewID := path.Join("dists", name, architecture.Family)
+		if _, err := generationSignerViewDist(viewID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO generation_view_signers(generation, view_id, signer_identity, trusted_public_key) VALUES (?, ?, ?, ?)`, generation, viewID, identity, trusted); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// insertCurrentGenerationViewSignersTx snapshots the signer identity for every
+// RPM view represented by the current built Dist projection. This is used only
+// when anchoring a pre-ledger repository: the public manifest proves which
+// views exist, while the Dist projection retains the verification key that
+// proves who signed each of those views. The subsequent coverage check makes
+// the bootstrap fail closed if those two sources do not describe the same
+// topology or signedness.
+func insertCurrentGenerationViewSignersTx(ctx context.Context, tx *sql.Tx, generation GenerationID) error {
+	rows, err := tx.QueryContext(ctx, `
+SELECT d.name, a.family, COALESCE(s.fingerprint, ''), COALESCE(s.public_key, X'')
+FROM dists AS d
+JOIN dist_architectures AS a ON a.dist_name = d.name
+LEFT JOIN dist_metadata_signers AS s ON s.dist_name = d.name
+WHERE d.format = 'rpm'
+ORDER BY d.name, a.family`)
+	if err != nil {
+		return err
+	}
+	type signerRow struct {
+		viewID, fingerprint string
+		publicKey           []byte
+	}
+	signers := []signerRow{}
+	for rows.Next() {
+		var distName, family string
+		var signer signerRow
+		if err := rows.Scan(&distName, &family, &signer.fingerprint, &signer.publicKey); err != nil {
+			rows.Close()
+			return err
+		}
+		signer.viewID = path.Join("dists", distName, family)
+		signers = append(signers, signer)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	for _, signer := range signers {
+		identity, trusted, err := generationSignerIdentity(signer.fingerprint, signer.publicKey, "")
+		if err != nil {
+			return fmt.Errorf("Generation view %q signer: %w", signer.viewID, err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO generation_view_signers(generation, view_id, signer_identity, trusted_public_key) VALUES (?, ?, ?, ?)`, generation, signer.viewID, identity, trusted); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func carryGenerationViewSignersTx(ctx context.Context, tx *sql.Tx, base, target GenerationID, replacedDists map[string]struct{}) error {
+	if base == 0 {
+		return nil
+	}
+	if err := requireVerifiedGenerationSigners(ctx, tx, base); err != nil {
+		return err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT view_id, signer_identity, trusted_public_key FROM generation_view_signers WHERE generation = ? ORDER BY view_id`, base)
+	if err != nil {
+		return err
+	}
+	type signerRow struct {
+		viewID, identity string
+		trusted          []byte
+	}
+	carried := []signerRow{}
+	for rows.Next() {
+		var row signerRow
+		if err := rows.Scan(&row.viewID, &row.identity, &row.trusted); err != nil {
+			rows.Close()
+			return err
+		}
+		dist, err := generationSignerViewDist(row.viewID)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		if _, replaced := replacedDists[dist]; !replaced {
+			carried = append(carried, row)
+		}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	for _, row := range carried {
+		var trusted any
+		if row.identity != "none" {
+			trusted = row.trusted
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO generation_view_signers(generation, view_id, signer_identity, trusted_public_key) VALUES (?, ?, ?, ?)`, target, row.viewID, row.identity, trusted); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type generationSignerEvidence struct {
+	identity string
+	trusted  []byte
+}
+
+type generationSignerRowQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func requireVerifiedGenerationSigners(ctx context.Context, queryer generationSignerRowQueryer, generation GenerationID) error {
+	var unverified int
+	if err := queryer.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM generation_view_signers WHERE generation = ? AND signer_identity = 'unverified')`, generation).Scan(&unverified); err != nil {
+		return err
+	}
+	if unverified != 0 {
+		return fmt.Errorf("%w: Generation %s has unverified historical RPM signer evidence", ErrConflict, generation)
+	}
+	return nil
+}
+
+func sameGenerationSignerEvidence(left, right generationSignerEvidence) bool {
+	return left.identity == right.identity && bytes.Equal(left.trusted, right.trusted)
+}
+
+func generationViewContentIdentity(manifest []GenerationFile, viewID string) string {
+	hash := sha256.New()
+	prefix := viewID + "/"
+	for _, file := range manifest {
+		if !strings.HasPrefix(file.Path, prefix) {
+			continue
+		}
+		fmt.Fprintf(hash, "%s\x00%s\x00%d\x00%s\n", file.Path, file.Phase, file.Size, file.SHA256)
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+// repairGenerationViewSignersTx repairs only signer identities that can be
+// proven from immutable state: unsigned manifests imply signer "none"; the
+// current Built topology anchors its retained signer keys; and an adjacent
+// Generation with byte-identical view content carries the same signer. A
+// historical signed view without any such anchor is rejected rather than
+// assigned a guessed identity.
+func repairGenerationViewSignersTx(ctx context.Context, tx *sql.Tx) error {
+	rows, err := tx.QueryContext(ctx, `SELECT generation FROM generations ORDER BY generation`)
+	if err != nil {
+		return err
+	}
+	type generationState struct {
+		generation GenerationID
+		manifest   []GenerationFile
+		signing    map[string]bool
+		content    map[string]string
+		signers    map[string]generationSignerEvidence
+		original   map[string]struct{}
+	}
+	states := []*generationState{}
+	for rows.Next() {
+		var generation GenerationID
+		if err := rows.Scan(&generation); err != nil {
+			rows.Close()
+			return err
+		}
+		states = append(states, &generationState{generation: generation})
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	if len(states) == 0 {
+		return nil
+	}
+	for _, state := range states {
+		state.manifest, err = generationManifestTx(ctx, tx, state.generation)
+		if err != nil {
+			return err
+		}
+		state.signing, err = rpmGenerationViewSigning(state.manifest)
+		if err != nil {
+			return err
+		}
+		state.content = make(map[string]string, len(state.signing))
+		state.signers = make(map[string]generationSignerEvidence, len(state.signing))
+		state.original = make(map[string]struct{}, len(state.signing))
+		for viewID, signed := range state.signing {
+			state.content[viewID] = generationViewContentIdentity(state.manifest, viewID)
+			if !signed {
+				state.signers[viewID] = generationSignerEvidence{identity: "none"}
+			}
+		}
+		signerRows, err := tx.QueryContext(ctx, `SELECT view_id, signer_identity, COALESCE(trusted_public_key, X'') FROM generation_view_signers WHERE generation = ? ORDER BY view_id`, state.generation)
+		if err != nil {
+			return err
+		}
+		for signerRows.Next() {
+			var viewID string
+			var evidence generationSignerEvidence
+			if err := signerRows.Scan(&viewID, &evidence.identity, &evidence.trusted); err != nil {
+				signerRows.Close()
+				return err
+			}
+			signed, expected := state.signing[viewID]
+			if !expected || signed != (evidence.identity != "none") {
+				signerRows.Close()
+				return fmt.Errorf("%w: Generation %s view %q has incompatible signer evidence", ErrConflict, state.generation, viewID)
+			}
+			if evidence.identity == GenerationSignerUnverified {
+				if !signed || len(evidence.trusted) != 0 {
+					signerRows.Close()
+					return fmt.Errorf("%w: Generation %s view %q has invalid unverified signer evidence", ErrConflict, state.generation, viewID)
+				}
+			} else if evidence.identity != "none" {
+				digest := sha256.Sum256(evidence.trusted)
+				if !validSHA256Text(evidence.identity) || len(evidence.trusted) == 0 || hex.EncodeToString(digest[:]) != evidence.identity {
+					signerRows.Close()
+					return fmt.Errorf("%w: Generation %s view %q signer evidence is invalid", ErrConflict, state.generation, viewID)
+				}
+			} else if len(evidence.trusted) != 0 {
+				signerRows.Close()
+				return fmt.Errorf("%w: Generation %s unsigned view %q retains a key", ErrConflict, state.generation, viewID)
+			}
+			state.signers[viewID] = evidence
+			state.original[viewID] = struct{}{}
+		}
+		if err := errors.Join(signerRows.Err(), signerRows.Close()); err != nil {
+			return err
+		}
+	}
+
+	var current GenerationID
+	if err := tx.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&current); err != nil {
+		return err
+	}
+	head := states[len(states)-1]
+	if head.generation != current {
+		return fmt.Errorf("%w: signer repair head %s differs from current Generation %s", ErrConflict, head.generation, current)
+	}
+	anchorRows, err := tx.QueryContext(ctx, `
+SELECT d.name, a.family, COALESCE(s.fingerprint, ''), COALESCE(s.public_key, X'')
+FROM dists AS d
+JOIN dist_architectures AS a ON a.dist_name = d.name
+LEFT JOIN dist_metadata_signers AS s ON s.dist_name = d.name
+WHERE d.format = 'rpm'
+ORDER BY d.name, a.family`)
+	if err != nil {
+		return err
+	}
+	anchors := map[string]generationSignerEvidence{}
+	for anchorRows.Next() {
+		var distName, family, fingerprint string
+		var publicKey []byte
+		if err := anchorRows.Scan(&distName, &family, &fingerprint, &publicKey); err != nil {
+			anchorRows.Close()
+			return err
+		}
+		identity, trusted, err := generationSignerIdentity(fingerprint, publicKey, "")
+		if err != nil {
+			anchorRows.Close()
+			return err
+		}
+		evidence := generationSignerEvidence{identity: identity}
+		if trusted != nil {
+			evidence.trusted = append([]byte(nil), publicKey...)
+		}
+		anchors[path.Join("dists", distName, family)] = evidence
+	}
+	if err := errors.Join(anchorRows.Err(), anchorRows.Close()); err != nil {
+		return err
+	}
+	for viewID, signed := range head.signing {
+		anchor, ok := anchors[viewID]
+		if !ok || signed != (anchor.identity != "none") {
+			return fmt.Errorf("%w: current Generation %s view %q lacks matching Dist signer state", ErrConflict, head.generation, viewID)
+		}
+		if existing, ok := head.signers[viewID]; ok && !sameGenerationSignerEvidence(existing, anchor) {
+			return fmt.Errorf("%w: current Generation %s view %q differs from Dist signer state", ErrConflict, head.generation, viewID)
+		}
+		head.signers[viewID] = anchor
+	}
+	if len(anchors) != len(head.signing) {
+		return fmt.Errorf("%w: current Dist signer topology differs from Generation %s", ErrConflict, head.generation)
+	}
+
+	for pass := 0; pass < len(states); pass++ {
+		changed := false
+		for index := 1; index < len(states); index++ {
+			prior, next := states[index-1], states[index]
+			for viewID := range next.signing {
+				if _, exists := next.signers[viewID]; exists || prior.content[viewID] == "" || prior.content[viewID] != next.content[viewID] {
+					continue
+				}
+				if evidence, ok := prior.signers[viewID]; ok && evidence.identity != GenerationSignerUnverified {
+					next.signers[viewID] = evidence
+					changed = true
+				}
+			}
+		}
+		for index := len(states) - 2; index >= 0; index-- {
+			prior, next := states[index], states[index+1]
+			for viewID := range prior.signing {
+				if _, exists := prior.signers[viewID]; exists || next.content[viewID] == "" || prior.content[viewID] != next.content[viewID] {
+					continue
+				}
+				if evidence, ok := next.signers[viewID]; ok && evidence.identity != GenerationSignerUnverified {
+					prior.signers[viewID] = evidence
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	for _, state := range states {
+		for viewID := range state.signing {
+			evidence, ok := state.signers[viewID]
+			if !ok {
+				if state.generation == current {
+					return fmt.Errorf("%w: cannot prove signer identity for current Generation %s view %q", ErrConflict, state.generation, viewID)
+				}
+				evidence = generationSignerEvidence{identity: GenerationSignerUnverified}
+				state.signers[viewID] = evidence
+			}
+			if _, exists := state.original[viewID]; exists {
+				continue
+			}
+			var trusted any
+			if evidence.identity != "none" && evidence.identity != GenerationSignerUnverified {
+				trusted = evidence.trusted
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO generation_view_signers(generation, view_id, signer_identity, trusted_public_key) VALUES (?, ?, ?, ?)`, state.generation, viewID, evidence.identity, trusted); err != nil {
+				return err
+			}
+		}
+		if err := validateGenerationViewSignerCoverage(ctx, tx, state.generation, state.manifest); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) GenerationViewSigner(ctx context.Context, generation GenerationID, viewID string) (GenerationViewSigner, error) {
 	if generation == 0 || path.Clean(viewID) != viewID || !strings.HasPrefix(viewID, "dists/") {
 		return GenerationViewSigner{}, errors.New("invalid Generation view signer lookup")
@@ -152,9 +622,9 @@ func (s *Store) GenerationViewSigner(ctx context.Context, generation GenerationI
 	if err != nil {
 		return GenerationViewSigner{}, err
 	}
-	if record.SignerIdentity == "none" {
+	if record.SignerIdentity == "none" || record.SignerIdentity == GenerationSignerUnverified {
 		if len(trusted) != 0 {
-			return GenerationViewSigner{}, fmt.Errorf("%w: unsigned Generation view has a trusted key", ErrSchema)
+			return GenerationViewSigner{}, fmt.Errorf("%w: keyless Generation signer evidence has a trusted key", ErrSchema)
 		}
 	} else if !validSHA256Text(record.SignerIdentity) || len(trusted) == 0 {
 		return GenerationViewSigner{}, fmt.Errorf("%w: invalid Generation view signer record", ErrSchema)
@@ -188,6 +658,16 @@ func ManifestBytesForLayout(input []GenerationFile, layout string) ([]byte, stri
 func (s *Store) GenerationRetentionIdentity(ctx context.Context, generation GenerationID) (string, string, error) {
 	info, err := s.GetGeneration(ctx, generation)
 	if err != nil {
+		return "", "", err
+	}
+	manifest, err := s.GenerationManifest(ctx, generation)
+	if err != nil {
+		return "", "", err
+	}
+	if err := validateGenerationViewSignerCoverage(ctx, s.db, generation, manifest); err != nil {
+		return "", "", err
+	}
+	if err := requireVerifiedGenerationSigners(ctx, s.db, generation); err != nil {
 		return "", "", err
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT signer_identity FROM generation_view_signers WHERE generation = ? ORDER BY signer_identity`, generation)
@@ -273,6 +753,12 @@ func (s *Store) BootstrapLegacyGeneration(ctx context.Context, operationID strin
 		return fmt.Errorf("anchor legacy generation %d: %w", generation, err)
 	}
 	if err := insertGenerationFilesTx(ctx, tx, generation, manifest); err != nil {
+		return err
+	}
+	if err := insertCurrentGenerationViewSignersTx(ctx, tx, generation); err != nil {
+		return fmt.Errorf("anchor legacy Generation signer evidence: %w", err)
+	}
+	if err := validateGenerationViewSignerCoverage(ctx, tx, generation, manifest); err != nil {
 		return err
 	}
 	if err := insertOperationFilesTx(ctx, tx, operationID, changes); err != nil {
@@ -447,6 +933,16 @@ func (s *Store) ValidateGenerationLedger(ctx context.Context) error {
 		normalized, digest, err := normalizeManifestForLayout(manifest, generationLayout)
 		if err != nil || digest != info.ManifestSHA256 {
 			return fmt.Errorf("%w: generation %d manifest hash differs", ErrConflict, info.Generation)
+		}
+		if s.SchemaVersion() >= 7 {
+			if err := validateGenerationViewSignerCoverage(ctx, s.db, info.Generation, normalized); err != nil {
+				return err
+			}
+			if info.Generation == current {
+				if err := requireVerifiedGenerationSigners(ctx, s.db, info.Generation); err != nil {
+					return err
+				}
+			}
 		}
 		changes, err := s.GenerationChanges(ctx, info.Generation)
 		if err != nil {
@@ -787,6 +1283,10 @@ func (s *Store) FinalizeBuild(ctx context.Context, input FinalizeBuildInput) err
 	if err := recordGenerationTx(ctx, tx, input.OperationID, input.Generation, input.Manifest, input.Changes, input.RendererIdentity); err != nil {
 		return err
 	}
+	generationInfo, err := generationInfoTx(ctx, tx, input.Generation)
+	if err != nil {
+		return err
+	}
 	seenDists := make(map[string]struct{}, len(input.Dists))
 	for _, dist := range input.Dists {
 		if dist.Name == "" || dist.EffectiveConfigSHA256 == "" {
@@ -821,24 +1321,15 @@ func (s *Store) FinalizeBuild(ctx context.Context, input FinalizeBuildInput) err
 		if err := replaceDistArchitecturesTx(ctx, tx, dist.Name, dist.Architectures, input.Generation); err != nil {
 			return err
 		}
-		if dist.Format == "rpm" {
-			identity := dist.MetadataSignerIdentity
-			var trusted any
-			if dist.MetadataSignerFingerprint == "" {
-				identity = "none"
-			} else {
-				if !validSHA256Text(identity) || len(dist.MetadataSignerPublicKey) == 0 {
-					return fmt.Errorf("invalid immutable RPM signer identity for Dist %q", dist.Name)
-				}
-				trusted = dist.MetadataSignerPublicKey
-			}
-			for _, architecture := range dist.Architectures {
-				viewID := path.Join("dists", dist.Name, architecture.Family)
-				if _, err := tx.ExecContext(ctx, `INSERT INTO generation_view_signers(generation, view_id, signer_identity, trusted_public_key) VALUES (?, ?, ?, ?)`, input.Generation, viewID, identity, trusted); err != nil {
-					return err
-				}
-			}
+		if err := insertGenerationDistViewSignersTx(ctx, tx, input.Generation, dist.Name, dist.Format, dist.Architectures, dist.MetadataSignerFingerprint, dist.MetadataSignerPublicKey, dist.MetadataSignerIdentity); err != nil {
+			return err
 		}
+	}
+	if err := carryGenerationViewSignersTx(ctx, tx, generationInfo.PreviousGeneration, input.Generation, seenDists); err != nil {
+		return err
+	}
+	if err := validateGenerationViewSignerCoverage(ctx, tx, input.Generation, input.Manifest); err != nil {
+		return err
 	}
 	for _, digest := range input.Pooled {
 		if !validSHA256Text(digest) {

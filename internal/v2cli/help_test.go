@@ -127,6 +127,9 @@ func TestLeafHelpMatchesClosedOptionMatrix(t *testing.T) {
 			if !ok {
 				t.Fatal("missing help")
 			}
+			if !strings.Contains(body, "\nOptions:\n") {
+				t.Error("leaf help has no described Options section")
+			}
 			for _, option := range test.want {
 				if !strings.Contains(body, option) {
 					t.Errorf("missing option %s", option)

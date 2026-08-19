@@ -352,6 +352,9 @@ func (s *Store) PutPublicationAttempt(ctx context.Context, attempt *PublicationA
 			if head.Valid != (attempt.BaseCheckpoint != "") || head.Valid && head.String != attempt.BaseCheckpoint {
 				return fmt.Errorf("%w: abandoned publication attempt base checkpoint differs from target head", ErrConflict)
 			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM publication_abandoned_objects WHERE attempt_identity = ?`, attempt.AttemptIdentity); err != nil {
+				return fmt.Errorf("clear resurrected publication evidence: %w", err)
+			}
 			if _, err := tx.ExecContext(ctx, `UPDATE publication_attempt_views SET state = 'pending' WHERE attempt_identity = ?`, attempt.AttemptIdentity); err != nil {
 				return err
 			}
@@ -427,6 +430,9 @@ func (s *Store) AbandonPublicationAttempt(ctx context.Context, attemptIdentity s
 		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 			return err
 		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM publication_abandoned_objects WHERE attempt_identity = ?`, attemptIdentity); err != nil {
+		return fmt.Errorf("reset publication abandon evidence: %w", err)
 	}
 	for _, object := range objects {
 		if _, existed := basePaths[object.Path]; existed {

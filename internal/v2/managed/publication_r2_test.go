@@ -30,8 +30,15 @@ type fakeR2PublicationObject struct {
 }
 
 type fakeR2PublicationClient struct {
-	objects map[string]fakeR2PublicationObject
-	next    int
+	objects    map[string]fakeR2PublicationObject
+	conditions map[string]r2.PutCondition
+	next       int
+}
+
+type managedRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f managedRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
 }
 
 func (f *fakeR2PublicationClient) ListObjectsV2Prefix(_ context.Context, prefix, continuation string) (r2.ObjectListPage, error) {
@@ -69,7 +76,7 @@ func (f *fakeR2PublicationClient) OpenObject(_ context.Context, key string) (r2.
 	return r2.ObjectContent{Info: info, Body: io.NopCloser(bytes.NewReader(f.objects[key].body))}, nil
 }
 
-func (f *fakeR2PublicationClient) Put(_ context.Context, key string, body io.Reader, size int64, sha string, condition r2.PutCondition) (string, error) {
+func (f *fakeR2PublicationClient) Put(_ context.Context, key string, body r2.ReadSeekReaderAt, size int64, sha string, condition r2.PutCondition) (string, error) {
 	current, exists := f.objects[key]
 	if condition.IfNoneMatch && exists {
 		return "", r2.ErrAlreadyExists
@@ -88,6 +95,10 @@ func (f *fakeR2PublicationClient) Put(_ context.Context, key string, body io.Rea
 	f.next++
 	etag := fmt.Sprintf("\"etag-%d\"", f.next)
 	f.objects[key] = fakeR2PublicationObject{body: data, sha: sha, etag: etag}
+	if f.conditions == nil {
+		f.conditions = map[string]r2.PutCondition{}
+	}
+	f.conditions[key] = condition
 	return etag, nil
 }
 
@@ -129,6 +140,9 @@ func TestR2PublicationBackendMapsOneCanonicalKeyAndUsesConditionalPut(t *testing
 	if err != nil || firstETag == "" || len(fake.objects) != 1 {
 		t.Fatalf("R2 add etag=%q objects=%d err=%v", firstETag, len(fake.objects), err)
 	}
+	if got := fake.conditions["repos/prod/"+objectPath].CacheControl; got != r2ImmutableCacheControl {
+		t.Fatalf("R2 payload Cache-Control=%q", got)
+	}
 	if replayETag, err := backend.Put(ctx, sourceRoot, add, strings.Repeat("a", 64)); err != nil || replayETag != firstETag || len(fake.objects) != 1 {
 		t.Fatalf("R2 add replay etag=%q err=%v", replayETag, err)
 	}
@@ -151,6 +165,119 @@ func TestR2PublicationBackendMapsOneCanonicalKeyAndUsesConditionalPut(t *testing
 	for key := range fake.objects {
 		if key != "repos/prod/"+objectPath || strings.Contains(key, ".sow") {
 			t.Fatalf("R2 backend created non-public/control key %q", key)
+		}
+	}
+}
+
+func TestR2PublicVerificationWaitsForCanonicalCacheRefresh(t *testing.T) {
+	oldBody := []byte("old-pointer")
+	newBody := []byte("new-pointer")
+	digest := sha256.Sum256(newBody)
+	expected := state.GenerationFile{Path: "dists/el9/x86_64/repodata/repomd.xml", Phase: "pointer", Size: int64(len(newBody)), SHA256: hex.EncodeToString(digest[:])}
+	refreshed := false
+	regular, revalidated := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.RawQuery != "" {
+			t.Errorf("public verification changed canonical cache key: %s", request.URL.String())
+		}
+		if request.Header.Get("Cache-Control") == "no-cache" {
+			revalidated++
+			refreshed = true
+			_, _ = response.Write(newBody)
+			return
+		}
+		regular++
+		if refreshed {
+			_, _ = response.Write(newBody)
+		} else {
+			_, _ = response.Write(oldBody)
+		}
+	}))
+	defer server.Close()
+	publicBase, err := url.Parse(server.URL + "/repo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &r2PublicationBackend{
+		publicBase: publicBase, publicClient: server.Client(), maxCacheTTL: time.Second,
+		verificationSleep: func(context.Context, time.Duration) error { return nil },
+	}
+	if err := backend.VerifyPublic(context.Background(), expected); err != nil {
+		t.Fatal(err)
+	}
+	if regular != 2 || revalidated != 1 {
+		t.Fatalf("public verification regular=%d revalidated=%d", regular, revalidated)
+	}
+}
+
+func TestR2PublicVerificationBoundsTransientAndIdleFailures(t *testing.T) {
+	t.Run("transient retries do not inherit cache TTL", func(t *testing.T) {
+		calls := 0
+		server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+			calls++
+			response.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+		publicBase, err := url.Parse(server.URL + "/repo/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		current := time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)
+		started := current
+		backend := &r2PublicationBackend{
+			publicBase: publicBase, publicClient: server.Client(), maxCacheTTL: 24 * time.Hour,
+			transientRetryWindow: 500 * time.Millisecond,
+			verificationNow:      func() time.Time { return current },
+			verificationSleep: func(_ context.Context, duration time.Duration) error {
+				current = current.Add(duration)
+				return nil
+			},
+		}
+		expected := state.GenerationFile{Path: "pool/p/package.rpm", Phase: "payload", Size: 1, SHA256: strings.Repeat("a", 64)}
+		if err := backend.VerifyPublic(context.Background(), expected); err == nil || calls < 2 || current.Sub(started) != 500*time.Millisecond {
+			t.Fatalf("transient calls=%d elapsed=%s err=%v", calls, current.Sub(started), err)
+		}
+	})
+
+	t.Run("idle response body", func(t *testing.T) {
+		reader, writer := io.Pipe()
+		defer writer.Close()
+		client := &http.Client{Transport: managedRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK, Status: "200 OK", Header: make(http.Header),
+				Body: reader, Request: request,
+			}, nil
+		})}
+		publicBase, err := url.Parse("https://repo.example.test/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		backend := &r2PublicationBackend{
+			publicBase: publicBase, publicClient: client, publicReadIdleTimeout: 20 * time.Millisecond,
+		}
+		expected := state.GenerationFile{Path: "pool/p/package.rpm", Phase: "payload", Size: 1, SHA256: strings.Repeat("a", 64)}
+		if err := backend.VerifyPublic(context.Background(), expected); !errors.Is(err, r2.ErrReadNoProgress) {
+			t.Fatalf("idle public verification error=%v", err)
+		}
+	})
+}
+
+func TestR2MutablePublicationCachePolicyCoversPointersAndAPTStableAliases(t *testing.T) {
+	for _, operation := range []state.PublicationPlanOperation{
+		{Path: "dists/el9/x86_64/repodata/repomd.xml", Phase: "pointer"},
+		{Path: "dists/noble/main/binary-amd64/Packages.gz", Phase: "metadata"},
+	} {
+		if !mutableR2PublicationPath(operation) {
+			t.Fatalf("mutable publication path was classified immutable: %#v", operation)
+		}
+	}
+	for _, operation := range []state.PublicationPlanOperation{
+		{Path: "pool/p/pkg/package.rpm", Phase: "payload"},
+		{Path: "dists/noble/main/binary-amd64/by-hash/SHA256/abc", Phase: "metadata"},
+		{Path: "dists/el9/x86_64/repodata/abc-primary.xml.gz", Phase: "metadata"},
+	} {
+		if mutableR2PublicationPath(operation) {
+			t.Fatalf("immutable publication path was classified mutable: %#v", operation)
 		}
 	}
 }

@@ -128,7 +128,7 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 		if err != nil {
 			return result, err
 		}
-		if err := verifyPublishedGeneration(ctx, backend, store, checkpoint.Generation, checkpoint.ManifestSHA256); err != nil {
+		if err := verifyAppliedCheckpointInventory(ctx, backend, store, checkpoint); err != nil {
 			return result, err
 		}
 		if err := putPublicationGrace(ctx, store, binding, checkpoint); err != nil {
@@ -190,18 +190,15 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 	if err != nil {
 		return result, err
 	}
-	baseInventory, err = recognizePublicationAbandonedObjects(remoteBefore, baseInventory, orphans)
-	if err != nil {
-		return result, err
-	}
 	if activeErr != nil {
+		baseInventory, err = recognizePublicationAbandonedObjects(remoteBefore, baseInventory, orphans)
+		if err != nil {
+			return result, err
+		}
 		if err := requireExactRemoteInventory(remoteBefore, baseInventory); err != nil {
 			return result, err
 		}
 		if len(changes) == 0 {
-			if err := verifyPublishedGeneration(ctx, backend, store, targetGeneration, manifestSHA); err != nil {
-				return result, err
-			}
 			result.Checkpoint, result.Phase, result.Objects, result.Noop = targetSnapshot.Head.CheckpointIdentity, "applied", len(remoteBefore), true
 			return result, nil
 		}
@@ -209,6 +206,7 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 		if active.RepositoryID != identity.RepositoryID || active.TargetIdentity != binding.TargetIdentity || active.BaseCheckpoint != plan.BaseCheckpoint || active.TargetGeneration != plan.TargetGeneration || active.ManifestSHA256 != plan.ManifestSHA256 || active.PlanSHA256 != plan.PlanSHA256 {
 			return result, fmt.Errorf("%w: active publication attempt differs from the only recoverable plan", ErrIntegrity)
 		}
+		baseInventory = recognizeRecoverablePublicationAbandonedObjects(remoteBefore, baseInventory, orphans)
 		if err := requireRecoverableRemoteInventory(remoteBefore, baseInventory, targetManifest); err != nil {
 			return result, err
 		}
@@ -301,11 +299,13 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 	if err := store.AdvancePublicationAttemptPhase(ctx, active.AttemptIdentity, "pointer_rollforward"); err != nil {
 		return result, err
 	}
-	for _, file := range targetManifest {
-		object, ok, err := backend.Head(ctx, file.Path)
-		if err != nil || !ok || object.Size != file.Size || object.SHA256 != file.SHA256 {
-			return result, errors.Join(fmt.Errorf("%w: target verification failed for %q", ErrIntegrity, file.Path), err)
-		}
+	remoteAfter, err := backend.List(ctx, nil)
+	if err != nil {
+		return result, err
+	}
+	inventory, err := publicationInventory(remoteAfter, targetManifest, baseInventory)
+	if err != nil {
+		return result, err
 	}
 	for _, view := range attemptViews {
 		if err := store.SetPublicationAttemptViewState(ctx, active.AttemptIdentity, view.ViewID, view.PointerPath, "verified"); err != nil {
@@ -318,22 +318,16 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 	if err := callFault(opts.Fault, "publish.verified"); err != nil {
 		return result, err
 	}
-	remoteAfter, err := backend.List(ctx, nil)
-	if err != nil {
-		return result, err
-	}
-	inventory, err := publicationInventory(remoteAfter, targetManifest, baseInventory)
-	if err != nil {
-		return result, err
-	}
 	checkpointViews, err := publicationCheckpointViews(ctx, backend, attemptViews)
 	if err != nil {
 		return result, err
 	}
-	for _, file := range targetManifest {
-		if err := backend.VerifyPublic(ctx, file); err != nil {
-			return result, err
-		}
+	verificationFiles, err := publicationVerificationFiles(plan, targetManifest)
+	if err != nil {
+		return result, err
+	}
+	if err := verifyPublishedFiles(ctx, backend, verificationFiles); err != nil {
+		return result, err
 	}
 	appliedAt := publicationObservedTime(opts.now)
 	if err := store.ObserveRepositoryTime(ctx, appliedAt); err != nil {
@@ -736,6 +730,37 @@ func recognizePublicationAbandonedObjects(remote []publicationRemoteObject, base
 	return result, nil
 }
 
+// recognizeRecoverablePublicationAbandonedObjects extends the old checkpoint
+// closure with exact add-only bytes left by earlier abandoned attempts, but it
+// deliberately does not require every base path to retain its old identity.
+// Once commit intent is durable, protocol pointers may already contain either
+// the old checkpoint bytes or the target Generation bytes; the caller's
+// requireRecoverableRemoteInventory check is the single authority for that
+// old/new decision and still rejects missing base paths or a third identity.
+func recognizeRecoverablePublicationAbandonedObjects(remote []publicationRemoteObject, base []state.PublicationInventoryObject, abandoned []state.PublicationAbandonedObject) []state.PublicationInventoryObject {
+	baseByPath := make(map[string]struct{}, len(base))
+	abandonedByPath := make(map[string]state.PublicationAbandonedObject, len(abandoned))
+	result := append([]state.PublicationInventoryObject(nil), base...)
+	for _, object := range base {
+		baseByPath[object.Path] = struct{}{}
+	}
+	for _, object := range abandoned {
+		abandonedByPath[object.Path] = object
+	}
+	for _, object := range remote {
+		if _, ok := baseByPath[object.Path]; ok {
+			continue
+		}
+		orphan, ok := abandonedByPath[object.Path]
+		if !ok || orphan.Size != object.Size || orphan.SHA256 != object.SHA256 || orphan.RemoteIdentity != object.RemoteIdentity {
+			continue
+		}
+		result = append(result, state.PublicationInventoryObject(orphan))
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	return result
+}
+
 func reconcileAbandonedPublicationInventory(remote []publicationRemoteObject, base []state.PublicationInventoryObject, eligible []state.PublicationPlanOperation) ([]state.PublicationAbandonedObject, error) {
 	baseByPath := make(map[string]state.PublicationInventoryObject, len(base))
 	eligibleByPath := make(map[string]state.PublicationPlanOperation, len(eligible))
@@ -882,20 +907,91 @@ func publicationCheckpointViews(ctx context.Context, backend publicationBackend,
 	return result, nil
 }
 
-func verifyPublishedGeneration(ctx context.Context, backend publicationBackend, store *state.Store, generation state.GenerationID, manifestSHA string) error {
+func publicationVerificationFiles(plan state.PublicationPlan, manifest []state.GenerationFile) ([]state.GenerationFile, error) {
+	byPath := make(map[string]state.GenerationFile, len(manifest))
+	for _, file := range manifest {
+		byPath[file.Path] = file
+	}
+	paths := map[string]struct{}{}
+	appendOperations := func(operations []state.PublicationPlanOperation) error {
+		for _, operation := range operations {
+			if operation.Operation != "add" && operation.Operation != "update" {
+				continue
+			}
+			file, ok := byPath[operation.Path]
+			if !ok || file.Phase != operation.Phase || file.Size != operation.Size || file.SHA256 != operation.SHA256 {
+				return fmt.Errorf("%w: public verification operation %q differs from target manifest", ErrIntegrity, operation.Path)
+			}
+			paths[operation.Path] = struct{}{}
+		}
+		return nil
+	}
+	if err := appendOperations(plan.Payload); err != nil {
+		return nil, err
+	}
+	if err := appendOperations(plan.ImmutableMetadata); err != nil {
+		return nil, err
+	}
+	if err := appendOperations(plan.StableAliases); err != nil {
+		return nil, err
+	}
+	for _, unit := range plan.CommitUnits {
+		if err := appendOperations(unit.Pointers); err != nil {
+			return nil, err
+		}
+	}
+	result := make([]state.GenerationFile, 0, len(paths))
+	for path := range paths {
+		result = append(result, byPath[path])
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Path < result[j].Path })
+	return result, nil
+}
+
+func verifiedGenerationManifest(ctx context.Context, store *state.Store, generation state.GenerationID, manifestSHA string) ([]state.GenerationFile, error) {
 	manifest, err := store.GenerationManifest(ctx, generation)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	_, digest, err := state.ManifestBytes(manifest)
 	if err != nil || digest != manifestSHA {
-		return errors.Join(fmt.Errorf("%w: checkpoint Generation manifest changed", ErrIntegrity), err)
+		return nil, errors.Join(fmt.Errorf("%w: checkpoint Generation manifest changed", ErrIntegrity), err)
+	}
+	return manifest, nil
+}
+
+func verifyAppliedCheckpointInventory(ctx context.Context, backend publicationBackend, store *state.Store, checkpoint state.AppliedCheckpoint) error {
+	if _, err := verifiedGenerationManifest(ctx, store, checkpoint.Generation, checkpoint.ManifestSHA256); err != nil {
+		return err
+	}
+	expected, err := store.PublicationLiveInventory(ctx, checkpoint.CheckpointIdentity)
+	if err != nil {
+		return err
+	}
+	remote, err := backend.List(ctx, nil)
+	if err != nil {
+		return err
+	}
+	return requireExactRemoteInventory(remote, expected)
+}
+
+func verifyPublishedPointers(ctx context.Context, backend publicationBackend, store *state.Store, generation state.GenerationID, manifestSHA string) error {
+	manifest, err := verifiedGenerationManifest(ctx, store, generation, manifestSHA)
+	if err != nil {
+		return err
 	}
 	for _, file := range manifest {
-		object, ok, headErr := backend.Head(ctx, file.Path)
-		if headErr != nil || !ok || object.Size != file.Size || object.SHA256 != file.SHA256 {
-			return errors.Join(fmt.Errorf("%w: published Generation differs at %q", ErrIntegrity, file.Path), headErr)
+		if file.Phase == "pointer" {
+			if err := backend.VerifyPublic(ctx, file); err != nil {
+				return err
+			}
 		}
+	}
+	return nil
+}
+
+func verifyPublishedFiles(ctx context.Context, backend publicationBackend, files []state.GenerationFile) error {
+	for _, file := range files {
 		if err := backend.VerifyPublic(ctx, file); err != nil {
 			return err
 		}

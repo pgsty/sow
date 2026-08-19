@@ -152,6 +152,22 @@ func TestMainP2P3PackageWorkflowEndToEnd(t *testing.T) {
 	assertCLISuccess(t, []string{"check", "-C", root, "-r", "repo", "--json"}, `"ready_to_copy":true`)
 	assertCLISuccess(t, []string{"changes", "0", "-C", root, "-r", "repo", "--json"}, `"base":"00000000000000000000"`)
 	assertCLISuccess(t, []string{"log", "-C", root, "-r", "repo", "--json"}, `"operations"`)
+	for _, test := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"show", "pgdg-redhat-nonfree-repo", "-C", root, "-r", "repo"}, "package repository=repo"},
+		{[]string{"where", "libpqtypes0", "-C", root}, "locations=1"},
+		{[]string{"build", "-C", root, "-r", "repo"}, "already current (noop)"},
+		{[]string{"rm", "pgdg-redhat-nonfree-repo", "--check", "-C", root, "-r", "repo", "-d", "el9"}, "preview repository=repo"},
+		{[]string{"log", "-C", root, "-r", "repo"}, "operations="},
+		{[]string{"log", "prune", "1970-01-01", "-C", root, "-r", "repo"}, "pruned log repository=repo"},
+	} {
+		stdout, stderr, code := runCLI(test.args)
+		if code != ExitOK || stderr != "" || strings.HasPrefix(strings.TrimSpace(stdout), "{") || !strings.Contains(stdout, test.want) {
+			t.Fatalf("human command args=%q code=%d stdout=%q stderr=%q", test.args, code, stdout, stderr)
+		}
+	}
 
 	stdout, stderr, code := runCLI([]string{"log", "export", "-", "-C", root, "-r", "repo"})
 	if code != ExitOK || stderr != "" || !strings.Contains(stdout, `"kind":"add"`) || !strings.HasSuffix(stdout, "\n") {
@@ -195,7 +211,10 @@ func TestMainCheckNotReadyUsesIntegrityExit(t *testing.T) {
 	assertCLISuccess(t, []string{"repo", "new", "repo", "-C", root, "--json"}, `"name":"repo"`)
 	assertCLISuccess(t, []string{"dist", "new", "el9", "--format", "rpm", "-C", root, "-r", "repo", "--json"}, `"format":"rpm"`)
 	assertCLISuccess(t, []string{"add", rpm, "--skip", "-C", root, "-r", "repo", "-d", "el9", "--json"}, `"dirty":true`)
-	assertCLIFailure(t, []string{"check", "-C", root, "-r", "repo", "--json"}, ExitIntegrity, "integrity")
+	stdout, stderr, code := runCLI([]string{"check", "-C", root, "-r", "repo", "--json"})
+	if code != ExitIntegrity || stderr == "" || strings.Contains(stdout, `"result":null`) || !strings.Contains(stdout, `"layers":`) {
+		t.Fatalf("diagnostic check result was not preserved: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
 }
 
 func TestMainAddPartialSuccessReturnsExit3WithCommittedResult(t *testing.T) {
@@ -685,21 +704,21 @@ func TestMainExitCodeAndFailureEnvelopeMatrix(t *testing.T) {
 		}, ExitRejected, "rejected")
 	})
 	t.Run("usage", func(t *testing.T) {
-		assertCLIFailure(t, []string{"dist", "new", "el9", "--json"}, ExitUsage, "usage")
+		assertCLIFailureNull(t, []string{"dist", "new", "el9", "--json"}, ExitUsage, "usage")
 	})
 	t.Run("discovery", func(t *testing.T) {
 		root := t.TempDir()
-		assertCLIFailure(t, []string{"repo", "ls", "-C", root, "--json"}, ExitUsage, "usage")
-		assertCLIFailure(t, []string{"repo", "rm", "missing", "-C", root, "--json"}, ExitUsage, "usage")
+		assertCLIFailureNull(t, []string{"repo", "ls", "-C", root, "--json"}, ExitUsage, "discovery")
+		assertCLIFailure(t, []string{"repo", "rm", "missing", "-C", root, "--json"}, ExitUsage, "discovery")
 	})
 	t.Run("config", func(t *testing.T) {
 		root := t.TempDir()
 		if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), []byte("schema: sow/v3\nunknown: true\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		assertCLIFailure(t, []string{"config", "check", "-C", root, "--json"}, ExitUsage, "usage")
-		assertCLIFailure(t, []string{"init", root, "--json"}, ExitUsage, "usage")
-		assertCLIFailure(t, []string{"repo", "rm", "missing", "-C", root, "--json"}, ExitUsage, "usage")
+		assertCLIFailureNull(t, []string{"config", "check", "-C", root, "--json"}, ExitUsage, "config")
+		assertCLIFailure(t, []string{"init", root, "--json"}, ExitUsage, "config")
+		assertCLIFailure(t, []string{"repo", "rm", "missing", "-C", root, "--json"}, ExitUsage, "config")
 	})
 	t.Run("state architecture rejection", func(t *testing.T) {
 		root := t.TempDir()
@@ -738,7 +757,7 @@ func TestMainExitCodeAndFailureEnvelopeMatrix(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), data, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		assertCLIFailure(t, []string{"repo", "rm", "prod", "-f", "-C", root, "--json"}, ExitRejected, "rejected")
+		assertCLIFailureNull(t, []string{"repo", "rm", "prod", "-f", "-C", root, "--json"}, ExitRejected, "rejected")
 	})
 	t.Run("integrity", func(t *testing.T) {
 		root := t.TempDir()
@@ -759,7 +778,7 @@ func TestMainExitCodeAndFailureEnvelopeMatrix(t *testing.T) {
 		if err := os.WriteFile(database, []byte("not sqlite"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		assertCLIFailure(t, []string{"repo", "show", "broken", "-C", root, "--json"}, ExitIntegrity, "integrity")
+		assertCLIFailureNull(t, []string{"repo", "show", "broken", "-C", root, "--json"}, ExitIntegrity, "integrity")
 	})
 	t.Run("lock", func(t *testing.T) {
 		root := t.TempDir()
@@ -773,7 +792,7 @@ func TestMainExitCodeAndFailureEnvelopeMatrix(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer unix.Flock(int(lock.Fd()), unix.LOCK_UN) //nolint:errcheck
-		assertCLIFailure(t, []string{"repo", "new", "locked", "-C", root, "-N", "--json"}, ExitLock, "lock")
+		assertCLIFailureNull(t, []string{"repo", "new", "locked", "-C", root, "-N", "--json"}, ExitLock, "lock")
 	})
 }
 
@@ -801,12 +820,16 @@ func TestMainP1P3SelectionAndWorkspaceFailureMatrix(t *testing.T) {
 			command := command
 			t.Run(strings.Join(command, "-")+"-missing", func(t *testing.T) {
 				args := append(append([]string(nil), command...), "-C", missing, "--json")
-				assertCLIFailure(t, args, ExitUsage, "usage")
+				assertCLIFailure(t, args, ExitUsage, "discovery")
 			})
 			t.Run(strings.Join(command, "-")+"-invalid", func(t *testing.T) {
 				args := append(append([]string(nil), command...), "-C", invalid, "--json")
-				assertCLIFailure(t, args, ExitUsage, "usage")
+				assertCLIFailure(t, args, ExitUsage, "config")
 			})
+		}
+		stdout, _, code := runCLI([]string{"status", "-C", missing, "--json"})
+		if code != ExitUsage || !strings.Contains(stdout, `"class":"discovery"`) || !strings.Contains(stdout, `"result":null`) {
+			t.Fatalf("status discovery envelope code=%d stdout=%q", code, stdout)
 		}
 	})
 
@@ -818,9 +841,10 @@ func TestMainP1P3SelectionAndWorkspaceFailureMatrix(t *testing.T) {
 	assertCLISuccess(t, []string{"init", root, "--json"}, `"repositories_initialized":2`)
 
 	t.Run("implicit repository ambiguity is discovery", func(t *testing.T) {
+		assertCLIFailureNull(t, []string{"config", "show", "-C", root, "--json"}, ExitUsage, "discovery")
 		for _, command := range [][]string{{"add", "missing.rpm"}, {"rm", "missing-package"}, {"ls"}, {"show", "missing-package"}, {"status"}, {"build"}, {"check"}, {"changes", "0"}, {"log"}, {"log", "prune", "2000-01-01T00:00:00Z"}} {
 			args := append(append([]string(nil), command...), "-C", root, "--json")
-			assertCLIFailure(t, args, ExitUsage, "usage")
+			assertCLIFailure(t, args, ExitUsage, "discovery")
 		}
 	})
 
@@ -834,7 +858,7 @@ func TestMainP1P3SelectionAndWorkspaceFailureMatrix(t *testing.T) {
 	t.Run("mutation dist ambiguity is discovery and explicit miss is rejected", func(t *testing.T) {
 		for _, command := range [][]string{{"add", "missing.rpm"}, {"rm", "missing-package"}, {"ls"}} {
 			implicit := append(append([]string(nil), command...), "-C", root, "-r", "alpha", "--json")
-			assertCLIFailure(t, implicit, ExitUsage, "usage")
+			assertCLIFailure(t, implicit, ExitUsage, "discovery")
 			explicit := append(append([]string(nil), command...), "-C", root, "-r", "alpha", "-d", "missing", "--json")
 			assertCLIFailure(t, explicit, ExitRejected, "rejected")
 		}
@@ -968,5 +992,15 @@ func assertCLIFailure(t *testing.T, args []string, code int, class string) {
 		if !strings.Contains(stdout, `"ok":false`) || !strings.Contains(stdout, `"code":`+strconv.Itoa(code)) || !strings.Contains(stdout, `"class":"`+class+`"`) {
 			t.Fatalf("args=%q malformed failure envelope: %s", args, stdout)
 		}
+	}
+}
+
+func assertCLIFailureNull(t *testing.T, args []string, code int, class string) {
+	t.Helper()
+	stdout, stderr, got := runCLI(args)
+	if got != code || stderr == "" || !strings.Contains(stdout, `"ok":false`) ||
+		!strings.Contains(stdout, `"code":`+strconv.Itoa(code)) || !strings.Contains(stdout, `"class":"`+class+`"`) ||
+		!strings.Contains(stdout, `"result":null`) {
+		t.Fatalf("args=%q expected null-result failure: code=%d want=%d stdout=%q stderr=%q", args, got, code, stdout, stderr)
 	}
 }

@@ -91,6 +91,126 @@ func TestOpenExistingForMigrationAddsReverseMembershipIndexesToV8(t *testing.T) 
 	assertMembershipReverseIndexes(t, store.DB())
 }
 
+func TestV11MigrationRepairsRepositoryProjectionStatus(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "repo.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddDist(ctx, Dist{
+		Name: "el9", Format: "rpm", EffectiveConfigSHA256: "cfg", BuiltGeneration: 0,
+		Architectures: []Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}},
+	}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	digest := strings.Repeat("7", 64)
+	object := PackageObject{
+		SHA256: digest, Format: "rpm", Coordinate: "pkg-0:1-1.x86_64", Architecture: "x86_64", CanonicalArch: "x86_64",
+		PoolPath: "pool/p/pkg/pkg-1-1.x86_64.rpm", Filename: "pkg-1-1.x86_64.rpm", Size: 1,
+		Name: "pkg", Source: "pkg", Version: "1", Release: "1", Kind: "main", Storage: "pending",
+	}
+	operationID := strings.Repeat("8", 64)
+	if err := store.BeginOperation(ctx, Operation{ID: operationID, Kind: "add", State: OperationPlanned, PayloadJSON: `{}`}); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.SetOperationState(ctx, operationID, OperationStaged, ""); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyDesiredMutation(ctx, operationID, []PackageObject{object}, map[string][]string{"el9": {digest}}, `{}`); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if summary, err := store.Summary(ctx); err != nil || summary.Status != "dirty" {
+		store.Close()
+		t.Fatalf("dirty v11 fixture summary=%#v err=%v", summary, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=rw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE repository_state SET status = 'clean', dirty_reason = NULL WHERE singleton = 1`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	downgradeV11FixtureToV10(t, db)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := OpenExisting(path); !errors.Is(err, ErrSchema) {
+		t.Fatalf("ordinary writer crossed explicit v10 migration boundary: %v", err)
+	}
+	migrated, err := OpenExistingForMigration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	if summary, err := migrated.Summary(ctx); err != nil || summary.Status != "dirty" || summary.DirtyReason == "" {
+		t.Fatalf("migrated projection summary=%#v err=%v", summary, err)
+	}
+	if err := migrated.Check(ctx); err != nil {
+		t.Fatalf("repaired v10 database remains invalid: %v", err)
+	}
+}
+
+func downgradeV11FixtureToV10(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.Exec(`
+PRAGMA foreign_keys = OFF;
+CREATE TEMP TABLE generation_view_signers_fixture AS
+SELECT generation, view_id, signer_identity, trusted_public_key FROM generation_view_signers;
+DROP TABLE generation_view_signers;
+CREATE TABLE generation_view_signers (
+    generation TEXT NOT NULL REFERENCES "generations"(generation) ON DELETE CASCADE,
+    view_id TEXT NOT NULL,
+    signer_identity TEXT NOT NULL CHECK (
+        signer_identity = 'none' OR (
+            length(signer_identity) = 64
+            AND signer_identity = lower(signer_identity)
+            AND signer_identity NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    trusted_public_key BLOB CHECK (
+        (signer_identity = 'none' AND trusted_public_key IS NULL)
+        OR (signer_identity != 'none' AND length(trusted_public_key) BETWEEN 1 AND 16777216)
+    ),
+    PRIMARY KEY (generation, view_id)
+) WITHOUT ROWID;
+INSERT INTO generation_view_signers(generation, view_id, signer_identity, trusted_public_key)
+SELECT generation, view_id, signer_identity, trusted_public_key FROM generation_view_signers_fixture;
+DROP TABLE generation_view_signers_fixture;
+DELETE FROM schema_migrations WHERE version = 11;
+PRAGMA user_version = 10;
+PRAGMA foreign_keys = ON;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := expectedSchemaObjects(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := readSchemaObjects(context.Background(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameSchemaObjects(got, want) {
+		for index := range min(len(got), len(want)) {
+			if got[index] != want[index] {
+				t.Fatalf("downgraded v10 schema object %d differs\ngot:  %#v\nwant: %#v", index, got[index], want[index])
+			}
+		}
+		t.Fatalf("downgraded v10 schema object count=%d want=%d", len(got), len(want))
+	}
+}
+
 func TestMembershipReverseIndexesCoverObjectLookup(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "repo.db"))
 	if err != nil {
@@ -1433,7 +1553,7 @@ func assertSchemaV2(t *testing.T, db *sql.DB) {
 		t.Fatalf("user_version=%d want=%d", version, SchemaVersion)
 	}
 	var migrationCount int
-	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE (version = 1 AND checksum = ?) OR (version = 2 AND checksum = ?) OR (version = 3 AND checksum = ?) OR (version = 4 AND checksum = ?) OR (version = 5 AND checksum = ?) OR (version = 6 AND checksum = ?) OR (version = 7 AND checksum = ?) OR (version = 8 AND checksum = ?) OR (version = 9 AND checksum = ?) OR (version = 10 AND checksum = ?)`, SchemaV1SHA256, SchemaV2SHA256, SchemaV3SHA256, SchemaV4SHA256, SchemaV5SHA256, SchemaV6SHA256, SchemaV7SHA256, SchemaV8SHA256, SchemaV9SHA256, SchemaV10SHA256).Scan(&migrationCount); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE (version = 1 AND checksum = ?) OR (version = 2 AND checksum = ?) OR (version = 3 AND checksum = ?) OR (version = 4 AND checksum = ?) OR (version = 5 AND checksum = ?) OR (version = 6 AND checksum = ?) OR (version = 7 AND checksum = ?) OR (version = 8 AND checksum = ?) OR (version = 9 AND checksum = ?) OR (version = 10 AND checksum = ?) OR (version = 11 AND checksum = ?)`, SchemaV1SHA256, SchemaV2SHA256, SchemaV3SHA256, SchemaV4SHA256, SchemaV5SHA256, SchemaV6SHA256, SchemaV7SHA256, SchemaV8SHA256, SchemaV9SHA256, SchemaV10SHA256, SchemaV11SHA256).Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
 	if migrationCount != SchemaVersion {

@@ -107,6 +107,22 @@ func TestClassifyError(t *testing.T) {
 	if got := ClassifyError(nil); got != (CLIError{}) {
 		t.Fatalf("ClassifyError(nil)=%#v", got)
 	}
+	for _, test := range []struct {
+		err   error
+		class string
+	}{
+		{Errorf(ErrDiscovery, "workspace absent"), "discovery"},
+		{Errorf(ErrConfig, "schema invalid"), "config"},
+	} {
+		got := ClassifyError(test.err)
+		if got.Code != ExitUsage || got.Class != test.class {
+			t.Fatalf("ClassifyError(%v)=%#v", test.err, got)
+		}
+		var output bytes.Buffer
+		if err := WriteJSON(&output, NewEnvelope("status", nil, nil, nil, test.err)); err != nil || !bytes.Contains(output.Bytes(), []byte(`"class":"`+test.class+`"`)) {
+			t.Fatalf("write %s class output=%s err=%v", test.class, output.Bytes(), err)
+		}
+	}
 }
 
 type failingWriter struct{ err error }

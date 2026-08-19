@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,6 +24,13 @@ import (
 
 const maxR2CredentialBytes = 64 << 10
 
+const (
+	r2ImmutableCacheControl = "public, max-age=31536000, immutable"
+	r2PointerCacheControl   = "no-cache, must-revalidate"
+	publicResponseTimeout   = 2 * time.Minute
+	publicTransientWindow   = 30 * time.Second
+)
+
 type r2CredentialDocument struct {
 	AccessKeyID     string `json:"access_key_id"`
 	SecretAccessKey string `json:"secret_access_key"`
@@ -33,13 +41,45 @@ type r2PublicationObjectClient interface {
 	ListObjectsV2Prefix(context.Context, string, string) (r2.ObjectListPage, error)
 	Head(context.Context, string) (r2.ObjectInfo, error)
 	OpenObject(context.Context, string) (r2.ObjectContent, error)
-	Put(context.Context, string, io.Reader, int64, string, r2.PutCondition) (string, error)
+	Put(context.Context, string, r2.ReadSeekReaderAt, int64, string, r2.PutCondition) (string, error)
+}
+
+type managedContextReadSeekAt struct {
+	ctx    context.Context
+	source r2.ReadSeekReaderAt
+}
+
+func (r *managedContextReadSeekAt) Read(buffer []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.source.Read(buffer)
+}
+
+func (r *managedContextReadSeekAt) ReadAt(buffer []byte, offset int64) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.source.ReadAt(buffer, offset)
+}
+
+func (r *managedContextReadSeekAt) Seek(offset int64, whence int) (int64, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.source.Seek(offset, whence)
 }
 
 type r2PublicationBackend struct {
-	objects    r2PublicationObjectClient
-	prefix     string
-	publicBase *url.URL
+	objects               r2PublicationObjectClient
+	prefix                string
+	publicBase            *url.URL
+	publicClient          *http.Client
+	maxCacheTTL           time.Duration
+	transientRetryWindow  time.Duration
+	publicReadIdleTimeout time.Duration
+	verificationSleep     func(context.Context, time.Duration) error
+	verificationNow       func() time.Time
 }
 
 func newR2PublicationBackend(target config.TargetConfig) (*r2PublicationBackend, error) {
@@ -61,7 +101,18 @@ func newR2PublicationBackend(target config.TargetConfig) (*r2PublicationBackend,
 	if err != nil || publicBase.Scheme != "https" && publicBase.Scheme != "http" {
 		return nil, fmt.Errorf("%w: R2 public endpoint must be HTTP(S)", ErrRejected)
 	}
-	return &r2PublicationBackend{objects: client, prefix: target.Prefix, publicBase: publicBase}, nil
+	maxCacheTTL := time.Duration(0)
+	if target.MaxCacheTTL != "" {
+		maxCacheTTL, err = time.ParseDuration(target.MaxCacheTTL)
+		if err != nil || maxCacheTTL < 0 {
+			return nil, fmt.Errorf("%w: invalid R2 public cache TTL", ErrRejected)
+		}
+	}
+	return &r2PublicationBackend{
+		objects: client, prefix: target.Prefix, publicBase: publicBase,
+		publicClient: newPublicVerificationClient(), maxCacheTTL: maxCacheTTL,
+		transientRetryWindow: publicTransientWindow, publicReadIdleTimeout: publicResponseTimeout,
+	}, nil
 }
 
 func resolveR2Credentials(reference, region string) (r2.S3Credentials, error) {
@@ -212,7 +263,10 @@ func (b *r2PublicationBackend) Put(ctx context.Context, sourceRoot string, opera
 	if exists && current.Size == operation.Size && current.SHA256 == operation.SHA256 {
 		return current.RemoteIdentity, nil
 	}
-	condition := r2.PutCondition{}
+	condition := r2.PutCondition{CacheControl: r2ImmutableCacheControl}
+	if mutableR2PublicationPath(operation) {
+		condition.CacheControl = r2PointerCacheControl
+	}
 	if operation.Operation == "add" {
 		if exists {
 			return "", fmt.Errorf("%w: create-only R2 object %q already exists with different identity", ErrIntegrity, operation.Path)
@@ -228,7 +282,7 @@ func (b *r2PublicationBackend) Put(ctx context.Context, sourceRoot string, opera
 	if err != nil {
 		return "", fmt.Errorf("%w: publication source %q is missing or unsafe: %v", ErrIntegrity, operation.Path, err)
 	}
-	etag, putErr := b.objects.Put(ctx, key, &managedContextReader{ctx: ctx, reader: source.file}, operation.Size, operation.SHA256, condition)
+	etag, putErr := b.objects.Put(ctx, key, &managedContextReadSeekAt{ctx: ctx, source: source.file}, operation.Size, operation.SHA256, condition)
 	closeErr := source.CloseVerified()
 	if putErr != nil || closeErr != nil {
 		if putErr != nil {
@@ -245,8 +299,65 @@ func (b *r2PublicationBackend) Put(ctx context.Context, sourceRoot string, opera
 	return installed.RemoteIdentity, nil
 }
 
+func mutableR2PublicationPath(operation state.PublicationPlanOperation) bool {
+	if operation.Phase == "pointer" {
+		return true
+	}
+	return operation.Phase == "metadata" && strings.HasPrefix(operation.Path, "dists/") &&
+		!strings.Contains(operation.Path, "/repodata/") && !strings.Contains(operation.Path, "/by-hash/")
+}
+
 func (b *r2PublicationBackend) VerifyPublic(ctx context.Context, expected state.GenerationFile) error {
-	return verifyHTTPPublicationObject(ctx, b.publicBase, expected)
+	client := b.publicClient
+	if client == nil {
+		client = newPublicVerificationClient()
+	}
+	now := b.nowVerification()
+	cacheDeadline := now.Add(b.maxCacheTTL)
+	transientDeadline := now.Add(b.transientRetryWindow)
+	backoff := 100 * time.Millisecond
+	for {
+		disposition, err := verifyHTTPPublicationObjectOnce(ctx, client, b.publicBase, expected, false, b.readIdleTimeout())
+		if err == nil {
+			return nil
+		}
+		deadline := transientDeadline
+		if disposition == publicVerificationStale {
+			deadline = cacheDeadline
+		}
+		if disposition == publicVerificationFatal || !b.nowVerification().Before(deadline) {
+			return err
+		}
+		if disposition == publicVerificationStale {
+			// A standards-compliant cache revalidates this same canonical cache
+			// key. Success is only an accelerator: the following ordinary GET must
+			// still prove what an unprivileged repository client observes.
+			_, _ = verifyHTTPPublicationObjectOnce(ctx, client, b.publicBase, expected, true, b.readIdleTimeout())
+		}
+		remaining := deadline.Sub(b.nowVerification())
+		wait := min(backoff, remaining)
+		if wait <= 0 {
+			return err
+		}
+		if sleepErr := b.sleepVerification(ctx, wait); sleepErr != nil {
+			return errors.Join(err, sleepErr)
+		}
+		backoff = min(2*backoff, 5*time.Second)
+	}
+}
+
+func (b *r2PublicationBackend) nowVerification() time.Time {
+	if b.verificationNow != nil {
+		return b.verificationNow()
+	}
+	return time.Now()
+}
+
+func (b *r2PublicationBackend) readIdleTimeout() time.Duration {
+	if b.publicReadIdleTimeout > 0 {
+		return b.publicReadIdleTimeout
+	}
+	return publicResponseTimeout
 }
 
 func (b *r2PublicationBackend) DeleteConditional(context.Context, state.PublicationCandidate) error {
@@ -257,30 +368,80 @@ func (b *r2PublicationBackend) VerifyPublicAbsent(context.Context, string) error
 	return fmt.Errorf("%w: R2 physical deletion is disabled", ErrRejected)
 }
 
-func verifyHTTPPublicationObject(ctx context.Context, base *url.URL, expected state.GenerationFile) error {
+type publicVerificationDisposition uint8
+
+const (
+	publicVerificationFatal publicVerificationDisposition = iota
+	publicVerificationTransient
+	publicVerificationStale
+)
+
+func newPublicVerificationClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = publicResponseTimeout
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func (b *r2PublicationBackend) sleepVerification(ctx context.Context, duration time.Duration) error {
+	if b.verificationSleep != nil {
+		return b.verificationSleep(ctx, duration)
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func verifyHTTPPublicationObjectOnce(ctx context.Context, client *http.Client, base *url.URL, expected state.GenerationFile, revalidate bool, readIdleTimeout time.Duration) (publicVerificationDisposition, error) {
+	if ctx == nil || client == nil || base == nil || expected.Size < 0 {
+		return publicVerificationFatal, fmt.Errorf("%w: invalid public verification input", ErrRejected)
+	}
 	u := *base
 	u.Path = strings.TrimSuffix(u.Path, "/") + "/" + expected.Path
 	u.RawPath, u.RawQuery, u.Fragment = "", "", ""
-	client := &http.Client{
-		Timeout:       2 * time.Minute,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
-	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return err
+		return publicVerificationFatal, err
+	}
+	if revalidate {
+		request.Header.Set("Cache-Control", "no-cache")
+		request.Header.Set("Pragma", "no-cache")
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return err
+		return publicVerificationTransient, err
 	}
+	response.Body = r2.NewIdleReadCloser(ctx, response.Body, readIdleTimeout)
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("%w: public GET %q returned %s", ErrIntegrity, expected.Path, response.Status)
+		disposition := publicVerificationFatal
+		if response.StatusCode == http.StatusNotFound {
+			disposition = publicVerificationStale
+		} else if response.StatusCode == http.StatusRequestTimeout || response.StatusCode == http.StatusTooEarly || response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= 500 {
+			disposition = publicVerificationTransient
+		}
+		return disposition, fmt.Errorf("%w: public GET %q returned %s", ErrIntegrity, expected.Path, response.Status)
 	}
 	hash := sha256.New()
-	size, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: io.LimitReader(response.Body, expected.Size+1)})
-	if err != nil || size != expected.Size || hex.EncodeToString(hash.Sum(nil)) != expected.SHA256 {
-		return errors.Join(fmt.Errorf("%w: public GET content differs for %q", ErrIntegrity, expected.Path), err)
+	limit := expected.Size
+	if limit < math.MaxInt64 {
+		limit++
 	}
-	return nil
+	size, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: io.LimitReader(response.Body, limit)})
+	if err != nil {
+		return publicVerificationTransient, errors.Join(fmt.Errorf("%w: public GET failed while reading %q", ErrIntegrity, expected.Path), err)
+	}
+	if size != expected.Size || hex.EncodeToString(hash.Sum(nil)) != expected.SHA256 {
+		return publicVerificationStale, fmt.Errorf("%w: public GET content differs for %q", ErrIntegrity, expected.Path)
+	}
+	return publicVerificationFatal, nil
 }

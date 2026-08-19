@@ -14,8 +14,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-# Normal CI remains local and secret-free. Networked client and S3 tests live
-# in integration.yml.
+# Normal CI remains secret-free. Live service compatibility tests that require
+# external credentials live in integration.yml; quality gates may download
+# pinned modules and the public vulnerability database.
 env:
   AWS_EC2_METADATA_DISABLED: "true"
 
@@ -51,6 +52,15 @@ jobs:
           go install "golang.org/x/tools/cmd/deadcode@${deadcode_version}"
           PATH="$(go env GOPATH)/bin:${PATH}" make deadcode DEADCODE_VERSION="${deadcode_version}"
 
+      - name: Vulnerability reachability
+        run: |
+          govulncheck_version="$(make --no-print-directory govulncheck-version)"
+          go install "golang.org/x/vuln/cmd/govulncheck@${govulncheck_version}"
+          PATH="$(go env GOPATH)/bin:${PATH}" make vuln GOVULNCHECK_VERSION="${govulncheck_version}"
+
+      - name: Verify patched RPM provenance
+        run: make verify-rpm-upstream
+
       - name: Compile performance contracts and verify fixtures
         run: make test-perf-contract
 
@@ -83,7 +93,7 @@ jobs:
   race:
     name: Core Race Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7

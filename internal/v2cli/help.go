@@ -281,30 +281,121 @@ Options:
 `,
 	"add": `Usage:
   sow add PATH... [-R|--recursive] [--skip] [-j|--jobs N] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [-T|--timeout DUR | -N|--no-wait] [--json]
+
+Arguments:
+  PATH                  RPM/DEB file or directory to ingest
+
+Options:
+  -R, --recursive       Recursively discover packages below directory inputs
+      --skip            Commit Desired membership without building
+  -j, --jobs N          Parallel package inspection/render workers
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -d, --dist NAME       Select a Dist; repeatable
+  -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely
+  -N, --no-wait         Fail immediately when the lock is held
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"rm": `Usage:
   sow rm PACKAGE... [-c|--check] [--skip] [-j|--jobs N] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [-T|--timeout DUR | -N|--no-wait] [--json]
+
+Arguments:
+  PACKAGE               Package name, coordinate, or sha256 reference
+
+Options:
+  -c, --check           Read-only exact preview of the immediate build
+      --skip            Commit Desired removal without building
+  -j, --jobs N          Parallel package inspection/render workers
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -d, --dist NAME       Select a Dist; repeatable
+  -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely
+  -N, --no-wait         Fail immediately when the lock is held
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"ls": `Usage:
   sow ls [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [--json]
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -d, --dist NAME       Select a Dist; repeatable
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"show": `Usage:
   sow show PACKAGE [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [--json]
+
+Arguments:
+  PACKAGE               Unambiguous package name, coordinate, or sha256 reference
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -d, --dist NAME       Limit lookup to a Dist; repeatable
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"where": `Usage:
   sow where PACKAGE [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [--json]
+
+Arguments:
+  PACKAGE               Package name, coordinate, or sha256 reference
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Limit lookup to one repository
+  -d, --dist NAME       Limit lookup to a Dist; repeatable
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"status": `Usage:
   sow status [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [--json]
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -d, --dist NAME       Scope dirty/readiness status; repeatable
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"build": `Usage:
   sow build [-j|--jobs N] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [-T|--timeout DUR | -N|--no-wait] [--json]
+
+Options:
+  -j, --jobs N          Parallel package inspection/render workers
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -d, --dist NAME       Converge only the selected Dist; repeatable
+  -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely
+  -N, --no-wait         Fail immediately when the lock is held
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"check": `Usage:
   sow check [-j|--jobs N] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [--json]
+
+Options:
+  -j, --jobs N          Parallel package validation workers
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -d, --dist NAME       Validate only the selected Dist; repeatable
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"changes": `Usage:
   sow changes [BASE_GENERATION] [-C|--workdir DIR] [-r|--repo NAME] [--json]
+
+Arguments:
+  BASE_GENERATION       Optional decimal Generation; default is the predecessor
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"publish": `Usage:
   sow publish TARGET [--abort] [-C|--workdir DIR] [-T|--timeout DUR | -N|--no-wait] [--json]
@@ -332,12 +423,40 @@ Use "sow help retain COMMAND" for command help.
 `,
 	"retain add": `Usage:
   sow retain add GENERATION [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json]
+
+Arguments:
+  GENERATION            Current verified Built Generation
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely
+  -N, --no-wait         Fail immediately when the lock is held
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"retain ls": `Usage:
   sow retain ls [-C|--workdir DIR] [-r|--repo NAME] [--json]
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"retain rm": `Usage:
   sow retain rm GENERATION [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json]
+
+Arguments:
+  GENERATION            Retained Generation to remove
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely
+  -N, --no-wait         Fail immediately when the lock is held
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"gc": `Usage:
   sow gc [TARGET] [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json]
@@ -348,17 +467,57 @@ Arguments:
 Target behavior:
   Filesystem targets conditionally delete only after grace and absence receipts.
   R2 targets persist exact retained-candidate reports and never delete objects.
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository for local GC
+  -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely
+  -N, --no-wait         Fail immediately when the lock is held
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"log": `Usage:
   sow log [OPERATION] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME] [--json]
   sow log export [FILE] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]
   sow log prune BEFORE [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json]
+
+Arguments:
+  OPERATION             Optional operation ID for full detail
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -d, --dist NAME       Filter operations by one Dist
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
+
+Use "sow help log export" or "sow help log prune" for subcommand options.
 `,
 	"log export": `Usage:
   sow log export [FILE] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]
+
+Arguments:
+  FILE                  Output JSONL path; default '-' writes stdout
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -d, --dist NAME       Export operations touching one Dist
+  -h, --help            Show help
 `,
 	"log prune": `Usage:
   sow log prune BEFORE [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json]
+
+Arguments:
+  BEFORE                YYYY-MM-DD or RFC 3339 cutoff
+
+Options:
+  -C, --workdir DIR     Workspace discovery start directory
+  -r, --repo NAME       Select a repository
+  -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely
+  -N, --no-wait         Fail immediately when the lock is held
+      --json            Emit the versioned JSON envelope
+  -h, --help            Show help
 `,
 	"help": `Usage:
   sow help [COMMAND [SUBCOMMAND]]

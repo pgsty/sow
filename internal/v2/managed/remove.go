@@ -78,9 +78,16 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 		return result, err
 	}
 	result.Removed, result.Dists = removed, distNames
-	buildDists, err := changedDesiredDists(ctx, store, desired)
+	desiredChangedDists, err := changedDesiredDists(ctx, store, desired)
 	if err != nil {
 		return result, err
+	}
+	buildDists := append([]string(nil), desiredChangedDists...)
+	if !opts.Skip {
+		buildDists, err = distsNeedingBuild(ctx, ws.Root, repoName, cfg, store, desired)
+		if err != nil {
+			return result, err
+		}
 	}
 	manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"removed": len(removed)}}
 	var preflight *mutationBuildPreflight
@@ -147,8 +154,8 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 		}
 		return result, err
 	}
-	if !sameStringSet(mutation.ChangedDists, payload.BuildDists) {
-		return result, fmt.Errorf("%w: applied remove Dist changes differ from its staged build scope", ErrIntegrity)
+	if !sameStringSet(mutation.ChangedDists, desiredChangedDists) {
+		return result, fmt.Errorf("%w: applied remove Dist changes differ from its staged Desired change set", ErrIntegrity)
 	}
 	for _, object := range mutation.DroppedPending {
 		if err := removePendingObject(ws.Root, repoName, object); err != nil {
@@ -213,6 +220,9 @@ func previewRemove(ctx context.Context, opts RemoveOptions) (result RemoveResult
 		return result, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
+	if _, err := checkConfigAtRootForLockedRepository(ctx, ws.Root, cfg, repoName, signingFormatMask{}); err != nil {
+		return result, err
+	}
 	pending, err := store.PendingOperations(ctx)
 	if err != nil || len(pending) != 0 {
 		return result, fmt.Errorf("%w: repository has an operation pending recovery", ErrIntegrity)
@@ -319,8 +329,10 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 		return nil, err
 	}
 	target := make(map[string]state.GenerationFile, len(base))
+	baseByPath := make(map[string]state.GenerationFile, len(base))
 	for _, file := range base {
 		target[file.Path] = file
+		baseByPath[file.Path] = file
 	}
 	previewRoot, err := os.MkdirTemp("", "sow-rm-check-")
 	if err != nil {
@@ -377,7 +389,7 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 			}
 		}
 		if dist.Format == "rpm" {
-			if err := previewRPMDist(ctx, filepath.Join(root, repoName), previewRoot, distName, nextGeneration, publicationTime, architectures, sources, rpmSigner, jobs, base, target); err != nil {
+			if err := previewRPMDist(ctx, filepath.Join(root, repoName), previewRoot, distName, nextGeneration, publicationTime, architectures, dist.Architectures, sources, rpmSigner, jobs, base, target); err != nil {
 				return nil, err
 			}
 			continue
@@ -387,15 +399,27 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 		if err != nil {
 			return nil, err
 		}
-		if err := retainPriorAPTByHash(ctx, filepath.Join(root, repoName, "dists", distName), rendered.Path, architectures); err != nil {
-			return nil, err
-		}
 		files, err := scanPreviewFiles(ctx, rendered.Path, distPrefix)
 		if err != nil {
 			return nil, err
 		}
 		for _, file := range files {
 			target[file.Path] = file
+		}
+		priorByHash, err := priorAPTByHashObjects(ctx, filepath.Join(root, repoName, "dists", distName), dist.Architectures)
+		if err != nil {
+			return nil, err
+		}
+		for _, object := range priorByHash {
+			path := distPrefix + object.targetRelative
+			file, exists := baseByPath[path]
+			if !exists || file.Phase != "metadata" || file.Size != object.size || file.SHA256 != object.digest {
+				return nil, fmt.Errorf("%w: prior APT by-hash object %q is absent from current Generation", ErrIntegrity, path)
+			}
+			if rendered, exists := target[path]; exists && rendered != file {
+				return nil, fmt.Errorf("%w: APT by-hash preview collision for %q", ErrIntegrity, path)
+			}
+			target[path] = file
 		}
 	}
 	targetManifest := make([]state.GenerationFile, 0, len(target))
@@ -406,12 +430,12 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 	return state.DiffManifests(base, targetManifest), nil
 }
 
-func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName string, generation state.GenerationID, publicationTime time.Time, architectures []state.Architecture, sources []ManagedPackageSource, signer yumrepo.DetachedSigner, jobs int, base []state.GenerationFile, target map[string]state.GenerationFile) error {
+func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName string, generation state.GenerationID, publicationTime time.Time, architectures, builtArchitectures []state.Architecture, sources []ManagedPackageSource, signer yumrepo.DetachedSigner, jobs int, base []state.GenerationFile, target map[string]state.GenerationFile) error {
 	baseByPath := make(map[string]state.GenerationFile, len(base))
 	for _, file := range base {
 		baseByPath[file.Path] = file
 	}
-	for _, architecture := range architectures {
+	for _, architecture := range builtArchitectures {
 		priorRoot := filepath.Join(repositoryRoot, "dists", distName, architecture.Family, "repodata")
 		var prior *yumrepo.Generation
 		var err error

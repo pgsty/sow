@@ -2,6 +2,55 @@
 
 All notable changes to SOW are recorded here.
 
+## Unreleased
+
+- Added schema v11 and an explicit `sow repo migrate` repair for the v0.3 Dist
+  lifecycle bug that could mark a Repository clean while another Dist remained
+  dirty. Repository status is now always derived in the committing transaction.
+  The migration also removes stale abandoned-object evidence from resurrected
+  attempts. Missing signed historical identities are represented explicitly as
+  unverified rather than guessed; they cannot reach the current head, propagate
+  to a successor, or become a retained trust assertion.
+- Fixed incremental publication recovery after commit intent. Every pointer may
+  contain its exact old checkpoint or target Generation bytes during replay;
+  unknown, missing, or third identities still fail closed. Re-abandoning a
+  resurrected pre-commit attempt is idempotent, and Target GC recognizes but
+  never deletes abandoned add-only evidence.
+- Made R2 publication resilient to slow and transient networks: phase-specific
+  HTTP timeouts replace the two-minute whole-request deadline, replayable
+  conditional writes and read operations use standard retries, stalled uploads
+  and response bodies are canceled by idle-progress deadlines, and large
+  objects use bounded conditional multipart upload. Transient public 5xx
+  retries use a short fixed window; only stale content waits up to cache TTL.
+  Mutable pointers/aliases now request revalidation while immutable objects get
+  long-lived cache metadata. Public verification waits within `max_cache_ttl`
+  on the canonical URL and rechecks ordinary client visibility.
+- Reduced routine publication verification from full public-Generation download
+  to the exact change set. No-op and applied-checkpoint recovery reuse complete
+  private inventory evidence, while Target GC streams only protocol pointers;
+  full storage inventory reconciliation remains fail-closed.
+- Made Generation RPM signer rows an exact manifest side table across initial
+  Dist creation, partial builds, Dist add/remove, layout migration, and local
+  GC. Heterogeneous key rotations remain faithfully represented and retained/v1
+  rejects them instead of asserting a false common signer.
+- Made default repeated `add` converge a previously skipped or config-dirty
+  selected Dist. Crash recovery retains the requested build concurrency while
+  remaining compatible with older journals. `rm --check` now shares the
+  mutating configuration guard, uses Built architectures for prior RPM and APT
+  metadata retention while rendering configured architectures, and is
+  independent of the scratch filesystem device.
+- Added human renderers for every managed command, distinct discovery/config
+  JSON error classes, null results before meaningful work while preserving
+  committed/partial/diagnostic results, and complete leaf command option help.
+  Root and nested-module `govulncheck`, RPM fork provenance, and both test-aware
+  and Linux-amd64-pinned binary-reachability dead-code gates now run in CI.
+- Increased the race-test package and CI job ceilings without reducing default
+  coverage, preserving headroom for the expanded publication and migration
+  fault matrices.
+- Removed the retired 3,058-line APT v1 build, external-sort, empty-Dist, and
+  Git-tracked by-hash ledger implementation together with its self-only tests.
+  Package parsing and the Plain/Managed APT render paths remain covered.
+
 ## 0.3.0 - 2026-08-10
 
 - Removed the retired V1 CLI/runtime, cloud/CDN publication saga, Edge worker,

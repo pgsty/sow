@@ -240,7 +240,7 @@ func verifyTargetMaintenanceInventory(ctx context.Context, store *state.Store, b
 	if target.Head.CheckpointIdentity == "" {
 		return fmt.Errorf("%w: target maintenance has no applied checkpoint", ErrIntegrity)
 	}
-	if err := verifyPublishedGeneration(ctx, backend, store, target.Head.Generation, target.Head.ManifestSHA256); err != nil {
+	if err := verifyPublishedPointers(ctx, backend, store, target.Head.Generation, target.Head.ManifestSHA256); err != nil {
 		return err
 	}
 	expected, err := store.PublicationLiveInventory(ctx, target.Head.CheckpointIdentity)
@@ -248,6 +248,14 @@ func verifyTargetMaintenanceInventory(ctx context.Context, store *state.Store, b
 		return err
 	}
 	remote, err := backend.List(ctx, nil)
+	if err != nil {
+		return err
+	}
+	abandoned, err := store.ListPublicationAbandonedObjects(ctx, targetIdentity)
+	if err != nil {
+		return err
+	}
+	expected, err = recognizePublicationAbandonedObjects(remote, expected, abandoned)
 	if err != nil {
 		return err
 	}

@@ -18,7 +18,11 @@ trap cleanup EXIT
 # a second, unauthenticated source of truth. Disable the network checksum
 # service so a local read-only module proxy can reproduce the comparison; the
 # downloaded zip must still match the fixed h1 before bytewise verification.
-metadata="$(GOWORK=off GOSUMDB=off GOMODCACHE="$upstream_cache" go mod download -json "${module}@${version}")"
+if ! metadata="$(GOWORK=off GOSUMDB=off GOMODCACHE="$upstream_cache" go mod download -json "${module}@${version}" 2>&1)"; then
+  echo 'unable to download pinned upstream RPM module:' >&2
+  printf '%s\n' "$metadata" >&2
+  exit 1
+fi
 upstream_root="$(printf '%s\n' "$metadata" | sed -n 's/^[[:space:]]*"Dir": "\(.*\)",$/\1/p')"
 actual_sum="$(printf '%s\n' "$metadata" | sed -n 's/^[[:space:]]*"Sum": "\(.*\)",$/\1/p')"
 if [[ -z "$upstream_root" || ! -d "$upstream_root" ]]; then

@@ -3,6 +3,8 @@ package r2
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -13,9 +15,12 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsretry "github.com/aws/aws-sdk-go-v2/aws/retry"
 	awsv4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -26,12 +31,24 @@ const (
 	maxListResponseSize  = 16 << 20
 	maxErrorResponseSize = 1 << 20
 	maxListPageKeys      = 1000
+	defaultMultipartAt   = 100 << 20
+	defaultPartSize      = 64 << 20
+	minimumPartSize      = 5 << 20
+	maximumPartSize      = 5 << 30
+	maximumMultipartSize = (5 << 40) - (5 << 30)
+	maximumParts         = 10000
+	responseHeaderLimit  = 2 * time.Minute
+	uploadProgressLimit  = 2 * time.Minute
 )
 
 var (
 	credentialIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,256}$`)
 	regionPattern       = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
 	copyBucketPattern   = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	errUploadNoProgress = errors.New("R2 upload made no progress before its idle deadline")
+	// ErrReadNoProgress reports a response body that stopped delivering bytes
+	// while its request remained otherwise live.
+	ErrReadNoProgress = errors.New("R2 response made no progress before its idle deadline")
 )
 
 type S3Credentials struct {
@@ -62,8 +79,11 @@ func safeHeaderSecret(value string, maximum int) bool {
 }
 
 type signedObjectHTTP struct {
-	sdk    *s3.Client
-	bucket string
+	sdk                  *s3.Client
+	bucket               string
+	multipartThreshold   int64
+	multipartMinPartSize int64
+	noProgressTimeout    time.Duration
 }
 
 func newSignedObjectHTTP(rawBase, configuredBucket string, credentials S3Credentials, client *http.Client, allowInsecure bool) (*signedObjectHTTP, error) {
@@ -75,7 +95,7 @@ func newSignedObjectHTTP(rawBase, configuredBucket string, credentials S3Credent
 		return nil, err
 	}
 	httpClient := cloneNoRedirectClient(client)
-	doer := &s3SDKHTTPClient{client: httpClient}
+	doer := &s3SDKHTTPClient{client: httpClient, readIdleTimeout: uploadProgressLimit}
 	provider := aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
 		return aws.Credentials{
 			AccessKeyID: credentials.AccessKeyID, SecretAccessKey: credentials.SecretAccessKey,
@@ -84,17 +104,19 @@ func newSignedObjectHTTP(rawBase, configuredBucket string, credentials S3Credent
 	})
 	awsConfig := aws.Config{
 		Region: credentials.Region, Credentials: provider, HTTPClient: doer,
-		Retryer: func() aws.Retryer { return aws.NopRetryer{} }, BaseEndpoint: aws.String(endpoint.String()),
+		Retryer: func() aws.Retryer { return awsretry.NewStandard() }, BaseEndpoint: aws.String(endpoint.String()),
 		RequestChecksumCalculation: aws.RequestChecksumCalculationWhenRequired,
 		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	}
 	clientSDK := s3.NewFromConfig(awsConfig, func(options *s3.Options) {
 		options.UsePathStyle = usePathStyle
-		options.Retryer = aws.NopRetryer{}
 		options.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		options.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
-	return &signedObjectHTTP{sdk: clientSDK, bucket: bucket}, nil
+	return &signedObjectHTTP{
+		sdk: clientSDK, bucket: bucket, multipartThreshold: defaultMultipartAt,
+		multipartMinPartSize: defaultPartSize, noProgressTimeout: uploadProgressLimit,
+	}, nil
 }
 
 func (c *signedObjectHTTP) head(ctx context.Context, key string) (ObjectInfo, error) {
@@ -192,13 +214,30 @@ func (c *signedObjectHTTP) listObjectsV2Prefix(ctx context.Context, prefix, cont
 	return page, nil
 }
 
-func (c *signedObjectHTTP) put(ctx context.Context, key string, body io.Reader, size int64, sha string, ifMatch string, createOnly bool) (string, error) {
+func (c *signedObjectHTTP) put(ctx context.Context, key string, body ReadSeekReaderAt, size int64, sha string, ifMatch string, createOnly bool, cacheControl string) (string, error) {
 	if body == nil || size < 0 || !hexSHA256Pattern.MatchString(sha) || validateRemoteKey(key) != nil {
 		return "", errors.New("invalid remote object size or sha256")
 	}
+	if position, err := body.Seek(0, io.SeekStart); err != nil || position != 0 {
+		return "", errors.Join(errors.New("rewind R2 upload source"), err)
+	}
+	if size > maximumMultipartSize {
+		return "", fmt.Errorf("%w: object size %d exceeds the R2 multipart limit", ErrCapability, size)
+	}
+	if size > c.multipartThreshold {
+		return c.putMultipart(ctx, key, body, size, sha, ifMatch, createOnly, cacheControl)
+	}
+	return c.putSingle(ctx, key, body, size, sha, ifMatch, createOnly, cacheControl)
+}
+
+func (c *signedObjectHTTP) putSingle(ctx context.Context, key string, body ReadSeekReaderAt, size int64, sha, ifMatch string, createOnly bool, cacheControl string) (string, error) {
+	requestCtx, monitored, finish := monitorUploadProgress(ctx, body, c.noProgressTimeout)
 	input := &s3.PutObjectInput{
-		Bucket: aws.String(c.bucket), Key: aws.String(key), Body: body, ContentLength: aws.Int64(size),
+		Bucket: aws.String(c.bucket), Key: aws.String(key), Body: monitored, ContentLength: aws.Int64(size),
 		Metadata: map[string]string{"sow-sha256": sha},
+	}
+	if cacheControl != "" {
+		input.CacheControl = aws.String(cacheControl)
 	}
 	if ifMatch != "" {
 		input.IfMatch = aws.String(ifMatch)
@@ -206,25 +245,217 @@ func (c *signedObjectHTTP) put(ctx context.Context, key string, body io.Reader, 
 	if createOnly {
 		input.IfNoneMatch = aws.String("*")
 	}
-	response, err := c.sdk.PutObject(ctx, input, withS3RequestContract(sha))
+	response, err := c.sdk.PutObject(requestCtx, input, withS3RequestContract(sha))
+	if finishErr := finish(); finishErr != nil {
+		err = errors.Join(err, finishErr)
+	}
 	if err != nil {
-		status := s3HTTPStatus(err)
-		if status == http.StatusPreconditionFailed || status == http.StatusConflict {
-			if createOnly {
-				return "", ErrAlreadyExists
-			}
-			return "", ErrConflict
-		}
-		if status == http.StatusNotImplemented {
-			return "", ErrCapability
-		}
-		return "", err
+		return "", classifyPutError(err, createOnly)
 	}
 	etag := aws.ToString(response.ETag)
 	if etag == "" {
 		return "", fmt.Errorf("%w: object write response has no ETag", ErrCapability)
 	}
 	return etag, nil
+}
+
+func (c *signedObjectHTTP) putMultipart(ctx context.Context, key string, body ReadSeekReaderAt, size int64, sha, ifMatch string, createOnly bool, cacheControl string) (string, error) {
+	partSize, err := multipartPartSize(size, c.multipartMinPartSize)
+	if err != nil {
+		return "", err
+	}
+	createInput := &s3.CreateMultipartUploadInput{
+		Bucket: aws.String(c.bucket), Key: aws.String(key), Metadata: map[string]string{"sow-sha256": sha},
+	}
+	if cacheControl != "" {
+		createInput.CacheControl = aws.String(cacheControl)
+	}
+	created, err := c.sdk.CreateMultipartUpload(ctx, createInput)
+	if err != nil {
+		return "", err
+	}
+	uploadID := aws.ToString(created.UploadId)
+	if uploadID == "" || len(uploadID) > 16<<10 || strings.ContainsAny(uploadID, "\x00\r\n") {
+		return "", errors.Join(fmt.Errorf("%w: multipart create returned no bounded upload identity", ErrCapability), c.abortMultipart(key, uploadID))
+	}
+	abort := func(result error) (string, error) {
+		return "", errors.Join(result, c.abortMultipart(key, uploadID))
+	}
+	parts := make([]types.CompletedPart, 0, (size+partSize-1)/partSize)
+	for offset, partNumber := int64(0), int32(1); offset < size; offset, partNumber = offset+partSize, partNumber+1 {
+		length := min(partSize, size-offset)
+		section := io.NewSectionReader(body, offset, length)
+		partHash := sha256.New()
+		read, hashErr := io.Copy(partHash, section)
+		if hashErr != nil || read != length {
+			return abort(errors.Join(fmt.Errorf("hash multipart part %d: read %d of %d bytes", partNumber, read, length), hashErr))
+		}
+		partSHA := hex.EncodeToString(partHash.Sum(nil))
+		if _, err := section.Seek(0, io.SeekStart); err != nil {
+			return abort(err)
+		}
+		requestCtx, monitored, finish := monitorUploadProgress(ctx, section, c.noProgressTimeout)
+		uploaded, uploadErr := c.sdk.UploadPart(requestCtx, &s3.UploadPartInput{
+			Bucket: aws.String(c.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+			PartNumber: aws.Int32(partNumber), Body: monitored, ContentLength: aws.Int64(length),
+		}, withS3RequestContract(partSHA))
+		if finishErr := finish(); finishErr != nil {
+			uploadErr = errors.Join(uploadErr, finishErr)
+		}
+		if uploadErr != nil {
+			return abort(uploadErr)
+		}
+		etag := aws.ToString(uploaded.ETag)
+		if etag == "" {
+			return abort(fmt.Errorf("%w: multipart part %d returned no ETag", ErrCapability, partNumber))
+		}
+		parts = append(parts, types.CompletedPart{ETag: aws.String(etag), PartNumber: aws.Int32(partNumber)})
+	}
+	input := &s3.CompleteMultipartUploadInput{
+		Bucket: aws.String(c.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
+	}
+	if ifMatch != "" {
+		input.IfMatch = aws.String(ifMatch)
+	}
+	if createOnly {
+		input.IfNoneMatch = aws.String("*")
+	}
+	completed, err := c.sdk.CompleteMultipartUpload(ctx, input)
+	if err != nil {
+		return abort(classifyPutError(err, createOnly))
+	}
+	etag := aws.ToString(completed.ETag)
+	if etag == "" {
+		return "", fmt.Errorf("%w: multipart completion returned no ETag", ErrCapability)
+	}
+	return etag, nil
+}
+
+func (c *signedObjectHTTP) abortMultipart(key, uploadID string) error {
+	if uploadID == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := c.sdk.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+		Bucket: aws.String(c.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
+	})
+	return err
+}
+
+func multipartPartSize(size, preferred int64) (int64, error) {
+	if size <= 0 || size > maximumMultipartSize {
+		return 0, fmt.Errorf("%w: invalid multipart object size %d", ErrCapability, size)
+	}
+	if preferred <= 0 {
+		preferred = defaultPartSize
+	}
+	required := (size + maximumParts - 1) / maximumParts
+	partSize := max(preferred, required)
+	if partSize >= minimumPartSize {
+		const alignment = int64(1 << 20)
+		partSize = (partSize + alignment - 1) / alignment * alignment
+	}
+	if partSize > maximumPartSize || (size+partSize-1)/partSize > maximumParts {
+		return 0, fmt.Errorf("%w: object size %d cannot fit the R2 multipart limits", ErrCapability, size)
+	}
+	return partSize, nil
+}
+
+func classifyPutError(err error, createOnly bool) error {
+	status := s3HTTPStatus(err)
+	if status == http.StatusPreconditionFailed || status == http.StatusConflict {
+		if createOnly {
+			return ErrAlreadyExists
+		}
+		return ErrConflict
+	}
+	if status == http.StatusNotImplemented {
+		return ErrCapability
+	}
+	return err
+}
+
+type uploadProgressReadSeekAt struct {
+	source   ReadSeekReaderAt
+	progress chan<- struct{}
+}
+
+func (r *uploadProgressReadSeekAt) observed(count int) {
+	if count <= 0 {
+		return
+	}
+	select {
+	case r.progress <- struct{}{}:
+	default:
+	}
+}
+
+func (r *uploadProgressReadSeekAt) Read(buffer []byte) (int, error) {
+	count, err := r.source.Read(buffer)
+	r.observed(count)
+	return count, err
+}
+
+func (r *uploadProgressReadSeekAt) ReadAt(buffer []byte, offset int64) (int, error) {
+	count, err := r.source.ReadAt(buffer, offset)
+	r.observed(count)
+	return count, err
+}
+
+func (r *uploadProgressReadSeekAt) Seek(offset int64, whence int) (int64, error) {
+	position, err := r.source.Seek(offset, whence)
+	if err == nil {
+		r.observed(1)
+	}
+	return position, err
+}
+
+func monitorUploadProgress(ctx context.Context, source ReadSeekReaderAt, timeout time.Duration) (context.Context, ReadSeekReaderAt, func() error) {
+	if timeout <= 0 {
+		return ctx, source, func() error { return nil }
+	}
+	requestCtx, cancel := context.WithCancel(ctx)
+	progress := make(chan struct{}, 1)
+	done := make(chan struct{})
+	var stalled atomic.Bool
+	var finished atomic.Bool
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-progress:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(timeout)
+			case <-timer.C:
+				stalled.Store(true)
+				cancel()
+				return
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	finish := func() error {
+		if finished.CompareAndSwap(false, true) {
+			close(done)
+			cancel()
+		}
+		if stalled.Load() {
+			return errUploadNoProgress
+		}
+		return nil
+	}
+	return requestCtx, &uploadProgressReadSeekAt{source: source, progress: progress}, finish
 }
 
 type s3RequestContractMiddleware struct {
@@ -299,7 +530,8 @@ func splitS3BucketRoot(rawBase, configuredBucket string, allowInsecure bool) (*u
 }
 
 type s3SDKHTTPClient struct {
-	client *http.Client
+	client          *http.Client
+	readIdleTimeout time.Duration
 }
 
 type s3ResponseLimitError struct {
@@ -311,12 +543,16 @@ func (e *s3ResponseLimitError) Error() string {
 	return fmt.Sprintf("S3 SDK response exceeds safety limit (%d bytes)", e.maximum)
 }
 
-func (e *s3ResponseLimitError) HTTPStatusCode() int { return e.statusCode }
+func (e *s3ResponseLimitError) HTTPStatusCode() int  { return e.statusCode }
+func (e *s3ResponseLimitError) RetryableError() bool { return false }
 
 func (c *s3SDKHTTPClient) Do(request *http.Request) (*http.Response, error) {
 	response, err := c.client.Do(request)
 	if err != nil {
 		return nil, err
+	}
+	if response.Body != nil && c.readIdleTimeout > 0 {
+		response.Body = NewIdleReadCloser(request.Context(), response.Body, c.readIdleTimeout)
 	}
 	// net/http's real transport exposes Content-Length both in the parsed field
 	// and header. Preserve that observable wire value for protocol transports
@@ -363,6 +599,103 @@ func (c *s3SDKHTTPClient) Do(request *http.Request) (*http.Response, error) {
 	return response, nil
 }
 
+type idleReadCloser struct {
+	ctx       context.Context
+	source    io.ReadCloser
+	progress  chan struct{}
+	done      chan struct{}
+	stalled   atomic.Bool
+	doneOnce  sync.Once
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// NewIdleReadCloser cancels a response body by closing it when no bytes arrive
+// within timeout. It limits inactivity rather than total transfer duration, so
+// large healthy downloads remain unbounded by object size.
+func NewIdleReadCloser(ctx context.Context, source io.ReadCloser, timeout time.Duration) io.ReadCloser {
+	if source == nil || timeout <= 0 {
+		return source
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	reader := &idleReadCloser{
+		ctx: ctx, source: source, progress: make(chan struct{}, 1), done: make(chan struct{}),
+	}
+	go reader.monitor(timeout)
+	return reader
+}
+
+func (r *idleReadCloser) monitor(timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-r.progress:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(timeout)
+		case <-timer.C:
+			r.stalled.Store(true)
+			_ = r.closeSource()
+			return
+		case <-r.ctx.Done():
+			_ = r.closeSource()
+			return
+		case <-r.done:
+			return
+		}
+	}
+}
+
+func (r *idleReadCloser) observed(count int) {
+	if count <= 0 {
+		return
+	}
+	select {
+	case r.progress <- struct{}{}:
+	default:
+	}
+}
+
+func (r *idleReadCloser) stop() {
+	r.doneOnce.Do(func() { close(r.done) })
+}
+
+func (r *idleReadCloser) closeSource() error {
+	r.closeOnce.Do(func() { r.closeErr = r.source.Close() })
+	return r.closeErr
+}
+
+func (r *idleReadCloser) Read(buffer []byte) (int, error) {
+	count, err := r.source.Read(buffer)
+	r.observed(count)
+	if err != nil {
+		r.stop()
+	}
+	if r.stalled.Load() {
+		return count, errors.Join(err, ErrReadNoProgress)
+	}
+	if err != nil && r.ctx.Err() != nil {
+		return count, errors.Join(err, r.ctx.Err())
+	}
+	return count, err
+}
+
+func (r *idleReadCloser) Close() error {
+	r.stop()
+	err := r.closeSource()
+	if r.stalled.Load() {
+		return errors.Join(err, ErrReadNoProgress)
+	}
+	return err
+}
+
 func s3HTTPStatus(err error) int {
 	for err != nil {
 		if responseError, ok := err.(interface{ HTTPStatusCode() int }); ok {
@@ -384,7 +717,9 @@ func s3ContentLength(value *int64) int64 {
 
 func cloneNoRedirectClient(client *http.Client) *http.Client {
 	if client == nil {
-		client = &http.Client{Timeout: 2 * time.Minute}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.ResponseHeaderTimeout = responseHeaderLimit
+		client = &http.Client{Transport: transport}
 	}
 	copyClient := *client
 	copyClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }

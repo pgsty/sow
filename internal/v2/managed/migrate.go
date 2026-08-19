@@ -449,7 +449,7 @@ func migrationWorkspace(opts WorkspaceOptions) (config.Workspace, config.Config,
 	cfg, _, _, legacy, err := config.LoadWorkspaceDocumentForMigration(ws)
 	if err != nil {
 		_ = guard.Close()
-		return config.Workspace{}, config.Config{}, false, nil, fmt.Errorf("%w: %v", ErrWorkspaceInput, err)
+		return config.Workspace{}, config.Config{}, false, nil, fmt.Errorf("%w: %v", ErrConfigInput, err)
 	}
 	return ws, cfg, legacy, guard, nil
 }

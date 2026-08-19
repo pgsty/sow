@@ -13,6 +13,7 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"golang.org/x/sys/unix"
 )
 
 func TestRemovePreviewAndBuildPreserveGenerationAboveMaxInt64(t *testing.T) {
@@ -406,6 +407,107 @@ func TestRemoveCheckPredictsExactImmediateBuild(t *testing.T) {
 			}
 			if preview.Generation != actual.Generation || preview.Revision != actual.Revision || !reflect.DeepEqual(preview.Removed, actual.Removed) || !reflect.DeepEqual(preview.Changes, actual.Changes) {
 				t.Fatalf("preview does not equal actual build\npreview=%#v\nactual=%#v", preview, actual)
+			}
+		})
+	}
+}
+
+func TestRemovePreviewMatchesArchitectureDriftGuards(t *testing.T) {
+	type fixture struct {
+		format, dist, path, filename, reference string
+		base, expanded                          []string
+	}
+	fixtures := []fixture{
+		{
+			format: "rpm", dist: "el9", path: filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"),
+			filename: "package.rpm", reference: "pgdg-redhat-nonfree-repo", base: []string{"x86_64"}, expanded: []string{"x86_64", "aarch64"},
+		},
+		{
+			format: "deb", dist: "noble", path: filepath.Join("..", "..", "aptrepo", "testdata", "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64"),
+			filename: "package.deb", reference: "libpqtypes0", base: []string{"aarch64"}, expanded: []string{"aarch64", "x86_64"},
+		},
+	}
+	setup := func(t *testing.T, test fixture, architectures []string) (context.Context, string, WorkspaceOptions, config.Config) {
+		t.Helper()
+		ctx := context.Background()
+		root := t.TempDir()
+		opts := WorkspaceOptions{Workdir: root, CWD: root}
+		cfg := config.Default()
+		cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{
+			test.dist: {Format: test.format, Architectures: architectures},
+		}}
+		writeManagedConfig(t, root, cfg)
+		if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+			t.Fatal(err)
+		}
+		inputs := filepath.Join(root, "inputs")
+		if err := os.Mkdir(inputs, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		input := decodeManagedFixture(t, test.path, filepath.Join(inputs, test.filename))
+		if _, err := Add(ctx, AddOptions{WorkspaceOptions: opts, Repository: "repo", Dists: []string{test.dist}, Paths: []string{input}, Jobs: 1}); err != nil {
+			t.Fatal(err)
+		}
+		return ctx, root, opts, cfg
+	}
+	differentDeviceTMP := func(t *testing.T, workspace string) string {
+		t.Helper()
+		var workspaceStat unix.Stat_t
+		if err := unix.Stat(workspace, &workspaceStat); err != nil {
+			return ""
+		}
+		for _, candidate := range []string{"/dev/shm", "/var/tmp", "/tmp"} {
+			var candidateStat unix.Stat_t
+			if err := unix.Stat(candidate, &candidateStat); err != nil || candidateStat.Dev == workspaceStat.Dev {
+				continue
+			}
+			temporary, err := os.MkdirTemp(candidate, "sow-rm-check-device-")
+			if err != nil {
+				continue
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(temporary) })
+			return temporary
+		}
+		return ""
+	}
+
+	for _, test := range fixtures {
+		t.Run(test.format+" architecture expansion", func(t *testing.T) {
+			ctx, root, opts, cfg := setup(t, test, test.base)
+			repository := cfg.Repositories["repo"]
+			dist := repository.Dists[test.dist]
+			dist.Architectures = test.expanded
+			repository.Dists[test.dist] = dist
+			cfg.Repositories["repo"] = repository
+			writeManagedConfig(t, root, cfg)
+			if temporary := differentDeviceTMP(t, root); temporary != "" {
+				t.Setenv("TMPDIR", temporary)
+			}
+			preview, err := Remove(ctx, RemoveOptions{WorkspaceOptions: opts, Repository: "repo", Dists: []string{test.dist}, Packages: []string{test.reference}, Check: true, Jobs: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			actual, err := Remove(ctx, RemoveOptions{WorkspaceOptions: opts, Repository: "repo", Dists: []string{test.dist}, Packages: []string{test.reference}, Jobs: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if preview.Generation != actual.Generation || !reflect.DeepEqual(preview.Changes, actual.Changes) {
+				t.Fatalf("expanded architecture preview differs\npreview=%#v\nactual=%#v", preview, actual)
+			}
+		})
+
+		t.Run(test.format+" architecture removal", func(t *testing.T) {
+			ctx, root, opts, cfg := setup(t, test, test.expanded)
+			repository := cfg.Repositories["repo"]
+			dist := repository.Dists[test.dist]
+			dist.Architectures = test.base
+			repository.Dists[test.dist] = dist
+			cfg.Repositories["repo"] = repository
+			writeManagedConfig(t, root, cfg)
+			_, previewErr := Remove(ctx, RemoveOptions{WorkspaceOptions: opts, Repository: "repo", Dists: []string{test.dist}, Packages: []string{test.reference}, Check: true, Jobs: 1})
+			_, actualErr := Remove(ctx, RemoveOptions{WorkspaceOptions: opts, Repository: "repo", Dists: []string{test.dist}, Packages: []string{test.reference}, Jobs: 1})
+			if !errors.Is(previewErr, ErrRejected) || !errors.Is(actualErr, ErrRejected) {
+				t.Fatalf("architecture removal previewErr=%v actualErr=%v", previewErr, actualErr)
 			}
 		})
 	}

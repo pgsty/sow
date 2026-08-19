@@ -5,10 +5,11 @@ SHELL := /bin/bash
 GO ?= go
 GORELEASER ?= goreleaser
 DEADCODE_VERSION ?= v0.45.0
+GOVULNCHECK_VERSION ?= v1.6.0
 VERSION ?= 0.3.0
 TEST_TIMEOUT ?= 60m
 CORE_TEST_TIMEOUT ?= 20m
-RACE_TIMEOUT ?= 30m
+RACE_TIMEOUT ?= 45m
 ARGS ?=
 
 ROOT_DIR := $(CURDIR)
@@ -19,7 +20,7 @@ CLEAN_DELIVERY_OUT ?= $(if $(TMPDIR),$(TMPDIR),/tmp)/sow-clean-delivery
 LDFLAGS := -s -w -X github.com/pgsty/sow/internal/v2cli.Version=$(VERSION)
 CORE_PACKAGES := ./internal/v2/... ./internal/v2cli ./internal/aptrepo ./internal/r2 ./internal/yumrepo
 
-.PHONY: all help version deadcode-version build run install fmt fmt-check tidy tidy-check vet lint deadcode \
+.PHONY: all help version deadcode-version govulncheck-version build run install fmt fmt-check tidy tidy-check vet lint deadcode vuln verify-rpm-upstream \
 	test test-go test-rpm test-core test-v2 test-perf-contract race check clean-delivery \
 	test-r2-live goreleaser-check release-local release clean clean-bin clean-dist
 
@@ -37,7 +38,7 @@ help:
 		'  make test-perf-contract  Compile perf-tagged tests and verify their fixture' \
 		'  make test-r2-live    Run the opt-in read-only Cloudflare R2 fixture gate' \
 		'  make race            Race-test the core repository packages' \
-		'  make check           Run format, module, vet, lint, deadcode, and focused tests' \
+		'  make check           Run quality, vulnerability, provenance, and focused tests' \
 		'  make clean-delivery  Rebuild and verify the deterministic source archive' \
 		'  make release-local   Build local archives and Linux packages with GoReleaser' \
 		'  make release         Run all local gates, then build the GoReleaser snapshot' \
@@ -48,6 +49,9 @@ version:
 
 deadcode-version:
 	@printf '%s\n' '$(DEADCODE_VERSION)'
+
+govulncheck-version:
+	@printf '%s\n' '$(GOVULNCHECK_VERSION)'
 
 build:
 	@mkdir -p '$(BIN_DIR)'
@@ -97,6 +101,18 @@ deadcode:
 		}
 	@output="$$(deadcode -test ./...)" || { status=$$?; printf '%s\n' "$$output" >&2; exit $$status; }; \
 		test -z "$$output" || { printf 'unreachable declarations:\n%s\n' "$$output" >&2; exit 1; }
+	bash test/compat/check-deadcode-binary.sh
+
+vuln:
+	@command -v govulncheck >/dev/null 2>&1 || { \
+		printf '%s\n' 'govulncheck is required: go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)' >&2; \
+		exit 1; \
+	}
+	govulncheck ./...
+	cd third_party/cavaliergopher-rpm && govulncheck ./...
+
+verify-rpm-upstream:
+	third_party/cavaliergopher-rpm/verify-upstream.sh
 
 test: test-go test-rpm
 
@@ -125,7 +141,7 @@ test-r2-live:
 race:
 	$(GO) test -race -timeout '$(RACE_TIMEOUT)' -count=1 $(CORE_PACKAGES)
 
-check: fmt-check tidy-check vet lint deadcode test-perf-contract test-core
+check: fmt-check tidy-check vet lint deadcode vuln verify-rpm-upstream test-perf-contract test-core
 
 clean-delivery:
 	test/compat/test-clean-delivery.sh '$(CLEAN_DELIVERY_OUT)'

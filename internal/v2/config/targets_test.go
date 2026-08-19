@@ -62,6 +62,7 @@ func TestTargetsRejectNonCanonicalAndSecretInputs(t *testing.T) {
 		{"prefix-encoded-separator", func(v *TargetConfig) { v.Prefix = "repos%2Facme" }, "percent-encoded"},
 		{"inline-secret", func(v *TargetConfig) { v.Credential = "secret-access-key" }, "inline secrets"},
 		{"unknown-ttl", func(v *TargetConfig) { v.MaxCacheTTL = "" }, "max_cache_ttl"},
+		{"bucket-grammar", func(v *TargetConfig) { v.Bucket = "bad_bucket" }, "DNS-safe"},
 		{"authority", func(v *TargetConfig) { v.ExclusiveWriteAuthority = false }, "exclusive_write_authority"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -59,7 +59,6 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 	result.Dists = distNames
 	desired := make(map[string][]string, len(distNames))
 	outcomes := []state.OperationMembership{}
-	affectedDists := []string{}
 	currentObjects, err := store.ListPackageObjects(ctx, distNames, false)
 	if err != nil {
 		return result, err
@@ -80,23 +79,11 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 		for _, object := range policy.Limited {
 			outcomes = append(outcomes, state.OperationMembership{DistName: distName, PackageSHA256: object.SHA256, Action: "limit"})
 		}
-		built, err := store.MembershipDigests(ctx, distName, true)
-		if err != nil {
-			return result, err
-		}
-		effectiveSHA, _, err := effectiveDistConfig(ctx, ws.Root, cfg, repoName, distName)
-		if err != nil {
-			return result, err
-		}
-		distState, err := store.GetDist(ctx, distName)
-		if err != nil {
-			return result, err
-		}
-		if !sameStringSet(desired[distName], built) || effectiveSHA != distState.EffectiveConfigSHA256 {
-			affectedDists = append(affectedDists, distName)
-		}
 	}
-	sort.Strings(affectedDists)
+	affectedDists, err := distsNeedingBuild(ctx, ws.Root, repoName, cfg, store, desired)
+	if err != nil {
+		return result, err
+	}
 	physicalChange := len(affectedDists) != 0
 	manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"dists": len(distNames)}, Outcomes: outcomes}
 	var preflight *mutationBuildPreflight
@@ -210,6 +197,29 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 		return result, err
 	}
 	return result, nil
+}
+
+func distsNeedingBuild(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, desired map[string][]string) ([]string, error) {
+	affected := []string{}
+	for _, distName := range mapsKeys(desired) {
+		built, err := store.MembershipDigests(ctx, distName, true)
+		if err != nil {
+			return nil, err
+		}
+		effectiveSHA, _, err := effectiveDistConfig(ctx, root, cfg, repoName, distName)
+		if err != nil {
+			return nil, err
+		}
+		distState, err := store.GetDist(ctx, distName)
+		if err != nil {
+			return nil, err
+		}
+		if !sameStringSet(desired[distName], built) || effectiveSHA != distState.EffectiveConfigSHA256 {
+			affected = append(affected, distName)
+		}
+	}
+	sort.Strings(affected)
+	return affected, nil
 }
 
 func selectedBuildDists(cfg config.Config, repoName string, explicit []string) ([]string, map[string]config.EffectiveDist, error) {

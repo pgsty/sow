@@ -8,10 +8,13 @@ import (
 	"net"
 	"net/url"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
+
+var r2BucketPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 // TargetConfig is a private publication binding. Credential is a reference,
 // never credential material; the public prefix itself remains pool/ + dists/.
@@ -123,6 +126,9 @@ func validateTarget(name string, target TargetConfig, repositories map[string]Re
 		}
 		if err := validateTargetComponent("bucket", target.Bucket); err != nil {
 			return TargetBinding{}, err
+		}
+		if !r2BucketPattern.MatchString(target.Bucket) {
+			return TargetBinding{}, fmt.Errorf("bucket %q is not a DNS-safe R2 bucket label", target.Bucket)
 		}
 		if err := validateCredentialReference(target.Credential); err != nil {
 			return TargetBinding{}, err

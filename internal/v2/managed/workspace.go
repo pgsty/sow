@@ -26,7 +26,7 @@ func workspace(opts WorkspaceOptions) (config.Workspace, config.Config, *workspa
 	cfg, err := config.LoadWorkspace(ws)
 	if err != nil {
 		_ = guard.Close()
-		return config.Workspace{}, config.Config{}, nil, fmt.Errorf("%w: %v", ErrWorkspaceInput, err)
+		return config.Workspace{}, config.Config{}, nil, fmt.Errorf("%w: %v", ErrConfigInput, err)
 	}
 	return ws, cfg, guard, nil
 }
@@ -49,7 +49,7 @@ func readWorkspace(ctx context.Context, opts WorkspaceOptions, requireState bool
 	}
 	preflightConfig, _, _, _, loadErr := config.LoadWorkspaceDocumentForMigration(ws)
 	if loadErr != nil {
-		return fail(fmt.Errorf("%w: %v", ErrWorkspaceInput, loadErr))
+		return fail(fmt.Errorf("%w: %v", ErrConfigInput, loadErr))
 	}
 	stateRoot := filepath.Join(ws.Root, ".sow")
 	info, err := os.Lstat(stateRoot)
@@ -74,7 +74,7 @@ func readWorkspace(ctx context.Context, opts WorkspaceOptions, requireState bool
 	cfg, _, _, _, err := config.LoadWorkspaceDocumentForMigration(ws)
 	if err != nil {
 		lock.Close()
-		return config.Workspace{}, config.Config{}, nil, fmt.Errorf("%w: %v", ErrWorkspaceInput, err)
+		return config.Workspace{}, config.Config{}, nil, fmt.Errorf("%w: %v", ErrConfigInput, err)
 	}
 	return ws, cfg, lock, nil
 }
@@ -82,7 +82,7 @@ func readWorkspace(ctx context.Context, opts WorkspaceOptions, requireState bool
 func loadWorkspaceWithSHA(ws config.Workspace) (config.Config, string, error) {
 	cfg, digest, err := config.LoadWorkspaceWithSHA(ws)
 	if err != nil {
-		return config.Config{}, "", fmt.Errorf("%w: %v", ErrWorkspaceInput, err)
+		return config.Config{}, "", fmt.Errorf("%w: %v", ErrConfigInput, err)
 	}
 	return cfg, digest, nil
 }

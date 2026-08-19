@@ -67,20 +67,16 @@ type Package struct {
 	paragraph     control.Paragraph
 }
 
+// InspectPackage parses an existing package using its current basename.
+func InspectPackage(ctx context.Context, filePath, component string) (Package, error) {
+	return InspectPackageAs(ctx, filePath, component, filepath.Base(filePath))
+}
+
 // ControlValue returns one parsed binary control field without exposing the
 // mutable paragraph used to produce Packages.
 func (p Package) ControlValue(name string) (string, bool) {
 	v, ok := p.paragraph.Values[name]
 	return v, ok
-}
-
-// InspectPackage parses an existing .deb with pault.ag/go/debian's ar and
-// control decoders and computes its immutable payload metadata. It deliberately
-// does not open data.tar: repository metadata inspection never needs installed
-// payload contents, and opening that compressor would make memory depend on its
-// advertised window. The input file is never mutated.
-func InspectPackage(ctx context.Context, filePath, component string) (Package, error) {
-	return InspectPackageAs(ctx, filePath, component, filepath.Base(filePath))
 }
 
 // InspectFlatPackage performs the single full-file hash used by Plain create.
@@ -90,10 +86,8 @@ func InspectFlatPackage(ctx context.Context, filePath, component string) (Packag
 	return inspectPackagePath(ctx, filePath, component, filepath.Base(filePath), true)
 }
 
-// InspectPackageAs parses an existing .deb while using originalBasename as
-// its externally visible pool filename. CAS objects are named by digest, so a
-// rebuildable derived catalog must be able to inspect those immutable bytes
-// without first materializing or copying them back to their public filename.
+// InspectPackageAs parses an existing package using an explicit public
+// basename. Managed CAS readers use the descriptor-based facts API instead.
 func InspectPackageAs(ctx context.Context, filePath, component, originalBasename string) (Package, error) {
 	return inspectPackagePath(ctx, filePath, component, originalBasename, false)
 }
@@ -700,18 +694,6 @@ func CompareVersions(left, right string) (int, error) {
 func validateComponent(component string) error {
 	if !componentPattern.MatchString(component) {
 		return fmt.Errorf("aptrepo: unsafe component %q", component)
-	}
-	return nil
-}
-
-func validateSegment(kind, value string) error {
-	if value == "" || value == "." || value == ".." || strings.ContainsAny(value, "/\\\x00\r\n\t") {
-		return fmt.Errorf("aptrepo: unsafe %s %q", kind, value)
-	}
-	for _, r := range value {
-		if !(r >= 'a' && r <= 'z') && !(r >= 'A' && r <= 'Z') && !(r >= '0' && r <= '9') && !strings.ContainsRune("+._-", r) {
-			return fmt.Errorf("aptrepo: unsafe %s %q", kind, value)
-		}
 	}
 	return nil
 }

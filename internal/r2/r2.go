@@ -55,8 +55,17 @@ type ObjectContent struct {
 }
 
 type PutCondition struct {
-	IfMatch     string
-	IfNoneMatch bool
+	IfMatch      string
+	IfNoneMatch  bool
+	CacheControl string
+}
+
+// ReadSeekReaderAt is the immutable replayable source contract required by
+// conditional single-part retries and bounded multipart section uploads.
+type ReadSeekReaderAt interface {
+	io.Reader
+	io.ReaderAt
+	io.Seeker
 }
 
 type Client struct {
@@ -83,11 +92,14 @@ func (c *Client) OpenObject(ctx context.Context, key string) (ObjectContent, err
 	return c.objects.openObject(ctx, key)
 }
 
-func (c *Client) Put(ctx context.Context, key string, body io.Reader, size int64, sha256 string, condition PutCondition) (string, error) {
+func (c *Client) Put(ctx context.Context, key string, body ReadSeekReaderAt, size int64, sha256 string, condition PutCondition) (string, error) {
 	if condition.IfMatch != "" && condition.IfNoneMatch {
 		return "", errors.New("R2 put cannot combine If-Match and If-None-Match")
 	}
-	return c.objects.put(ctx, key, body, size, sha256, condition.IfMatch, condition.IfNoneMatch)
+	if len(condition.CacheControl) > 1024 || strings.ContainsAny(condition.CacheControl, "\x00\r\n") {
+		return "", errors.New("R2 put cache control is unsafe")
+	}
+	return c.objects.put(ctx, key, body, size, sha256, condition.IfMatch, condition.IfNoneMatch, condition.CacheControl)
 }
 
 func validateRemoteKey(value string) error {
