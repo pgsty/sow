@@ -18,6 +18,7 @@ internal/v2/managed/rpm_leaf_export.go: VerifyRPMLeafExportStandalone
 internal/v2/managed/signing_fingerprints.go: EffectiveConfigView
 internal/v2/managed/signing_fingerprints.go: validateSigningApplicability
 internal/v2/state/audit.go: Store.PruneTerminalOperations
+internal/v2/state/facts.go: Store.ListPackageFacts
 internal/v2/state/publication_plan.go: PublicationPlanBytes
 internal/v2/state/signing_keys.go: Store.RetainRPMSigningKeys
 internal/v2/state/state.go: Store.AddDist
@@ -26,7 +27,6 @@ internal/v2/state/state.go: Store.ReferencedArchitectures
 internal/v2/state/state.go: Store.RemoveDist
 internal/v2cli/app.go: Main
 internal/v2cli/help.go: RootHelp
-internal/workmetrics/metrics.go: RecordSQLStatements
 internal/yumrepo/catalog.go: InspectCatalogPackage
 internal/yumrepo/catalog.go: catalogDependencyOperator
 internal/yumrepo/catalog.go: rpmDisplayVersion

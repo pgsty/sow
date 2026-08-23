@@ -251,7 +251,7 @@ func NewRepository(ctx context.Context, opts RepositoryNewOptions) (result Repos
 	if err := config.ValidateName(opts.Name); err != nil {
 		return RepositoryInfo{}, fmt.Errorf("%w: %v", ErrRejected, err)
 	}
-	ws, cfg, rootGuard, err := workspace(opts.WorkspaceOptions)
+	ws, _, rootGuard, err := workspace(opts.WorkspaceOptions)
 	if err != nil {
 		return RepositoryInfo{}, err
 	}
@@ -265,7 +265,7 @@ func NewRepository(ctx context.Context, opts RepositoryNewOptions) (result Repos
 		return RepositoryInfo{}, err
 	}
 	var oldData []byte
-	cfg, oldData, _, err = config.LoadWorkspaceDocument(ws)
+	cfg, oldData, _, err := config.LoadWorkspaceDocument(ws)
 	if err != nil {
 		return RepositoryInfo{}, err
 	}
@@ -369,7 +369,7 @@ func removeRepository(ctx context.Context, opts RepositoryRemoveOptions, result 
 	if err := config.ValidateName(opts.Name); err != nil {
 		return fmt.Errorf("%w: %v", ErrRejected, err)
 	}
-	ws, cfg, rootGuard, err := workspace(opts.WorkspaceOptions)
+	ws, _, rootGuard, err := workspace(opts.WorkspaceOptions)
 	if err != nil {
 		return err
 	}
@@ -383,7 +383,7 @@ func removeRepository(ctx context.Context, opts RepositoryRemoveOptions, result 
 		return err
 	}
 	var oldData []byte
-	cfg, oldData, _, err = config.LoadWorkspaceDocument(ws)
+	cfg, oldData, _, err := config.LoadWorkspaceDocument(ws)
 	if err != nil {
 		return err
 	}

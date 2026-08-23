@@ -582,7 +582,7 @@ func planC2Transition(ctx context.Context, root, repoName string, cfg config.Con
 			}
 		}
 	}
-	if err := loadManagedPackageFacts(ctx, allRPMSources, store, jobs); err != nil {
+	if err := loadManagedPackageFacts(ctx, allRPMSources, store, jobs, nil); err != nil {
 		return nil, err
 	}
 	for _, dist := range dists {

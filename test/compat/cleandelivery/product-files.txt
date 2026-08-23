@@ -44,6 +44,7 @@ internal/v2/managed/canonical_json.go
 internal/v2/managed/changes.go
 internal/v2/managed/changes_test.go
 internal/v2/managed/check.go
+internal/v2/managed/check_evidence.go
 internal/v2/managed/check_recovery.go
 internal/v2/managed/check_test.go
 internal/v2/managed/dist.go
@@ -83,6 +84,8 @@ internal/v2/managed/public_fast_validation.go
 internal/v2/managed/publication.go
 internal/v2/managed/publication_filesystem.go
 internal/v2/managed/publication_gc_target.go
+internal/v2/managed/publication_http.go
+internal/v2/managed/publication_http_test.go
 internal/v2/managed/publication_r2.go
 internal/v2/managed/publication_r2_test.go
 internal/v2/managed/publication_test.go
@@ -155,6 +158,7 @@ internal/v2/state/repository.go
 internal/v2/state/schema_v1.sql
 internal/v2/state/schema_v10.sql
 internal/v2/state/schema_v11.sql
+internal/v2/state/schema_v12.sql
 internal/v2/state/schema_v2.sql
 internal/v2/state/schema_v3.sql
 internal/v2/state/schema_v4.sql

@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/pgsty/sow/internal/v2/config"
+	"github.com/pgsty/sow/internal/workmetrics"
 	"golang.org/x/sys/unix"
 )
 
@@ -1264,6 +1265,7 @@ func readRootedPrivateRegular(root, relative string, maximum int64, allowEmpty b
 // child with O_NOFOLLOW. Directory modification during traversal and entry
 // replacement between readdir and open are both rejected.
 func walkRootedTree(ctx context.Context, root string, visitFile func(string, *os.File, os.FileInfo) error, visitDirectory func(string, *os.File, os.FileInfo) error) error {
+	workmetrics.RecordTreeWalk(ctx)
 	handle, rootBinding, err := openBoundRootDirectory(root)
 	if err != nil {
 		return fmt.Errorf("managed: open rooted tree: %w", err)

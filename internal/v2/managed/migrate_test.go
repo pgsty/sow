@@ -203,6 +203,8 @@ func downgradeManagedV11FixtureToV10(t *testing.T, db *sql.DB) {
 	t.Helper()
 	_, err := db.Exec(`
 PRAGMA foreign_keys = OFF;
+DROP TABLE publication_target_binding_revisions;
+DELETE FROM schema_migrations WHERE version = 12;
 CREATE TEMP TABLE generation_view_signers_fixture AS
 SELECT generation, view_id, signer_identity, trusted_public_key FROM generation_view_signers;
 DROP TABLE generation_view_signers;

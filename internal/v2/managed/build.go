@@ -451,7 +451,11 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 			wantDEB = true
 		}
 	}
-	if err := loadManagedPackageFacts(ctx, allSourcesBySHA, store, jobs); err != nil {
+	var authenticatedFacts *publicGenerationSnapshot
+	if preflight != nil {
+		authenticatedFacts = preflight.baseSnapshot
+	}
+	if err := loadManagedPackageFacts(ctx, allSourcesBySHA, store, jobs, authenticatedFacts); err != nil {
 		return nil, nil, nil, err
 	}
 	var metadataSnapshot metadataSignerSnapshot
@@ -1451,8 +1455,9 @@ func recordNormalizedPublicModes(ctx context.Context, store *state.Store, operat
 }
 
 type publicGenerationSnapshot struct {
-	Manifest   []state.GenerationFile
-	Identities map[string]rootedRegularIdentity
+	Manifest              []state.GenerationFile
+	Identities            map[string]rootedRegularIdentity
+	AuthenticatedPayloads map[string]rootedRegularIdentity
 }
 
 func (snapshot *publicGenerationSnapshot) clone() *publicGenerationSnapshot {
@@ -1460,11 +1465,15 @@ func (snapshot *publicGenerationSnapshot) clone() *publicGenerationSnapshot {
 		return nil
 	}
 	cloned := &publicGenerationSnapshot{
-		Manifest:   append([]state.GenerationFile(nil), snapshot.Manifest...),
-		Identities: make(map[string]rootedRegularIdentity, len(snapshot.Identities)),
+		Manifest:              append([]state.GenerationFile(nil), snapshot.Manifest...),
+		Identities:            make(map[string]rootedRegularIdentity, len(snapshot.Identities)),
+		AuthenticatedPayloads: make(map[string]rootedRegularIdentity, len(snapshot.AuthenticatedPayloads)),
 	}
 	for path, identity := range snapshot.Identities {
 		cloned.Identities[path] = identity
+	}
+	for path, identity := range snapshot.AuthenticatedPayloads {
+		cloned.AuthenticatedPayloads[path] = identity
 	}
 	return cloned
 }
@@ -1490,8 +1499,10 @@ func scanPublicGenerationSnapshot(ctx context.Context, repositoryRoot string) (*
 }
 
 func scanPublicGenerationSnapshotForLayout(ctx context.Context, repositoryRoot, layout string) (*publicGenerationSnapshot, error) {
+	workmetrics.RecordMetadataTreeHash(ctx)
 	files := []state.GenerationFile{}
 	identities := map[string]rootedRegularIdentity{}
+	authenticated := map[string]rootedRegularIdentity{}
 	err := walkRootedTree(ctx, repositoryRoot, func(relative string, file *os.File, info os.FileInfo) error {
 		if !strings.HasPrefix(relative, "pool/") && !strings.HasPrefix(relative, "dists/") {
 			return fmt.Errorf("%w: public Repository contains an unmanaged root entry", ErrIntegrity)
@@ -1507,6 +1518,8 @@ func scanPublicGenerationSnapshotForLayout(ctx context.Context, repositoryRoot, 
 		}
 		if phase == "payload" {
 			workmetrics.RecordFullPackageRead(ctx, read)
+		} else {
+			workmetrics.RecordMetadataRead(ctx, read)
 		}
 		identity, err := snapshotRegularDescriptorIdentity(file)
 		if err != nil {
@@ -1514,13 +1527,62 @@ func scanPublicGenerationSnapshotForLayout(ctx context.Context, repositoryRoot, 
 		}
 		files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
 		identities[relative] = identity
+		if phase == "payload" {
+			authenticated[relative] = identity
+		}
 		return nil
 	}, nil)
 	if err != nil {
 		return nil, err
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	return &publicGenerationSnapshot{Manifest: files, Identities: identities}, nil
+	return &publicGenerationSnapshot{Manifest: files, Identities: identities, AuthenticatedPayloads: authenticated}, nil
+}
+
+func scanPublicGenerationSnapshotForLayoutWithEvidence(ctx context.Context, repositoryRoot, layout string, evidence *payloadEvidenceRegistry) (*publicGenerationSnapshot, error) {
+	if evidence == nil {
+		return scanPublicGenerationSnapshotForLayout(ctx, repositoryRoot, layout)
+	}
+	workmetrics.RecordMetadataTreeHash(ctx)
+	files := []state.GenerationFile{}
+	identities := map[string]rootedRegularIdentity{}
+	authenticated := map[string]rootedRegularIdentity{}
+	err := walkRootedTree(ctx, repositoryRoot, func(relative string, file *os.File, info os.FileInfo) error {
+		if !strings.HasPrefix(relative, "pool/") && !strings.HasPrefix(relative, "dists/") {
+			return fmt.Errorf("%w: public Repository contains an unmanaged root entry", ErrIntegrity)
+		}
+		phase := publicFilePhaseForLayout(relative, layout)
+		if phase == "" {
+			return fmt.Errorf("%w: dists contains package payload %s", ErrIntegrity, relative)
+		}
+		identity, err := snapshotRegularDescriptorIdentity(file)
+		if err != nil {
+			return err
+		}
+		if phase == "payload" {
+			entry, err := evidence.walkedPayload(ctx, file, info, relative)
+			if err != nil {
+				return err
+			}
+			files = append(files, entry)
+			authenticated[relative] = identity
+		} else {
+			hash := sha256.New()
+			read, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
+			if err != nil {
+				return err
+			}
+			workmetrics.RecordMetadataRead(ctx, read)
+			files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
+		}
+		identities[relative] = identity
+		return nil
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+	return &publicGenerationSnapshot{Manifest: files, Identities: identities, AuthenticatedPayloads: authenticated}, nil
 }
 
 func publicFilePhase(path string) string {

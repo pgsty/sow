@@ -103,7 +103,7 @@ func TestRetainedGenerationVerifierAcceptsEmptyManifest(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(directory, "record.json"), recordBytes, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	verified, err := verifyRetainedGenerationDirectory(context.Background(), root, "repo", generation, repositoryID, directory)
+	verified, err := verifyRetainedGenerationDirectoryWithEvidence(context.Background(), root, "repo", generation, repositoryID, directory, newPayloadEvidenceRegistry())
 	if err != nil || verified.Record != record {
 		t.Fatalf("verified=%#v err=%v", verified, err)
 	}

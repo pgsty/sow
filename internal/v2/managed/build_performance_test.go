@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -642,7 +643,7 @@ func TestWarmManagedBuildUsesFactsAndStatWithoutPayloadReads(t *testing.T) {
 	if err := os.Mkdir(inputRoot, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	body, err := managedBenchmarkDEBBytesWithPayload("sow-warm-stat", 1<<20)
+	body, err := managedBenchmarkDEBBytesWithPayload("sow-warm-stat", 64<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,6 +692,83 @@ func TestWarmManagedBuildUsesFactsAndStatWithoutPayloadReads(t *testing.T) {
 		return
 	}
 	t.Fatalf("warm build omitted build_metrics: events=%#v", detail.Events)
+}
+
+func TestSelectiveBuildReadsOnlySelectedFactRowsAndBytes(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{
+		"noble": {Format: "deb"},
+		"jammy": {Format: "deb"},
+	}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	selectedBody, err := managedBenchmarkDEBBytesWithPayload("sow-selected-facts", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedBody, err := managedBenchmarkDEBBytesWithPayload("sow-unrelated-facts", 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedPath := filepath.Join(inputs, "sow-selected-facts_1.0-1_amd64.deb")
+	unrelatedPath := filepath.Join(inputs, "sow-unrelated-facts_1.0-1_amd64.deb")
+	if err := os.WriteFile(selectedPath, selectedBody, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(unrelatedPath, unrelatedBody, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Paths: []string{selectedPath}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"jammy"}, Paths: []string{unrelatedPath}, Skip: true, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.Open(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedObjects, selectedErr := store.ListPackageObjects(ctx, []string{"noble"}, false)
+	unrelatedObjects, unrelatedErr := store.ListPackageObjects(ctx, []string{"jammy"}, false)
+	if err := errors.Join(selectedErr, unrelatedErr); err != nil || len(selectedObjects) != 1 || len(unrelatedObjects) != 1 {
+		store.Close()
+		t.Fatalf("selected=%#v unrelated=%#v err=%v", selectedObjects, unrelatedObjects, err)
+	}
+	var selectedFactBytes int64
+	if err := store.DB().QueryRowContext(ctx, `SELECT length(facts) FROM package_facts WHERE package_sha256 = ?`, selectedObjects[0].SHA256).Scan(&selectedFactBytes); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE package_facts SET facts = zeroblob(?), facts_sha256 = ? WHERE package_sha256 = ?`, 8<<20, strings.Repeat("f", 64), unrelatedObjects[0].SHA256); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	repository := cfg.Repositories["repo"]
+	dist := repository.Dists["noble"]
+	dist.Exclude = []config.ExcludeRule{{Name: []string{"__selective_facts_rebuild__"}}}
+	repository.Dists["noble"] = dist
+	cfg.Repositories["repo"] = repository
+	writeManagedConfig(t, root, cfg)
+	result, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Jobs: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := managedBuildMetrics(t, root, result.Operation)
+	if metrics.FactRowsRead != 1 || metrics.FactBytesRead != selectedFactBytes || metrics.SQLStatements != 1 || metrics.FactCacheHits != 1 || metrics.FactCacheMisses != 0 {
+		t.Fatalf("selective facts metrics=%#v want rows=1 bytes=%d SQL=1", metrics, selectedFactBytes)
+	}
 }
 
 func TestAuthenticatedPayloadSnapshotRejectsRestoredMTimeRewrite(t *testing.T) {
@@ -805,14 +883,27 @@ func TestManagedFingerprintDriftRehashesOnceAndSelfHeals(t *testing.T) {
 	if err := errors.Join(fingerprintErr, closeErr); err != nil || len(fingerprints) != 1 || fingerprints[0].Fingerprint == nil || *fingerprints[0].Fingerprint != *wantFingerprint {
 		t.Fatalf("read-only preview changed the persisted fingerprint: fingerprints=%#v err=%v", fingerprints, err)
 	}
+	store, err = state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `DELETE FROM package_facts WHERE package_sha256 = ?`, objects[0].SHA256); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
 	setManagedBenchmarkExclude(t, root, &cfg, "__ctime_rehash__")
 	first, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
 	metrics := managedBuildMetrics(t, root, first.Operation)
-	if metrics.StatMisses != 1 || metrics.StatHits != 0 || metrics.PayloadByPhase["current_public_generation"].Full != 1 || metrics.FactCacheHits != 1 {
-		t.Fatalf("ctime drift did not use one hash fallback: %#v", metrics)
+	if metrics.StatMisses != 1 || metrics.StatHits != 0 || metrics.FullPackageReads != 1 ||
+		metrics.PayloadByPhase["current_public_generation"].Full != 1 || metrics.PayloadByPhase["facts_backfill"].Full != 0 ||
+		metrics.FactCacheHits != 0 || metrics.FactCacheMisses != 1 {
+		t.Fatalf("ctime drift plus missing facts did not share one authenticated payload pass: %#v", metrics)
 	}
 	setManagedBenchmarkExclude(t, root, &cfg, "__ctime_healed__")
 	second, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 2})
@@ -886,7 +977,7 @@ func TestManagedMissingAndPoisonedFactsLazilyRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	metrics := managedBuildMetrics(t, root, missing.Operation)
-	if metrics.FactCacheMisses != 1 || metrics.PayloadByPhase["facts_backfill"].Full != 1 {
+	if metrics.FactCacheMisses != 1 || metrics.FullPackageReads != 1 || metrics.PayloadByPhase["current_public_generation"].Full != 1 || metrics.PayloadByPhase["facts_backfill"].Full != 0 {
 		t.Fatalf("missing facts were not lazily rebuilt: %#v", metrics)
 	}
 	store, err = state.Open(database)

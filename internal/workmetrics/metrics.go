@@ -19,14 +19,21 @@ type PayloadReads struct {
 // Stat and SQL counters are present from the first schema so later fast-path
 // milestones can populate them without changing the event wire format.
 type Snapshot struct {
-	PayloadBytesRead int64                   `json:"payload_bytes_read"`
-	FullPackageReads int64                   `json:"full_package_reads"`
-	StatHits         int64                   `json:"stat_hits"`
-	StatMisses       int64                   `json:"stat_misses"`
-	FactCacheHits    int64                   `json:"fact_cache_hits"`
-	FactCacheMisses  int64                   `json:"fact_cache_misses"`
-	SQLStatements    int64                   `json:"sql_statements"`
-	PayloadByPhase   map[string]PayloadReads `json:"payload_by_phase,omitempty"`
+	PayloadBytesRead   int64                   `json:"payload_bytes_read"`
+	FullPackageReads   int64                   `json:"full_package_reads"`
+	SignatureBytesRead int64                   `json:"signature_bytes_read"`
+	SignatureStreams   int64                   `json:"signature_streams"`
+	MetadataBytesRead  int64                   `json:"metadata_bytes_read"`
+	MetadataTreeHashes int64                   `json:"metadata_tree_hashes"`
+	TreeWalks          int64                   `json:"tree_walks"`
+	FactRowsRead       int64                   `json:"fact_rows_read"`
+	FactBytesRead      int64                   `json:"fact_bytes_read"`
+	StatHits           int64                   `json:"stat_hits"`
+	StatMisses         int64                   `json:"stat_misses"`
+	FactCacheHits      int64                   `json:"fact_cache_hits"`
+	FactCacheMisses    int64                   `json:"fact_cache_misses"`
+	SQLStatements      int64                   `json:"sql_statements"`
+	PayloadByPhase     map[string]PayloadReads `json:"payload_by_phase,omitempty"`
 }
 
 // Collector is safe for concurrent package workers.
@@ -93,6 +100,57 @@ func RecordFullPackageRead(ctx context.Context, bytes int64) {
 	value.Bytes += bytes
 	value.Full++
 	collector.snapshot.PayloadByPhase[phase] = value
+}
+
+// RecordSignatureStream records one complete RPM signature-verification byte
+// stream. The stream may feed multiple hashers and trust rings; callers must
+// record the physical read once rather than once per consumer.
+func RecordSignatureStream(ctx context.Context, bytes int64) {
+	if collector := FromContext(ctx); collector != nil && bytes >= 0 {
+		collector.mu.Lock()
+		collector.snapshot.SignatureBytesRead += bytes
+		collector.snapshot.SignatureStreams++
+		collector.mu.Unlock()
+	}
+}
+
+// RecordMetadataRead records bytes consumed while hashing or authenticating
+// public/private metadata. Package payload bytes belong in RecordFullPackageRead.
+func RecordMetadataRead(ctx context.Context, bytes int64) {
+	if collector := FromContext(ctx); collector != nil && bytes >= 0 {
+		collector.mu.Lock()
+		collector.snapshot.MetadataBytesRead += bytes
+		collector.mu.Unlock()
+	}
+}
+
+// RecordMetadataTreeHash records one complete metadata-tree hash traversal.
+func RecordMetadataTreeHash(ctx context.Context) {
+	if collector := FromContext(ctx); collector != nil {
+		collector.mu.Lock()
+		collector.snapshot.MetadataTreeHashes++
+		collector.mu.Unlock()
+	}
+}
+
+// RecordTreeWalk records one descriptor-bound filesystem tree traversal.
+func RecordTreeWalk(ctx context.Context) {
+	if collector := FromContext(ctx); collector != nil {
+		collector.mu.Lock()
+		collector.snapshot.TreeWalks++
+		collector.mu.Unlock()
+	}
+}
+
+// RecordFactRows records validated SQLite package-fact rows and their BLOB
+// bytes. Invalid negative deltas are ignored to keep metrics observational.
+func RecordFactRows(ctx context.Context, rows, bytes int64) {
+	if collector := FromContext(ctx); collector != nil && rows >= 0 && bytes >= 0 {
+		collector.mu.Lock()
+		collector.snapshot.FactRowsRead += rows
+		collector.snapshot.FactBytesRead += bytes
+		collector.mu.Unlock()
+	}
 }
 
 // RecordStatHit records one file whose persisted fingerprint avoided hashing.

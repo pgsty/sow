@@ -3,15 +3,300 @@ package managed
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
+	"golang.org/x/sys/unix"
 )
+
+func TestCheckSignedPayloadAuditIsOneAuthenticityAndOneSignatureStreamAcrossDistsAndRetainedGenerations(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	cfg := config.Default()
+	dists := map[string]config.DistConfig{}
+	for _, name := range []string{"el8", "el9", "el10"} {
+		dists[name] = config.DistConfig{Format: "rpm"}
+	}
+	repository := config.RepositoryConfig{Dists: dists}
+	repository.Signing.RPM.Packages = config.RPMPackageSigningConfig{Mode: "fill", Key: "file://keys/pgdg.asc"}
+	cfg.Repositories["repo"] = repository
+	if err := os.Mkdir(filepath.Join(root, "keys"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	publicKey, err := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "PGDG-RPM-GPG-KEY-RHEL-nonfree.asc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "keys", "pgdg.asc"), publicKey, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fingerprints, err := resolveReferenceFingerprints(ctx, root, "file://keys/pgdg.asc")
+	if err != nil || len(fingerprints) != 1 {
+		t.Fatalf("fingerprints=%v err=%v", fingerprints, err)
+	}
+	tools := t.TempDir()
+	gpg := fmt.Sprintf("#!/bin/sh\nlast=\nfor arg in \"$@\"; do last=\"$arg\"; done\ncase \" $* \" in\n  *\" --list-secret-keys \"*) printf 'sec::::::::::\\nfpr:::::::::%s:\\n' \"$last\"; exit 0;;\nesac\nexit 0\n", fingerprints[0])
+	if err := os.WriteFile(filepath.Join(tools, "gpg"), []byte(gpg), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tools, "rpm"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", tools+string(os.PathListSeparator)+os.Getenv("PATH"))
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el8", "el9", "el10"}, Paths: []string{rpm}, Jobs: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RetainAdd(ctx, RetainAddOptions{WorkspaceOptions: options, Repository: "repo", Generation: added.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	for revision := 1; revision <= 2; revision++ {
+		repository = cfg.Repositories["repo"]
+		for name, dist := range repository.Dists {
+			dist.Exclude = []config.ExcludeRule{{Name: []string{fmt.Sprintf("__retained_%d__", revision)}}}
+			repository.Dists[name] = dist
+		}
+		cfg.Repositories["repo"] = repository
+		writeManagedConfig(t, root, cfg)
+		built, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 3})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := RetainAdd(ctx, RetainAddOptions{WorkspaceOptions: options, Repository: "repo", Generation: built.Generation}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkCtx, checkCollector := workmetrics.Ensure(context.Background())
+	checked, err := Check(checkCtx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 3})
+	if err != nil || !checked.ReadyToCopy {
+		t.Fatalf("check=%#v err=%v", checked, err)
+	}
+	checkMetrics := checkCollector.Snapshot()
+	if checkMetrics.FullPackageReads != 1 || checkMetrics.SignatureStreams != 1 {
+		t.Fatalf("check payload amplification=%#v", checkMetrics)
+	}
+	changesCtx, changesCollector := workmetrics.Ensure(context.Background())
+	if _, err := Changes(changesCtx, ChangesOptions{WorkspaceOptions: options, Repository: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	changesMetrics := changesCollector.Snapshot()
+	if changesMetrics.FullPackageReads != checkMetrics.FullPackageReads || changesMetrics.SignatureStreams != checkMetrics.SignatureStreams {
+		t.Fatalf("Changes added payload reads: check=%#v changes=%#v", checkMetrics, changesMetrics)
+	}
+	listCtx, listCollector := workmetrics.Ensure(context.Background())
+	listed, err := RetainList(listCtx, RetainListOptions{WorkspaceOptions: options, Repository: "repo"})
+	if err != nil || len(listed.Generations) != 3 {
+		t.Fatalf("retained=%#v err=%v", listed, err)
+	}
+	if metrics := listCollector.Snapshot(); metrics.FullPackageReads != 1 {
+		t.Fatalf("RetainList rehashed shared payload: %#v", metrics)
+	}
+}
+
+func TestCheckMissingFactsUsesAuthenticatedKnownHeaderWithoutSecondPayloadRead(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"noble": {Format: "deb"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, err := managedBenchmarkDEBBytesWithPayload("sow-check-facts", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := filepath.Join(inputs, "sow-check-facts_1.0-1_amd64.deb")
+	if err := os.WriteFile(input, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Paths: []string{input}, Jobs: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `DELETE FROM package_facts WHERE package_sha256 = ?`, added.Items[0].SHA256); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	checkCtx, collector := workmetrics.Ensure(context.Background())
+	if _, err := Check(checkCtx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if metrics := collector.Snapshot(); metrics.FullPackageReads != 1 || metrics.SignatureStreams != 0 || metrics.FactRowsRead != 0 {
+		t.Fatalf("missing-facts check metrics=%#v", metrics)
+	}
+}
+
+func TestCheckFindsForgedContentDespiteMatchingPersistedFingerprint(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"noble": {Format: "deb"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, err := managedBenchmarkDEBBytesWithPayload("sow-forged-stat", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := filepath.Join(inputs, "sow-forged-stat_1.0-1_amd64.deb")
+	if err := os.WriteFile(input, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Paths: []string{input}, Jobs: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := store.GetPackageObject(ctx, added.Items[0].SHA256)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	payload := filepath.Join(root, "repo", filepath.FromSlash(object.PoolPath))
+	data, err := os.ReadFile(payload)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	data[len(data)-1] ^= 1
+	info, err := os.Stat(payload)
+	if err != nil || os.WriteFile(payload, data, 0o644) != nil || os.Chtimes(payload, info.ModTime(), info.ModTime()) != nil {
+		store.Close()
+		t.Fatalf("forge payload err=%v", err)
+	}
+	var raw unix.Stat_t
+	if err := unix.Stat(payload, &raw); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE package_facts SET device = ?, inode = ?, size = ?, mtime_ns = ?, ctime_ns = ? WHERE package_sha256 = ?`,
+		strconv.FormatUint(uint64(raw.Dev), 10), strconv.FormatUint(uint64(raw.Ino), 10), raw.Size, info.ModTime().UnixNano(), statChangeTimeNano(raw), object.SHA256); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	checkCtx, collector := workmetrics.Ensure(context.Background())
+	checked, err := Check(checkCtx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})
+	if !errors.Is(err, ErrIntegrity) || checked.Status != "error" || collector.Snapshot().FullPackageReads != 1 {
+		t.Fatalf("forged check=%#v metrics=%#v err=%v", checked, collector.Snapshot(), err)
+	}
+}
+
+func TestPayloadEvidenceCTimeDriftForcesReaudit(t *testing.T) {
+	root := t.TempDir()
+	payload := filepath.Join(root, "pool", "p", "package.deb")
+	if err := os.MkdirAll(filepath.Dir(payload), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("ctime-bound evidence")
+	if err := os.WriteFile(payload, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file := state.GenerationFile{Path: "pool/p/package.deb", Phase: "payload", Size: int64(len(body)), SHA256: bytesSHA(body)}
+	registry := newPayloadEvidenceRegistry()
+	ctx, collector := workmetrics.Ensure(context.Background())
+	if err := registry.verifyRetainedReference(ctx, root, file); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := os.Chmod(payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.verifyRetainedReference(ctx, root, file); err != nil {
+		t.Fatal(err)
+	}
+	if metrics := collector.Snapshot(); metrics.FullPackageReads != 2 {
+		t.Fatalf("ctime drift reused stale evidence: %#v", metrics)
+	}
+}
+
+func TestConcurrentDescriptorChangeInvalidatesPayloadEvidence(t *testing.T) {
+	root := t.TempDir()
+	payload := filepath.Join(root, "pool", "p", "package.deb")
+	if err := os.MkdirAll(filepath.Dir(payload), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := make([]byte, 32<<20)
+	for index := range body {
+		body[index] = byte(index)
+	}
+	if err := os.WriteFile(payload, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file := state.GenerationFile{Path: "pool/p/package.deb", Phase: "payload", Size: int64(len(body)), SHA256: bytesSHA(body)}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		mode := os.FileMode(0o600)
+		for {
+			select {
+			case <-stop:
+				_ = os.Chmod(payload, 0o644)
+				return
+			default:
+				_ = os.Chmod(payload, mode)
+				if mode == 0o600 {
+					mode = 0o644
+				} else {
+					mode = 0o600
+				}
+			}
+		}
+	}()
+	err := newPayloadEvidenceRegistry().verifyRetainedReference(context.Background(), root, file)
+	close(stop)
+	<-done
+	if !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("concurrent descriptor change error=%v", err)
+	}
+}
 
 func TestCheckCleanDirtyAndIntegrityWithoutMutation(t *testing.T) {
 	ctx := context.Background()

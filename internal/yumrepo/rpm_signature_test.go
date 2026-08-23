@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
+	"github.com/pgsty/sow/internal/workmetrics"
 )
 
 var rpmSignatureVerificationTime = time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC)
@@ -61,6 +63,48 @@ func TestVerifyEmbeddedRPMSignaturesAuthenticatesRealPGDGPackage(t *testing.T) {
 	}
 	t.Logf("verified real PGDG RPM signer=%s fingerprint=%s primary=%s tag=%s signed_bytes=%d payload_sha256=%s",
 		proof.SignerKeyID, proof.SignerFingerprint, proof.SignerPrimaryFingerprint, proof.HeaderTag, proof.SignedBytes, proof.PayloadDigest)
+}
+
+type combinedTestKeyRing []openpgp.KeyRing
+
+func (rings combinedTestKeyRing) KeysById(id uint64) []openpgp.Key {
+	var keys []openpgp.Key
+	for _, ring := range rings {
+		keys = append(keys, ring.KeysById(id)...)
+	}
+	return keys
+}
+
+func (rings combinedTestKeyRing) KeysByIdUsage(id uint64, requiredUsage byte) []openpgp.Key {
+	var keys []openpgp.Key
+	for _, ring := range rings {
+		keys = append(keys, ring.KeysByIdUsage(id, requiredUsage)...)
+	}
+	return keys
+}
+
+func (rings combinedTestKeyRing) DecryptionKeys() []openpgp.Key { return nil }
+
+func TestVerifyEmbeddedRPMSignaturesMultiStreamsOnceAndKeepsRingResultsIndependent(t *testing.T) {
+	data := readPGDGRPMFixture(t)
+	trusted := readPGDGPackageKeyring(t)
+	untrusted := readHistoricalCentOSKeyring(t, "../../third_party/cavaliergopher-rpm/testdata/RPM-GPG-KEY-CentOS-5")
+	ctx, collector := workmetrics.Ensure(context.Background())
+	results, err := VerifyEmbeddedRPMSignaturesMulti(ctx, bytes.NewReader(data), []RPMSignatureTrustRing{
+		{Identity: "combined", Keyring: combinedTestKeyRing{trusted, untrusted}},
+		{Identity: "retained-untrusted", Keyring: untrusted},
+		{Identity: "retained-valid", Keyring: trusted},
+	}, rpmSignatureVerificationTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 || !results[0].Verified || results[1].Verified || !results[2].Verified || results[1].Err == nil {
+		t.Fatalf("ring results=%#v", results)
+	}
+	metrics := collector.Snapshot()
+	if metrics.SignatureStreams != 1 || metrics.SignatureBytesRead <= 0 || metrics.FullPackageReads != 0 {
+		t.Fatalf("signature metrics=%#v", metrics)
+	}
 }
 
 func TestVerifyEmbeddedRPMSignaturesPreservesHistoricalCentOS7PackageAt2026Observation(t *testing.T) {
@@ -1171,6 +1215,77 @@ func TestVerifyEmbeddedRPMSignaturesLegacyPacketCoversHeaderAndPayload(t *testin
 	_, err = VerifyEmbeddedRPMSignatures(context.Background(), bytes.NewReader(tampered), openpgp.EntityList{entity}, rpmSignatureVerificationTime)
 	if !errors.Is(err, ErrRPMPackageSignature) || !strings.Contains(err.Error(), "not valid under the trusted keyring") {
 		t.Fatalf("legacy payload tamper error=%v", err)
+	}
+}
+
+func TestVerifyEmbeddedRPMSignaturesMultiDoesNotCrossAssembleDualSignerPackets(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "dual-signed.rpm")
+	writeRPMFixture(t, filename, "dual-signed")
+	unsigned, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const unsignedMainHeaderStart = 112
+	entities := make([]*openpgp.Entity, 2)
+	packets := make([][]byte, 2)
+	for index := range entities {
+		entities[index], err = openpgp.NewEntity(fmt.Sprintf("Dual signer %d", index), "", fmt.Sprintf("dual-%d@example.invalid", index), &packet.Config{
+			Time: func() time.Time { return rpmSignatureVerificationTime.Add(-time.Hour) }, RSABits: 2048,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var signature bytes.Buffer
+		if err := openpgp.DetachSign(&signature, entities[index], bytes.NewReader(unsigned[unsignedMainHeaderStart:]), &packet.Config{
+			DefaultHash: crypto.SHA256, Time: func() time.Time { return rpmSignatureVerificationTime.Add(-time.Minute) },
+		}); err != nil {
+			t.Fatal(err)
+		}
+		packets[index] = signature.Bytes()
+	}
+	insertFixtureSignatureTags(t, filename, []fixtureSignatureTag{{id: 1002, packet: packets[0]}, {id: 1005, packet: packets[1]}})
+	signed, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, collector := workmetrics.Ensure(context.Background())
+	results, err := VerifyEmbeddedRPMSignaturesMulti(ctx, bytes.NewReader(signed), []RPMSignatureTrustRing{
+		{Identity: "combined", Keyring: openpgp.EntityList{entities[0], entities[1]}},
+		{Identity: "single-a", Keyring: openpgp.EntityList{entities[0]}},
+		{Identity: "single-b", Keyring: openpgp.EntityList{entities[1]}},
+	}, rpmSignatureVerificationTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 || !results[0].Verified || results[1].Verified || results[2].Verified || results[1].Err == nil || results[2].Err == nil {
+		t.Fatalf("dual-signer ring results=%#v", results)
+	}
+	if metrics := collector.Snapshot(); metrics.SignatureStreams != 1 {
+		t.Fatalf("dual-signer signature streams=%#v", metrics)
+	}
+}
+
+func TestVerifyEmbeddedRPMSignaturesMultiPreservesHistoricalV3AndV4Packages(t *testing.T) {
+	keyring := readHistoricalCentOSKeyring(t,
+		"../../third_party/cavaliergopher-rpm/testdata/RPM-GPG-KEY-CentOS-4",
+		"../../third_party/cavaliergopher-rpm/testdata/RPM-GPG-KEY-CentOS-5",
+		"testdata/RPM-GPG-KEY-CentOS-7.asc",
+	)
+	for _, filename := range []string{
+		"centos-release-4-0.1.x86_64.rpm",
+		"centos-release-5-0.0.el5.centos.2.x86_64.rpm",
+		"centos-release-7-2.1511.el7.centos.2.10.x86_64.rpm",
+	} {
+		t.Run(filename, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("../../third_party/cavaliergopher-rpm/testdata", filename))
+			if err != nil {
+				t.Fatal(err)
+			}
+			results, err := VerifyEmbeddedRPMSignaturesMulti(context.Background(), bytes.NewReader(data), []RPMSignatureTrustRing{{Identity: "historical", Keyring: keyring}}, rpmSignatureVerificationTime)
+			if err != nil || len(results) != 1 || !results[0].Verified {
+				t.Fatalf("historical multi results=%#v err=%v", results, err)
+			}
+		})
 	}
 }
 

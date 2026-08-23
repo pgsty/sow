@@ -258,90 +258,6 @@ func loadRetainedRPMKeyrings(ctx context.Context, store *state.Store) (retainedR
 	return result, nil
 }
 
-func validateStoredRPMIdentity(ctx context.Context, reader io.ReadSeeker, object state.PackageObject, retained retainedRPMKeyrings) error {
-	identity := strings.ToUpper(object.SignatureKey)
-	if len(identity) == 40 || len(identity) == 64 {
-		keyrings := retained[identity]
-		if len(keyrings) == 0 {
-			return fmt.Errorf("no retained public certificate for stored signer %s", identity)
-		}
-		verified := false
-		for _, keyring := range keyrings {
-			fingerprint, ok := verifiedRPMSignerReader(ctx, reader, keyring)
-			if ok && fingerprint == identity {
-				verified = true
-				break
-			}
-		}
-		if !verified {
-			return fmt.Errorf("package is not verified by its retained signer %s", identity)
-		}
-		return nil
-	}
-	structural, err := inspectStructuralRPMKeyIDReader(ctx, reader)
-	if err != nil {
-		return err
-	}
-	if strings.ToUpper(structural) != identity {
-		return fmt.Errorf("structural signature identity %q differs from stored identity %q", structural, object.SignatureKey)
-	}
-	return nil
-}
-
-func validateBuiltRPMAuthorization(ctx context.Context, root, repoName string, object state.PackageObject, signing config.EffectiveRPMPackageSigningConfig, retained retainedRPMKeyrings) error {
-	if signing.Mode == "" || signing.Mode == "never" {
-		return validateStoredRPMIdentityFromSource(ctx, root, repoName, object, retained)
-	}
-	allowed := map[string]map[string]struct{}{}
-	if signing.Mode == "always" {
-		allowed[strings.ToUpper(signing.KeyFingerprint)] = map[string]struct{}{signing.KeySnapshotSHA256: {}}
-	} else if signing.Mode == "fill" {
-		for _, fingerprint := range signing.TrustedKeyFingerprints {
-			allowed[strings.ToUpper(fingerprint)] = map[string]struct{}{}
-		}
-		for _, snapshot := range signing.TrustedKeySnapshotSHA256s {
-			for fingerprint, keyrings := range retained {
-				if _, authorizedFingerprint := allowed[fingerprint]; authorizedFingerprint {
-					if _, exists := keyrings[snapshot]; exists {
-						allowed[fingerprint][snapshot] = struct{}{}
-					}
-				}
-			}
-		}
-	} else {
-		return fmt.Errorf("unknown retained RPM package signing mode %q", signing.Mode)
-	}
-	source, err := availableManagedPackageSource(root, repoName, object)
-	if err != nil {
-		return err
-	}
-	opened, err := source.open()
-	if err != nil {
-		return err
-	}
-	var signer string
-	for fingerprint, snapshots := range allowed {
-		for snapshot := range snapshots {
-			keyring := retained[fingerprint][snapshot]
-			if verified, ok := verifiedRPMSignerReader(ctx, opened.file, keyring); ok {
-				signer = verified
-				break
-			}
-		}
-		if signer != "" {
-			break
-		}
-	}
-	closeErr := opened.CloseVerified()
-	if signer == "" {
-		return errors.Join(fmt.Errorf("package is not verified by the retained %s authorization", signing.Mode), closeErr)
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	return nil
-}
-
 // decodeRetainedEffectiveSigning is deliberately stricter than ordinary JSON
 // decoding. Built signing evidence is an immutable authorization snapshot, so
 // aliases, unsorted identities, duplicate identities, and dormant resolved
@@ -387,18 +303,6 @@ func decodeRetainedEffectiveSigning(value string) (config.EffectiveSigningConfig
 		}
 	}
 	return frozen, nil
-}
-
-func validateStoredRPMIdentityFromSource(ctx context.Context, root, repoName string, object state.PackageObject, retained retainedRPMKeyrings) error {
-	source, err := availableManagedPackageSource(root, repoName, object)
-	if err != nil {
-		return err
-	}
-	opened, err := source.open()
-	if err != nil {
-		return err
-	}
-	return errors.Join(validateStoredRPMIdentity(ctx, opened.file, object, retained), opened.CloseVerified())
 }
 
 func (policy rpmSigningPolicy) prepare(ctx context.Context, snapshot, basename string, object state.PackageObject) (state.PackageObject, error) {

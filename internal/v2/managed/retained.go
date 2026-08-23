@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 	"golang.org/x/sys/unix"
 )
 
@@ -523,11 +524,15 @@ func VerifyRetainedGeneration(ctx context.Context, opts RetainVerifyOptions) (re
 }
 
 func verifyRetainedGenerationLocked(ctx context.Context, root, repoName string, generation state.GenerationID, repositoryID string) (RetainedGeneration, error) {
-	directory := filepath.Join(root, ".sow", repoName, "retained", generation.String())
-	return verifyRetainedGenerationDirectory(ctx, root, repoName, generation, repositoryID, directory)
+	return verifyRetainedGenerationLockedWithEvidence(ctx, root, repoName, generation, repositoryID, newPayloadEvidenceRegistry())
 }
 
-func verifyRetainedGenerationDirectory(ctx context.Context, root, repoName string, generation state.GenerationID, repositoryID, directory string) (RetainedGeneration, error) {
+func verifyRetainedGenerationLockedWithEvidence(ctx context.Context, root, repoName string, generation state.GenerationID, repositoryID string, evidence *payloadEvidenceRegistry) (RetainedGeneration, error) {
+	directory := filepath.Join(root, ".sow", repoName, "retained", generation.String())
+	return verifyRetainedGenerationDirectoryWithEvidence(ctx, root, repoName, generation, repositoryID, directory, evidence)
+}
+
+func verifyRetainedGenerationDirectoryWithEvidence(ctx context.Context, root, repoName string, generation state.GenerationID, repositoryID, directory string, evidence *payloadEvidenceRegistry) (RetainedGeneration, error) {
 	entries, err := listRootedDirectory(directory)
 	if err != nil {
 		return RetainedGeneration{}, fmt.Errorf("%w: retained Generation directory is missing or unsafe: %v", ErrIntegrity, err)
@@ -555,7 +560,7 @@ func verifyRetainedGenerationDirectory(ctx context.Context, root, repoName strin
 	expectedMetadata := map[string]state.GenerationFile{}
 	for _, file := range manifest {
 		if file.Phase == "payload" {
-			if err := verifyRetainedSource(ctx, filepath.Join(root, repoName), file); err != nil {
+			if err := evidence.verifyRetainedReference(ctx, filepath.Join(root, repoName), file); err != nil {
 				return RetainedGeneration{}, err
 			}
 		} else {
@@ -589,6 +594,11 @@ func verifyRetainedSource(ctx context.Context, root string, file state.Generatio
 	}
 	hash := sha256.New()
 	count, copyErr := io.Copy(hash, &retainedContextReader{ctx: ctx, reader: opened.file})
+	if file.Phase == "payload" {
+		workmetrics.RecordFullPackageRead(workmetrics.WithPhase(ctx, "retained_payload"), count)
+	} else {
+		workmetrics.RecordMetadataRead(ctx, count)
+	}
 	closeErr := opened.CloseVerified()
 	if err := errors.Join(copyErr, closeErr); err != nil || count != file.Size || hex.EncodeToString(hash.Sum(nil)) != file.SHA256 {
 		return fmt.Errorf("%w: retained source %q differs from manifest: %v", ErrIntegrity, file.Path, err)
@@ -764,12 +774,13 @@ func listRetainedGenerationsResult(ctx context.Context, opts RetainListOptions) 
 		return result, err
 	}
 	result.Generations = []RetainedGeneration{}
+	evidence := newPayloadEvidenceRegistry()
 	for _, entry := range entries {
 		generation, err := state.ParseGenerationID(entry.Name())
 		if err != nil || generation == 0 || !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
 			return result, fmt.Errorf("%w: non-canonical retained entry %q", ErrIntegrity, entry.Name())
 		}
-		retained, err := verifyRetainedGenerationLocked(ctx, ws.Root, repoName, generation, identity.RepositoryID)
+		retained, err := verifyRetainedGenerationLockedWithEvidence(ctx, ws.Root, repoName, generation, identity.RepositoryID, evidence)
 		if err != nil {
 			return result, err
 		}
@@ -782,7 +793,7 @@ func listRetainedGenerationsResult(ctx context.Context, opts RetainListOptions) 
 // predicate used by ordinary check.  It intentionally rejects every
 // non-generation entry instead of silently skipping a damaged or attacker-
 // supplied retained root.
-func verifyAllRetainedGenerationsLocked(ctx context.Context, root, repoName, repositoryID string) (int64, []string) {
+func verifyAllRetainedGenerationsLockedWithEvidence(ctx context.Context, root, repoName, repositoryID string, evidence *payloadEvidenceRegistry) (int64, []string) {
 	entries, err := listRootedDirectory(filepath.Join(root, ".sow", repoName, "retained"))
 	if err != nil {
 		return 0, []string{fmt.Sprintf("retained inventory is unavailable: %v", err)}
@@ -794,7 +805,7 @@ func verifyAllRetainedGenerationsLocked(ctx context.Context, root, repoName, rep
 			issues = append(issues, fmt.Sprintf("non-canonical retained entry %q", entry.Name))
 			continue
 		}
-		if _, verifyErr := verifyRetainedGenerationLocked(ctx, root, repoName, generation, repositoryID); verifyErr != nil {
+		if _, verifyErr := verifyRetainedGenerationLockedWithEvidence(ctx, root, repoName, generation, repositoryID, evidence); verifyErr != nil {
 			issues = append(issues, fmt.Sprintf("retained Generation %s is invalid: %v", generation, verifyErr))
 		}
 	}

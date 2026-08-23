@@ -7,10 +7,17 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
+
+	"github.com/pgsty/sow/internal/workmetrics"
 )
 
-const MaxPackageFactsBytes = 64 << 20
+const (
+	MaxPackageFactsBytes       = 64 << 20
+	packageFactDigestBatchSize = 500
+)
 
 // PackageFact is a rebuildable render cache for one immutable package object.
 // Fingerprint is optional until the object has acquired its final Pool name.
@@ -97,33 +104,103 @@ FROM package_facts ORDER BY package_sha256`)
 	if err != nil {
 		return nil, err
 	}
+	workmetrics.RecordSQLStatements(ctx, 1)
 	defer rows.Close()
 	result := []PackageFact{}
 	for rows.Next() {
-		var fact PackageFact
-		var factsSHA string
-		var device, inode sql.NullString
-		var size, mtime, ctime sql.NullInt64
-		if err := rows.Scan(&fact.PackageSHA256, &fact.FactSchema, &fact.Facts, &factsSHA, &device, &inode, &size, &mtime, &ctime); err != nil {
+		fact, err := scanPackageFact(rows)
+		if err != nil {
 			return nil, err
 		}
-		if err := validatePackageFact(fact); err != nil {
-			fact.Corrupt = true
-		} else {
-			digest := sha256.Sum256(fact.Facts)
-			if factsSHA != hex.EncodeToString(digest[:]) {
-				fact.Corrupt = true
-			}
-		}
-		fingerprint, fingerprintCorrupt := decodePackageFingerprint(device, inode, size, mtime, ctime)
-		if fingerprintCorrupt {
-			fact.Corrupt = true
-		} else {
-			fact.Fingerprint = fingerprint
-		}
+		workmetrics.RecordFactRows(ctx, 1, int64(len(fact.Facts)))
 		result = append(result, fact)
 	}
 	return result, rows.Err()
+}
+
+// ListPackageFactsForDigests is the production build read path. It normalizes
+// caller input to sorted unique digests, stays well below SQLite's bind limit,
+// and validates each selected facts_sha256 exactly as the diagnostic all-facts
+// API does. Unselected BLOBs are never read or hashed.
+func (s *Store) ListPackageFactsForDigests(ctx context.Context, requested []string) ([]PackageFact, error) {
+	unique := make(map[string]struct{}, len(requested))
+	for _, digest := range requested {
+		if !validSHA256Text(digest) {
+			return nil, fmt.Errorf("invalid package fact digest %q", digest)
+		}
+		unique[digest] = struct{}{}
+	}
+	digests := make([]string, 0, len(unique))
+	for digest := range unique {
+		digests = append(digests, digest)
+	}
+	sort.Strings(digests)
+	result := make([]PackageFact, 0, len(digests))
+	for start := 0; start < len(digests); start += packageFactDigestBatchSize {
+		end := min(start+packageFactDigestBatchSize, len(digests))
+		var query strings.Builder
+		query.WriteString(`SELECT package_sha256, fact_schema, facts, facts_sha256, device, inode, size, mtime_ns, ctime_ns FROM package_facts WHERE package_sha256 IN (`)
+		arguments := make([]any, 0, end-start)
+		for index, digest := range digests[start:end] {
+			if index != 0 {
+				query.WriteByte(',')
+			}
+			query.WriteByte('?')
+			arguments = append(arguments, digest)
+		}
+		query.WriteString(`) ORDER BY package_sha256`)
+		rows, err := s.db.QueryContext(ctx, query.String(), arguments...)
+		if err != nil {
+			return nil, err
+		}
+		workmetrics.RecordSQLStatements(ctx, 1)
+		for rows.Next() {
+			fact, scanErr := scanPackageFact(rows)
+			if scanErr != nil {
+				rows.Close()
+				return nil, scanErr
+			}
+			workmetrics.RecordFactRows(ctx, 1, int64(len(fact.Facts)))
+			result = append(result, fact)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+type packageFactScanner interface {
+	Scan(...any) error
+}
+
+func scanPackageFact(scanner packageFactScanner) (PackageFact, error) {
+	var fact PackageFact
+	var factsSHA string
+	var device, inode sql.NullString
+	var size, mtime, ctime sql.NullInt64
+	if err := scanner.Scan(&fact.PackageSHA256, &fact.FactSchema, &fact.Facts, &factsSHA, &device, &inode, &size, &mtime, &ctime); err != nil {
+		return PackageFact{}, err
+	}
+	if err := validatePackageFact(fact); err != nil {
+		fact.Corrupt = true
+	} else {
+		digest := sha256.Sum256(fact.Facts)
+		if factsSHA != hex.EncodeToString(digest[:]) {
+			fact.Corrupt = true
+		}
+	}
+	fingerprint, fingerprintCorrupt := decodePackageFingerprint(device, inode, size, mtime, ctime)
+	if fingerprintCorrupt {
+		fact.Corrupt = true
+	} else {
+		fact.Fingerprint = fingerprint
+	}
+	return fact, nil
 }
 
 // ListPackageFingerprints is the metadata-only cache view used by ordinary

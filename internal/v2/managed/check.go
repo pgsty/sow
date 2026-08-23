@@ -17,6 +17,7 @@ import (
 	"github.com/pgsty/sow/internal/aptrepo"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
 
@@ -25,6 +26,7 @@ func Check(ctx context.Context, opts CheckOptions) (result CheckResult, resultEr
 	if ctx == nil {
 		return result, errors.New("managed: nil context")
 	}
+	ctx, _ = workmetrics.Ensure(ctx)
 	if opts.Jobs < 1 {
 		return result, fmt.Errorf("%w: check jobs must be at least 1", ErrRejected)
 	}
@@ -88,14 +90,13 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 	result.Generation, result.Revision, result.Status = summary.BuiltGeneration, summary.DesiredRevision, "clean"
 	layout := inspectRepositoryReadLayout(ctx, ws.Root, repoName, store)
 	legacyC2, identity := layout.FrozenC2, layout.Identity
+	evidenceRegistry := newPayloadEvidenceRegistry()
+	result.verification = &checkVerificationSnapshot{Evidence: evidenceRegistry}
 	retainedChecked := int64(0)
 	retainedIssues := []string{}
 	if !legacyC2 && layout.IdentityErr != nil {
 		retainedIssues = append(retainedIssues, layout.IdentityErr.Error())
-	} else if !legacyC2 {
-		retainedChecked, retainedIssues = verifyAllRetainedGenerationsLocked(ctx, ws.Root, repoName, identity.RepositoryID)
 	}
-	addLayer("retained", retainedChecked, retainedIssues)
 	if !scoped || summary.Status == "error" {
 		result.Status = summary.Status
 	}
@@ -207,8 +208,23 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 	if retainedErr != nil {
 		signatureIssues = append(signatureIssues, retainedErr.Error())
 	}
+	trustPlan := buildCheckRPMTrustPlan(retainedRPMKeys, rpmPolicy)
+	digests := make([]string, len(objects))
+	for index, object := range objects {
+		digests[index] = object.SHA256
+	}
+	storedFacts, factsErr := store.ListPackageFactsForDigests(ctx, digests)
+	if factsErr != nil {
+		return result, factsErr
+	}
+	factsByDigest := make(map[string]state.PackageFact, len(storedFacts))
+	for _, fact := range storedFacts {
+		factsByDigest[fact.PackageSHA256] = fact
+	}
 	objectIssues := make([][]string, len(objects))
 	objectSignatureIssues := make([][]string, len(objects))
+	objectEvidence := make([]*checkPayloadEvidence, len(objects))
+	signatureObservedAt := time.Now().UTC()
 	for _, object := range objects {
 		if object.Format == "rpm" {
 			signatureChecked++
@@ -232,48 +248,32 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 						objectIssues[index] = append(objectIssues[index], sourceErr.Error())
 						continue
 					}
-					opened, openErr := source.open()
-					if openErr != nil {
-						objectIssues[index] = append(objectIssues[index], openErr.Error())
+					var stored *state.PackageFact
+					if fact, exists := factsByDigest[object.SHA256]; exists {
+						copyFact := fact
+						stored = &copyFact
+					}
+					evidence, auditErr := evidenceRegistry.auditObject(ctx, source, object, stored, trustPlan, signatureObservedAt)
+					if auditErr != nil {
+						objectIssues[index] = append(objectIssues[index], auditErr.Error())
 						continue
 					}
-					if object.Storage == "pool" {
-						if opened.before.Mode().Perm() != 0o644 {
-							objectIssues[index] = append(objectIssues[index], fmt.Sprintf("public package %s mode is not 0644", object.SHA256))
-							_ = opened.CloseVerified()
-							continue
-						}
-					}
-					digest, hashErr := hashOpenedFileContext(ctx, opened.file)
-					if hashErr != nil || digest != object.SHA256 {
-						objectIssues[index] = append(objectIssues[index], fmt.Sprintf("package %s checksum differs", object.SHA256))
-						_ = opened.CloseVerified()
-						continue
-					}
-					parsed, inspectErr := inspectSnapshotReader(ctx, opened.file, object.Filename)
-					if inspectErr != nil || !sameManagedPackageFacts(object, parsed) {
-						objectIssues[index] = append(objectIssues[index], fmt.Sprintf("package %s facts differ from SQLite: %v", object.SHA256, inspectErr))
-						_ = opened.CloseVerified()
+					objectEvidence[index] = evidence
+					if object.Storage == "pool" && evidence.Identity.mode.Perm() != 0o644 {
+						objectIssues[index] = append(objectIssues[index], fmt.Sprintf("public package %s mode is not 0644", object.SHA256))
 						continue
 					}
 					if object.Format == "deb" {
 						if object.SignatureKey != "" {
 							objectIssues[index] = append(objectIssues[index], fmt.Sprintf("DEB %s has an unexpected package signature identity", object.SHA256))
 						}
-						if closeErr := opened.CloseVerified(); closeErr != nil {
-							objectIssues[index] = append(objectIssues[index], closeErr.Error())
-						}
 						continue
 					}
 					if retainedErr != nil {
-						_ = opened.CloseVerified()
 						continue
 					}
-					if signatureErr := validateStoredRPMIdentity(ctx, opened.file, object, retainedRPMKeys); signatureErr != nil {
+					if signatureErr := validateStoredRPMEvidence(object, evidence, trustPlan); signatureErr != nil {
 						objectSignatureIssues[index] = append(objectSignatureIssues[index], fmt.Sprintf("RPM %s retained signature proof is invalid: %v", object.SHA256, signatureErr))
-					}
-					if closeErr := opened.CloseVerified(); closeErr != nil {
-						objectIssues[index] = append(objectIssues[index], closeErr.Error())
 					}
 				}
 			}()
@@ -290,6 +290,16 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 	for _, issues := range objectSignatureIssues {
 		signatureIssues = append(signatureIssues, issues...)
 	}
+	evidenceByDigest := make(map[string]*checkPayloadEvidence, len(objects))
+	for index, evidence := range objectEvidence {
+		if evidence != nil {
+			evidenceByDigest[objects[index].SHA256] = evidence
+		}
+	}
+	if !legacyC2 && layout.IdentityErr == nil {
+		retainedChecked, retainedIssues = verifyAllRetainedGenerationsLockedWithEvidence(ctx, ws.Root, repoName, identity.RepositoryID, evidenceRegistry)
+	}
+	addLayer("retained", retainedChecked, retainedIssues)
 	poolIssues, _ := validatePublicPoolObjectBijection(ctx, filepath.Join(ws.Root, repoName), allObjects, recoveryView)
 	packageIssues = append(packageIssues, poolIssues...)
 	pendingExpected := make(map[string]state.PackageObject)
@@ -358,20 +368,7 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 		}
 		if cfg.Repositories[repoName].Dists[distName].Format == "rpm" && policyErr == nil {
 			for _, object := range desiredObjects {
-				source, sourceErr := availableManagedPackageSource(ws.Root, repoName, object)
-				if sourceErr != nil {
-					membershipIssues = append(membershipIssues, sourceErr.Error())
-					continue
-				}
-				opened, openErr := source.open()
-				if openErr != nil {
-					membershipIssues = append(membershipIssues, openErr.Error())
-					continue
-				}
-				policyCheckErr := rpmPolicy.authorizeDesiredReader(ctx, opened.file)
-				if closeErr := opened.CloseVerified(); closeErr != nil {
-					policyCheckErr = errors.Join(policyCheckErr, closeErr)
-				}
+				policyCheckErr := authorizeDesiredRPMEvidence(rpmPolicy, evidenceByDigest[object.SHA256], trustPlan)
 				if policyCheckErr != nil {
 					// Current Desired authorization is mutable policy, not proof that
 					// the immutable object or retained Built Generation is corrupt.
@@ -410,7 +407,7 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 			} else {
 				for _, object := range builtObjects {
 					signatureChecked++
-					if signingErr := validateBuiltRPMAuthorization(ctx, ws.Root, repoName, object, frozenSigning.RPM.Packages, retainedRPMKeys); signingErr != nil {
+					if signingErr := validateBuiltRPMAuthorizationEvidence(object, evidenceByDigest[object.SHA256], frozenSigning.RPM.Packages, trustPlan); signingErr != nil {
 						signatureIssues = append(signatureIssues, fmt.Sprintf("Dist %s built RPM %s signing authorization is invalid: %v", distName, object.SHA256, signingErr))
 					}
 				}
@@ -578,7 +575,12 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 		if legacyC2 {
 			layout = state.LayoutC2V1
 		}
-		physical, scanErr := scanPublicManifestForLayout(ctx, filepath.Join(ws.Root, repoName), layout)
+		physicalSnapshot, scanErr := scanPublicGenerationSnapshotForLayoutWithEvidence(ctx, filepath.Join(ws.Root, repoName), layout, evidenceRegistry)
+		physical := []state.GenerationFile(nil)
+		if physicalSnapshot != nil {
+			physical = physicalSnapshot.Manifest
+			result.verification.Public = physicalSnapshot
+		}
 		if scanErr != nil {
 			manifestIssues = append(manifestIssues, fmt.Sprintf("public delivery tree cannot be scanned: %v", scanErr))
 		} else if summary.BuiltGeneration == 0 {

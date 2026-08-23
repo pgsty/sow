@@ -274,8 +274,8 @@ func TestRootedDirectoryExchangeRejectsAncestorSymlinkRaceWithoutEscape(t *testi
 	}
 	for path, want := range map[string]string{
 		filepath.Join(originalRepo, "dists", "el9", "x86_64", "repodata", "marker"): "old",
-		filepath.Join(right, "marker"):                                              "new",
-		outsideMarker:                                                               "outside",
+		filepath.Join(right, "marker"): "new",
+		outsideMarker:                  "outside",
 	} {
 		data, readErr := os.ReadFile(path)
 		if readErr != nil || string(data) != want {

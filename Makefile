@@ -18,7 +18,7 @@ DIST_DIR := $(ROOT_DIR)/dist
 BINARY := $(BIN_DIR)/sow
 CLEAN_DELIVERY_OUT ?= $(if $(TMPDIR),$(TMPDIR),/tmp)/sow-clean-delivery
 LDFLAGS := -s -w -X github.com/pgsty/sow/internal/v2cli.Version=$(VERSION)
-CORE_PACKAGES := ./internal/v2/... ./internal/v2cli ./internal/aptrepo ./internal/r2 ./internal/yumrepo
+CORE_PACKAGES := ./internal/v2/... ./internal/v2cli ./internal/aptrepo ./internal/r2 ./internal/workmetrics ./internal/yumrepo
 
 .PHONY: all help version deadcode-version govulncheck-version build run install fmt fmt-check tidy tidy-check vet lint deadcode vuln verify-rpm-upstream \
 	test test-go test-rpm test-core test-v2 test-perf-contract race check clean-delivery \

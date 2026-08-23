@@ -12,6 +12,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/subtle"
+	"encoding"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -60,6 +61,18 @@ var embeddedRPMSignatureTags = [...]struct {
 type embeddedRPMSignaturePacket struct {
 	metadata EmbeddedRPMSignature
 	packet   []byte
+}
+
+type RPMSignatureTrustRing struct {
+	Identity string
+	Keyring  openpgp.KeyRing
+}
+
+type RPMSignatureTrustRingResult struct {
+	Identity string
+	Verified bool
+	Proofs   []VerifiedEmbeddedRPMSignature
+	Err      error
 }
 
 // InspectEmbeddedRPMSignatures parses the bounded RPM signature header and
@@ -198,6 +211,386 @@ func RPMSignatureNeutralDigest(ctx context.Context, r io.ReadSeeker) (_ string, 
 	}
 	workmetrics.RecordFullPackageRead(ctx, read)
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+type preparedEmbeddedRPMSignature struct {
+	candidate   embeddedRPMSignaturePacket
+	coverage    RPMSignatureCoverage
+	signedBytes int64
+	hasher      hash.Hash
+	v3          *preparedOpenPGPV3Signature
+	v4          *packet.Signature
+}
+
+type preparedOpenPGPV3Signature struct {
+	body               []byte
+	issuerKeyID        uint64
+	publicKeyAlgorithm int
+	hashID             crypto.Hash
+	first              []byte
+	second             []byte
+}
+
+// VerifyEmbeddedRPMSignaturesMulti verifies canonical candidate trust rings
+// independently while streaming mainHeaderStart..EOF exactly once. No packet
+// or key from one ring can complete the proof of another ring.
+func VerifyEmbeddedRPMSignaturesMulti(ctx context.Context, r io.ReadSeeker, rings []RPMSignatureTrustRing, at time.Time) (results []RPMSignatureTrustRingResult, resultErr error) {
+	if ctx == nil {
+		return nil, errors.New("yumrepo: nil context")
+	}
+	if r == nil || at.IsZero() || len(rings) == 0 {
+		return nil, fmt.Errorf("%w: invalid multi-ring RPM verification input", ErrRPMPackageSignature)
+	}
+	for index, ring := range rings {
+		if ring.Identity == "" || ring.Identity != strings.TrimSpace(ring.Identity) || len(ring.Identity) > 256 || strings.ContainsAny(ring.Identity, "\x00\r\n") || ring.Keyring == nil || index > 0 && rings[index-1].Identity >= ring.Identity {
+			return nil, fmt.Errorf("%w: candidate RPM trust rings are not canonical sorted unique identities", ErrRPMPackageSignature)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	originalOffset, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, fmt.Errorf("%w: read original RPM offset: %v", ErrRPMPackageSignature, err)
+	}
+	defer func() {
+		if _, restoreErr := r.Seek(originalOffset, io.SeekStart); restoreErr != nil && resultErr == nil {
+			results = nil
+			resultErr = fmt.Errorf("%w: restore RPM offset: %v", ErrRPMPackageSignature, restoreErr)
+		}
+	}()
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("%w: seek RPM start: %v", ErrRPMPackageSignature, err)
+	}
+	packets, err := inspectEmbeddedRPMSignaturePackets(ctx, r)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrRPMPackageSignature, err)
+	}
+	mainHeaderStart, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, fmt.Errorf("%w: locate RPM main header: %v", ErrRPMPackageSignature, err)
+	}
+	layout, err := inspectRPMVerificationLayout(ctx, r, mainHeaderStart)
+	if err != nil {
+		return nil, err
+	}
+	prepared := make([]preparedEmbeddedRPMSignature, 0, len(packets))
+	needPayloadDigest := false
+	for _, candidate := range packets {
+		createdAt := candidate.metadata.SignatureCreatedAt
+		if createdAt.IsZero() {
+			return nil, fmt.Errorf("%w: %s has no authenticated signature creation time", ErrRPMPackageSignature, candidate.metadata.HeaderTag)
+		}
+		if createdAt.After(at.UTC().Add(MaxRPMSignatureClockSkew)) {
+			return nil, fmt.Errorf("%w: %s creation time %s is later than observation %s plus %s clock skew", ErrRPMPackageSignature, candidate.metadata.HeaderTag, createdAt.Format(time.RFC3339), at.UTC().Format(time.RFC3339), MaxRPMSignatureClockSkew)
+		}
+		coverage, _, signedBytes := signedRPMRange(candidate.metadata.HeaderTagID, layout)
+		entry := preparedEmbeddedRPMSignature{candidate: candidate, coverage: coverage, signedBytes: signedBytes}
+		if coverage == RPMSignatureCoverageHeaderPayloadDigest {
+			if len(layout.payloadDigests) == 0 && layout.payloadHashAlgo == 0 {
+				entry.coverage = RPMSignatureCoverageHeader
+			} else {
+				needPayloadDigest = true
+			}
+		}
+		switch candidate.metadata.PacketVersion {
+		case 3:
+			entry.v3, entry.hasher, err = prepareOpenPGPV3SignatureHash(candidate.packet, createdAt)
+		case 4:
+			entry.v4, entry.hasher, err = prepareOpenPGPV4SignatureHash(candidate.packet, createdAt)
+		default:
+			err = fmt.Errorf("unsupported OpenPGP signature version %d", candidate.metadata.PacketVersion)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: prepare %s: %v", ErrRPMPackageSignature, candidate.metadata.HeaderTag, err)
+		}
+		prepared = append(prepared, entry)
+	}
+
+	var payloadHasher hash.Hash
+	var payloadAlgorithm, payloadDigest string
+	if needPayloadDigest {
+		if len(layout.payloadDigests) != 1 {
+			return nil, fmt.Errorf("%w: signed RPM header must contain exactly one payload digest, got %d", ErrRPMPackageSignature, len(layout.payloadDigests))
+		}
+		payloadDigest = strings.ToLower(layout.payloadDigests[0])
+		var encodedBytes int
+		payloadHasher, payloadAlgorithm, encodedBytes, err = rpmPayloadHasher(layout.payloadHashAlgo)
+		if err != nil {
+			return nil, err
+		}
+		if len(payloadDigest) != encodedBytes*2 {
+			return nil, fmt.Errorf("%w: signed %s payload digest has length %d, want %d", ErrRPMPackageSignature, payloadAlgorithm, len(payloadDigest), encodedBytes*2)
+		}
+		if _, err := hex.DecodeString(payloadDigest); err != nil {
+			return nil, fmt.Errorf("%w: signed %s payload digest is not hexadecimal", ErrRPMPackageSignature, payloadAlgorithm)
+		}
+	}
+	if _, err := r.Seek(layout.mainHeaderStart, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("%w: seek RPM signed stream: %v", ErrRPMPackageSignature, err)
+	}
+	remaining := layout.fileEnd - layout.mainHeaderStart
+	streamBytes := remaining
+	position := layout.mainHeaderStart
+	buffer := make([]byte, 128<<10)
+	for remaining > 0 {
+		chunk := min(int64(len(buffer)), remaining)
+		n, readErr := io.ReadFull(&contextReader{ctx: ctx, r: r}, buffer[:chunk])
+		if readErr != nil {
+			return nil, fmt.Errorf("%w: stream RPM signed bytes: %v", ErrRPMPackageSignature, readErr)
+		}
+		data := buffer[:n]
+		for index := range prepared {
+			limit := layout.fileEnd
+			if prepared[index].coverage == RPMSignatureCoverageHeaderPayloadDigest || prepared[index].coverage == RPMSignatureCoverageHeader {
+				limit = layout.mainHeaderEnd
+			}
+			if position < limit {
+				count := min(int64(n), limit-position)
+				if count > 0 {
+					if _, err := prepared[index].hasher.Write(data[:count]); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+		if payloadHasher != nil && position+int64(n) > layout.mainHeaderEnd {
+			start := max(int64(0), layout.mainHeaderEnd-position)
+			if _, err := payloadHasher.Write(data[start:]); err != nil {
+				return nil, err
+			}
+		}
+		position += int64(n)
+		remaining -= int64(n)
+	}
+	workmetrics.RecordSignatureStream(ctx, streamBytes)
+	if payloadHasher != nil && hex.EncodeToString(payloadHasher.Sum(nil)) != payloadDigest {
+		return nil, fmt.Errorf("%w: signed %s payload digest mismatch", ErrRPMPackageSignature, payloadAlgorithm)
+	}
+
+	results = make([]RPMSignatureTrustRingResult, len(rings))
+	for ringIndex, ring := range rings {
+		result := RPMSignatureTrustRingResult{Identity: ring.Identity, Proofs: make([]VerifiedEmbeddedRPMSignature, 0, len(prepared))}
+		payloadAuthenticated := false
+		for _, entry := range prepared {
+			var signer openpgp.Key
+			cloned, cloneErr := cloneRPMVerificationHash(entry.hasher, func() (hash.Hash, error) {
+				if entry.v3 != nil {
+					return entry.v3.hashID.New(), nil
+				}
+				return entry.v4.PrepareVerify()
+			})
+			if cloneErr == nil && entry.v3 != nil {
+				signer, cloneErr = verifyPreparedOpenPGPV3Signature(cloned, entry.v3, ring.Keyring, entry.candidate.metadata.SignatureCreatedAt)
+			} else if cloneErr == nil {
+				signer, cloneErr = verifyPreparedOpenPGPV4Signature(cloned, entry.v4, ring.Keyring, entry.candidate.metadata.SignatureCreatedAt)
+			}
+			if cloneErr != nil {
+				result.Err = fmt.Errorf("%w: %s is not valid under trust ring %q: %v", ErrRPMPackageSignature, entry.candidate.metadata.HeaderTag, ring.Identity, cloneErr)
+				break
+			}
+			proof := verifiedEmbeddedRPMProof(entry.candidate.metadata, entry.coverage, entry.signedBytes, signer)
+			if entry.coverage == RPMSignatureCoverageHeaderPayloadDigest {
+				proof.PayloadDigestAlgorithm = payloadAlgorithm
+				proof.PayloadDigest = payloadDigest
+				payloadAuthenticated = true
+			} else if entry.coverage == RPMSignatureCoverageHeaderPayload {
+				payloadAuthenticated = true
+			}
+			result.Proofs = append(result.Proofs, proof)
+		}
+		if result.Err == nil && !payloadAuthenticated {
+			result.Err = fmt.Errorf("%w: no trusted embedded signature authenticates the RPM payload under trust ring %q", ErrRPMPackageSignature, ring.Identity)
+		}
+		if result.Err == nil {
+			result.Verified = true
+		} else {
+			result.Proofs = nil
+		}
+		results[ringIndex] = result
+	}
+	return results, nil
+}
+
+func verifiedEmbeddedRPMProof(metadata EmbeddedRPMSignature, coverage RPMSignatureCoverage, signedBytes int64, signer openpgp.Key) VerifiedEmbeddedRPMSignature {
+	proof := VerifiedEmbeddedRPMSignature{
+		EmbeddedRPMSignature: metadata, Coverage: coverage, SignedBytes: signedBytes,
+		SignerKeyID: fmt.Sprintf("%016x", signer.PublicKey.KeyId), SignerFingerprint: hex.EncodeToString(signer.PublicKey.Fingerprint),
+		PublicKeyAlgorithmName: openPGPPublicKeyAlgorithmName(metadata.PublicKeyAlgorithm), HashAlgorithmName: openPGPHashAlgorithmName(metadata.HashAlgorithm),
+	}
+	if signer.Entity != nil && signer.Entity.PrimaryKey != nil {
+		proof.SignerPrimaryFingerprint = hex.EncodeToString(signer.Entity.PrimaryKey.Fingerprint)
+	}
+	return proof
+}
+
+func cloneRPMVerificationHash(source hash.Hash, fresh func() (hash.Hash, error)) (hash.Hash, error) {
+	marshaler, ok := source.(encoding.BinaryMarshaler)
+	if !ok {
+		return nil, errors.New("RPM signature hash state cannot be cloned")
+	}
+	state, err := marshaler.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	cloned, err := fresh()
+	if err != nil {
+		return nil, err
+	}
+	unmarshaler, ok := cloned.(encoding.BinaryUnmarshaler)
+	if !ok {
+		return nil, errors.New("RPM signature hash state cannot be restored")
+	}
+	if err := unmarshaler.UnmarshalBinary(state); err != nil {
+		return nil, err
+	}
+	return cloned, nil
+}
+
+func prepareOpenPGPV3SignatureHash(encoded []byte, createdAt time.Time) (*preparedOpenPGPV3Signature, hash.Hash, error) {
+	body, err := unwrapOpenPGPSignaturePacket(encoded)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(body) < 22 || body[0] != 3 || body[1] != 5 || body[2] != 0x00 || !time.Unix(int64(binary.BigEndian.Uint32(body[3:7])), 0).UTC().Equal(createdAt) {
+		return nil, nil, errors.New("malformed OpenPGP v3 binary signature")
+	}
+	prepared := &preparedOpenPGPV3Signature{
+		body: append([]byte(nil), body...), issuerKeyID: binary.BigEndian.Uint64(body[7:15]), publicKeyAlgorithm: int(body[15]),
+	}
+	prepared.hashID, err = openPGPHash(int(body[16]))
+	if err != nil {
+		return nil, nil, err
+	}
+	material := body[19:]
+	prepared.first, material, err = readOpenPGPMPI(material)
+	if err == nil && prepared.publicKeyAlgorithm == 17 {
+		prepared.second, material, err = readOpenPGPMPI(material)
+	}
+	if err != nil || len(material) != 0 {
+		return nil, nil, errors.Join(errors.New("malformed OpenPGP v3 signature material"), err)
+	}
+	return prepared, prepared.hashID.New(), nil
+}
+
+func verifyPreparedOpenPGPV3Signature(hasher hash.Hash, prepared *preparedOpenPGPV3Signature, keyring openpgp.KeyRing, createdAt time.Time) (openpgp.Key, error) {
+	if _, err := hasher.Write(prepared.body[2:7]); err != nil {
+		return openpgp.Key{}, err
+	}
+	digest := hasher.Sum(nil)
+	if len(digest) < 2 || subtle.ConstantTimeCompare(digest[:2], prepared.body[17:19]) != 1 {
+		return openpgp.Key{}, errors.New("OpenPGP v3 signed-hash prefix mismatch")
+	}
+	keys := openPGPKeysByIDAt(keyring, prepared.issuerKeyID, createdAt)
+	if len(keys) == 0 {
+		return openpgp.Key{}, fmt.Errorf("OpenPGP v3 signature issuer %016x is not in the trusted keyring", prepared.issuerKeyID)
+	}
+	var lastErr error
+	for _, key := range keys {
+		if key.PublicKey == nil || int(key.PublicKey.PubKeyAlgo) != prepared.publicKeyAlgorithm {
+			lastErr = errors.New("trusted key uses a different public-key algorithm")
+			continue
+		}
+		if err := validateOpenPGPSigningKeyAt(key, createdAt); err != nil {
+			lastErr = err
+			continue
+		}
+		switch prepared.publicKeyAlgorithm {
+		case 1, 3:
+			publicKey, ok := key.PublicKey.PublicKey.(*rsa.PublicKey)
+			if !ok {
+				lastErr = errors.New("trusted RSA key has an incompatible implementation")
+				continue
+			}
+			keyBytes := (publicKey.N.BitLen() + 7) / 8
+			if len(prepared.first) > keyBytes {
+				lastErr = errors.New("OpenPGP RSA signature is larger than the trusted key")
+				continue
+			}
+			padded := make([]byte, keyBytes)
+			copy(padded[keyBytes-len(prepared.first):], prepared.first)
+			if err := rsa.VerifyPKCS1v15(publicKey, prepared.hashID, digest, padded); err != nil {
+				lastErr = errors.New("OpenPGP RSA signature verification failed")
+				continue
+			}
+		case 17:
+			publicKey, ok := key.PublicKey.PublicKey.(*dsa.PublicKey)
+			if !ok {
+				lastErr = errors.New("trusted DSA key has an incompatible implementation")
+				continue
+			}
+			truncated := digest
+			subgroupBytes := (publicKey.Q.BitLen() + 7) / 8
+			if len(truncated) > subgroupBytes {
+				truncated = truncated[:subgroupBytes]
+			}
+			if !dsa.Verify(publicKey, truncated, new(big.Int).SetBytes(prepared.first), new(big.Int).SetBytes(prepared.second)) {
+				lastErr = errors.New("OpenPGP DSA signature verification failed")
+				continue
+			}
+		default:
+			return openpgp.Key{}, fmt.Errorf("unsupported OpenPGP v3 public-key algorithm %d", prepared.publicKeyAlgorithm)
+		}
+		return key, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no trusted OpenPGP v3 signing key verified the packet")
+	}
+	return openpgp.Key{}, lastErr
+}
+
+func prepareOpenPGPV4SignatureHash(encoded []byte, createdAt time.Time) (*packet.Signature, hash.Hash, error) {
+	packets := packet.NewReader(bytes.NewReader(encoded))
+	value, err := packets.Next()
+	if err != nil {
+		return nil, nil, err
+	}
+	signature, ok := value.(*packet.Signature)
+	if !ok || signature.Version != 4 || signature.SigType != packet.SigTypeBinary || signature.IssuerKeyId == nil {
+		return nil, nil, errors.New("malformed OpenPGP v4 binary signature")
+	}
+	if trailing, nextErr := packets.Next(); nextErr != io.EOF || trailing != nil || !signature.CreationTime.UTC().Equal(createdAt) {
+		return nil, nil, errors.New("trailing or changed OpenPGP v4 signature material")
+	}
+	for _, notation := range signature.Notations {
+		if notation.IsCritical {
+			return nil, nil, fmt.Errorf("OpenPGP v4 signature has unsupported critical notation %q", notation.Name)
+		}
+	}
+	hasher, err := signature.PrepareVerify()
+	return signature, hasher, err
+}
+
+func verifyPreparedOpenPGPV4Signature(hasher hash.Hash, signature *packet.Signature, keyring openpgp.KeyRing, createdAt time.Time) (openpgp.Key, error) {
+	var selected *openpgp.Key
+	var fingerprint string
+	var lastErr error
+	for _, candidate := range openPGPKeysByIDAt(keyring, *signature.IssuerKeyId, createdAt) {
+		if candidate.PublicKey == nil || candidate.PublicKey.PubKeyAlgo != signature.PubKeyAlgo {
+			lastErr = errors.New("trusted key uses a different public-key algorithm")
+			continue
+		}
+		if err := validateOpenPGPSigningKeyAt(candidate, createdAt); err != nil {
+			lastErr = err
+			continue
+		}
+		current := hex.EncodeToString(candidate.PublicKey.Fingerprint)
+		if selected != nil && current != fingerprint {
+			return openpgp.Key{}, fmt.Errorf("ambiguous trusted OpenPGP v4 issuer %016x", *signature.IssuerKeyId)
+		}
+		copyCandidate := candidate
+		selected, fingerprint = &copyCandidate, current
+	}
+	if selected == nil {
+		if lastErr != nil {
+			return openpgp.Key{}, fmt.Errorf("OpenPGP v4 signature issuer %016x has no historically valid trusted signing key: %w", *signature.IssuerKeyId, lastErr)
+		}
+		return openpgp.Key{}, fmt.Errorf("OpenPGP v4 signature issuer %016x has no historically valid trusted signing key", *signature.IssuerKeyId)
+	}
+	if err := selected.PublicKey.VerifySignature(hasher, signature); err != nil {
+		return openpgp.Key{}, err
+	}
+	return *selected, nil
 }
 
 // VerifyEmbeddedRPMSignatures verifies every recognized signature packet in a

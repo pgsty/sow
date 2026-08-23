@@ -4,15 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"runtime"
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 )
 
 func Changes(ctx context.Context, opts ChangesOptions) (result ChangesResult, resultErr error) {
 	result = ChangesResult{Changes: []state.FileChange{}}
+	if ctx == nil {
+		return result, errors.New("managed: nil context")
+	}
+	ctx, _ = workmetrics.Ensure(ctx)
 	ws, cfg, workspaceLock, err := readWorkspace(ctx, opts.WorkspaceOptions, true)
 	if err != nil {
 		return result, err
@@ -85,14 +89,13 @@ func Changes(ctx context.Context, opts ChangesOptions) (result ChangesResult, re
 		return result, fmt.Errorf("%w: changes are unavailable while repository state is %s", ErrIntegrity, observedStatus)
 	}
 	result.Generation, result.Dirty = summary.BuiltGeneration, observedStatus != "clean"
+	if checked.verification == nil || checked.verification.Public == nil {
+		return result, fmt.Errorf("%w: changes check returned no verified public snapshot", ErrIntegrity)
+	}
+	physicalCurrent := checked.verification.Public.Manifest
 	if summary.BuiltGeneration == 0 {
-		manifestLayout := state.LayoutSinglePayloadV1
-		if legacyC2 {
-			manifestLayout = state.LayoutC2V1
-		}
-		physical, scanErr := scanPublicManifestForLayout(ctx, filepath.Join(ws.Root, repoName), manifestLayout)
-		if scanErr != nil || len(physical) != 0 {
-			return result, fmt.Errorf("%w: Generation 0 public delivery tree is not empty or readable: %v", ErrIntegrity, scanErr)
+		if len(physicalCurrent) != 0 {
+			return result, fmt.Errorf("%w: Generation 0 public delivery tree is not empty", ErrIntegrity)
 		}
 		result.Base = 0
 		return result, nil
@@ -101,13 +104,8 @@ func Changes(ctx context.Context, opts ChangesOptions) (result ChangesResult, re
 	if err != nil {
 		return result, fmt.Errorf("%w: current generation manifest is unavailable", ErrIntegrity)
 	}
-	manifestLayout := state.LayoutSinglePayloadV1
-	if legacyC2 {
-		manifestLayout = state.LayoutC2V1
-	}
-	physicalCurrent, err := scanPublicManifestForLayout(ctx, filepath.Join(ws.Root, repoName), manifestLayout)
-	if err != nil || !sameGenerationManifest(retainedCurrent, physicalCurrent) {
-		return result, fmt.Errorf("%w: current public delivery tree differs from Generation %d: %v", ErrIntegrity, summary.BuiltGeneration, err)
+	if !sameGenerationManifest(retainedCurrent, physicalCurrent) {
+		return result, fmt.Errorf("%w: current public delivery tree differs from Generation %d", ErrIntegrity, summary.BuiltGeneration)
 	}
 	if opts.Base == nil {
 		info, err := store.GetGeneration(ctx, summary.BuiltGeneration)

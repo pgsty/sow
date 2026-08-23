@@ -29,6 +29,7 @@ type publicPayloadExpectation struct {
 // and the fingerprint is then repaired. Changed bytes remain an integrity
 // failure.
 func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string, retained []state.GenerationFile, store *state.Store) (*publicGenerationSnapshot, error) {
+	workmetrics.RecordMetadataTreeHash(ctx)
 	objects, err := store.ListPackageObjects(ctx, nil, false)
 	if err != nil {
 		return nil, err
@@ -64,6 +65,7 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 	}
 	files := make([]state.GenerationFile, 0, len(retained))
 	identities := make(map[string]rootedRegularIdentity, len(retained))
+	authenticated := make(map[string]rootedRegularIdentity)
 	seen := make(map[string]struct{}, len(retained))
 	backfill := []state.PackageFact{}
 	err = walkRootedTree(ctx, repositoryRoot, func(relative string, file *os.File, info os.FileInfo) error {
@@ -119,6 +121,7 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 				if hex.EncodeToString(hash.Sum(nil)) != want.SHA256 {
 					return fmt.Errorf("%w: public payload checksum changed at %s", ErrIntegrity, relative)
 				}
+				authenticated[relative] = identity
 				if expectation.factExists {
 					backfill = append(backfill, state.PackageFact{PackageSHA256: expectation.object.SHA256, Fingerprint: packageFingerprint(identity)})
 				}
@@ -127,9 +130,11 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 			return nil
 		}
 		hash := sha256.New()
-		if _, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file}); err != nil {
+		read, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
+		if err != nil {
 			return err
 		}
+		workmetrics.RecordMetadataRead(ctx, read)
 		if hex.EncodeToString(hash.Sum(nil)) != want.SHA256 {
 			return fmt.Errorf("%w: public metadata checksum changed at %s", ErrIntegrity, relative)
 		}
@@ -161,7 +166,7 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 		return nil, err
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	return &publicGenerationSnapshot{Manifest: files, Identities: identities}, nil
+	return &publicGenerationSnapshot{Manifest: files, Identities: identities, AuthenticatedPayloads: authenticated}, nil
 }
 
 func packageFingerprint(identity rootedRegularIdentity) *state.PackageFingerprint {

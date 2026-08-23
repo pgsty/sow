@@ -20,8 +20,13 @@ import (
 // selected objects in memory, and parallel-backfills only missing or invalid
 // cache rows. Cache failures never become repository truth: source bytes remain
 // authoritative and every rebuilt fact is checked against PackageObject.
-func loadManagedPackageFacts(ctx context.Context, sources map[string]ManagedPackageSource, store *state.Store, jobs int) error {
-	stored, err := store.ListPackageFacts(ctx)
+func loadManagedPackageFacts(ctx context.Context, sources map[string]ManagedPackageSource, store *state.Store, jobs int, authenticated *publicGenerationSnapshot) error {
+	digests := make([]string, 0, len(sources))
+	for digest := range sources {
+		digests = append(digests, digest)
+	}
+	sort.Strings(digests)
+	stored, err := store.ListPackageFactsForDigests(ctx, digests)
 	if err != nil {
 		return err
 	}
@@ -29,11 +34,6 @@ func loadManagedPackageFacts(ctx context.Context, sources map[string]ManagedPack
 	for _, fact := range stored {
 		byDigest[fact.PackageSHA256] = fact
 	}
-	digests := make([]string, 0, len(sources))
-	for digest := range sources {
-		digests = append(digests, digest)
-	}
-	sort.Strings(digests)
 	if jobs < 1 {
 		jobs = 1
 	}
@@ -65,7 +65,14 @@ func loadManagedPackageFacts(ctx context.Context, sources map[string]ManagedPack
 							continue
 						}
 					}
-					decoded, rebuilt, rebuildErr := rebuildManagedPackageFact(workmetrics.WithPhase(ctx, "facts_backfill"), source)
+					var identity *rootedRegularIdentity
+					if authenticated != nil && source.Object.Storage == "pool" {
+						if value, ok := authenticated.AuthenticatedPayloads[source.Object.PoolPath]; ok {
+							copyIdentity := value
+							identity = &copyIdentity
+						}
+					}
+					decoded, rebuilt, rebuildErr := rebuildManagedPackageFact(workmetrics.WithPhase(ctx, "facts_backfill"), source, identity)
 					results[index] = factResult{source: decoded, fact: rebuilt, miss: true, err: rebuildErr}
 					workmetrics.RecordFactCacheMiss(ctx)
 				}
@@ -137,7 +144,7 @@ func decodeManagedPackageFact(source ManagedPackageSource, fact state.PackageFac
 	}
 }
 
-func rebuildManagedPackageFact(ctx context.Context, source ManagedPackageSource) (ManagedPackageSource, state.PackageFact, error) {
+func rebuildManagedPackageFact(ctx context.Context, source ManagedPackageSource, authenticated *rootedRegularIdentity) (ManagedPackageSource, state.PackageFact, error) {
 	var fact state.PackageFact
 	if source.Object.Format != "rpm" && source.Object.Format != "deb" {
 		return ManagedPackageSource{}, fact, errors.New("unsupported package object format")
@@ -146,13 +153,23 @@ func rebuildManagedPackageFact(ctx context.Context, source ManagedPackageSource)
 	if err != nil {
 		return ManagedPackageSource{}, fact, err
 	}
-	if err := authenticatePackageFactSource(ctx, opened, source.Object); err != nil {
+	openedIdentity, err := snapshotRootedRegularIdentity(opened)
+	if err != nil {
 		return ManagedPackageSource{}, fact, errors.Join(err, opened.CloseVerified())
+	}
+	reuseAuthenticated := false
+	if authenticated != nil {
+		reuseAuthenticated = authenticated.sameContentStat(openedIdentity) && authenticated.valid(source.Object.Size)
+	}
+	if !reuseAuthenticated {
+		if err := authenticatePackageFactSource(ctx, opened, source.Object); err != nil {
+			return ManagedPackageSource{}, fact, errors.Join(err, opened.CloseVerified())
+		}
 	}
 	switch source.Object.Format {
 	case "rpm":
 		parsed, info, inspectErr := yumrepo.InspectManagedPackageFactsReaderKnown(ctx, opened.file, source.Object.Filename, source.Object.SHA256, source.Object.Size)
-		closeErr := opened.CloseVerified()
+		closeErr := closePackageFactSource(opened, openedIdentity)
 		if err := errors.Join(inspectErr, closeErr); err != nil {
 			return ManagedPackageSource{}, fact, err
 		}
@@ -170,7 +187,7 @@ func rebuildManagedPackageFact(ctx context.Context, source ManagedPackageSource)
 	case "deb":
 		parsed, inspectErr := aptrepo.InspectPackageReaderKnown(ctx, opened.file, "main", source.Object.Filename, source.Object.SHA256, source.Object.Size)
 		parsed.SourcePath = source.Path
-		closeErr := opened.CloseVerified()
+		closeErr := closePackageFactSource(opened, openedIdentity)
 		if err := errors.Join(inspectErr, closeErr); err != nil {
 			return ManagedPackageSource{}, fact, err
 		}
@@ -187,6 +204,15 @@ func rebuildManagedPackageFact(ctx context.Context, source ManagedPackageSource)
 		return source, fact, nil
 	}
 	return ManagedPackageSource{}, fact, errors.New("unsupported package object format")
+}
+
+func closePackageFactSource(opened *rootedRegularFile, before rootedRegularIdentity) error {
+	after, identityErr := snapshotRootedRegularIdentity(opened)
+	closeErr := opened.CloseVerified()
+	if identityErr != nil || !before.sameContentStat(after) {
+		return errors.Join(errors.New("package fact source identity changed during inspection"), identityErr, closeErr)
+	}
+	return closeErr
 }
 
 func authenticatePackageFactSource(ctx context.Context, opened *rootedRegularFile, object state.PackageObject) error {
