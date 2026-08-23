@@ -32,7 +32,8 @@ func (s *Store) PublicationRootRequirement(ctx context.Context) (PublicationRoot
 	}
 	var evidenceCount int
 	if err := s.db.QueryRowContext(ctx, `SELECT
- (SELECT count(*) FROM publication_target_bindings) +
+	 (SELECT count(*) FROM publication_target_bindings) +
+		 (SELECT count(*) FROM publication_target_binding_revisions) +
 	 (SELECT count(*) FROM publication_attempts) +
 	 (SELECT count(*) FROM publication_checkpoints) +
 	 (SELECT count(*) FROM publication_grace_records) +
@@ -48,6 +49,7 @@ func (s *Store) PublicationRootRequirement(ctx context.Context) (PublicationRoot
 	h := sha256.New()
 	queries := []struct{ label, query string }{
 		{"bindings", `SELECT target_identity, target_storage_id, repository_id, target_name, provider, endpoint, region, bucket, prefix, public_endpoint, max_cache_ttl_ns, config_identity FROM publication_target_bindings ORDER BY target_identity`},
+		{"binding_revisions", `SELECT target_identity, revision, target_storage_id, repository_id, target_name, provider, endpoint, region, bucket, prefix, public_endpoint, max_cache_ttl_ns, config_identity, reason, operator_confirmed, recorded_at FROM publication_target_binding_revisions ORDER BY target_identity, revision`},
 		{"heads", `SELECT target_identity, COALESCE(checkpoint_identity, ''), generation, COALESCE(manifest_sha256, ''), revision FROM publication_target_heads ORDER BY target_identity`},
 		{"attempts", `SELECT attempt_identity, repository_id, target_identity, COALESCE(base_checkpoint, ''), target_generation, manifest_sha256, plan_sha256, phase, commit_intent FROM publication_attempts ORDER BY attempt_identity`},
 		{"attempt_views", `SELECT attempt_identity, sequence, view_id, pointer_path, COALESCE(old_identity, ''), new_identity, state FROM publication_attempt_views ORDER BY attempt_identity, view_id, pointer_path`},
@@ -194,8 +196,18 @@ func (s *Store) validatePublicationEvidenceForGC(ctx context.Context) error {
 	}
 	sets := []validationSet{
 		{`SELECT target_identity FROM publication_target_bindings ORDER BY target_identity`, func(identity string) error {
-			_, err := s.GetPublicationTarget(ctx, identity)
-			return err
+			target, err := s.GetPublicationTarget(ctx, identity)
+			if err != nil {
+				return err
+			}
+			revisions, err := s.ListPublicationTargetBindingRevisions(ctx, identity)
+			if err != nil || len(revisions) == 0 {
+				return errors.Join(errors.New("publication target has no binding revisions"), err)
+			}
+			if revisions[len(revisions)-1].PublicationTargetBinding != target.Binding {
+				return errors.New("publication target binding differs from latest revision")
+			}
+			return nil
 		}},
 		{`SELECT attempt_identity FROM publication_attempts ORDER BY attempt_identity`, func(identity string) error {
 			_, err := s.GetPublicationAttempt(ctx, identity)

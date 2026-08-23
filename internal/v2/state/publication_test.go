@@ -67,6 +67,299 @@ INSERT INTO generation_view_signers(generation, view_id, signer_identity, truste
 	return store, binding, manifest
 }
 
+func TestPublicationTargetBindingCacheTTLBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		ttl  time.Duration
+		ok   bool
+	}{
+		{name: "maximum accepted", ttl: maximumPublicationCacheTTL, ok: true},
+		{name: "maximum plus one rejected", ttl: maximumPublicationCacheTTL + time.Nanosecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, binding, _ := publicationStoreFixture(t)
+			defer store.Close()
+			binding.TargetName = "boundary"
+			binding.Prefix = "boundary/repo"
+			binding.TargetStorageID, binding.TargetIdentity = "", ""
+			binding.MaxCacheTTL = test.ttl
+			binding.ConfigIdentity = ""
+			err := store.BindPublicationTarget(context.Background(), binding)
+			if test.ok && err != nil || !test.ok && err == nil {
+				t.Fatalf("ttl=%s ok=%t err=%v", test.ttl, test.ok, err)
+			}
+		})
+	}
+}
+
+func TestPublicationTargetBindingRevisionsAreAppendOnlyAndRebindKeepsStableIdentity(t *testing.T) {
+	ctx := context.Background()
+	store, binding, manifest := publicationStoreFixture(t)
+	defer store.Close()
+
+	revisions, err := store.ListPublicationTargetBindingRevisions(ctx, binding.TargetIdentity)
+	if err != nil || len(revisions) != 1 || revisions[0].Revision != 1 || revisions[0].Reason != "initial_bind" || revisions[0].OperatorConfirmed {
+		t.Fatalf("initial revisions=%#v err=%v", revisions, err)
+	}
+	_, manifestSHA, err := ManifestBytes(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := PublicationAttempt{
+		RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, TargetGeneration: 1,
+		ManifestSHA256: manifestSHA, PlanSHA256: strings.Repeat("b", 64), Phase: "planned",
+		Views: []PublicationAttemptView{{ViewID: "dists/el9/x86_64", PointerPath: manifest[0].Path, NewIdentity: manifest[0].SHA256, State: "pending"}},
+	}
+	if err := store.PutPublicationAttempt(ctx, &attempt); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"payload", "immutable_metadata", "pointer_prepared"} {
+		if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SetPublicationAttemptViewState(ctx, attempt.AttemptIdentity, attempt.Views[0].ViewID, attempt.Views[0].PointerPath, "prepared"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetPublicationCommitIntent(ctx, attempt.AttemptIdentity); err != nil {
+		t.Fatal(err)
+	}
+
+	rebound := binding
+	rebound.TargetName = "prod-fixed"
+	rebound.PublicEndpoint = "https://fixed.example.test/prod/repo/"
+	rebound.MaxCacheTTL = 48 * time.Hour
+	rebound.ConfigIdentity = ""
+	input := PublicationTargetRebind{Binding: rebound, Reason: "operator_endpoint_fix", OperatorConfirmed: true}
+	if err := store.RebindPublicationTarget(ctx, input); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RebindPublicationTarget(ctx, input); err != nil {
+		t.Fatalf("idempotent rebind: %v", err)
+	}
+	target, err := store.GetPublicationTarget(ctx, binding.TargetIdentity)
+	if err != nil || target.Binding.TargetIdentity != binding.TargetIdentity || target.Binding.TargetStorageID != binding.TargetStorageID ||
+		target.Binding.TargetName != rebound.TargetName || target.Binding.PublicEndpoint != rebound.PublicEndpoint || target.Binding.MaxCacheTTL != rebound.MaxCacheTTL {
+		t.Fatalf("rebound target=%#v err=%v", target, err)
+	}
+	active, err := store.GetActivePublicationAttempt(ctx, binding.TargetIdentity)
+	if err != nil || active.AttemptIdentity != attempt.AttemptIdentity || !active.CommitIntent {
+		t.Fatalf("active attempt after rebind=%#v err=%v", active, err)
+	}
+	revisions, err = store.ListPublicationTargetBindingRevisions(ctx, binding.TargetIdentity)
+	if err != nil || len(revisions) != 2 || revisions[1].Revision != 2 || revisions[1].Reason != input.Reason || !revisions[1].OperatorConfirmed || revisions[1].ConfigIdentity != target.Binding.ConfigIdentity {
+		t.Fatalf("rebind revisions=%#v err=%v", revisions, err)
+	}
+	if _, err := store.DB().Exec(`UPDATE publication_target_binding_revisions SET reason = 'tampered' WHERE target_identity = ? AND revision = 1`, binding.TargetIdentity); err == nil {
+		t.Fatal("binding revision UPDATE succeeded")
+	}
+	if _, err := store.DB().Exec(`DELETE FROM publication_target_binding_revisions WHERE target_identity = ? AND revision = 1`, binding.TargetIdentity); err == nil {
+		t.Fatal("binding revision DELETE succeeded")
+	}
+	tampered := target.Binding
+	tampered.PublicEndpoint = "https://tampered.example.test/prod/repo/"
+	tampered.ConfigIdentity = PublicationTargetConfigIdentity(tampered)
+	if _, err := store.DB().Exec(`UPDATE publication_target_bindings SET public_endpoint = ?, config_identity = ? WHERE target_identity = ?`, tampered.PublicEndpoint, tampered.ConfigIdentity, binding.TargetIdentity); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Check(ctx); err == nil {
+		t.Fatal("Store.Check accepted a binding projection not present in revision history")
+	}
+}
+
+func TestPublicationTargetRebindRejectsUnconfirmedAndImmutableChanges(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name   string
+		mutate func(*PublicationTargetBinding)
+	}{
+		{name: "storage endpoint", mutate: func(binding *PublicationTargetBinding) { binding.Endpoint = "https://other.r2.cloudflarestorage.com" }},
+		{name: "bucket", mutate: func(binding *PublicationTargetBinding) { binding.Bucket = "other" }},
+		{name: "prefix", mutate: func(binding *PublicationTargetBinding) { binding.Prefix = "other/repo" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, binding, _ := publicationStoreFixture(t)
+			defer store.Close()
+			test.mutate(&binding)
+			binding.TargetStorageID, binding.TargetIdentity, binding.ConfigIdentity = "", "", ""
+			err := store.RebindPublicationTarget(ctx, PublicationTargetRebind{Binding: binding, Reason: "operator_change", OperatorConfirmed: true})
+			if !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "new target") {
+				t.Fatalf("immutable rebind error=%v", err)
+			}
+		})
+	}
+	store, binding, _ := publicationStoreFixture(t)
+	defer store.Close()
+	binding.PublicEndpoint = "https://fixed.example.test/prod/repo/"
+	binding.ConfigIdentity = ""
+	if err := store.RebindPublicationTarget(ctx, PublicationTargetRebind{Binding: binding, Reason: "operator_change"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("unconfirmed rebind error=%v", err)
+	}
+}
+
+func TestV12MigrationBackfillsInitialPublicationTargetRevision(t *testing.T) {
+	ctx := context.Background()
+	store, binding, _ := publicationStoreFixture(t)
+	path := store.path
+	if _, err := store.DB().Exec(`DROP TABLE publication_target_binding_revisions;
+DELETE FROM schema_migrations WHERE version = 12;
+PRAGMA user_version = 11;`); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := OpenExistingForMigration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	revisions, err := migrated.ListPublicationTargetBindingRevisions(ctx, binding.TargetIdentity)
+	if err != nil || len(revisions) != 1 || revisions[0].Reason != "backfill" || revisions[0].OperatorConfirmed || revisions[0].Revision != 1 {
+		t.Fatalf("backfilled revisions=%#v err=%v", revisions, err)
+	}
+}
+
+func TestPublicationTargetRebindUsesCurrentTTLWithoutRewritingHistoricalGrace(t *testing.T) {
+	ctx := context.Background()
+	store, binding, manifest := publicationStoreFixture(t)
+	defer store.Close()
+	now := time.Now().UTC()
+	_, checkpoint, grace := seedPublicationGrace(t, store, binding, manifest, now.Add(-45*24*time.Hour))
+	historicalNotBefore := grace.NotBefore
+
+	increased := binding
+	increased.MaxCacheTTL = 60 * 24 * time.Hour
+	increased.ConfigIdentity = ""
+	if err := store.RebindPublicationTarget(ctx, PublicationTargetRebind{Binding: increased, Reason: "operator_cache_increase", OperatorConfirmed: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExactPublicationCandidates(ctx, checkpoint.CheckpointIdentity, now); !errors.Is(err, ErrTransition) {
+		t.Fatalf("increased current TTL did not extend deletion eligibility: %v", err)
+	}
+	storedGrace, err := store.GetGraceRecord(ctx, checkpoint.CheckpointIdentity)
+	if err != nil || !storedGrace.NotBefore.Equal(historicalNotBefore) {
+		t.Fatalf("historical grace was rewritten: %#v err=%v", storedGrace, err)
+	}
+
+	reduced := increased
+	reduced.MaxCacheTTL = 24 * time.Hour
+	reduced.ConfigIdentity = ""
+	if err := store.RebindPublicationTarget(ctx, PublicationTargetRebind{Binding: reduced, Reason: "operator_cache_reduce", OperatorConfirmed: true}); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := store.ExactPublicationCandidates(ctx, checkpoint.CheckpointIdentity, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := PublicationCandidateReport{
+		TargetIdentity: binding.TargetIdentity, CheckpointIdentity: checkpoint.CheckpointIdentity,
+		InventoryIdentity: checkpoint.InventoryIdentity, Mode: "report_only", Candidates: candidates, CreatedAt: now,
+	}
+	if err := store.PutPublicationCandidateReport(ctx, &report); err != nil {
+		t.Fatal(err)
+	}
+	for _, ttl := range []time.Duration{time.Hour, 72 * time.Hour} {
+		blocked := reduced
+		blocked.MaxCacheTTL = ttl
+		blocked.ConfigIdentity = ""
+		if err := store.RebindPublicationTarget(ctx, PublicationTargetRebind{Binding: blocked, Reason: "operator_pending_ttl", OperatorConfirmed: true}); !errors.Is(err, ErrConflict) {
+			t.Fatalf("pending maintenance TTL %s rebind error=%v", ttl, err)
+		}
+	}
+	endpointOnly := reduced
+	endpointOnly.PublicEndpoint = "https://fixed.example.test/prod/repo/"
+	endpointOnly.ConfigIdentity = ""
+	if err := store.RebindPublicationTarget(ctx, PublicationTargetRebind{Binding: endpointOnly, Reason: "operator_report_only_endpoint", OperatorConfirmed: true}); err != nil {
+		t.Fatalf("R2 report-only endpoint rebind: %v", err)
+	}
+}
+
+func TestFilesystemConditionalDeleteBlocksEndpointRebind(t *testing.T) {
+	ctx := context.Background()
+	store, original, manifest := publicationStoreFixture(t)
+	defer store.Close()
+	binding := PublicationTargetBinding{
+		RepositoryID: original.RepositoryID, TargetName: "filesystem", Provider: "filesystem",
+		Endpoint: "file:///srv/publication", Prefix: "prod/repo", PublicEndpoint: "https://cdn.example.test/prod/repo/",
+		MaxCacheTTL: 24 * time.Hour, AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}
+	if err := store.BindPublicationTarget(ctx, binding); err != nil {
+		t.Fatal(err)
+	}
+	binding.TargetStorageID = publicationIdentity("sow/target-storage/v1", binding.Provider, binding.Endpoint, binding.Region, binding.Bucket)
+	binding.TargetIdentity = publicationIdentity("sow/target/v1", binding.TargetStorageID, binding.Prefix)
+	now := time.Now().UTC()
+	_, checkpoint, _ := seedPublicationGrace(t, store, binding, manifest, now.Add(-45*24*time.Hour))
+	candidates, err := store.ExactPublicationCandidates(ctx, checkpoint.CheckpointIdentity, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := PublicationCandidateReport{
+		TargetIdentity: binding.TargetIdentity, CheckpointIdentity: checkpoint.CheckpointIdentity,
+		InventoryIdentity: checkpoint.InventoryIdentity, Mode: "conditional_delete", Candidates: candidates, CreatedAt: now,
+	}
+	if err := store.PutPublicationCandidateReport(ctx, &report); err != nil {
+		t.Fatal(err)
+	}
+	rebound := binding
+	rebound.PublicEndpoint = "https://other.example.test/prod/repo/"
+	rebound.ConfigIdentity = ""
+	if err := store.RebindPublicationTarget(ctx, PublicationTargetRebind{Binding: rebound, Reason: "operator_endpoint_change", OperatorConfirmed: true}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("conditional-delete endpoint rebind error=%v", err)
+	}
+}
+
+func seedPublicationGrace(t *testing.T, store *Store, binding PublicationTargetBinding, manifest []GenerationFile, appliedAt time.Time) (PublicationAttempt, AppliedCheckpoint, GraceRecord) {
+	t.Helper()
+	ctx := context.Background()
+	_, manifestSHA, err := ManifestBytes(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := PublicationAttempt{
+		RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, TargetGeneration: 1,
+		ManifestSHA256: manifestSHA, PlanSHA256: strings.Repeat("9", 64), Phase: "planned", Views: []PublicationAttemptView{},
+	}
+	if err := store.PutPublicationAttempt(ctx, &attempt); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"payload", "immutable_metadata", "pointer_prepared"} {
+		if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SetPublicationCommitIntent(ctx, attempt.AttemptIdentity); err != nil {
+		t.Fatal(err)
+	}
+	for _, phase := range []string{"pointer_rollforward", "verified"} {
+		if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inventory := make([]PublicationInventoryObject, 0, len(manifest))
+	for _, file := range manifest {
+		inventory = append(inventory, PublicationInventoryObject{Path: file.Path, Phase: file.Phase, Size: file.Size, SHA256: file.SHA256, RemoteIdentity: "remote-" + file.SHA256})
+	}
+	checkpoint := AppliedCheckpoint{
+		RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: attempt.AttemptIdentity,
+		Generation: 1, ManifestSHA256: manifestSHA, InventoryComplete: true, Views: []PublicationCheckpointView{},
+		Inventory: inventory, AppliedAt: appliedAt,
+	}
+	if err := store.PutAppliedCheckpoint(ctx, &checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	grace := GraceRecord{
+		TargetIdentity: binding.TargetIdentity, CheckpointIdentity: checkpoint.CheckpointIdentity,
+		VerifiedAt: appliedAt, NotBefore: appliedAt.Add(30 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64),
+	}
+	if err := store.PutGraceRecord(ctx, &grace); err != nil {
+		t.Fatal(err)
+	}
+	return attempt, checkpoint, grace
+}
+
 func TestPublicationStatePersistsPrivateRecordsAndTextGeneration(t *testing.T) {
 	ctx := context.Background()
 	store, binding, manifest := publicationStoreFixture(t)
@@ -151,9 +444,10 @@ func TestPublicationStatePersistsPrivateRecordsAndTextGeneration(t *testing.T) {
 		{Path: manifest[1].Path, Phase: manifest[1].Phase, Size: manifest[1].Size, SHA256: manifest[1].SHA256, RemoteIdentity: "etag-payload"},
 		{Path: "pool/z/retained-old.rpm", Phase: "payload", Size: 9, SHA256: strings.Repeat("e", 64), RemoteIdentity: "etag-retained"},
 	}
+	verified := time.Now().UTC().Add(-31 * 24 * time.Hour)
 	checkpoint := AppliedCheckpoint{
 		RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: attempt.AttemptIdentity, Generation: 1, ManifestSHA256: manifestSHA, InventoryComplete: true,
-		Views: []PublicationCheckpointView{{ViewID: "dists/el9/x86_64", PointerPath: manifest[0].Path, RemoteIdentity: "etag-new"}}, Inventory: inventory,
+		Views: []PublicationCheckpointView{{ViewID: "dists/el9/x86_64", PointerPath: manifest[0].Path, RemoteIdentity: "etag-new"}}, Inventory: inventory, AppliedAt: verified,
 	}
 	incomplete := checkpoint
 	incomplete.InventoryComplete = false
@@ -193,7 +487,16 @@ func TestPublicationStatePersistsPrivateRecordsAndTextGeneration(t *testing.T) {
 	if err := store.DB().QueryRow(`SELECT revision, checkpoint_identity IS NULL FROM publication_target_heads WHERE target_identity = ?`, binding.TargetIdentity).Scan(&revision, &emptyHead); err != nil || revision != 1 || emptyHead != 0 {
 		t.Fatalf("checkpoint replay changed head more than once: revision=%d empty=%d err=%v", revision, emptyHead, err)
 	}
-	verified := time.Now().UTC().Add(-31 * 24 * time.Hour)
+	if _, err := store.DB().Exec(`UPDATE publication_target_bindings SET max_cache_ttl_ns = ? WHERE target_identity = ?`, int64(maximumPublicationCacheTTL)+1, binding.TargetIdentity); err != nil {
+		t.Fatal(err)
+	}
+	overflow := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: checkpoint.CheckpointIdentity, VerifiedAt: verified, NotBefore: verified.Add(30 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("d", 64)}
+	if err := store.PutGraceRecord(ctx, &overflow); err == nil || !strings.Contains(err.Error(), "invalid publication cache TTL") {
+		t.Fatalf("overflowing stored TTL grace error=%v", err)
+	}
+	if _, err := store.DB().Exec(`UPDATE publication_target_bindings SET max_cache_ttl_ns = ? WHERE target_identity = ?`, binding.MaxCacheTTL.Nanoseconds(), binding.TargetIdentity); err != nil {
+		t.Fatal(err)
+	}
 	short := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: checkpoint.CheckpointIdentity, VerifiedAt: verified, NotBefore: verified.Add(29 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
 	if err := store.PutGraceRecord(ctx, &short); !errors.Is(err, ErrConflict) {
 		t.Fatalf("short grace error=%v", err)
@@ -535,11 +838,11 @@ func TestPublicationCandidatesProtectCurrentHeadAndOtherGraceClosures(t *testing
 		firstInventory = append(firstInventory, PublicationInventoryObject{Path: file.Path, Phase: file.Phase, Size: file.Size, SHA256: file.SHA256, RemoteIdentity: "etag-" + file.SHA256})
 	}
 	firstInventory = append(firstInventory, PublicationInventoryObject{Path: extra.Path, Phase: extra.Phase, Size: extra.Size, SHA256: extra.SHA256, RemoteIdentity: "etag-" + extra.SHA256})
-	firstCheckpoint := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: first.AttemptIdentity, Generation: 1, ManifestSHA256: firstSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: firstInventory}
+	oldVerified := time.Now().UTC().Add(-31 * 24 * time.Hour)
+	firstCheckpoint := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: first.AttemptIdentity, Generation: 1, ManifestSHA256: firstSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: firstInventory, AppliedAt: oldVerified}
 	if err := store.PutAppliedCheckpoint(ctx, &firstCheckpoint); err != nil {
 		t.Fatal(err)
 	}
-	oldVerified := time.Now().UTC().Add(-31 * 24 * time.Hour)
 	firstGrace := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: firstCheckpoint.CheckpointIdentity, VerifiedAt: oldVerified, NotBefore: oldVerified.Add(30 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
 	if err := store.PutGraceRecord(ctx, &firstGrace); err != nil {
 		t.Fatal(err)
@@ -644,14 +947,14 @@ func TestFilesystemDeletionRequiresExactReceiptsAndProjectsLiveInventory(t *test
 		inventory[index] = PublicationInventoryObject{Path: file.Path, Phase: file.Phase, Size: file.Size, SHA256: file.SHA256, RemoteIdentity: "filesystem-etag"}
 	}
 	inventory = append(inventory, PublicationInventoryObject{Path: "pool/z/old.rpm", Phase: "payload", Size: 9, SHA256: strings.Repeat("e", 64), RemoteIdentity: strings.Repeat("e", 64)})
+	verified := time.Now().UTC().Add(-31 * 24 * time.Hour)
 	checkpoint := AppliedCheckpoint{
 		RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: attempt.AttemptIdentity,
-		Generation: 1, ManifestSHA256: manifestSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inventory,
+		Generation: 1, ManifestSHA256: manifestSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inventory, AppliedAt: verified,
 	}
 	if err := store.PutAppliedCheckpoint(ctx, &checkpoint); err != nil {
 		t.Fatal(err)
 	}
-	verified := time.Now().UTC().Add(-31 * 24 * time.Hour)
 	grace := GraceRecord{
 		TargetIdentity: binding.TargetIdentity, CheckpointIdentity: checkpoint.CheckpointIdentity, VerifiedAt: verified,
 		NotBefore: verified.Add(30 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64),

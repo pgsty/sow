@@ -164,8 +164,10 @@ func TestV11MigrationRepairsRepositoryProjectionStatus(t *testing.T) {
 func downgradeV11FixtureToV10(t *testing.T, db *sql.DB) {
 	t.Helper()
 	_, err := db.Exec(`
-PRAGMA foreign_keys = OFF;
-CREATE TEMP TABLE generation_view_signers_fixture AS
+	PRAGMA foreign_keys = OFF;
+	DROP TABLE publication_target_binding_revisions;
+	DELETE FROM schema_migrations WHERE version = 12;
+	CREATE TEMP TABLE generation_view_signers_fixture AS
 SELECT generation, view_id, signer_identity, trusted_public_key FROM generation_view_signers;
 DROP TABLE generation_view_signers;
 CREATE TABLE generation_view_signers (
@@ -1553,7 +1555,7 @@ func assertSchemaV2(t *testing.T, db *sql.DB) {
 		t.Fatalf("user_version=%d want=%d", version, SchemaVersion)
 	}
 	var migrationCount int
-	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE (version = 1 AND checksum = ?) OR (version = 2 AND checksum = ?) OR (version = 3 AND checksum = ?) OR (version = 4 AND checksum = ?) OR (version = 5 AND checksum = ?) OR (version = 6 AND checksum = ?) OR (version = 7 AND checksum = ?) OR (version = 8 AND checksum = ?) OR (version = 9 AND checksum = ?) OR (version = 10 AND checksum = ?) OR (version = 11 AND checksum = ?)`, SchemaV1SHA256, SchemaV2SHA256, SchemaV3SHA256, SchemaV4SHA256, SchemaV5SHA256, SchemaV6SHA256, SchemaV7SHA256, SchemaV8SHA256, SchemaV9SHA256, SchemaV10SHA256, SchemaV11SHA256).Scan(&migrationCount); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE (version = 1 AND checksum = ?) OR (version = 2 AND checksum = ?) OR (version = 3 AND checksum = ?) OR (version = 4 AND checksum = ?) OR (version = 5 AND checksum = ?) OR (version = 6 AND checksum = ?) OR (version = 7 AND checksum = ?) OR (version = 8 AND checksum = ?) OR (version = 9 AND checksum = ?) OR (version = 10 AND checksum = ?) OR (version = 11 AND checksum = ?) OR (version = 12 AND checksum = ?)`, SchemaV1SHA256, SchemaV2SHA256, SchemaV3SHA256, SchemaV4SHA256, SchemaV5SHA256, SchemaV6SHA256, SchemaV7SHA256, SchemaV8SHA256, SchemaV9SHA256, SchemaV10SHA256, SchemaV11SHA256, SchemaV12SHA256).Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
 	if migrationCount != SchemaVersion {

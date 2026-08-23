@@ -78,7 +78,7 @@ Commands:
   build                              Converge Desired to a Built Generation
   check                              Verify repository integrity end to end
   changes [BASE_GENERATION]          Show physical delivery changes
-  publish TARGET [--abort]           Publish or abandon a pre-commit attempt
+  publish TARGET [--abort|--rebind]  Publish, rebind, or abandon an attempt
   retain add GENERATION              Retain one verified Generation
   retain ls                          List retained Generations
   retain rm GENERATION               Remove one retained Generation
@@ -398,13 +398,14 @@ Options:
   -h, --help            Show help
 `,
 	"publish": `Usage:
-  sow publish TARGET [--abort] [-C|--workdir DIR] [-T|--timeout DUR | -N|--no-wait] [--json]
+  sow publish TARGET [--abort | --rebind] [-C|--workdir DIR] [-T|--timeout DUR | -N|--no-wait] [--json]
 
 Arguments:
   TARGET                Configured filesystem or R2 target name
 
 Options:
       --abort           Abandon a reconciled pre-commit attempt
+      --rebind          Confirm mutable target endpoint/name/TTL changes and resume
   -C, --workdir DIR     Workspace discovery start directory
   -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely
   -N, --no-wait         Fail immediately when the lock is held

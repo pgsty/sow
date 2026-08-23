@@ -62,12 +62,15 @@ func MainContext(ctx context.Context, args []string, stdout, stderr io.Writer) i
 				classified = WithExitCode(ExitPartial, classified)
 			}
 		}
-		if ExitCode(classified) == ExitPartial && output.preserveFailureResult && !inv.Global.JSON && output.human != "" {
-			if code := writeHuman(stdout, stderr, output.human); code != ExitOK {
-				return code
+		showHumanResult := ExitCode(classified) == ExitPartial || command == "check" || command == "rm" && inv.Check
+		if command == "rm" {
+			if result, ok := output.result.(managed.RemoveResult); ok && result.Revision != 0 {
+				// A non-zero Desired revision proves the mutation transaction
+				// committed. Preserve that result in human mode just as JSON does.
+				showHumanResult = true
 			}
 		}
-		if command == "check" && output.preserveFailureResult && !inv.Global.JSON && output.human != "" {
+		if showHumanResult && output.preserveFailureResult && !inv.Global.JSON && output.human != "" {
 			if code := writeHuman(stdout, stderr, output.human); code != ExitOK {
 				return code
 			}
@@ -267,7 +270,8 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo,
 			Dists: inv.Global.Dists, Packages: inv.Positionals, Check: inv.Check, Skip: inv.Skip, Jobs: inv.Jobs,
 		})
-		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, preserveFailureResult: result.Operation != "", human: removeHuman(result)}, err
+		diagnosticPreview := result.Check && result.Repository != "" && len(result.Dists) != 0 && result.Revision != 0
+		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, preserveFailureResult: result.Operation != "" || diagnosticPreview, human: removeHuman(result)}, err
 
 	case "ls":
 		result, err := managed.ListPackages(ctx, managed.PackageListOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo, Dists: inv.Global.Dists})
@@ -319,7 +323,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			)}, err
 		}
 		result, err := managed.Publish(ctx, managed.PublishOptions{
-			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Target: inv.Positionals[0],
+			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Target: inv.Positionals[0], Rebind: inv.Rebind,
 		})
 		human := fmt.Sprintf("published %s generation=%s to %s (%s): phase=%s objects=%d\n", result.Repository, result.Generation, result.Target, result.Provider, result.Phase, result.Objects)
 		if result.Noop {

@@ -13,7 +13,36 @@ import (
 	"time"
 )
 
-const publicationRecordSchemaV1 = 1
+const (
+	publicationRecordSchemaV1    = 1
+	publicationCacheGracePadding = 24 * time.Hour
+	maximumPublicationCacheTTL   = time.Duration(1<<63-1) - publicationCacheGracePadding
+)
+
+func publicationGraceMinimum(ttl time.Duration) (time.Duration, error) {
+	if ttl < 0 || ttl > maximumPublicationCacheTTL {
+		return 0, errors.New("invalid publication cache TTL")
+	}
+	minimum := 30 * 24 * time.Hour
+	if cacheMinimum := ttl + publicationCacheGracePadding; cacheMinimum > minimum {
+		minimum = cacheMinimum
+	}
+	return minimum, nil
+}
+
+func effectivePublicationGraceDeadline(historicalText, appliedText string, ttlNS int64) (time.Time, error) {
+	historical, historicalErr := time.Parse(time.RFC3339Nano, historicalText)
+	applied, appliedErr := time.Parse(time.RFC3339Nano, appliedText)
+	minimum, minimumErr := publicationGraceMinimum(time.Duration(ttlNS))
+	if err := errors.Join(historicalErr, appliedErr, minimumErr); err != nil {
+		return time.Time{}, fmt.Errorf("%w: invalid publication grace deadline: %v", ErrSchema, err)
+	}
+	currentPolicy := applied.Add(minimum)
+	if currentPolicy.After(historical) {
+		return currentPolicy, nil
+	}
+	return historical, nil
+}
 
 type PublicationTargetBinding struct {
 	TargetIdentity          string
@@ -31,6 +60,20 @@ type PublicationTargetBinding struct {
 	SingleWriter            bool
 	ExclusiveWriteAuthority bool
 	ConfigIdentity          string
+}
+
+type PublicationTargetRebind struct {
+	Binding           PublicationTargetBinding
+	Reason            string
+	OperatorConfirmed bool
+}
+
+type PublicationTargetBindingRevision struct {
+	PublicationTargetBinding
+	Revision          int64     `json:"revision"`
+	Reason            string    `json:"reason"`
+	OperatorConfirmed bool      `json:"operator_confirmed"`
+	RecordedAt        time.Time `json:"recorded_at"`
 }
 
 type PublicationAttemptView struct {
@@ -236,34 +279,60 @@ func acceptSemanticIdentity(provided, computed, label string) (string, error) {
 	return computed, nil
 }
 
-func (s *Store) BindPublicationTarget(ctx context.Context, binding PublicationTargetBinding) error {
+func (s *Store) canonicalPublicationTargetBinding(ctx context.Context, binding PublicationTargetBinding) (PublicationTargetBinding, error) {
 	identity, err := s.RepositoryIdentity(ctx)
 	if err != nil {
-		return err
+		return PublicationTargetBinding{}, err
 	}
 	binding.TargetStorageID, err = acceptSemanticIdentity(binding.TargetStorageID, publicationIdentity("sow/target-storage/v1", binding.Provider, binding.Endpoint, binding.Region, binding.Bucket), "target storage identity")
 	if err != nil {
-		return err
+		return PublicationTargetBinding{}, err
 	}
 	binding.TargetIdentity, err = acceptSemanticIdentity(binding.TargetIdentity, publicationIdentity("sow/target/v1", binding.TargetStorageID, binding.Prefix), "target identity")
 	if err != nil {
-		return err
+		return PublicationTargetBinding{}, err
 	}
 	binding.ConfigIdentity, err = acceptSemanticIdentity(binding.ConfigIdentity, PublicationTargetConfigIdentity(binding), "target config identity")
 	if err != nil {
-		return err
+		return PublicationTargetBinding{}, err
 	}
-	if binding.RepositoryID != identity.RepositoryID || !validSHA256Text(binding.TargetStorageID) || !validSHA256Text(binding.TargetIdentity) || !validSHA256Text(binding.ConfigIdentity) || binding.TargetName == "" || binding.Endpoint == "" || binding.PublicEndpoint == "" || binding.MaxCacheTTL < 0 || !binding.AuthoritativeWorkspace || !binding.SingleWriter || !binding.ExclusiveWriteAuthority {
-		return errors.New("invalid publication target binding")
+	if binding.RepositoryID != identity.RepositoryID || !validSHA256Text(binding.TargetStorageID) || !validSHA256Text(binding.TargetIdentity) || !validSHA256Text(binding.ConfigIdentity) || binding.TargetName == "" || binding.Endpoint == "" || binding.PublicEndpoint == "" || binding.MaxCacheTTL < 0 || binding.MaxCacheTTL > maximumPublicationCacheTTL || !binding.AuthoritativeWorkspace || !binding.SingleWriter || !binding.ExclusiveWriteAuthority {
+		return PublicationTargetBinding{}, errors.New("invalid publication target binding")
 	}
 	if binding.Provider != "filesystem" && binding.Provider != "r2" {
-		return errors.New("invalid publication target provider")
+		return PublicationTargetBinding{}, errors.New("invalid publication target provider")
+	}
+	return binding, nil
+}
+
+func (s *Store) BindPublicationTarget(ctx context.Context, binding PublicationTargetBinding) error {
+	binding, err := s.canonicalPublicationTargetBinding(ctx, binding)
+	if err != nil {
+		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	stored, found, err := publicationTargetBindingTx(ctx, tx, binding.TargetIdentity)
+	if err != nil {
+		return err
+	}
+	if found {
+		if stored == binding {
+			return tx.Commit()
+		}
+		return fmt.Errorf("%w: publication target %q is already bound with different mutable configuration; rerun publish with --rebind after operator review", ErrConflict, stored.TargetName)
+	}
+	var nameIdentity string
+	err = tx.QueryRowContext(ctx, `SELECT target_identity FROM publication_target_bindings WHERE target_name = ?`, binding.TargetName).Scan(&nameIdentity)
+	if err == nil {
+		return fmt.Errorf("%w: publication target name %q is already bound to different storage or prefix; configure a new target name", ErrConflict, binding.TargetName)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT target_identity, target_name, prefix FROM publication_target_bindings WHERE target_storage_id = ? ORDER BY prefix, target_name`, binding.TargetStorageID)
 	if err != nil {
 		return err
@@ -282,14 +351,6 @@ func (s *Store) BindPublicationTarget(ctx context.Context, binding PublicationTa
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return err
 	}
-	var count int
-	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM publication_target_bindings WHERE target_identity = ? AND repository_id = ? AND target_name = ? AND target_storage_id = ? AND provider = ? AND endpoint = ? AND region = ? AND bucket = ? AND prefix = ? AND public_endpoint = ? AND max_cache_ttl_ns = ? AND config_identity = ?`,
-		binding.TargetIdentity, binding.RepositoryID, binding.TargetName, binding.TargetStorageID, binding.Provider, binding.Endpoint, binding.Region, binding.Bucket, binding.Prefix, binding.PublicEndpoint, binding.MaxCacheTTL.Nanoseconds(), binding.ConfigIdentity).Scan(&count); err != nil {
-		return err
-	}
-	if count == 1 {
-		return tx.Commit()
-	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO publication_target_bindings(target_identity, target_storage_id, repository_id, target_name, provider, endpoint, region, bucket, prefix, public_endpoint, max_cache_ttl_ns, authoritative_workspace, single_writer, exclusive_write_authority, config_identity, bound_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, ?, ?)`,
 		binding.TargetIdentity, binding.TargetStorageID, binding.RepositoryID, binding.TargetName, binding.Provider, binding.Endpoint, binding.Region, binding.Bucket, binding.Prefix, binding.PublicEndpoint, binding.MaxCacheTTL.Nanoseconds(), binding.ConfigIdentity, nowText()); err != nil {
 		return fmt.Errorf("%w: bind publication target: %v", ErrConflict, err)
@@ -297,7 +358,156 @@ func (s *Store) BindPublicationTarget(ctx context.Context, binding PublicationTa
 	if _, err := tx.ExecContext(ctx, `INSERT INTO publication_target_heads(target_identity, checkpoint_identity, generation, manifest_sha256, revision, updated_at) VALUES (?, NULL, '00000000000000000000', NULL, 0, ?)`, binding.TargetIdentity, nowText()); err != nil {
 		return err
 	}
+	if err := appendPublicationTargetBindingRevisionTx(ctx, tx, binding, 1, "initial_bind", false); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+func (s *Store) RebindPublicationTarget(ctx context.Context, input PublicationTargetRebind) error {
+	if !input.OperatorConfirmed {
+		return fmt.Errorf("%w: publication target rebind requires explicit operator confirmation", ErrConflict)
+	}
+	if input.Reason == "" || input.Reason != strings.TrimSpace(input.Reason) || len(input.Reason) > 256 {
+		return errors.New("invalid publication target rebind reason")
+	}
+	binding, err := s.canonicalPublicationTargetBinding(ctx, input.Binding)
+	if err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stored, found, err := publicationTargetBindingTx(ctx, tx, binding.TargetIdentity)
+	if err != nil {
+		return err
+	}
+	if !found {
+		var existingIdentity string
+		nameErr := tx.QueryRowContext(ctx, `SELECT target_identity FROM publication_target_bindings WHERE target_name = ?`, binding.TargetName).Scan(&existingIdentity)
+		if nameErr == nil {
+			return fmt.Errorf("%w: publication target storage or prefix changed; configure a new target", ErrConflict)
+		}
+		if !errors.Is(nameErr, sql.ErrNoRows) {
+			return nameErr
+		}
+		return fmt.Errorf("%w: publication target is not bound; publish without --rebind first", ErrNotFound)
+	}
+	if !sameImmutablePublicationTargetBinding(stored, binding) {
+		return fmt.Errorf("%w: publication target storage or prefix changed; configure a new target", ErrConflict)
+	}
+	if stored == binding {
+		return tx.Commit()
+	}
+	pendingMaintenance, err := hasPendingPublicationMaintenanceTx(ctx, tx, binding.TargetIdentity)
+	if err != nil {
+		return err
+	}
+	conditionalDelete, err := hasActiveConditionalDeleteWorkflowTx(ctx, tx, binding.TargetIdentity)
+	if err != nil {
+		return err
+	}
+	if stored.MaxCacheTTL != binding.MaxCacheTTL && (pendingMaintenance || conditionalDelete) {
+		return fmt.Errorf("%w: max_cache_ttl cannot change while target maintenance is pending", ErrConflict)
+	}
+	if stored.Provider == "filesystem" && stored.PublicEndpoint != binding.PublicEndpoint && conditionalDelete {
+		return fmt.Errorf("%w: filesystem public_endpoint cannot change during conditional-delete maintenance", ErrConflict)
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE publication_target_bindings
+SET target_name = ?, public_endpoint = ?, max_cache_ttl_ns = ?, config_identity = ?
+WHERE target_identity = ? AND target_storage_id = ? AND repository_id = ? AND provider = ? AND endpoint = ? AND region = ? AND bucket = ? AND prefix = ? AND config_identity = ?`,
+		binding.TargetName, binding.PublicEndpoint, binding.MaxCacheTTL.Nanoseconds(), binding.ConfigIdentity,
+		stored.TargetIdentity, stored.TargetStorageID, stored.RepositoryID, stored.Provider, stored.Endpoint, stored.Region, stored.Bucket, stored.Prefix, stored.ConfigIdentity)
+	if err != nil {
+		return fmt.Errorf("%w: rebind publication target: %v", ErrConflict, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		return errors.Join(fmt.Errorf("%w: publication target changed during rebind", ErrConflict), err)
+	}
+	var revision int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(revision), 0) + 1 FROM publication_target_binding_revisions WHERE target_identity = ?`, binding.TargetIdentity).Scan(&revision); err != nil {
+		return err
+	}
+	if err := appendPublicationTargetBindingRevisionTx(ctx, tx, binding, revision, input.Reason, true); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func sameImmutablePublicationTargetBinding(left, right PublicationTargetBinding) bool {
+	return left.TargetIdentity == right.TargetIdentity && left.TargetStorageID == right.TargetStorageID &&
+		left.RepositoryID == right.RepositoryID && left.Provider == right.Provider && left.Endpoint == right.Endpoint &&
+		left.Region == right.Region && left.Bucket == right.Bucket && left.Prefix == right.Prefix &&
+		left.AuthoritativeWorkspace == right.AuthoritativeWorkspace && left.SingleWriter == right.SingleWriter &&
+		left.ExclusiveWriteAuthority == right.ExclusiveWriteAuthority
+}
+
+func publicationTargetBindingTx(ctx context.Context, tx *sql.Tx, targetIdentity string) (PublicationTargetBinding, bool, error) {
+	var binding PublicationTargetBinding
+	var ttl int64
+	var authoritative, singleWriter, exclusive int
+	err := tx.QueryRowContext(ctx, `SELECT target_identity, target_storage_id, repository_id, target_name, provider,
+endpoint, region, bucket, prefix, public_endpoint, max_cache_ttl_ns,
+authoritative_workspace, single_writer, exclusive_write_authority, config_identity
+FROM publication_target_bindings WHERE target_identity = ?`, targetIdentity).Scan(
+		&binding.TargetIdentity, &binding.TargetStorageID, &binding.RepositoryID, &binding.TargetName, &binding.Provider,
+		&binding.Endpoint, &binding.Region, &binding.Bucket, &binding.Prefix, &binding.PublicEndpoint, &ttl,
+		&authoritative, &singleWriter, &exclusive, &binding.ConfigIdentity)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PublicationTargetBinding{}, false, nil
+	}
+	if err != nil {
+		return PublicationTargetBinding{}, false, err
+	}
+	binding.MaxCacheTTL = time.Duration(ttl)
+	binding.AuthoritativeWorkspace = authoritative == 1
+	binding.SingleWriter = singleWriter == 1
+	binding.ExclusiveWriteAuthority = exclusive == 1
+	if binding.TargetStorageID != publicationIdentity("sow/target-storage/v1", binding.Provider, binding.Endpoint, binding.Region, binding.Bucket) ||
+		binding.TargetIdentity != publicationIdentity("sow/target/v1", binding.TargetStorageID, binding.Prefix) ||
+		binding.ConfigIdentity != PublicationTargetConfigIdentity(binding) {
+		return PublicationTargetBinding{}, false, fmt.Errorf("%w: publication target binding semantic identity is corrupt", ErrConflict)
+	}
+	return binding, true, nil
+}
+
+func appendPublicationTargetBindingRevisionTx(ctx context.Context, tx *sql.Tx, binding PublicationTargetBinding, revision int64, reason string, operatorConfirmed bool) error {
+	confirmed := 0
+	if operatorConfirmed {
+		confirmed = 1
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO publication_target_binding_revisions(
+target_identity, revision, target_storage_id, repository_id, target_name, provider, endpoint, region, bucket, prefix,
+public_endpoint, max_cache_ttl_ns, authoritative_workspace, single_writer, exclusive_write_authority,
+config_identity, reason, operator_confirmed, recorded_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1, ?, ?, ?, ?)`,
+		binding.TargetIdentity, revision, binding.TargetStorageID, binding.RepositoryID, binding.TargetName, binding.Provider,
+		binding.Endpoint, binding.Region, binding.Bucket, binding.Prefix, binding.PublicEndpoint, binding.MaxCacheTTL.Nanoseconds(),
+		binding.ConfigIdentity, reason, confirmed, nowText())
+	return err
+}
+
+func hasPendingPublicationMaintenanceTx(ctx context.Context, tx *sql.Tx, targetIdentity string) (bool, error) {
+	var count int
+	err := tx.QueryRowContext(ctx, `SELECT count(*)
+FROM publication_candidate_reports AS r
+JOIN publication_checkpoints AS c ON c.checkpoint_identity = r.checkpoint_identity
+JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
+WHERE r.target_identity = ? AND a.phase != 'done'`, targetIdentity).Scan(&count)
+	return count != 0, err
+}
+
+func hasActiveConditionalDeleteWorkflowTx(ctx context.Context, tx *sql.Tx, targetIdentity string) (bool, error) {
+	var count int
+	err := tx.QueryRowContext(ctx, `SELECT count(*)
+FROM publication_candidate_reports AS r
+JOIN publication_checkpoints AS c ON c.checkpoint_identity = r.checkpoint_identity
+JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
+WHERE r.target_identity = ? AND r.mode = 'conditional_delete' AND a.phase != 'done'`, targetIdentity).Scan(&count)
+	return count != 0, err
 }
 
 func (s *Store) PutPublicationAttempt(ctx context.Context, attempt *PublicationAttempt) error {
@@ -736,9 +946,9 @@ WHERE b.target_identity = ? AND c.checkpoint_identity = ?`, record.TargetIdentit
 	if attemptPhase != "applied" {
 		return fmt.Errorf("%w: grace requires the current applied checkpoint", ErrTransition)
 	}
-	minimum := 30 * 24 * time.Hour
-	if cacheMinimum := time.Duration(ttlNS) + 24*time.Hour; cacheMinimum > minimum {
-		minimum = cacheMinimum
+	minimum, err := publicationGraceMinimum(time.Duration(ttlNS))
+	if err != nil {
+		return err
 	}
 	if record.NotBefore.Before(record.VerifiedAt.Add(minimum)) {
 		return fmt.Errorf("%w: grace is shorter than max(30d, cache TTL + 24h)", ErrConflict)
@@ -790,18 +1000,19 @@ func (s *Store) PutPublicationCandidateReport(ctx context.Context, report *Publi
 		}
 		return tx.Commit()
 	}
-	var provider, inventory, attemptPhase, graceState, notBefore string
-	if err := tx.QueryRowContext(ctx, `SELECT b.provider, c.inventory_identity, a.phase, g.state, g.not_before
-FROM publication_target_bindings AS b
+	var provider, inventory, attemptPhase, graceState, notBefore, appliedAt string
+	var ttlNS int64
+	if err := tx.QueryRowContext(ctx, `SELECT b.provider, c.inventory_identity, a.phase, g.state, g.not_before, c.applied_at, b.max_cache_ttl_ns
+	FROM publication_target_bindings AS b
 JOIN publication_checkpoints AS c ON c.target_identity = b.target_identity
 JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
 JOIN publication_grace_records AS g ON g.target_identity = c.target_identity AND g.checkpoint_identity = c.checkpoint_identity
-WHERE b.target_identity = ? AND c.checkpoint_identity = ?`, report.TargetIdentity, report.CheckpointIdentity).Scan(&provider, &inventory, &attemptPhase, &graceState, &notBefore); err != nil {
+	WHERE b.target_identity = ? AND c.checkpoint_identity = ?`, report.TargetIdentity, report.CheckpointIdentity).Scan(&provider, &inventory, &attemptPhase, &graceState, &notBefore, &appliedAt, &ttlNS); err != nil {
 		return err
 	}
-	deadline, err := time.Parse(time.RFC3339Nano, notBefore)
+	deadline, err := effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
 	if err != nil {
-		return fmt.Errorf("%w: invalid publication grace deadline", ErrSchema)
+		return err
 	}
 	if inventory != report.InventoryIdentity || provider == "r2" && report.Mode != "report_only" || provider == "filesystem" && report.Mode != "conditional_delete" || attemptPhase != "grace" || graceState != "grace" || report.CreatedAt.Before(deadline) {
 		return fmt.Errorf("%w: candidate report capability or inventory mismatch", ErrConflict)
@@ -861,25 +1072,26 @@ func (s *Store) PutPublicationDeletionReceipt(ctx context.Context, receipt *Publ
 		*receipt = stored
 		return tx.Commit()
 	}
-	var provider, mode, attemptPhase, graceState, notBefore string
+	var provider, mode, attemptPhase, graceState, notBefore, appliedAt string
+	var ttlNS int64
 	var candidate PublicationCandidate
-	if err := tx.QueryRowContext(ctx, `SELECT b.provider, r.mode, a.phase, g.state, g.not_before,
- p.path, p.phase, p.size, p.sha256, p.remote_identity
+	if err := tx.QueryRowContext(ctx, `SELECT b.provider, r.mode, a.phase, g.state, g.not_before, c.applied_at, b.max_cache_ttl_ns,
+	 p.path, p.phase, p.size, p.sha256, p.remote_identity
 FROM publication_candidate_reports AS r
 JOIN publication_candidates AS p ON p.report_identity = r.report_identity
 JOIN publication_checkpoints AS c ON c.checkpoint_identity = r.checkpoint_identity
 JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
 JOIN publication_target_bindings AS b ON b.target_identity = r.target_identity
 JOIN publication_grace_records AS g ON g.target_identity = r.target_identity AND g.checkpoint_identity = r.checkpoint_identity
-WHERE r.report_identity = ? AND p.path = ?`, receipt.ReportIdentity, receipt.Path).Scan(
-		&provider, &mode, &attemptPhase, &graceState, &notBefore,
+	WHERE r.report_identity = ? AND p.path = ?`, receipt.ReportIdentity, receipt.Path).Scan(
+		&provider, &mode, &attemptPhase, &graceState, &notBefore, &appliedAt, &ttlNS,
 		&candidate.Path, &candidate.Phase, &candidate.Size, &candidate.SHA256, &candidate.RemoteIdentity,
 	); err != nil {
 		return err
 	}
-	deadline, err := time.Parse(time.RFC3339Nano, notBefore)
+	deadline, err := effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
 	if err != nil {
-		return fmt.Errorf("%w: invalid publication grace deadline", ErrSchema)
+		return err
 	}
 	if provider != "filesystem" || mode != "conditional_delete" || attemptPhase != "grace" || graceState != "grace" || receipt.ObservedAt.Before(deadline) || candidate.Path != receipt.Path || candidate.Phase != receipt.Phase || candidate.Size != receipt.Size || candidate.SHA256 != receipt.SHA256 || candidate.RemoteIdentity != receipt.RemoteIdentity {
 		return fmt.Errorf("%w: deletion receipt is not exact conditional-delete evidence", ErrTransition)
@@ -912,14 +1124,15 @@ func (s *Store) MarkPublicationDeletionVerified(ctx context.Context, attemptIden
 		return err
 	}
 	defer tx.Rollback()
-	var provider, mode, phase, graceState, notBefore, checkpointIdentity string
-	if err := tx.QueryRowContext(ctx, `SELECT b.provider, r.mode, a.phase, g.state, g.not_before, c.checkpoint_identity
+	var provider, mode, phase, graceState, notBefore, appliedAt, checkpointIdentity string
+	var ttlNS int64
+	if err := tx.QueryRowContext(ctx, `SELECT b.provider, r.mode, a.phase, g.state, g.not_before, c.applied_at, b.max_cache_ttl_ns, c.checkpoint_identity
 FROM publication_attempts AS a
 JOIN publication_checkpoints AS c ON c.attempt_identity = a.attempt_identity
 JOIN publication_target_bindings AS b ON b.target_identity = a.target_identity
 JOIN publication_grace_records AS g ON g.target_identity = a.target_identity AND g.checkpoint_identity = c.checkpoint_identity
 JOIN publication_candidate_reports AS r ON r.target_identity = a.target_identity AND r.checkpoint_identity = c.checkpoint_identity AND r.inventory_identity = c.inventory_identity
-WHERE a.attempt_identity = ? AND r.report_identity = ?`, attemptIdentity, reportIdentity).Scan(&provider, &mode, &phase, &graceState, &notBefore, &checkpointIdentity); err != nil {
+	WHERE a.attempt_identity = ? AND r.report_identity = ?`, attemptIdentity, reportIdentity).Scan(&provider, &mode, &phase, &graceState, &notBefore, &appliedAt, &ttlNS, &checkpointIdentity); err != nil {
 		return err
 	}
 	if provider != "filesystem" || mode != "conditional_delete" {
@@ -931,9 +1144,9 @@ WHERE a.attempt_identity = ? AND r.report_identity = ?`, attemptIdentity, report
 		}
 		return tx.Commit()
 	}
-	deadline, err := time.Parse(time.RFC3339Nano, notBefore)
+	deadline, err := effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
 	if err != nil {
-		return fmt.Errorf("%w: invalid publication grace deadline", ErrSchema)
+		return err
 	}
 	if phase != "grace" || graceState != "grace" || observedAt.Before(deadline) {
 		return fmt.Errorf("%w: grace is not expired or deletion evidence is not pending", ErrTransition)
@@ -975,14 +1188,15 @@ func (s *Store) MarkPublicationRetainedReported(ctx context.Context, attemptIden
 		return err
 	}
 	defer tx.Rollback()
-	var provider, phase, graceState, notBefore, mode, checkpointIdentity string
-	if err := tx.QueryRowContext(ctx, `SELECT b.provider, a.phase, g.state, g.not_before, r.mode, c.checkpoint_identity
+	var provider, phase, graceState, notBefore, appliedAt, mode, checkpointIdentity string
+	var ttlNS int64
+	if err := tx.QueryRowContext(ctx, `SELECT b.provider, a.phase, g.state, g.not_before, c.applied_at, b.max_cache_ttl_ns, r.mode, c.checkpoint_identity
 FROM publication_attempts AS a
 JOIN publication_checkpoints AS c ON c.attempt_identity = a.attempt_identity
 JOIN publication_target_bindings AS b ON b.target_identity = a.target_identity
 JOIN publication_grace_records AS g ON g.target_identity = a.target_identity AND g.checkpoint_identity = c.checkpoint_identity
 JOIN publication_candidate_reports AS r ON r.target_identity = a.target_identity AND r.checkpoint_identity = c.checkpoint_identity AND r.inventory_identity = c.inventory_identity
-WHERE a.attempt_identity = ? AND r.report_identity = ?`, attemptIdentity, reportIdentity).Scan(&provider, &phase, &graceState, &notBefore, &mode, &checkpointIdentity); err != nil {
+	WHERE a.attempt_identity = ? AND r.report_identity = ?`, attemptIdentity, reportIdentity).Scan(&provider, &phase, &graceState, &notBefore, &appliedAt, &ttlNS, &mode, &checkpointIdentity); err != nil {
 		return err
 	}
 	if provider != "r2" || mode != "report_only" {
@@ -991,9 +1205,9 @@ WHERE a.attempt_identity = ? AND r.report_identity = ?`, attemptIdentity, report
 	if (phase == "retained_reported" || phase == "done") && graceState == "retained_reported" {
 		return tx.Commit()
 	}
-	deadline, err := time.Parse(time.RFC3339Nano, notBefore)
+	deadline, err := effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
 	if err != nil {
-		return fmt.Errorf("%w: invalid grace deadline", ErrSchema)
+		return err
 	}
 	if phase != "grace" || graceState != "grace" || observedAt.Before(deadline) {
 		return fmt.Errorf("%w: grace is not expired or retention evidence is not pending", ErrTransition)

@@ -47,6 +47,7 @@ type Invocation struct {
 	Check       bool
 	Hardlink    bool
 	Abort       bool
+	Rebind      bool
 }
 
 type optionUse uint16
@@ -76,6 +77,7 @@ type commandSpec struct {
 	check     bool
 	hardlink  bool
 	abort     bool
+	rebind    bool
 }
 
 var commandSpecs = map[string]commandSpec{
@@ -101,7 +103,7 @@ var commandSpecs = map[string]commandSpec{
 	"build":           {globals: useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, jobs: true},
 	"check":           {globals: useWorkdir | useRepo | useDist | useJSON, jobs: true},
 	"changes":         {globals: useWorkdir | useRepo | useJSON, minArgs: 0, maxArgs: 1},
-	"publish":         {globals: useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, abort: true},
+	"publish":         {globals: useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, abort: true, rebind: true},
 	"retain add":      {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
 	"retain ls":       {globals: useWorkdir | useRepo | useJSON},
 	"retain rm":       {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
@@ -226,6 +228,9 @@ func Parse(args []string) (Invocation, error) {
 	if inv.Check && inv.Skip {
 		return Invocation{}, usageError("--check and --skip are mutually exclusive")
 	}
+	if inv.Abort && inv.Rebind {
+		return Invocation{}, usageError("--abort and --rebind are mutually exclusive")
+	}
 	if inv.Command == "rm" && inv.Check && (global.timeoutSet || global.noWaitSet) {
 		return Invocation{}, usageError("rm --check does not accept --timeout or --no-wait")
 	}
@@ -339,7 +344,7 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 	positionals := make([]string, 0, len(args))
 	stopped := false
 	jobsSet, pigstySet, signWithSet, overwriteSet, allSet, forceSet, formatSet := false, false, false, false, false, false, false
-	recursiveSet, skipSet, checkSet, hardlinkSet, abortSet := false, false, false, false, false
+	recursiveSet, skipSet, checkSet, hardlinkSet, abortSet, rebindSet := false, false, false, false, false, false
 	for i := 0; i < len(args); i++ {
 		token := args[i]
 		if token == "--" && !stopped {
@@ -438,6 +443,11 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 				return nil, usageError("option --abort is not allowed, duplicated, or has a value")
 			}
 			inv.Abort, abortSet = true, true
+		case "--rebind":
+			if !spec.rebind || rebindSet || hasInline {
+				return nil, usageError("option --rebind is not allowed, duplicated, or has a value")
+			}
+			inv.Rebind, rebindSet = true, true
 		default:
 			return nil, usageError("unknown option %q", token)
 		}

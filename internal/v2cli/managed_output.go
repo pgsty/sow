@@ -50,6 +50,14 @@ func removeHuman(result managed.RemoveResult) string {
 	if result.Check {
 		action = "preview"
 	}
+	if result.Check && !result.PredictionComplete {
+		fmt.Fprintf(&output, "%s repository=%s operation=%s dists=%s memberships=%d revision=%d prediction=incomplete\n",
+			action, result.Repository, result.Operation, strings.Join(result.Dists, ","), len(result.Removed), result.Revision)
+		for _, item := range result.Removed {
+			fmt.Fprintf(&output, "membership dist=%s name=%q coordinate=%q sha256:%s\n", item.Dist, item.Name, item.Coordinate, item.SHA256)
+		}
+		return output.String()
+	}
 	fmt.Fprintf(&output, "%s repository=%s operation=%s dists=%s memberships=%d revision=%d generation=%s dirty=%t changes=%d\n",
 		action, result.Repository, result.Operation, strings.Join(result.Dists, ","), len(result.Removed), result.Revision, result.Generation, result.Dirty, len(result.Changes))
 	for _, item := range result.Removed {

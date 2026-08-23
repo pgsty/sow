@@ -16,6 +16,8 @@ import (
 
 var r2BucketPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
+const maximumPublicationCacheTTL = time.Duration(1<<63-1) - 24*time.Hour
+
 // TargetConfig is a private publication binding. Credential is a reference,
 // never credential material; the public prefix itself remains pool/ + dists/.
 type TargetConfig struct {
@@ -105,12 +107,18 @@ func validateTarget(name string, target TargetConfig, repositories map[string]Re
 	if err := validateCanonicalPublicEndpoint(target.PublicEndpoint); err != nil {
 		return TargetBinding{}, fmt.Errorf("public endpoint: %w", err)
 	}
+	if target.Provider == "r2" {
+		public, _ := url.Parse(target.PublicEndpoint)
+		if public.Scheme != "https" && public.Scheme != "http" {
+			return TargetBinding{}, errors.New("r2 public endpoint scheme must be https or http")
+		}
+	}
 	if target.MaxCacheTTL == "" {
 		return TargetBinding{}, errors.New("max_cache_ttl is required, including explicit 0s")
 	}
 	ttl, err := time.ParseDuration(target.MaxCacheTTL)
-	if err != nil || ttl < 0 || target.MaxCacheTTL != ttl.String() {
-		return TargetBinding{}, fmt.Errorf("max_cache_ttl %q is not a canonical non-negative Go duration", target.MaxCacheTTL)
+	if err != nil || ttl < 0 || ttl > maximumPublicationCacheTTL || target.MaxCacheTTL != ttl.String() {
+		return TargetBinding{}, fmt.Errorf("max_cache_ttl %q must be canonical and between 0s and %s", target.MaxCacheTTL, maximumPublicationCacheTTL)
 	}
 	if !target.AuthoritativeWorkspace || !target.SingleWriter || !target.ExclusiveWriteAuthority {
 		return TargetBinding{}, errors.New("authoritative_workspace, single_writer, and exclusive_write_authority must all be true")

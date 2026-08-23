@@ -281,6 +281,100 @@ func TestMainAddPartialSuccessHumanReportsCommittedAndFailedItems(t *testing.T) 
 	assertCLISuccess(t, []string{"check", "-C", root, "-r", "repo", "--json"}, `"ready_to_copy":true`)
 }
 
+func TestMainRemoveCheckFailurePreservesDiagnosticPreview(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{
+		"el9": {Format: "rpm"},
+	}}
+	data, err := config.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := managed.Init(ctx, managed.InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeCLIFixture(t, filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	options := managed.WorkspaceOptions{Workdir: root, CWD: root}
+	added, err := managed.Add(ctx, managed.AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", filepath.Join(root, "missing-preview-temp"))
+
+	args := []string{"rm", "pgdg-redhat-nonfree-repo", "--check", "-C", root, "-r", "repo", "-d", "el9"}
+	stdout, stderr, code := runCLI(append(append([]string(nil), args...), "--json"))
+	if code != ExitRuntime || stderr == "" || !strings.Contains(stdout, `"result":{"repository":"repo"`) ||
+		!strings.Contains(stdout, `"check":true`) || !strings.Contains(stdout, `"dists":["el9"]`) ||
+		!strings.Contains(stdout, `"built_generation":"`+added.Generation.String()+`"`) ||
+		strings.Contains(stdout, `"prediction_complete":true`) || strings.Contains(stdout, `"result":null`) {
+		t.Fatalf("JSON diagnostic preview code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI(args)
+	if code != ExitRuntime || stderr == "" || !strings.Contains(stdout, "preview repository=repo") || !strings.Contains(stdout, "dists=el9") ||
+		!strings.Contains(stdout, "prediction=incomplete") || strings.Contains(stdout, " generation=") {
+		t.Fatalf("human diagnostic preview code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestMainPublishConflictPreservesRebindGuidance(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	endpoint, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := "mirror/repo"
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}
+	cfg.Targets = map[string]config.TargetConfig{"local": {
+		Repository: "repo", Provider: "filesystem", Endpoint: "file://" + endpoint, Prefix: prefix,
+		PublicEndpoint: "file://" + filepath.Join(endpoint, filepath.FromSlash(prefix)) + "/", MaxCacheTTL: "0s",
+		AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}}
+	data, err := config.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := managed.Init(ctx, managed.InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeCLIFixture(t, filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	if _, err := managed.Add(ctx, managed.AddOptions{WorkspaceOptions: managed.WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	assertCLISuccess(t, []string{"publish", "local", "-C", root, "--json"}, `"phase":"grace"`)
+	target := cfg.Targets["local"]
+	target.PublicEndpoint = "https://wrong.example.test/repo/"
+	cfg.Targets["local"] = target
+	data, err = config.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, config.ConfigFilename), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := runCLI([]string{"publish", "local", "-C", root, "--json"})
+	if code != ExitRuntime || !strings.Contains(stdout+stderr, "--rebind") || !strings.Contains(stdout, `"ok":false`) {
+		t.Fatalf("publish conflict code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
 func decodeCLIFixture(t *testing.T, source, destination string) string {
 	t.Helper()
 	encoded, err := os.ReadFile(source)

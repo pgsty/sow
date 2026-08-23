@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func targetFixture(prefix string) TargetConfig {
@@ -62,6 +63,8 @@ func TestTargetsRejectNonCanonicalAndSecretInputs(t *testing.T) {
 		{"prefix-encoded-separator", func(v *TargetConfig) { v.Prefix = "repos%2Facme" }, "percent-encoded"},
 		{"inline-secret", func(v *TargetConfig) { v.Credential = "secret-access-key" }, "inline secrets"},
 		{"unknown-ttl", func(v *TargetConfig) { v.MaxCacheTTL = "" }, "max_cache_ttl"},
+		{"overflowing-ttl", func(v *TargetConfig) { v.MaxCacheTTL = time.Duration(1<<63 - 1).String() }, "max_cache_ttl"},
+		{"r2-file-public-endpoint", func(v *TargetConfig) { v.PublicEndpoint = "file:///srv/public/" }, "https or http"},
 		{"bucket-grammar", func(v *TargetConfig) { v.Bucket = "bad_bucket" }, "DNS-safe"},
 		{"authority", func(v *TargetConfig) { v.ExclusiveWriteAuthority = false }, "exclusive_write_authority"},
 	} {
@@ -74,6 +77,29 @@ func TestTargetsRejectNonCanonicalAndSecretInputs(t *testing.T) {
 			_, err := Marshal(cfg)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("want %q rejection, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestTargetMaximumCacheTTLLeavesRoomForGracePadding(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		ttl  time.Duration
+		ok   bool
+	}{
+		{name: "boundary", ttl: maximumPublicationCacheTTL, ok: true},
+		{name: "boundary plus one", ttl: maximumPublicationCacheTTL + time.Nanosecond},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			target := targetFixture("repos/acme")
+			target.MaxCacheTTL = test.ttl.String()
+			cfg := Default()
+			cfg.Repositories["repo"] = RepositoryConfig{}
+			cfg.Targets = map[string]TargetConfig{"prod": target}
+			_, err := Marshal(cfg)
+			if test.ok && err != nil || !test.ok && err == nil {
+				t.Fatalf("ttl=%s ok=%t err=%v", test.ttl, test.ok, err)
 			}
 		})
 	}

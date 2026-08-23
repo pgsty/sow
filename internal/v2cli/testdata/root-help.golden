@@ -30,7 +30,7 @@ Commands:
   build                              Converge Desired to a Built Generation
   check                              Verify repository integrity end to end
   changes [BASE_GENERATION]          Show physical delivery changes
-  publish TARGET [--abort]           Publish or abandon a pre-commit attempt
+  publish TARGET [--abort|--rebind]  Publish, rebind, or abandon an attempt
   retain add GENERATION              Retain one verified Generation
   retain ls                          List retained Generations
   retain rm GENERATION               Remove one retained Generation

@@ -282,11 +282,12 @@ func (c *signedObjectHTTP) putMultipart(ctx context.Context, key string, body Re
 		return "", errors.Join(result, c.abortMultipart(key, uploadID))
 	}
 	parts := make([]types.CompletedPart, 0, (size+partSize-1)/partSize)
+	wholeHash := sha256.New()
 	for offset, partNumber := int64(0), int32(1); offset < size; offset, partNumber = offset+partSize, partNumber+1 {
 		length := min(partSize, size-offset)
 		section := io.NewSectionReader(body, offset, length)
 		partHash := sha256.New()
-		read, hashErr := io.Copy(partHash, section)
+		read, hashErr := io.Copy(io.MultiWriter(partHash, wholeHash), section)
 		if hashErr != nil || read != length {
 			return abort(errors.Join(fmt.Errorf("hash multipart part %d: read %d of %d bytes", partNumber, read, length), hashErr))
 		}
@@ -310,6 +311,10 @@ func (c *signedObjectHTTP) putMultipart(ctx context.Context, key string, body Re
 			return abort(fmt.Errorf("%w: multipart part %d returned no ETag", ErrCapability, partNumber))
 		}
 		parts = append(parts, types.CompletedPart{ETag: aws.String(etag), PartNumber: aws.Int32(partNumber)})
+	}
+	actualSHA := hex.EncodeToString(wholeHash.Sum(nil))
+	if actualSHA != sha {
+		return abort(fmt.Errorf("multipart object SHA-256 mismatch: got %s, want %s", actualSHA, sha))
 	}
 	input := &s3.CompleteMultipartUploadInput{
 		Bucket: aws.String(c.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),

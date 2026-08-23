@@ -190,6 +190,53 @@ func TestMultipartPutUsesBoundedReplayablePartsAndConditionalComplete(t *testing
 	}
 }
 
+func TestMultipartPutRejectsWholeObjectDigestMismatchBeforeComplete(t *testing.T) {
+	body := []byte("same-size-content-b")
+	declaredBody := []byte("same-size-content-a")
+	if len(body) != len(declaredBody) {
+		t.Fatal("digest mismatch fixture sizes differ")
+	}
+	digest := sha256.Sum256(declaredBody)
+	declaredSHA := hex.EncodeToString(digest[:])
+	aborted, completed := false, false
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		query := request.URL.Query()
+		switch {
+		case request.Method == http.MethodPost && query.Has("uploads"):
+			writer.Header().Set("Content-Type", "application/xml")
+			_, _ = io.WriteString(writer, `<InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>object</Key><UploadId>upload-digest</UploadId></InitiateMultipartUploadResult>`)
+		case request.Method == http.MethodPut && query.Get("uploadId") == "upload-digest":
+			_, _ = io.Copy(io.Discard, request.Body)
+			writer.Header().Set("ETag", `"part"`)
+		case request.Method == http.MethodPost && query.Get("uploadId") == "upload-digest":
+			completed = true
+			writer.Header().Set("Content-Type", "application/xml")
+			_, _ = io.WriteString(writer, `<CompleteMultipartUploadResult><ETag>&quot;unexpected&quot;</ETag></CompleteMultipartUploadResult>`)
+		case request.Method == http.MethodDelete && query.Get("uploadId") == "upload-digest":
+			aborted = true
+			writer.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected multipart digest request: %s %s", request.Method, request.URL.String())
+			writer.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{
+		Bucket: "bucket", ObjectBaseURL: server.URL + "/bucket", Client: server.Client(), AllowInsecure: true,
+		Credentials: S3Credentials{AccessKeyID: "access", SecretAccessKey: "secret", Region: "auto"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.objects.multipartThreshold = 4
+	client.objects.multipartMinPartSize = 5
+	client.objects.noProgressTimeout = time.Second
+	_, err = client.Put(context.Background(), "object", bytes.NewReader(body), int64(len(body)), declaredSHA, PutCondition{})
+	if err == nil || !strings.Contains(err.Error(), "SHA-256 mismatch") || !aborted || completed {
+		t.Fatalf("multipart mismatch err=%v aborted=%t completed=%t", err, aborted, completed)
+	}
+}
+
 func TestMultipartConditionalFailureAbortsUpload(t *testing.T) {
 	body := []byte("multipart-conflict")
 	digest := sha256.Sum256(body)

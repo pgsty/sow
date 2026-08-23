@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -19,6 +20,7 @@ type PublishOptions struct {
 	WorkspaceOptions
 	LockOptions
 	Target  string
+	Rebind  bool
 	Fault   func(string) error
 	backend publicationBackend
 	now     func() time.Time
@@ -94,8 +96,20 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 	if err != nil {
 		return result, err
 	}
-	if err := store.BindPublicationTarget(ctx, binding); err != nil {
-		return result, fmt.Errorf("%w: bind publication target: %v", ErrIntegrity, err)
+	backend := opts.backend
+	if err := preflightFilesystemTargetAliases(cfg, opts.Target); err != nil {
+		return result, err
+	}
+	if err := preflightPublicationTarget(targetConfig, filepath.Join(ws.Root, repoName), filepath.Join(ws.Root, ".sow"), backend); err != nil {
+		return result, err
+	}
+	if opts.Rebind {
+		err = store.RebindPublicationTarget(ctx, state.PublicationTargetRebind{Binding: binding, Reason: "operator_rebind", OperatorConfirmed: true})
+	} else {
+		err = store.BindPublicationTarget(ctx, binding)
+	}
+	if err != nil {
+		return result, fmt.Errorf("bind publication target %q: %w", opts.Target, err)
 	}
 	pendingMaintenance, err := store.HasPendingPublicationMaintenance(ctx, binding.TargetIdentity)
 	if err != nil {
@@ -104,23 +118,11 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 	if pendingMaintenance {
 		return result, fmt.Errorf("%w: target %q has an unfinished candidate report; resume with gc %s", ErrNotReady, opts.Target, opts.Target)
 	}
-	if targetConfig.Provider == "filesystem" {
-		targetRoot, err := filesystemPublicationRoot(targetConfig)
-		if err != nil {
-			return result, err
-		}
-		if err := rejectPublicationSourceTargetOverlap(filepath.Join(ws.Root, repoName), filepath.Join(ws.Root, ".sow"), targetRoot); err != nil {
-			return result, err
-		}
-	}
-	backend := opts.backend
 	if backend == nil {
 		backend, err = newPublicationBackend(targetConfig)
 		if err != nil {
 			return result, err
 		}
-	} else if backend.Provider() != targetConfig.Provider {
-		return result, fmt.Errorf("%w: publication backend provider differs from target", ErrRejected)
 	}
 	active, activeErr := store.GetActivePublicationAttempt(ctx, binding.TargetIdentity)
 	if activeErr == nil && active.Phase == "applied" {
@@ -618,6 +620,33 @@ func newPublicationBackend(target config.TargetConfig) (publicationBackend, erro
 	}
 }
 
+func preflightPublicationTarget(target config.TargetConfig, sourceRoot, privateRoot string, backend publicationBackend) error {
+	if backend != nil && backend.Provider() != target.Provider {
+		return fmt.Errorf("%w: publication backend provider differs from target", ErrRejected)
+	}
+	switch target.Provider {
+	case "filesystem":
+		targetRoot, err := preflightFilesystemPublicationBackend(target)
+		if err != nil {
+			return err
+		}
+		return rejectPublicationSourceTargetOverlap(sourceRoot, privateRoot, targetRoot)
+	case "r2":
+		if backend == nil {
+			if _, err := resolveR2Credentials(target.Credential, target.Region); err != nil {
+				return err
+			}
+		}
+		publicBase, err := url.Parse(target.PublicEndpoint)
+		if err != nil || publicBase.Scheme != "https" && publicBase.Scheme != "http" {
+			return fmt.Errorf("%w: R2 public endpoint must be HTTP(S)", ErrRejected)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: unsupported publication provider %q", ErrRejected, target.Provider)
+	}
+}
+
 func publicationSourceGeneration(ctx context.Context, root, repoName string, store *state.Store, active state.PublicationAttempt, recovering bool) (state.GenerationID, []state.GenerationFile, string, error) {
 	summary, err := store.Summary(ctx)
 	if err != nil {
@@ -999,10 +1028,23 @@ func verifyPublishedFiles(ctx context.Context, backend publicationBackend, files
 	return nil
 }
 
-func putPublicationGrace(ctx context.Context, store *state.Store, binding state.PublicationTargetBinding, checkpoint state.AppliedCheckpoint) error {
+func publicationGraceMinimum(ttl time.Duration) (time.Duration, error) {
+	const padding = 24 * time.Hour
+	const maximum = time.Duration(1<<63-1) - padding
+	if ttl < 0 || ttl > maximum {
+		return 0, fmt.Errorf("%w: publication cache TTL is outside the supported range", ErrIntegrity)
+	}
 	minimum := 30 * 24 * time.Hour
-	if cacheMinimum := binding.MaxCacheTTL + 24*time.Hour; cacheMinimum > minimum {
+	if cacheMinimum := ttl + padding; cacheMinimum > minimum {
 		minimum = cacheMinimum
+	}
+	return minimum, nil
+}
+
+func putPublicationGrace(ctx context.Context, store *state.Store, binding state.PublicationTargetBinding, checkpoint state.AppliedCheckpoint) error {
+	minimum, err := publicationGraceMinimum(binding.MaxCacheTTL)
+	if err != nil {
+		return err
 	}
 	cacheHash := sha256.New()
 	cacheHash.Write([]byte("sow/cache-policy/v1"))

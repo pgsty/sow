@@ -15,6 +15,17 @@ import (
 	"github.com/pgsty/sow/internal/v2/state"
 )
 
+func TestPublicationGraceMinimumRejectsOverflow(t *testing.T) {
+	const padding = 24 * time.Hour
+	maximum := time.Duration(1<<63-1) - padding
+	if minimum, err := publicationGraceMinimum(maximum); err != nil || minimum != time.Duration(1<<63-1) {
+		t.Fatalf("boundary grace minimum=%s err=%v", minimum, err)
+	}
+	if _, err := publicationGraceMinimum(maximum + time.Nanosecond); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("overflowing grace error=%v", err)
+	}
+}
+
 func filesystemPublishFixture(t *testing.T) (localGCFixture, string, string) {
 	t.Helper()
 	fixture := newLocalGCFixture(t, false)
@@ -36,6 +47,161 @@ func filesystemPublishFixture(t *testing.T) (localGCFixture, string, string) {
 	}}
 	writeManagedConfig(t, fixture.root, cfg)
 	return fixture, endpoint, filepath.Join(endpoint, filepath.FromSlash(prefix))
+}
+
+func TestPublicationBackendPreflightFailureLeavesNoBindingOrFilesystemPrefix(t *testing.T) {
+	ctx := context.Background()
+	fixture, _, targetRoot := filesystemPublishFixture(t)
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongPublicRoot := t.TempDir()
+	target := cfg.Targets["local"]
+	target.PublicEndpoint = (&url.URL{Scheme: "file", Path: filepath.Join(wrongPublicRoot, "different") + string(filepath.Separator)}).String()
+	cfg.Targets["local"] = target
+	writeManagedConfig(t, fixture.root, cfg)
+	if _, err := os.Lstat(targetRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("target prefix existed before preflight: %v", err)
+	}
+	_, err = Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local"})
+	if err == nil {
+		t.Fatal("publish accepted mismatched file public endpoint")
+	}
+	if _, statErr := os.Lstat(targetRoot); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("failed preflight created target prefix: %v", statErr)
+	}
+	store, openErr := state.OpenReadOnly(filepath.Join(fixture.root, ".sow", "repo.db"))
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	var bindings int
+	queryErr := store.DB().QueryRowContext(ctx, `SELECT count(*) FROM publication_target_bindings`).Scan(&bindings)
+	closeErr := store.Close()
+	if err := errors.Join(queryErr, closeErr); err != nil || bindings != 0 {
+		t.Fatalf("failed preflight bindings=%d err=%v", bindings, err)
+	}
+}
+
+func TestFilesystemPublicationPreflightDetectsProspectiveCaseAliasBeforeBind(t *testing.T) {
+	ctx := context.Background()
+	fixture, endpoint, _ := filesystemPublishFixture(t)
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseURL := (&url.URL{Scheme: "file", Path: endpoint}).String()
+	common := config.TargetConfig{
+		Repository: "repo", Provider: "filesystem", Endpoint: baseURL, PublicEndpoint: "https://cdn.example.test/repo/", MaxCacheTTL: "0s",
+		AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}
+	upper, lower := common, common
+	upper.Prefix, upper.PublicEndpoint = "Stable/repo", "https://upper.example.test/repo/"
+	lower.Prefix, lower.PublicEndpoint = "stable/repo", "https://lower.example.test/repo/"
+	cfg.Targets = map[string]config.TargetConfig{"upper": upper, "lower": lower}
+	writeManagedConfig(t, fixture.root, cfg)
+	caseInsensitive, err := filesystemDirectoryIsCaseInsensitive(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preflightErr := preflightFilesystemTargetAliases(cfg, "upper")
+	if !caseInsensitive {
+		if preflightErr != nil {
+			t.Fatalf("case-sensitive filesystem globally lowercased targets: %v", preflightErr)
+		}
+		return
+	}
+	if !errors.Is(preflightErr, ErrRejected) || !strings.Contains(preflightErr.Error(), "case alias") {
+		t.Fatalf("case-insensitive alias preflight error=%v", preflightErr)
+	}
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "upper"}); !errors.Is(err, ErrRejected) {
+		t.Fatalf("case alias publish error=%v", err)
+	}
+	store, err := state.OpenReadOnly(filepath.Join(fixture.root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	queryErr := store.DB().QueryRowContext(ctx, `SELECT count(*) FROM publication_target_bindings`).Scan(&count)
+	closeErr := store.Close()
+	if err := errors.Join(queryErr, closeErr); err != nil || count != 0 {
+		t.Fatalf("case alias left binding count=%d err=%v", count, err)
+	}
+	for _, path := range []string{filepath.Join(endpoint, "Stable"), filepath.Join(endpoint, "stable")} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("case alias preflight created %s: %v", path, err)
+		}
+	}
+}
+
+func TestPublicationOperatorRebindRollsForwardCommitIntentAndRejectsStorageChange(t *testing.T) {
+	ctx := context.Background()
+	fixture, _, _ := filesystemPublishFixture(t)
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	correctPublicEndpoint := cfg.Targets["local"].PublicEndpoint
+	target := cfg.Targets["local"]
+	target.PublicEndpoint = "https://wrong.example.test/repo/"
+	cfg.Targets["local"] = target
+	writeManagedConfig(t, fixture.root, cfg)
+	injected := errors.New("stop at commit intent")
+	stopped, err := Publish(ctx, PublishOptions{
+		WorkspaceOptions: fixture.options, Target: "local",
+		Fault: func(point string) error {
+			if point == "publish.commit_intent" {
+				return injected
+			}
+			return nil
+		},
+	})
+	if !errors.Is(err, injected) || stopped.Attempt == "" {
+		t.Fatalf("stopped publication=%#v err=%v", stopped, err)
+	}
+
+	cfg, err = config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target = cfg.Targets["local"]
+	target.PublicEndpoint = correctPublicEndpoint
+	cfg.Targets["local"] = target
+	writeManagedConfig(t, fixture.root, cfg)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local"}); !errors.Is(err, state.ErrConflict) || !strings.Contains(err.Error(), "--rebind") {
+		t.Fatalf("ordinary publish conflict=%v", err)
+	}
+	resumed, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", Rebind: true})
+	if err != nil || resumed.Attempt != stopped.Attempt || resumed.Phase != "grace" {
+		t.Fatalf("rebound publication=%#v stopped=%#v err=%v", resumed, stopped, err)
+	}
+
+	store, err := state.OpenReadOnly(filepath.Join(fixture.root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := cfg.TargetBindings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisions, revisionErr := store.ListPublicationTargetBindingRevisions(ctx, bindings[0].TargetIdentity)
+	closeErr := store.Close()
+	if err := errors.Join(revisionErr, closeErr); err != nil || len(revisions) != 2 || !revisions[1].OperatorConfirmed {
+		t.Fatalf("managed rebind revisions=%#v err=%v", revisions, err)
+	}
+
+	cfg, err = config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target = cfg.Targets["local"]
+	target.Prefix = "other/repo"
+	target.PublicEndpoint = "https://cdn.example.test/other/repo/"
+	cfg.Targets["local"] = target
+	writeManagedConfig(t, fixture.root, cfg)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", Rebind: true}); !errors.Is(err, state.ErrConflict) || !strings.Contains(err.Error(), "new target") {
+		t.Fatalf("storage/prefix rebind error=%v", err)
+	}
 }
 
 type recordingPublicationBackend struct {

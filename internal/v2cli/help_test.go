@@ -111,7 +111,7 @@ func TestLeafHelpMatchesClosedOptionMatrix(t *testing.T) {
 		{topic: "build", want: []string{"--jobs", "--workdir", "--repo", "--dist", "--timeout", "--no-wait", "--json"}, deny: []string{"--skip", "--check", "--force"}},
 		{topic: "check", want: []string{"--jobs", "--workdir", "--repo", "--dist", "--json"}, deny: []string{"--timeout", "--no-wait", "--force"}},
 		{topic: "changes", want: []string{"--workdir", "--repo", "--json"}, deny: []string{"--dist", "--jobs", "--timeout"}},
-		{topic: "publish", want: []string{"--abort", "--workdir", "--timeout", "--no-wait", "--json"}, deny: []string{"--repo", "--dist", "--jobs", "--force"}},
+		{topic: "publish", want: []string{"--abort", "--rebind", "--workdir", "--timeout", "--no-wait", "--json"}, deny: []string{"--repo", "--dist", "--jobs", "--force"}},
 		{topic: "retain add", want: []string{"--workdir", "--repo", "--timeout", "--no-wait", "--json"}, deny: []string{"--dist", "--jobs", "--force"}},
 		{topic: "retain ls", want: []string{"--workdir", "--repo", "--json"}, deny: []string{"--dist", "--jobs", "--timeout", "--no-wait"}},
 		{topic: "retain rm", want: []string{"--workdir", "--repo", "--timeout", "--no-wait", "--json"}, deny: []string{"--dist", "--jobs", "--force"}},

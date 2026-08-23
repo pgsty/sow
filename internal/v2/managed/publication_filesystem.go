@@ -38,8 +38,14 @@ type publicationBackend interface {
 }
 
 type filesystemPublicationBackend struct {
-	root       string
-	publicBase *url.URL
+	root                  string
+	publicBase            *url.URL
+	publicClient          *http.Client
+	maxCacheTTL           time.Duration
+	transientRetryWindow  time.Duration
+	publicReadIdleTimeout time.Duration
+	verificationSleep     func(context.Context, time.Duration) error
+	verificationNow       func() time.Time
 }
 
 func newFilesystemPublicationBackend(target config.TargetConfig) (*filesystemPublicationBackend, error) {
@@ -71,7 +77,173 @@ func newFilesystemPublicationBackend(target config.TargetConfig) (*filesystemPub
 			return nil, fmt.Errorf("%w: file public_endpoint does not name the exact publish prefix: %v", ErrRejected, publicErr)
 		}
 	}
-	return &filesystemPublicationBackend{root: physicalTarget, publicBase: publicBase}, nil
+	maxCacheTTL := time.Duration(0)
+	if target.MaxCacheTTL != "" {
+		maxCacheTTL, err = time.ParseDuration(target.MaxCacheTTL)
+		if err != nil || maxCacheTTL < 0 {
+			return nil, fmt.Errorf("%w: invalid filesystem public cache TTL", ErrRejected)
+		}
+	}
+	return &filesystemPublicationBackend{
+		root: physicalTarget, publicBase: publicBase, publicClient: newPublicVerificationClient(),
+		maxCacheTTL: maxCacheTTL, transientRetryWindow: publicTransientWindow, publicReadIdleTimeout: publicResponseTimeout,
+	}, nil
+}
+
+// preflightFilesystemPublicationBackend resolves every configured physical
+// path without creating the target prefix. Durable binding is allowed only
+// after this side-effect-free check succeeds.
+func preflightFilesystemPublicationBackend(target config.TargetConfig) (string, error) {
+	targetRoot, err := filesystemPublicationRoot(target)
+	if err != nil {
+		return "", err
+	}
+	publicBase, err := url.Parse(target.PublicEndpoint)
+	if err != nil {
+		return "", fmt.Errorf("%w: invalid public endpoint", ErrRejected)
+	}
+	switch publicBase.Scheme {
+	case "http", "https":
+		return targetRoot, nil
+	case "file":
+		publicPath := filepath.Clean(filepath.FromSlash(strings.TrimSuffix(publicBase.Path, "/")))
+		physicalPublic, _, publicErr := prospectiveRealDirectory(publicPath)
+		physicalTarget, _, targetErr := prospectiveRealDirectory(targetRoot)
+		if publicErr != nil || targetErr != nil || physicalPublic != physicalTarget {
+			return "", fmt.Errorf("%w: file public_endpoint does not name the exact prospective publish prefix: %v", ErrRejected, errors.Join(publicErr, targetErr))
+		}
+		return targetRoot, nil
+	default:
+		return "", fmt.Errorf("%w: filesystem public endpoint must be file or HTTP(S)", ErrRejected)
+	}
+}
+
+func preflightFilesystemTargetAliases(cfg config.Config, targetName string) error {
+	target, ok := cfg.Targets[targetName]
+	if !ok || target.Provider != "filesystem" {
+		return nil
+	}
+	endpointPath, targetRoot, err := filesystemConfiguredPublicationRoot(target)
+	if err != nil {
+		return err
+	}
+	caseInsensitive, err := filesystemDirectoryIsCaseInsensitive(endpointPath)
+	if err != nil {
+		return err
+	}
+	physicalTarget, _, err := prospectiveRealDirectory(targetRoot)
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(cfg.Targets))
+	for name := range cfg.Targets {
+		if name != targetName {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		other := cfg.Targets[name]
+		if other.Provider != "filesystem" {
+			continue
+		}
+		_, otherRoot, err := filesystemConfiguredPublicationRoot(other)
+		if err != nil {
+			return err
+		}
+		physicalOther, _, err := prospectiveRealDirectory(otherRoot)
+		if err != nil {
+			return err
+		}
+		if pathsOverlap(physicalTarget, physicalOther) {
+			return fmt.Errorf("%w: filesystem targets %q and %q overlap at prospective physical paths %q and %q", ErrRejected, targetName, name, physicalTarget, physicalOther)
+		}
+		if caseInsensitive && caseFoldedPathsOverlap(physicalTarget, physicalOther) {
+			return fmt.Errorf("%w: filesystem targets %q and %q are a prospective case alias at %q and %q", ErrRejected, targetName, name, physicalTarget, physicalOther)
+		}
+	}
+	return nil
+}
+
+// filesystemDirectoryIsCaseInsensitive performs a read-only capability probe
+// against an existing directory entry. It never creates a sentinel and never
+// applies case folding to paths on a case-sensitive volume.
+func filesystemDirectoryIsCaseInsensitive(directory string) (bool, error) {
+	physical, err := realDirectory(directory, false, 0)
+	if err != nil {
+		return false, err
+	}
+	current := physical
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+		base := filepath.Base(current)
+		variant, changed := asciiCaseVariant(base)
+		if changed {
+			original, originalErr := os.Stat(current)
+			alias, aliasErr := os.Stat(filepath.Join(parent, variant))
+			if errors.Is(aliasErr, os.ErrNotExist) {
+				return false, nil
+			}
+			if originalErr != nil || aliasErr != nil {
+				return false, errors.Join(originalErr, aliasErr)
+			}
+			return os.SameFile(original, alias), nil
+		}
+		current = parent
+	}
+	// A valid mount may use only numeric components (for example /1/2/3).
+	// Preserve the read-only probe by examining one ordinary alphabetic entry
+	// in the endpoint or its ancestors rather than silently assuming sensitivity.
+	for probe := physical; ; probe = filepath.Dir(probe) {
+		entries, err := os.ReadDir(probe)
+		if err != nil {
+			return false, err
+		}
+		for _, entry := range entries {
+			if entry.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			variant, changed := asciiCaseVariant(entry.Name())
+			if !changed {
+				continue
+			}
+			original, originalErr := os.Stat(filepath.Join(probe, entry.Name()))
+			alias, aliasErr := os.Stat(filepath.Join(probe, variant))
+			if errors.Is(aliasErr, os.ErrNotExist) {
+				return false, nil
+			}
+			if originalErr != nil || aliasErr != nil {
+				return false, errors.Join(originalErr, aliasErr)
+			}
+			return os.SameFile(original, alias), nil
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return false, nil
+		}
+	}
+}
+
+func asciiCaseVariant(value string) (string, bool) {
+	bytes := []byte(value)
+	for index, character := range bytes {
+		switch {
+		case character >= 'a' && character <= 'z':
+			bytes[index] = character - ('a' - 'A')
+			return string(bytes), true
+		case character >= 'A' && character <= 'Z':
+			bytes[index] = character + ('a' - 'A')
+			return string(bytes), true
+		}
+	}
+	return value, false
+}
+
+func caseFoldedPathsOverlap(left, right string) bool {
+	return pathsOverlap(strings.ToLower(filepath.Clean(left)), strings.ToLower(filepath.Clean(right)))
 }
 
 func filesystemPublicationRoot(target config.TargetConfig) (string, error) {
@@ -304,33 +476,7 @@ func (b *filesystemPublicationBackend) VerifyPublic(ctx context.Context, expecte
 		}
 		return nil
 	}
-	u := *b.publicBase
-	u.Path = strings.TrimSuffix(u.Path, "/") + "/" + expected.Path
-	u.RawPath, u.RawQuery, u.Fragment = "", "", ""
-	client := &http.Client{Timeout: 2 * time.Minute, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return err
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("%w: public GET %q returned %s", ErrIntegrity, expected.Path, response.Status)
-	}
-	hash := sha256.New()
-	written, readErr := io.Copy(hash, io.LimitReader(response.Body, expected.Size))
-	var extra [1]byte
-	extraCount, extraErr := response.Body.Read(extra[:])
-	if extraErr != nil && !errors.Is(extraErr, io.EOF) {
-		readErr = errors.Join(readErr, extraErr)
-	}
-	if readErr != nil || written != expected.Size || extraCount != 0 || hex.EncodeToString(hash.Sum(nil)) != expected.SHA256 {
-		return errors.Join(fmt.Errorf("%w: public GET content differs for %q", ErrIntegrity, expected.Path), readErr)
-	}
-	return nil
+	return b.httpVerifier().Verify(ctx, expected)
 }
 
 func (b *filesystemPublicationBackend) DeleteConditional(ctx context.Context, candidate state.PublicationCandidate) error {
@@ -363,21 +509,13 @@ func (b *filesystemPublicationBackend) VerifyPublicAbsent(ctx context.Context, o
 		}
 		return nil
 	}
-	u := *b.publicBase
-	u.Path = strings.TrimSuffix(u.Path, "/") + "/" + objectPath
-	u.RawPath, u.RawQuery, u.Fragment = "", "", ""
-	client := &http.Client{Timeout: 2 * time.Minute, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return err
+	return b.httpVerifier().VerifyAbsent(ctx, objectPath)
+}
+
+func (b *filesystemPublicationBackend) httpVerifier() httpPublicationVerifier {
+	return httpPublicationVerifier{
+		client: b.publicClient, base: b.publicBase, maxCacheTTL: b.maxCacheTTL,
+		transientRetryWindow: b.transientRetryWindow, readIdleTimeout: b.publicReadIdleTimeout,
+		sleep: b.verificationSleep, now: b.verificationNow,
 	}
-	response, err := client.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusNotFound && response.StatusCode != http.StatusGone {
-		return fmt.Errorf("%w: public GET %q returned %s instead of absence", ErrIntegrity, objectPath, response.Status)
-	}
-	return nil
 }

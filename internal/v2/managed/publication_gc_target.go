@@ -80,31 +80,26 @@ func TargetGC(ctx context.Context, opts TargetGCOptions) (result TargetGCResult,
 	if err != nil {
 		return result, err
 	}
+	backend := opts.backend
+	if err := preflightFilesystemTargetAliases(cfg, opts.Target); err != nil {
+		return result, err
+	}
+	if err := preflightPublicationTarget(targetConfig, filepath.Join(ws.Root, repoName), filepath.Join(ws.Root, ".sow"), backend); err != nil {
+		return result, err
+	}
 	if err := store.BindPublicationTarget(ctx, binding); err != nil {
-		return result, fmt.Errorf("%w: bind publication target: %v", ErrIntegrity, err)
+		return result, fmt.Errorf("bind publication target %q: %w", opts.Target, err)
 	}
 	if active, activeErr := store.GetActivePublicationAttempt(ctx, binding.TargetIdentity); activeErr == nil {
 		return result, fmt.Errorf("%w: target %q has write-active publication attempt %s in phase %s", ErrNotReady, opts.Target, active.AttemptIdentity, active.Phase)
 	} else if !errors.Is(activeErr, state.ErrNotFound) {
 		return result, activeErr
 	}
-	if targetConfig.Provider == "filesystem" {
-		targetRoot, err := filesystemPublicationRoot(targetConfig)
-		if err != nil {
-			return result, err
-		}
-		if err := rejectPublicationSourceTargetOverlap(filepath.Join(ws.Root, repoName), filepath.Join(ws.Root, ".sow"), targetRoot); err != nil {
-			return result, err
-		}
-	}
-	backend := opts.backend
 	if backend == nil {
 		backend, err = newPublicationBackend(targetConfig)
 		if err != nil {
 			return result, err
 		}
-	} else if backend.Provider() != targetConfig.Provider {
-		return result, fmt.Errorf("%w: publication backend provider differs from target", ErrRejected)
 	}
 	maintenance, err := store.ListPublicationMaintenance(ctx, binding.TargetIdentity)
 	if err != nil {

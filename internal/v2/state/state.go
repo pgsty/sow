@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	SchemaVersion            = 11
+	SchemaVersion            = 12
 	SchemaV1SHA256           = "9953cdc1f655fb03814da8b4c7a45a4a92a74e03facf03c2a45709cc860b9bc7"
 	SchemaV2SHA256           = "aea5b37365510221ab36c4f0fc9e6bc77ba825354649e1e06336b64551c14e25"
 	SchemaV3SHA256           = "9ae957e0e8d9eac21eda3929386f11d001608df5ee7feb75c44194f624f0a177"
@@ -35,6 +35,7 @@ const (
 	SchemaV9SHA256           = "dcbe4aa8dff14151879b48c069f161261a2f30cb6d2b7668fe0ccac2aff298ce"
 	SchemaV10SHA256          = "9a6a64d7276ca7eb3a7579ddb55e1e9e6073baf235e0e1d1a909684783cb38dd"
 	SchemaV11SHA256          = "bda9cef7bc98d7893529724d3eb6bb87aab51c54a7b3ca5d60cf07c6e7da115c"
+	SchemaV12SHA256          = "e842671281c454d960e1ac8b4adbd26129bc46ba15369286e7a0ff2dafcb8f81"
 	MaxOperationPayloadBytes = 16 << 20
 )
 
@@ -70,6 +71,9 @@ var schemaV10SQL string
 
 //go:embed schema_v11.sql
 var schemaV11SQL string
+
+//go:embed schema_v12.sql
+var schemaV12SQL string
 
 var (
 	ErrSchema     = errors.New("unsupported or corrupt repository schema")
@@ -111,6 +115,9 @@ var (
 	schemaV11ContractOnce    sync.Once
 	schemaV11ContractObjects []schemaObject
 	schemaV11ContractErr     error
+	schemaV12ContractOnce    sync.Once
+	schemaV12ContractObjects []schemaObject
+	schemaV12ContractErr     error
 )
 
 // Legacy lowercase hexadecimal IDs remain readable so interrupted development
@@ -605,7 +612,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		return s.validateSchema(ctx)
 	case version > SchemaVersion:
 		return fmt.Errorf("%w: database version %d is newer than supported version %d", ErrSchema, version, SchemaVersion)
-	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 && version != 8 && version != 9 && version != 10:
+	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 && version != 8 && version != 9 && version != 10 && version != 11:
 		return fmt.Errorf("%w: cannot migrate version %d", ErrSchema, version)
 	}
 	if version == 0 {
@@ -650,6 +657,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := validateEmbeddedSchema("v11", schemaV11SQL, SchemaV11SHA256); err != nil {
+		return err
+	}
+	if err := validateEmbeddedSchema("v12", schemaV12SQL, SchemaV12SHA256); err != nil {
 		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -764,8 +774,16 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("record schema v11: %w", err)
 		}
 	}
+	if version <= 11 {
+		if _, err := tx.ExecContext(ctx, schemaV12SQL); err != nil {
+			return fmt.Errorf("apply schema v12: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (12, ?, ?)`, SchemaV12SHA256, nowText()); err != nil {
+			return fmt.Errorf("record schema v12: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit schema v11: %w", err)
+		return fmt.Errorf("commit schema v12: %w", err)
 	}
 	return s.validateSchema(ctx)
 }
@@ -816,7 +834,7 @@ func (s *Store) validateUpgradeableSchema(ctx context.Context) error {
 		return fmt.Errorf("%w: read user_version: %v", ErrSchema, err)
 	}
 	switch version {
-	case 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, SchemaVersion:
+	case 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, SchemaVersion:
 		return s.validateSchemaVersion(ctx, version)
 	case 0:
 		return fmt.Errorf("%w: uninitialized database cannot be adopted", ErrSchema)
@@ -923,6 +941,12 @@ func (s *Store) validateSchemaVersion(ctx context.Context, expectedVersion int) 
 			version  int
 			checksum string
 		}{11, SchemaV11SHA256})
+	}
+	if expectedVersion >= 12 {
+		expectedMigrations = append(expectedMigrations, struct {
+			version  int
+			checksum string
+		}{12, SchemaV12SHA256})
 	}
 	if !reflectMigrations(migrations, expectedMigrations) {
 		return fmt.Errorf("%w: migration ledger does not exactly match schema v%d", ErrSchema, expectedVersion)
@@ -1042,6 +1066,12 @@ func expectedSchemaObjects(version int) ([]schemaObject, error) {
 		})
 		return append([]schemaObject(nil), schemaV11ContractObjects...), schemaV11ContractErr
 	}
+	if version == 12 {
+		schemaV12ContractOnce.Do(func() {
+			schemaV12ContractObjects, schemaV12ContractErr = buildExpectedSchemaObjects(schemaV1SQL, schemaV2SQL, schemaV3SQL, schemaV4SQL, schemaV5SQL, schemaV6SQL, schemaV7SQL, schemaV8SQL, schemaV9SQL, schemaV10SQL, schemaV11SQL, schemaV12SQL)
+		})
+		return append([]schemaObject(nil), schemaV12ContractObjects...), schemaV12ContractErr
+	}
 	return nil, fmt.Errorf("unsupported schema contract version %d", version)
 }
 
@@ -1102,6 +1132,11 @@ func (s *Store) Check(ctx context.Context) error {
 	}
 	if err := s.validateSemanticState(ctx); err != nil {
 		return err
+	}
+	if s.schemaVersion >= 12 {
+		if err := s.validatePublicationTargetBindingRevisions(ctx); err != nil {
+			return fmt.Errorf("%w: validate publication target binding revisions: %v", ErrSchema, err)
+		}
 	}
 	// Row-level package validation is intentionally part of the semantic DB
 	// check. SQL constraints cannot express the source-derived pool path, and

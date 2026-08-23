@@ -32,6 +32,81 @@ type PublicationMaintenance struct {
 	NotBefore          time.Time `json:"not_before"`
 }
 
+func (s *Store) ListPublicationTargetBindingRevisions(ctx context.Context, targetIdentity string) ([]PublicationTargetBindingRevision, error) {
+	if !validSHA256Text(targetIdentity) {
+		return nil, errors.New("invalid publication target identity")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT revision, target_identity, target_storage_id, repository_id, target_name,
+provider, endpoint, region, bucket, prefix, public_endpoint, max_cache_ttl_ns,
+authoritative_workspace, single_writer, exclusive_write_authority, config_identity,
+reason, operator_confirmed, recorded_at
+FROM publication_target_binding_revisions WHERE target_identity = ? ORDER BY revision`, targetIdentity)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []PublicationTargetBindingRevision{}
+	for rows.Next() {
+		var revision PublicationTargetBindingRevision
+		var ttl int64
+		var authoritative, singleWriter, exclusive, confirmed int
+		var recorded string
+		if err := rows.Scan(&revision.Revision, &revision.TargetIdentity, &revision.TargetStorageID, &revision.RepositoryID,
+			&revision.TargetName, &revision.Provider, &revision.Endpoint, &revision.Region, &revision.Bucket, &revision.Prefix,
+			&revision.PublicEndpoint, &ttl, &authoritative, &singleWriter, &exclusive, &revision.ConfigIdentity,
+			&revision.Reason, &confirmed, &recorded); err != nil {
+			return nil, err
+		}
+		revision.MaxCacheTTL = time.Duration(ttl)
+		revision.AuthoritativeWorkspace = authoritative == 1
+		revision.SingleWriter = singleWriter == 1
+		revision.ExclusiveWriteAuthority = exclusive == 1
+		revision.OperatorConfirmed = confirmed == 1
+		revision.RecordedAt, err = time.Parse(time.RFC3339Nano, recorded)
+		if err != nil || revision.Revision != int64(len(result)+1) || revision.RecordedAt.IsZero() ||
+			revision.Revision == 1 && (revision.OperatorConfirmed || revision.Reason != "initial_bind" && revision.Reason != "backfill") ||
+			revision.Revision > 1 && !revision.OperatorConfirmed ||
+			revision.TargetName == "" || revision.Endpoint == "" || revision.PublicEndpoint == "" || revision.MaxCacheTTL < 0 || revision.MaxCacheTTL > maximumPublicationCacheTTL ||
+			revision.TargetStorageID != publicationIdentity("sow/target-storage/v1", revision.Provider, revision.Endpoint, revision.Region, revision.Bucket) ||
+			revision.TargetIdentity != publicationIdentity("sow/target/v1", revision.TargetStorageID, revision.Prefix) ||
+			revision.ConfigIdentity != PublicationTargetConfigIdentity(revision.PublicationTargetBinding) {
+			return nil, fmt.Errorf("%w: publication target binding revision is corrupt", ErrConflict)
+		}
+		result = append(result, revision)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) validatePublicationTargetBindingRevisions(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT target_identity FROM publication_target_bindings ORDER BY target_identity`)
+	if err != nil {
+		return err
+	}
+	identities := []string{}
+	for rows.Next() {
+		var identity string
+		if err := rows.Scan(&identity); err != nil {
+			rows.Close()
+			return err
+		}
+		identities = append(identities, identity)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	for _, identity := range identities {
+		target, err := s.GetPublicationTarget(ctx, identity)
+		if err != nil {
+			return err
+		}
+		revisions, err := s.ListPublicationTargetBindingRevisions(ctx, identity)
+		if err != nil || len(revisions) == 0 || revisions[len(revisions)-1].PublicationTargetBinding != target.Binding {
+			return errors.Join(fmt.Errorf("%w: publication target differs from its append-only binding revisions", ErrConflict), err)
+		}
+	}
+	return nil
+}
+
 // GetPublicationTarget returns one binding and head after recomputing every
 // persisted semantic identity. Callers must never resume from unchecked rows.
 func (s *Store) GetPublicationTarget(ctx context.Context, targetIdentity string) (PublicationTargetSnapshot, error) {
@@ -72,6 +147,7 @@ WHERE b.target_identity = ?`, targetIdentity).Scan(
 	wantTarget := publicationIdentity("sow/target/v1", wantStorage, out.Binding.Prefix)
 	wantConfig := PublicationTargetConfigIdentity(out.Binding)
 	if out.Binding.TargetStorageID != wantStorage || out.Binding.TargetIdentity != wantTarget || out.Binding.ConfigIdentity != wantConfig ||
+		out.Binding.TargetName == "" || out.Binding.Endpoint == "" || out.Binding.PublicEndpoint == "" || out.Binding.MaxCacheTTL < 0 || out.Binding.MaxCacheTTL > maximumPublicationCacheTTL ||
 		!out.Binding.AuthoritativeWorkspace || !out.Binding.SingleWriter || !out.Binding.ExclusiveWriteAuthority ||
 		(out.Head.CheckpointIdentity == "") != (out.Head.Generation == 0) ||
 		(out.Head.CheckpointIdentity == "") != (out.Head.ManifestSHA256 == "") {
@@ -206,10 +282,11 @@ func (s *Store) ListPublicationMaintenance(ctx context.Context, targetIdentity s
 		return nil, errors.New("invalid publication target identity")
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT a.attempt_identity, c.checkpoint_identity, g.grace_identity,
- a.phase, g.state, g.not_before
-FROM publication_grace_records AS g
-JOIN publication_checkpoints AS c ON c.checkpoint_identity = g.checkpoint_identity
-JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
+	 a.phase, g.state, g.not_before, c.applied_at, b.max_cache_ttl_ns
+	FROM publication_grace_records AS g
+	JOIN publication_checkpoints AS c ON c.checkpoint_identity = g.checkpoint_identity
+	JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
+	JOIN publication_target_bindings AS b ON b.target_identity = g.target_identity
 WHERE g.target_identity = ? AND a.phase != 'done'
 ORDER BY g.not_before, c.checkpoint_identity`, targetIdentity)
 	if err != nil {
@@ -219,11 +296,12 @@ ORDER BY g.not_before, c.checkpoint_identity`, targetIdentity)
 	result := []PublicationMaintenance{}
 	for rows.Next() {
 		var item PublicationMaintenance
-		var notBefore string
-		if err := rows.Scan(&item.AttemptIdentity, &item.CheckpointIdentity, &item.GraceIdentity, &item.AttemptPhase, &item.GraceState, &notBefore); err != nil {
+		var notBefore, appliedAt string
+		var ttlNS int64
+		if err := rows.Scan(&item.AttemptIdentity, &item.CheckpointIdentity, &item.GraceIdentity, &item.AttemptPhase, &item.GraceState, &notBefore, &appliedAt, &ttlNS); err != nil {
 			return nil, err
 		}
-		item.NotBefore, err = time.Parse(time.RFC3339Nano, notBefore)
+		item.NotBefore, err = effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
 		if err != nil || !validSHA256Text(item.AttemptIdentity) || !validSHA256Text(item.CheckpointIdentity) || !validSHA256Text(item.GraceIdentity) || publicationPhaseRank(item.AttemptPhase) < publicationPhaseRank("grace") || item.GraceState != "grace" && item.GraceState != "deletion_verified" && item.GraceState != "retained_reported" {
 			return nil, fmt.Errorf("%w: invalid publication maintenance state", ErrConflict)
 		}
@@ -390,17 +468,19 @@ func (s *Store) ExactPublicationCandidates(ctx context.Context, checkpointIdenti
 		return nil, err
 	}
 	defer tx.Rollback()
-	var targetIdentity, graceState, attemptPhase, notBefore string
-	if err := tx.QueryRowContext(ctx, `SELECT c.target_identity, g.state, a.phase, g.not_before
-FROM publication_checkpoints AS c
-JOIN publication_grace_records AS g ON g.target_identity = c.target_identity AND g.checkpoint_identity = c.checkpoint_identity
-JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
-WHERE c.checkpoint_identity = ?`, checkpointIdentity).Scan(&targetIdentity, &graceState, &attemptPhase, &notBefore); err != nil {
+	var targetIdentity, graceState, attemptPhase, notBefore, appliedAt string
+	var ttlNS int64
+	if err := tx.QueryRowContext(ctx, `SELECT c.target_identity, g.state, a.phase, g.not_before, c.applied_at, b.max_cache_ttl_ns
+	FROM publication_checkpoints AS c
+	JOIN publication_grace_records AS g ON g.target_identity = c.target_identity AND g.checkpoint_identity = c.checkpoint_identity
+	JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
+	JOIN publication_target_bindings AS b ON b.target_identity = c.target_identity
+	WHERE c.checkpoint_identity = ?`, checkpointIdentity).Scan(&targetIdentity, &graceState, &attemptPhase, &notBefore, &appliedAt, &ttlNS); err != nil {
 		return nil, err
 	}
-	deadline, err := time.Parse(time.RFC3339Nano, notBefore)
+	deadline, err := effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
 	if err != nil {
-		return nil, fmt.Errorf("%w: invalid publication grace deadline", ErrSchema)
+		return nil, err
 	}
 	if graceState != "grace" || attemptPhase != "grace" || observedAt.Before(deadline) {
 		return nil, fmt.Errorf("%w: publication grace is not ready for maintenance", ErrTransition)
