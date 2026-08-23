@@ -82,7 +82,9 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	if err != nil {
 		return result, err
 	}
-	buildDists := append([]string(nil), desiredChangedDists...)
+	// Keep an empty staged scope non-nil so the recovery journal encodes []
+	// rather than the indistinguishable-from-absent JSON null value.
+	buildDists := append([]string{}, desiredChangedDists...)
 	if !opts.Skip {
 		buildDists, err = distsNeedingBuild(ctx, ws.Root, repoName, cfg, store, desired)
 		if err != nil {
@@ -107,7 +109,11 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 		return result, err
 	}
 	result.Operation = id
-	payload := mutationOperationPayload{Version: mutationOperationVersion, Repository: repoName, Kind: "rm", ConfigSHA256: configSHA, Skip: opts.Skip, Dists: distNames, BuildDists: buildDists}
+	payload := mutationOperationPayload{
+		Version: mutationOperationVersion, Repository: repoName, Kind: "rm", ConfigSHA256: configSHA,
+		Skip: opts.Skip, Noop: !opts.Skip && len(buildDists) == 0, Jobs: opts.Jobs,
+		Dists: distNames, BuildDists: buildDists,
+	}
 	payloadData, _ := json.Marshal(payload)
 	defer func() {
 		resultErr = finalizePreApplyMutationOperation(ctx, ws.Root, repoName, id, store, resultErr, func() any {
@@ -166,8 +172,28 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 		return result, err
 	}
 	if opts.Skip {
-		if err := store.SetOperationState(ctx, id, state.OperationDoneDirty, ""); err != nil {
-			if retainCommittedTerminalProjection(ctx, ws.Root, repoName, cfg, store, id, state.OperationDoneDirty, &result.Generation, &result.Dirty) {
+		terminal, err := mutationTerminalStateForProjection(ctx, ws.Root, repoName, cfg, store)
+		if err != nil {
+			return result, err
+		}
+		if err := store.SetOperationState(ctx, id, terminal, ""); err != nil {
+			if retainCommittedTerminalProjection(ctx, ws.Root, repoName, cfg, store, id, terminal, &result.Generation, &result.Dirty) {
+				err = errors.Join(err, cleanupMutationStage(ws.Root, repoName, id))
+			}
+			return result, err
+		}
+		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
+		if err := cleanupMutationStage(ws.Root, repoName, id); err != nil {
+			return result, err
+		}
+		return result, nil
+	}
+	if len(payload.BuildDists) == 0 {
+		if _, err := normalizeCurrentPublicTreeWithSnapshot(ctx, ws.Root, repoName, id, store, opts.Fault, currentSnapshot); err != nil {
+			return result, err
+		}
+		if err := store.FinalizeNoopBuild(ctx, id); err != nil {
+			if retainCommittedTerminalProjection(ctx, ws.Root, repoName, cfg, store, id, state.OperationDone, &result.Generation, &result.Dirty) {
 				err = errors.Join(err, cleanupMutationStage(ws.Root, repoName, id))
 			}
 			return result, err
@@ -227,7 +253,11 @@ func previewRemove(ctx context.Context, opts RemoveOptions) (result RemoveResult
 	if err != nil || len(pending) != 0 {
 		return result, fmt.Errorf("%w: repository has an operation pending recovery", ErrIntegrity)
 	}
-	if err := validateCurrentPublicGeneration(ctx, ws.Root, repoName, store); err != nil {
+	if err := requireNoWriteActivePublication(ctx, store); err != nil {
+		return result, err
+	}
+	currentSnapshot, err := validateCurrentPublicGenerationSnapshot(ctx, ws.Root, repoName, store)
+	if err != nil {
 		return result, err
 	}
 	distNames, effectiveDists, err := selectedMutationDists(ws, cfg, repoName, opts.Dists)
@@ -239,39 +269,52 @@ func previewRemove(ctx context.Context, opts RemoveOptions) (result RemoveResult
 		return result, err
 	}
 	desired, removed, err := desiredAfterRemoval(ctx, store, distNames, effectiveDists, objects)
-	result.Removed = removed
-	result.Dists = distNames
-	affected := []string{}
-	if err == nil {
-		affected, err = changedDesiredDists(ctx, store, desired)
-		if err == nil {
-			result.Changes, err = previewRemovalChanges(ctx, ws.Root, repoName, cfg, affected, desired, store, opts.Jobs)
-		}
+	result.Removed, result.Dists = removed, distNames
+	if err != nil {
+		return result, err
 	}
-	if summary, summaryErr := store.Summary(ctx); summaryErr == nil {
-		// A successful default rm immediately commits one Desired revision and
-		// one physical Generation. --check reports that predicted identity while
-		// remaining entirely read-only.
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.Revision = summary.DesiredRevision + 1
+	// Preserve an accurate current baseline if prediction fails below. The CLI
+	// marks that result incomplete instead of presenting zero-value fields as a
+	// finished --check forecast.
+	result.Generation = summary.BuiltGeneration
+	result.Dirty = summary.Status != "clean"
+	predictedGeneration := summary.BuiltGeneration
+	buildDists, err := distsNeedingBuild(ctx, ws.Root, repoName, cfg, store, desired)
+	if err != nil {
+		return result, err
+	}
+	if len(buildDists) != 0 {
 		nextGeneration, nextErr := summary.BuiltGeneration.Next()
 		if nextErr != nil {
-			if err == nil {
-				err = fmt.Errorf("%w: %v", ErrRejected, nextErr)
-			}
-		} else {
-			result.Revision, result.Generation = summary.DesiredRevision+1, nextGeneration
+			return result, fmt.Errorf("%w: %v", ErrRejected, nextErr)
 		}
-		if dirty, dirtyErr := predictedDirtyAfterBuild(ctx, ws.Root, repoName, cfg, store, affected); dirtyErr == nil {
-			result.Dirty = dirty
-		} else if err == nil {
-			err = dirtyErr
+		predictedGeneration = nextGeneration
+		manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"removed": len(removed)}}
+		preflight, preflightErr := prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, nil, currentSnapshot)
+		if preflightErr != nil {
+			return result, preflightErr
 		}
-	} else if err == nil {
-		err = summaryErr
+		result.Changes, err = previewRemovalChanges(ctx, ws.Root, repoName, buildDists, desired, store, opts.Jobs, preflight)
+		if err != nil {
+			return result, err
+		}
 	}
-	return result, err
+	predictedDirty, err := predictedDirtyAfterBuild(ctx, ws.Root, repoName, cfg, store, buildDists, desired)
+	if err != nil {
+		return result, err
+	}
+	result.Generation = predictedGeneration
+	result.Dirty = predictedDirty
+	result.PredictionComplete = true
+	return result, nil
 }
 
-func predictedDirtyAfterBuild(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, builtDists []string) (bool, error) {
+func predictedDirtyAfterBuild(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, builtDists []string, proposedDesired map[string][]string) (bool, error) {
 	builtSet := map[string]struct{}{}
 	for _, name := range builtDists {
 		builtSet[name] = struct{}{}
@@ -299,7 +342,11 @@ func predictedDirtyAfterBuild(ctx context.Context, root, repoName string, cfg co
 			// default rm commits that exact projection as Built.
 			continue
 		}
-		desired, desiredErr := store.MembershipDigests(ctx, name, false)
+		desired, proposed := proposedDesired[name]
+		var desiredErr error
+		if !proposed {
+			desired, desiredErr = store.MembershipDigests(ctx, name, false)
+		}
 		built, builtErr := store.MembershipDigests(ctx, name, true)
 		_, configDirty, configErr := observedEffectiveDistConfig(ctx, root, cfg, repoName, name, dist)
 		if err := errors.Join(desiredErr, builtErr, configErr); err != nil {
@@ -312,22 +359,15 @@ func predictedDirtyAfterBuild(ctx context.Context, root, repoName string, cfg co
 	return false, nil
 }
 
-func previewRemovalChanges(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, desired map[string][]string, store *state.Store, jobs int) ([]state.FileChange, error) {
+func previewRemovalChanges(ctx context.Context, root, repoName string, distNames []string, desired map[string][]string, store *state.Store, jobs int, preflight *mutationBuildPreflight) ([]state.FileChange, error) {
 	if jobs < 1 {
 		return nil, fmt.Errorf("%w: remove jobs must be at least 1", ErrRejected)
 	}
-	summary, err := store.Summary(ctx)
-	if err != nil {
-		return nil, err
+	if preflight == nil || !sameStringSet(preflight.distNames, distNames) {
+		return nil, fmt.Errorf("%w: remove preview lacks its exact build preflight", ErrIntegrity)
 	}
-	nextGeneration, err := summary.BuiltGeneration.Next()
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrRejected, err)
-	}
-	base, err := scanPublicManifest(ctx, filepath.Join(root, repoName))
-	if err != nil {
-		return nil, err
-	}
+	nextGeneration := preflight.generation
+	base := append([]state.GenerationFile(nil), preflight.baseManifest...)
 	target := make(map[string]state.GenerationFile, len(base))
 	baseByPath := make(map[string]state.GenerationFile, len(base))
 	for _, file := range base {
@@ -339,34 +379,48 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 		return nil, err
 	}
 	defer func() { _ = removeOwnedDirectory(previewRoot, filepath.Dir(previewRoot)) }()
-	formats := configuredSigningFormats(cfg, repoName, distNames)
-	publicationTime, err := nextMutationPublicationTime(ctx, root, cfg.Repositories[repoName], store, summary.BuiltGeneration, formats.rpm, formats.deb)
-	if err != nil {
-		return nil, err
-	}
-	metadataSnapshot, err := loadMetadataSignerSnapshotForFormats(ctx, root, cfg.Repositories[repoName], publicationTime, formats.rpm, formats.deb)
-	if err != nil {
-		return nil, err
-	}
-	rpmSigner, debSigner := metadataSnapshot.RPMSigner, metadataSnapshot.APTSigner
+	publicationTime := preflight.publicationTime
+	rpmSigner, debSigner := preflight.metadataSnapshot.RPMSigner, preflight.metadataSnapshot.APTSigner
 	allSources := make(map[string]ManagedPackageSource)
+	rpmObjects := make(map[string]state.PackageObject)
+	projectedDists := make(map[string]mutationBuildDist, len(preflight.projectedDists))
+	for _, dist := range preflight.projectedDists {
+		projectedDists[dist.Name] = dist
+	}
 	for _, distName := range distNames {
 		for _, digest := range desired[distName] {
-			if _, exists := allSources[digest]; exists {
-				continue
-			}
 			object, err := store.GetPackageObject(ctx, digest)
 			if err != nil {
 				return nil, err
 			}
-			source, err := availableManagedPackageSource(root, repoName, object)
-			if err != nil {
-				return nil, err
+			if object.Format == "rpm" {
+				rpmObjects[digest] = object
 			}
-			allSources[digest] = source
+			if object.Storage == "pending" {
+				file := state.GenerationFile{Path: object.PoolPath, Phase: "payload", Size: object.Size, SHA256: object.SHA256}
+				if existing, exists := target[object.PoolPath]; exists && existing != file {
+					return nil, fmt.Errorf("%w: pending payload preview conflicts at %s", ErrIntegrity, object.PoolPath)
+				}
+				target[object.PoolPath] = file
+			}
+			if _, exists := allSources[digest]; !exists {
+				source, sourceErr := availableManagedPackageSource(root, repoName, object)
+				if sourceErr != nil {
+					return nil, sourceErr
+				}
+				allSources[digest] = source
+			}
 		}
 	}
-	if err := loadManagedPackageFacts(ctx, allSources, store, jobs); err != nil {
+	if err := loadManagedPackageFacts(ctx, allSources, store, jobs, nil); err != nil {
+		return nil, err
+	}
+	rpmObjectList := make([]state.PackageObject, 0, len(rpmObjects))
+	for _, object := range rpmObjects {
+		rpmObjectList = append(rpmObjectList, object)
+	}
+	sort.Slice(rpmObjectList, func(i, j int) bool { return rpmObjectList[i].SHA256 < rpmObjectList[j].SHA256 })
+	if err := validateBuildRPMSigning(ctx, root, repoName, rpmObjectList, preflight.rpmPolicy, jobs); err != nil {
 		return nil, err
 	}
 	for _, distName := range distNames {
@@ -374,10 +428,11 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, cfg confi
 		if err != nil {
 			return nil, err
 		}
-		architectures, err := configuredArchitectureState(cfg, repoName, distName, dist.Format)
-		if err != nil {
-			return nil, err
+		projected, exists := projectedDists[distName]
+		if !exists {
+			return nil, fmt.Errorf("%w: remove preview Dist %q is absent from preflight", ErrIntegrity, distName)
 		}
+		architectures := projected.Architectures
 		sources := make([]ManagedPackageSource, 0, len(desired[distName]))
 		for _, digest := range desired[distName] {
 			sources = append(sources, allSources[digest])
@@ -437,6 +492,18 @@ func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName s
 	}
 	for _, architecture := range builtArchitectures {
 		priorRoot := filepath.Join(repositoryRoot, "dists", distName, architecture.Family, "repodata")
+		info, statErr := os.Lstat(priorRoot)
+		if errors.Is(statErr, os.ErrNotExist) {
+			// Match retainPriorRPMMetadata: a legacy Built architecture can
+			// legitimately have no prior metadata subtree to retain.
+			continue
+		}
+		if statErr != nil {
+			return fmt.Errorf("%w: inspect prior RPM metadata for removal preview: %v", ErrIntegrity, statErr)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%w: prior RPM metadata root is unsafe", ErrIntegrity)
+		}
 		var prior *yumrepo.Generation
 		var err error
 		if _, statErr := os.Lstat(filepath.Join(priorRoot, "repomd.xml.asc")); statErr == nil {
@@ -469,6 +536,9 @@ func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName s
 		return err
 	}
 	for _, file := range files {
+		if retained, exists := target[file.Path]; exists && retained != file {
+			return fmt.Errorf("%w: RPM metadata preview collision differs by content", ErrIntegrity)
+		}
 		target[file.Path] = file
 	}
 	return nil

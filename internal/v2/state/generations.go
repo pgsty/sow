@@ -408,8 +408,8 @@ func generationViewContentIdentity(manifest []GenerationFile, viewID string) str
 // proven from immutable state: unsigned manifests imply signer "none"; the
 // current Built topology anchors its retained signer keys; and an adjacent
 // Generation with byte-identical view content carries the same signer. A
-// historical signed view without any such anchor is rejected rather than
-// assigned a guessed identity.
+// historical signed view without any such anchor receives the explicit
+// fail-closed "unverified" identity rather than a guessed signer.
 func repairGenerationViewSignersTx(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `SELECT generation FROM generations ORDER BY generation`)
 	if err != nil {
@@ -1360,9 +1360,8 @@ func (s *Store) FinalizeBuild(ctx context.Context, input FinalizeBuildInput) err
 
 // FinalizeNoopBuild closes a build whose policy reconciliation changed
 // Desired state but whose resulting physical projection is already the current
-// Built Generation. Recomputing repository status in the same transaction is
-// essential: ApplyDesiredMutation conservatively marks every Desired change
-// dirty, even when that change converges back to the existing Built set.
+// Built Generation. Recomputing repository status in the final transaction
+// keeps the no-op audit transition and the repository projection atomic.
 func (s *Store) FinalizeNoopBuild(ctx context.Context, operationID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

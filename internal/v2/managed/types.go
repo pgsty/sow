@@ -210,15 +210,16 @@ type RemovedMembership struct {
 }
 
 type RemoveResult struct {
-	Operation  string              `json:"operation,omitempty"`
-	Repository string              `json:"repository"`
-	Revision   int64               `json:"desired_revision"`
-	Generation state.GenerationID  `json:"built_generation"`
-	Dirty      bool                `json:"dirty"`
-	Check      bool                `json:"check"`
-	Removed    []RemovedMembership `json:"removed"`
-	Dists      []string            `json:"dists"`
-	Changes    []state.FileChange  `json:"changes"`
+	Operation          string              `json:"operation,omitempty"`
+	Repository         string              `json:"repository"`
+	Revision           int64               `json:"desired_revision"`
+	Generation         state.GenerationID  `json:"built_generation"`
+	Dirty              bool                `json:"dirty"`
+	Check              bool                `json:"check"`
+	PredictionComplete bool                `json:"prediction_complete,omitempty"`
+	Removed            []RemovedMembership `json:"removed"`
+	Dists              []string            `json:"dists"`
+	Changes            []state.FileChange  `json:"changes"`
 }
 
 type BuildOptions struct {
@@ -368,12 +369,13 @@ type CheckLayer struct {
 }
 
 type CheckResult struct {
-	Repository  string             `json:"repository"`
-	Status      string             `json:"status"`
-	ReadyToCopy bool               `json:"ready_to_copy"`
-	Generation  state.GenerationID `json:"built_generation"`
-	Revision    int64              `json:"desired_revision"`
-	Layers      []CheckLayer       `json:"layers"`
+	Repository   string             `json:"repository"`
+	Status       string             `json:"status"`
+	ReadyToCopy  bool               `json:"ready_to_copy"`
+	Generation   state.GenerationID `json:"built_generation"`
+	Revision     int64              `json:"desired_revision"`
+	Layers       []CheckLayer       `json:"layers"`
+	verification *checkVerificationSnapshot
 }
 
 type PartialError struct {

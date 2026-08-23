@@ -1,6 +1,7 @@
 package managed
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"math"
@@ -409,6 +410,457 @@ func TestRemoveCheckPredictsExactImmediateBuild(t *testing.T) {
 				t.Fatalf("preview does not equal actual build\npreview=%#v\nactual=%#v", preview, actual)
 			}
 		})
+	}
+}
+
+func TestRemoveCheckIncludesPendingPayloadPromotion(t *testing.T) {
+	ctx, root, options, firstRPM := newMutationConvergenceFixture(t)
+	first, err := Add(ctx, AddOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{firstRPM}, Jobs: 1,
+	})
+	if err != nil || len(first.Items) != 1 {
+		t.Fatalf("first add=%#v err=%v", first, err)
+	}
+	body, err := os.ReadFile(firstRPM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated := bytes.ReplaceAll(body, []byte("20PGDG"), []byte("21PGDG"))
+	if bytes.Equal(updated, body) {
+		t.Fatal("RPM fixture release marker was absent")
+	}
+	secondRPM := filepath.Join(root, "inputs", "package2.rpm")
+	if err := os.WriteFile(secondRPM, updated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Add(ctx, AddOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{secondRPM}, Skip: true, Jobs: 1,
+	})
+	if err != nil || len(second.Items) != 1 || !second.Dirty {
+		t.Fatalf("second skipped add=%#v err=%v", second, err)
+	}
+	store, err := state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingObject, objectErr := store.GetPackageObject(ctx, second.Items[0].SHA256)
+	closeErr := store.Close()
+	if err := errors.Join(objectErr, closeErr); err != nil || pendingObject.Storage != "pending" {
+		t.Fatalf("pending object=%#v err=%v", pendingObject, err)
+	}
+	removeOptions := RemoveOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"},
+		Packages: []string{"sha256:" + first.Items[0].SHA256}, Jobs: 1,
+	}
+	previewOptions := removeOptions
+	previewOptions.Check = true
+	preview, err := Remove(ctx, previewOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundPayload := false
+	for _, change := range preview.Changes {
+		if change.Path == pendingObject.PoolPath && change.Phase == "payload" && change.Operation == "add" {
+			foundPayload = true
+		}
+	}
+	if !foundPayload {
+		t.Fatalf("preview omitted pending Pool promotion for %s: %#v", pendingObject.PoolPath, preview.Changes)
+	}
+	actual, err := Remove(ctx, removeOptions)
+	if err != nil || !reflect.DeepEqual(preview.Changes, actual.Changes) {
+		t.Fatalf("pending promotion preview differs\npreview=%#v\nactual=%#v\nerr=%v", preview, actual, err)
+	}
+}
+
+func TestRemoveCheckMatchesBuildWhenPriorRPMMetadataIsAbsent(t *testing.T) {
+	ctx, root, options, rpm := newMutationConvergenceFixture(t)
+	if _, err := Add(ctx, AddOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Skip: true, Jobs: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := cfg.Repositories["repo"]
+	dist := repository.Dists["el9"]
+	dist.Architectures = []string{"x86_64", "aarch64"}
+	repository.Dists["el9"] = dist
+	cfg.Repositories["repo"] = repository
+	writeManagedConfig(t, root, cfg)
+	removeOptions := RemoveOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"},
+		Packages: []string{"pgdg-redhat-nonfree-repo"}, Jobs: 1,
+	}
+	previewOptions := removeOptions
+	previewOptions.Check = true
+	preview, err := Remove(ctx, previewOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual, err := Remove(ctx, removeOptions)
+	if err != nil || !reflect.DeepEqual(preview.Changes, actual.Changes) {
+		t.Fatalf("missing prior metadata preview differs\npreview=%#v\nactual=%#v\nerr=%v", preview, actual, err)
+	}
+}
+
+func TestPreviewRPMDistRejectsUnsafePriorMetadataRoot(t *testing.T) {
+	ctx := context.Background()
+	repositoryRoot := t.TempDir()
+	priorParent := filepath.Join(repositoryRoot, "dists", "el9", "x86_64")
+	if err := os.MkdirAll(priorParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(priorParent, "repodata")); err != nil {
+		t.Fatal(err)
+	}
+	err := previewRPMDist(
+		ctx, repositoryRoot, t.TempDir(), "el9", 1, time.Unix(1_700_000_000, 0).UTC(),
+		nil, []state.Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}}, nil, nil, 1, nil, map[string]state.GenerationFile{},
+	)
+	if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "metadata root is unsafe") {
+		t.Fatalf("unsafe prior RPM metadata error=%v", err)
+	}
+}
+
+func TestPreviewRPMDistRejectsRenderedMetadataCollision(t *testing.T) {
+	ctx := context.Background()
+	architectures := []state.Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}}
+	publishedAt := time.Unix(1_700_000_000, 0).UTC()
+	seedRoot := t.TempDir()
+	if _, err := RenderManagedDist(ctx, seedRoot, ManagedDistSpec{
+		Name: "el9", Format: "rpm", Architectures: architectures,
+		Generation: 1, Jobs: 1, PublishedAt: publishedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	files, err := scanPreviewFiles(ctx, filepath.Join(seedRoot, "dists", "el9"), "dists/el9/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var retained state.GenerationFile
+	for _, file := range files {
+		if file.Phase == "metadata" {
+			retained = file
+			break
+		}
+	}
+	if retained.Path == "" {
+		t.Fatalf("seed RPM preview has no immutable metadata: %#v", files)
+	}
+	retained.SHA256 = strings.Repeat("f", 64)
+	target := map[string]state.GenerationFile{retained.Path: retained}
+	err = previewRPMDist(
+		ctx, t.TempDir(), t.TempDir(), "el9", 1, publishedAt,
+		architectures, nil, nil, nil, 1, nil, target,
+	)
+	if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "collision differs by content") {
+		t.Fatalf("RPM metadata collision error=%v", err)
+	}
+}
+
+func TestRemoveCheckRejectsWriteActivePublication(t *testing.T) {
+	ctx, root, options, rpm := newMutationConvergenceFixture(t)
+	added, err := Add(ctx, AddOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1,
+	})
+	if err != nil || len(added.Items) != 1 {
+		t.Fatalf("add=%#v err=%v", added, err)
+	}
+	binding, store := bindLocalGCPublicationTarget(t, localGCFixture{root: root})
+	summary, summaryErr := store.Summary(ctx)
+	manifest, manifestErr := store.GenerationManifest(ctx, summary.BuiltGeneration)
+	_, manifestSHA, hashErr := state.ManifestBytes(manifest)
+	if err := errors.Join(summaryErr, manifestErr, hashErr); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	attempt := state.PublicationAttempt{
+		RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity,
+		TargetGeneration: summary.BuiltGeneration, ManifestSHA256: manifestSHA,
+		PlanSHA256: strings.Repeat("a", 64), Phase: "planned", Views: []state.PublicationAttemptView{},
+	}
+	putErr := store.PutPublicationAttempt(ctx, &attempt)
+	closeErr := store.Close()
+	if err := errors.Join(putErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	base := RemoveOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"},
+		Packages: []string{"sha256:" + added.Items[0].SHA256}, Jobs: 1,
+	}
+	preview := base
+	preview.Check = true
+	if _, err := Remove(ctx, preview); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("rm --check error=%v, want ErrNotReady", err)
+	}
+	if _, err := Remove(ctx, base); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("rm error=%v, want ErrNotReady", err)
+	}
+}
+
+func TestConvergingNoopMutationsNormalizePublicModes(t *testing.T) {
+	for _, command := range []string{"add", "rm"} {
+		t.Run(command, func(t *testing.T) {
+			ctx, root, options, firstRPM := newMutationConvergenceFixture(t)
+			first, err := Add(ctx, AddOptions{
+				WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{firstRPM}, Jobs: 1,
+			})
+			if err != nil || len(first.Items) != 1 {
+				t.Fatalf("first add=%#v err=%v", first, err)
+			}
+			store, err := state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstObject, objectErr := store.GetPackageObject(ctx, first.Items[0].SHA256)
+			closeErr := store.Close()
+			if err := errors.Join(objectErr, closeErr); err != nil {
+				t.Fatal(err)
+			}
+
+			var generation state.GenerationID
+			var dirty bool
+			if command == "add" {
+				if _, err := Remove(ctx, RemoveOptions{
+					WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"},
+					Packages: []string{"sha256:" + first.Items[0].SHA256}, Skip: true, Jobs: 1,
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(filepath.Join(root, "repo", filepath.FromSlash(firstObject.PoolPath)), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				result, err := Add(ctx, AddOptions{
+					WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{firstRPM}, Jobs: 1,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				generation, dirty = result.Generation, result.Dirty
+			} else {
+				body, err := os.ReadFile(firstRPM)
+				if err != nil {
+					t.Fatal(err)
+				}
+				updated := bytes.ReplaceAll(body, []byte("20PGDG"), []byte("21PGDG"))
+				if bytes.Equal(updated, body) {
+					t.Fatal("RPM fixture release marker was absent")
+				}
+				secondRPM := filepath.Join(root, "inputs", "package2.rpm")
+				if err := os.WriteFile(secondRPM, updated, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				second, err := Add(ctx, AddOptions{
+					WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{secondRPM}, Skip: true, Jobs: 1,
+				})
+				if err != nil || len(second.Items) != 1 {
+					t.Fatalf("second add=%#v err=%v", second, err)
+				}
+				if err := os.Chmod(filepath.Join(root, "repo", filepath.FromSlash(firstObject.PoolPath)), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				result, err := Remove(ctx, RemoveOptions{
+					WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"},
+					Packages: []string{"sha256:" + second.Items[0].SHA256}, Jobs: 1,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				generation, dirty = result.Generation, result.Dirty
+			}
+			info, err := os.Stat(filepath.Join(root, "repo", filepath.FromSlash(firstObject.PoolPath)))
+			mode := os.FileMode(0)
+			if err == nil {
+				mode = info.Mode().Perm()
+			}
+			if err != nil || mode != 0o644 || generation != first.Generation || dirty {
+				t.Fatalf("normalized mode=%v generation=%s want=%s dirty=%t err=%v", mode, generation, first.Generation, dirty, err)
+			}
+		})
+	}
+}
+
+func TestJournaledBuildRecoveryUsesFrozenSigningMaterial(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	privateKey, _ := managedTestPrivateKey(t, "journaled-build-recovery")
+	t.Setenv("SOW_TEST_RECOVERY_METADATA_KEY", string(privateKey))
+	cfg := config.Default()
+	repository := config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}
+	repository.Signing.RPM.Metadata.Key = "env://SOW_TEST_RECOVERY_METADATA_KEY"
+	cfg.Repositories["repo"] = repository
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	added, err := Add(ctx, AddOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1,
+	})
+	if err != nil || len(added.Items) != 1 {
+		t.Fatalf("add=%#v err=%v", added, err)
+	}
+	injected := errors.New("injected after frozen build plan")
+	interrupted, err := Remove(ctx, RemoveOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"},
+		Packages: []string{"sha256:" + added.Items[0].SHA256}, Jobs: 1,
+		Fault: func(point string) error {
+			if point == "build.staged" {
+				return injected
+			}
+			return nil
+		},
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("interrupted remove=%#v err=%v", interrupted, err)
+	}
+	if err := os.Unsetenv("SOW_TEST_RECOVERY_METADATA_KEY"); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoverErr := recoverDistOperations(ctx, root, "repo", store)
+	detail, detailErr := store.GetOperation(ctx, interrupted.Operation)
+	summary, summaryErr := store.Summary(ctx)
+	closeErr := store.Close()
+	if err := errors.Join(recoverErr, detailErr, summaryErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if detail.Operation.State != state.OperationDone || summary.Status != "clean" {
+		t.Fatalf("recovered operation=%#v summary=%#v", detail.Operation, summary)
+	}
+	checked, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})
+	if err != nil || !checked.ReadyToCopy || checked.Status != "clean" {
+		t.Fatalf("post-recovery check=%#v err=%v", checked, err)
+	}
+}
+
+func TestJournaledBuildRecoveryKeepsFrozenScopeAcrossSigningRotation(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	privateKeyA, _ := managedTestPrivateKey(t, "journaled-scope-a")
+	privateKeyB, _ := managedTestPrivateKey(t, "journaled-scope-b")
+	t.Setenv("SOW_TEST_RECOVERY_SCOPE_KEY", string(privateKeyA))
+	cfg := config.Default()
+	repository := config.RepositoryConfig{Dists: map[string]config.DistConfig{
+		"el9": {Format: "rpm"}, "el10": {Format: "rpm"},
+	}}
+	repository.Signing.RPM.Metadata.Key = "env://SOW_TEST_RECOVERY_SCOPE_KEY"
+	cfg.Repositories["repo"] = repository
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	added, err := Add(ctx, AddOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1,
+	})
+	if err != nil || len(added.Items) != 1 {
+		t.Fatalf("add=%#v err=%v", added, err)
+	}
+	injected := errors.New("injected after frozen selective build plan")
+	interrupted, err := Remove(ctx, RemoveOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9", "el10"},
+		Packages: []string{"sha256:" + added.Items[0].SHA256}, Jobs: 1,
+		Fault: func(point string) error {
+			if point == "build.staged" {
+				return injected
+			}
+			return nil
+		},
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("interrupted remove=%#v err=%v", interrupted, err)
+	}
+	t.Setenv("SOW_TEST_RECOVERY_SCOPE_KEY", string(privateKeyB))
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoverErr := recoverDistOperations(ctx, root, "repo", store)
+	detail, detailErr := store.GetOperation(ctx, interrupted.Operation)
+	closeErr := store.Close()
+	if err := errors.Join(recoverErr, detailErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if detail.Operation.State != state.OperationDone {
+		t.Fatalf("recovered operation=%#v", detail.Operation)
+	}
+	status, err := Status(ctx, StatusOptions{WorkspaceOptions: options, Repository: "repo"})
+	if err != nil || status.Status != "dirty" || !reflect.DeepEqual(status.DirtyDists, []string{"el10", "el9"}) {
+		t.Fatalf("rotated signing status=%#v err=%v", status, err)
+	}
+	t.Setenv("SOW_TEST_RECOVERY_SCOPE_KEY", string(privateKeyA))
+	checked, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})
+	if err != nil || !checked.ReadyToCopy || checked.Status != "clean" {
+		t.Fatalf("restored signing check=%#v err=%v", checked, err)
+	}
+}
+
+func TestRemoveCheckIncludesSelectedConfigDirtyDist(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{
+		"el9": {Format: "rpm"}, "el10": {Format: "rpm", Architectures: []string{"x86_64"}},
+	}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	repository := cfg.Repositories["repo"]
+	el10 := repository.Dists["el10"]
+	el10.Architectures = []string{"x86_64", "aarch64"}
+	repository.Dists["el10"] = el10
+	cfg.Repositories["repo"] = repository
+	writeManagedConfig(t, root, cfg)
+	removeOptions := RemoveOptions{
+		WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9", "el10"},
+		Packages: []string{"pgdg-redhat-nonfree-repo"}, Jobs: 1,
+	}
+	previewOptions := removeOptions
+	previewOptions.Check = true
+	preview, err := Remove(ctx, previewOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundEL10 := false
+	for _, change := range preview.Changes {
+		if strings.HasPrefix(change.Path, "dists/el10/") {
+			foundEL10 = true
+			break
+		}
+	}
+	if !foundEL10 {
+		t.Fatalf("preview omitted selected config-dirty el10: %#v", preview.Changes)
+	}
+	actual, err := Remove(ctx, removeOptions)
+	if err != nil || preview.Generation != actual.Generation || preview.Revision != actual.Revision || !reflect.DeepEqual(preview.Changes, actual.Changes) {
+		t.Fatalf("mixed-scope preview differs\npreview=%#v\nactual=%#v\nerr=%v", preview, actual, err)
 	}
 }
 

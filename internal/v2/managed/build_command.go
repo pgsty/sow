@@ -103,7 +103,10 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 		return result, err
 	}
 	result.Operation = id
-	payload := mutationOperationPayload{Version: mutationOperationVersion, Repository: repoName, Kind: "build", ConfigSHA256: configSHA, Dists: distNames, BuildDists: affectedDists, Noop: !physicalChange}
+	payload := mutationOperationPayload{
+		Version: mutationOperationVersion, Repository: repoName, Kind: "build", ConfigSHA256: configSHA,
+		Jobs: opts.Jobs, Dists: distNames, BuildDists: affectedDists, Noop: !physicalChange,
+	}
 	payloadData, _ := json.Marshal(payload)
 	defer func() {
 		resultErr = finalizePreApplyMutationOperation(ctx, ws.Root, repoName, id, store, resultErr, func() any {
@@ -215,6 +218,50 @@ func distsNeedingBuild(ctx context.Context, root, repoName string, cfg config.Co
 			return nil, err
 		}
 		if !sameStringSet(desired[distName], built) || effectiveSHA != distState.EffectiveConfigSHA256 {
+			affected = append(affected, distName)
+		}
+	}
+	sort.Strings(affected)
+	return affected, nil
+}
+
+// distsNeedingRecoveredBuild validates a pending journal against the current
+// Built projection without making an already-frozen build depend on mutable
+// external signing references. Once the build plan exists, its Dist set and
+// effective-config digests are authoritative for this operation; the config
+// file itself remains bound by the operation payload. Membership is still
+// checked for every selected Dist so concurrent state drift cannot escape the
+// staged scope. Before a plan exists, ordinary observed-config resolution is
+// required so recovery can safely create one.
+func distsNeedingRecoveredBuild(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, manifest mutationManifest) ([]string, error) {
+	planned := map[string]mutationBuildDist{}
+	if manifest.Build != nil {
+		for _, dist := range manifest.Build.Dists {
+			planned[dist.Name] = dist
+		}
+	}
+	affected := []string{}
+	for _, distName := range mapsKeys(manifest.Desired) {
+		built, err := store.MembershipDigests(ctx, distName, true)
+		if err != nil {
+			return nil, err
+		}
+		distState, err := store.GetDist(ctx, distName)
+		if err != nil {
+			return nil, err
+		}
+		configDirty := false
+		if manifest.Build != nil {
+			if frozen, exists := planned[distName]; exists {
+				configDirty = frozen.EffectiveConfigSHA256 != distState.EffectiveConfigSHA256
+			}
+		} else {
+			_, configDirty, err = observedEffectiveDistConfig(ctx, root, cfg, repoName, distName, distState)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !sameStringSet(manifest.Desired[distName], built) || configDirty {
 			affected = append(affected, distName)
 		}
 	}

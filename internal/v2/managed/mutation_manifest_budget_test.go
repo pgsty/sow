@@ -12,6 +12,57 @@ import (
 	"github.com/pgsty/sow/internal/v2/state"
 )
 
+func TestReadMutationManifestRejectsInvalidBuildDistBindings(t *testing.T) {
+	validManifest := func() mutationManifest {
+		return mutationManifest{
+			Version: mutationOperationVersion,
+			Desired: map[string][]string{"el9": {}},
+			Build: &mutationBuildManifest{
+				Generation:         1,
+				BaseManifestSHA256: strings.Repeat("a", 64),
+				Dists: []mutationBuildDist{{
+					Name: "el9", TreeSHA256: strings.Repeat("b", 64), EffectiveConfigSHA256: strings.Repeat("c", 64),
+					Architectures: []state.Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}},
+				}},
+			},
+		}
+	}
+	tests := []struct {
+		name   string
+		mutate func(*mutationManifest)
+	}{
+		{name: "invalid name", mutate: func(manifest *mutationManifest) { manifest.Build.Dists[0].Name = "../el9" }},
+		{name: "malformed tree digest", mutate: func(manifest *mutationManifest) { manifest.Build.Dists[0].TreeSHA256 = "invalid" }},
+		{name: "malformed config digest", mutate: func(manifest *mutationManifest) { manifest.Build.Dists[0].EffectiveConfigSHA256 = "invalid" }},
+		{name: "empty architectures", mutate: func(manifest *mutationManifest) { manifest.Build.Dists[0].Architectures = nil }},
+		{name: "duplicate Dist", mutate: func(manifest *mutationManifest) {
+			manifest.Build.Dists = append(manifest.Build.Dists, manifest.Build.Dists[0])
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			manifest := validManifest()
+			test.mutate(&manifest)
+			data, err := marshalMutationManifest(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const repoName, operationID = "repo", "operation"
+			if err := os.MkdirAll(mutationStageRoot(root, repoName, operationID), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			digest := bytesSHA(data)
+			if err := os.WriteFile(mutationManifestPath(root, repoName, operationID, digest), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readMutationManifest(root, repoName, operationID, digest); !errors.Is(err, ErrIntegrity) {
+				t.Fatalf("read invalid manifest err=%v", err)
+			}
+		})
+	}
+}
+
 func TestBuildRejectsOversizedRPMCertificateSnapshotsBeforeOperation(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

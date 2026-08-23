@@ -474,7 +474,10 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	if err != nil {
 		return result, err
 	}
-	payload.BuildDists = append([]string(nil), desiredChangedDists...)
+	// Preserve an explicitly bound empty build scope as [] in the recovery
+	// journal. A nil slice encodes as JSON null and is deliberately rejected by
+	// validateMutationBuildDists as an absent pre-v2 binding.
+	payload.BuildDists = append([]string{}, desiredChangedDists...)
 	if !opts.Skip {
 		payload.BuildDists, err = distsNeedingBuild(ctx, ws.Root, repoName, cfg, store, desired)
 		if err != nil {
@@ -554,9 +557,9 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 		return result, err
 	}
 	if opts.Skip {
-		terminal := state.OperationDone
-		if mutationResult.Changed {
-			terminal = state.OperationDoneDirty
+		terminal, err := mutationTerminalStateForProjection(ctx, ws.Root, repoName, cfg, store)
+		if err != nil {
+			return result, err
 		}
 		if err := store.SetOperationState(ctx, id, terminal, ""); err != nil {
 			if retainCommittedTerminalProjection(ctx, ws.Root, repoName, cfg, store, id, terminal, &result.Generation, &result.Dirty) {
@@ -576,7 +579,10 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 			return result, err
 		}
 	} else {
-		if err := store.SetOperationState(ctx, id, state.OperationDone, ""); err != nil {
+		if _, err := normalizeCurrentPublicTreeWithSnapshot(ctx, ws.Root, repoName, id, store, opts.Fault, currentSnapshot); err != nil {
+			return result, err
+		}
+		if err := store.FinalizeNoopBuild(ctx, id); err != nil {
 			if retainCommittedTerminalProjection(ctx, ws.Root, repoName, cfg, store, id, state.OperationDone, &result.Generation, &result.Dirty) {
 				err = errors.Join(err, cleanupMutationStage(ws.Root, repoName, id))
 			}
@@ -617,6 +623,17 @@ func retainCommittedTerminalProjection(ctx context.Context, root, repoName strin
 	retainCommittedProjection(ctx, root, repoName, cfg, store, generation, dirty)
 	detail, err := store.GetOperation(ctx, operationID)
 	return err == nil && detail.Operation.State == terminal
+}
+
+func mutationTerminalStateForProjection(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store) (state.OperationState, error) {
+	dirty, err := observedRepositoryDirty(ctx, root, repoName, cfg, store)
+	if err != nil {
+		return "", err
+	}
+	if dirty {
+		return state.OperationDoneDirty, nil
+	}
+	return state.OperationDone, nil
 }
 
 func mutationPackageRecords(items []MutationItem) []state.OperationPackage {
@@ -931,12 +948,21 @@ func readMutationManifest(root, repoName, id, expectedSHA string) (mutationManif
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return mutationManifest{}, fmt.Errorf("%w: mutation manifest has trailing content", ErrIntegrity)
 	}
-	for _, dist := range func() []mutationBuildDist {
+	buildDists := func() []mutationBuildDist {
 		if manifest.Build == nil {
 			return nil
 		}
 		return manifest.Build.Dists
-	}() {
+	}()
+	seenBuildDists := make(map[string]struct{}, len(buildDists))
+	for _, dist := range buildDists {
+		if config.ValidateName(dist.Name) != nil || !lowercaseSHA256.MatchString(dist.TreeSHA256) || !lowercaseSHA256.MatchString(dist.EffectiveConfigSHA256) || len(dist.Architectures) == 0 {
+			return mutationManifest{}, fmt.Errorf("%w: invalid mutation build Dist binding", ErrIntegrity)
+		}
+		if _, duplicate := seenBuildDists[dist.Name]; duplicate {
+			return mutationManifest{}, fmt.Errorf("%w: mutation build repeats Dist %q", ErrIntegrity, dist.Name)
+		}
+		seenBuildDists[dist.Name] = struct{}{}
 		identity := metadataSignerIdentity{Fingerprint: dist.MetadataSignerFingerprint, PublicKey: dist.MetadataSignerPublicKey}
 		if err := validateMetadataSignerIdentity(identity); err != nil {
 			return mutationManifest{}, fmt.Errorf("%w: mutation build signer identity for Dist %q is invalid", ErrIntegrity, dist.Name)
@@ -1014,23 +1040,46 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 	if err := validateMutationBuildDists(payload); err != nil {
 		return err
 	}
+	if manifest.Build != nil {
+		buildDistNames := make([]string, 0, len(manifest.Build.Dists))
+		for _, buildDist := range manifest.Build.Dists {
+			buildDistNames = append(buildDistNames, buildDist.Name)
+		}
+		if !sameStringSet(buildDistNames, payload.BuildDists) {
+			return fmt.Errorf("%w: mutation build Dist set differs from operation", ErrIntegrity)
+		}
+	}
 	for _, object := range manifest.Objects {
 		if err := ensureMutationObjectAvailable(ctx, root, repoName, operation.ID, object); err != nil {
 			return err
 		}
 	}
-	var (
-		cfg       config.Config
-		preflight *mutationBuildPreflight
-	)
-	if !payload.Skip && !payload.Noop && manifest.Build == nil {
-		cfg, err = config.Load(filepath.Join(root, config.ConfigFilename))
-		if err != nil {
-			return err
+	cfg, err := config.Load(filepath.Join(root, config.ConfigFilename))
+	if err != nil {
+		return err
+	}
+	if payload.Skip && payload.Noop {
+		return fmt.Errorf("%w: skipped mutation cannot be journaled as a no-op build", ErrIntegrity)
+	}
+	noop := false
+	var preflight *mutationBuildPreflight
+	if !payload.Skip {
+		requiredBuildDists, requiredErr := distsNeedingRecoveredBuild(ctx, root, repoName, cfg, store, manifest)
+		if requiredErr != nil {
+			return requiredErr
 		}
-		preflight, err = prepareMutationBuildPreflight(ctx, root, repoName, cfg, payload.BuildDists, manifest, store, nil, nil)
-		if err != nil {
-			return err
+		if !sameStringSet(requiredBuildDists, payload.BuildDists) {
+			return fmt.Errorf("%w: recovered physical build scope differs from the staged journal", ErrIntegrity)
+		}
+		noop = len(requiredBuildDists) == 0
+		if payload.Noop && !noop {
+			return fmt.Errorf("%w: mutation journal marks a required physical build as no-op", ErrIntegrity)
+		}
+		if !noop && manifest.Build == nil {
+			preflight, err = prepareMutationBuildPreflight(ctx, root, repoName, cfg, payload.BuildDists, manifest, store, nil, nil)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	resultJSON, err := json.Marshal(manifest.Result)
@@ -1041,7 +1090,7 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 	if err != nil {
 		return err
 	}
-	if !stringSetSubset(mutation.ChangedDists, payload.BuildDists) {
+	if payload.Skip && !stringSetSubset(mutation.ChangedDists, payload.BuildDists) {
 		return fmt.Errorf("%w: recovered Desired changes exceed the staged build scope", ErrIntegrity)
 	}
 	if err := store.RecordOperationMembershipOutcomes(ctx, operation.ID, manifest.Outcomes); err != nil {
@@ -1053,20 +1102,16 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 		}
 	}
 	if payload.Skip {
-		summary, err := store.Summary(ctx)
+		terminal, err := mutationTerminalStateForProjection(ctx, root, repoName, cfg, store)
 		if err != nil {
 			return err
-		}
-		terminal := state.OperationDone
-		if summary.Status != "clean" {
-			terminal = state.OperationDoneDirty
 		}
 		if err := store.SetOperationState(ctx, operation.ID, terminal, ""); err != nil {
 			return err
 		}
 		return cleanupMutationStage(root, repoName, operation.ID)
 	}
-	if payload.Noop {
+	if noop {
 		if _, err := normalizeCurrentPublicTree(ctx, root, repoName, operation.ID, store, nil); err != nil {
 			return err
 		}
@@ -1074,12 +1119,6 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 			return err
 		}
 		return cleanupMutationStage(root, repoName, operation.ID)
-	}
-	if cfg.Schema == "" {
-		cfg, err = config.Load(filepath.Join(root, config.ConfigFilename))
-		if err != nil {
-			return err
-		}
 	}
 	jobs, err := mutationRecoveryJobs(payload)
 	if err != nil {
