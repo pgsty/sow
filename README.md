@@ -1,6 +1,6 @@
 # SOW
 
-SOW is a local RPM/DEB repository manager written in Go. SOW 0.3 supports two
+SOW is a local RPM/DEB repository manager written in Go. SOW 0.4 supports two
 workflows:
 
 - `sow create` turns a directory of RPM or DEB packages into a simple
@@ -32,7 +32,7 @@ make test          # all Go packages plus the patched RPM module
 make check         # format, module, vet, staticcheck, deadcode, focused tests
 ```
 
-The binary is written to `bin/sow`. Its default version is `0.3.0`; release
+The binary is written to `bin/sow`. Its default version is `0.4.0`; release
 builds also inject that version at link time.
 
 ## Simple repositories
@@ -74,8 +74,9 @@ default. Use `--skip` only when intentionally batching Desired changes, then run
 
 Schema upgrades are explicit. After upgrading a v0.3 workspace, run
 `sow repo migrate REPOSITORY --workdir DIR` once for each Repository before
-ordinary reads or writes; schema v11 safely recomputes derived status and
-repairs publication/signer evidence without guessing a historical signer. A
+ordinary reads or writes; schemas v11 and v12 safely recompute derived status,
+repair publication/signer evidence without guessing a historical signer, and
+backfill the append-only publication-target binding revision ledger. A
 signed historical view whose v0.3 signer was never recorded remains explicitly
 unverified and cannot be exported as a retained trust assertion; the current
 Built Generation must always retain a fully proven signer identity.
@@ -93,6 +94,11 @@ and may be reused. After commit intent, recovery is forward-only. A configured
 target with an Applied Checkpoint also fences removal of its published Dist,
 architecture, or signing pointers: retire/unbind that target, or configure a
 differently named target on a new prefix, before withdrawing those views.
+
+Changing only a target's name, public endpoint, or maximum cache TTL requires
+explicit operator confirmation with `sow publish TARGET --rebind`. Provider,
+storage endpoint, region, bucket, and prefix remain immutable; configure a new
+target for any storage-identity change.
 
 The one-copy boundary is one Repository per publish prefix. Publishing the same
 Repository to two prefixes deliberately stores one payload copy in each prefix.
@@ -118,8 +124,8 @@ make release-local
 `make release-local` uses GoReleaser to build a local snapshot under `dist/`.
 It creates Linux/macOS archives for amd64/arm64 plus RPM and DEB packages for
 both Linux architectures. Linux package revisions use the project suffix
-`1PGSTY`, for example `sow-0.3.0-1PGSTY.x86_64.rpm` and
-`sow_0.3.0-1PGSTY_amd64.deb`.
+`1PGSTY`, for example `sow-0.4.0-1PGSTY.x86_64.rpm` and
+`sow_0.4.0-1PGSTY_amd64.deb`.
 
 GitHub Actions runs regular checks in `CI` and real Docker-backed client/S3
 coverage in `Integration`. Pushing an exact semantic-version tag creates a
@@ -132,8 +138,8 @@ the common `SOW_REAL_R2_` prefix. The fixture must be immutable and carry the
 matching `sow-sha256` object metadata; the test never writes or deletes it.
 
 ```bash
-git tag -a v0.3.0 -m "SOW v0.3.0"
-git push origin v0.3.0
+git tag -a v0.4.0 -m "SOW v0.4.0"
+git push origin v0.4.0
 ```
 
 The tag workflow verifies that the tag points into `main`, agrees with the

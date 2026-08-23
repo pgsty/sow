@@ -4,6 +4,45 @@ All notable changes to SOW are recorded here.
 
 ## Unreleased
 
+## 0.4.0 - 2026-08-24
+
+- Added schema v12 and operator-confirmed publication target rebinding. Target
+  storage identity, provider, endpoint, region, bucket, and prefix remain
+  immutable, while target name, public endpoint, and maximum cache TTL may be
+  revised under the same stable TargetIdentity. Initial bindings, migration
+  backfills, and every rebind now append immutable binding revisions; pending
+  maintenance and filesystem conditional-delete workflows preserve their TTL
+  and endpoint safety fences.
+- Made each `sow check` authenticate every unique physical package payload
+  exactly once, independent of cached fingerprints, retained Generation count,
+  Dist count, and trust-ring count. Descriptor-bound evidence is keyed by
+  device/inode/size/mtime/ctime and shared by retained validation, final
+  manifest traversal, and `sow changes`. Signed RPMs use one additional
+  main-header-to-EOF stream for all signature packets and candidate trust rings.
+- Added independent multi-ring embedded RPM signature verification. Every
+  recognized packet must verify within one candidate ring and at least one path
+  must authenticate the payload, so a combined trusted ring can accept a
+  deliberately dual-signed package without cross-assembling packet-by-key
+  successes for single retained rings. Historical CentOS v3/v4 signatures
+  remain covered.
+- Scoped production package-facts reads to the selected digest set in bounded,
+  deterministic SQLite batches. Warm 64 MiB builds perform no package-body
+  reads; fingerprint drift and missing facts share one authoritative payload
+  pass, and selected rows/bytes, signature streams, metadata hashing, tree
+  walks, and package reads are recorded in operation metrics and CI contracts.
+- Shared one hardened public HTTP verifier between R2 and filesystem HTTP(S)
+  targets. Response-header and body-idle deadlines are independent, ordinary
+  canonical GETs remain authoritative, stale content follows cache TTL,
+  transient HTTP failures use a short bounded window, oversize bodies fail
+  closed, and filesystem public absence waits for canonical 404/410 visibility.
+  Filesystem target aliases are also rejected before durable bind on their
+  prospective physical paths, including case aliases on case-insensitive
+  volumes.
+- Raised the required build toolchain to Go 1.27.0 and refreshed the AWS SDK,
+  SQLite, compression, and cryptography dependencies. Quality gates now pin
+  staticcheck v0.8.1, deadcode v0.49.0, and govulncheck v1.7.0. Repository
+  behavior and the public layout are unchanged.
+
 - Added schema v11 and an explicit `sow repo migrate` repair for the v0.3 Dist
   lifecycle bug that could mark a Repository clean while another Dist remained
   dirty. Repository status is now always derived in the committing transaction.
