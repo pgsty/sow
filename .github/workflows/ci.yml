@@ -43,7 +43,7 @@ jobs:
 
       - name: Staticcheck
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@v0.6.1
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
           "$(go env GOPATH)/bin/staticcheck" ./...
 
       - name: Dead code reachability

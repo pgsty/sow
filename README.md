@@ -20,7 +20,7 @@ version tags; they are not a second documentation authority. The remaining
 
 ## Build and test
 
-Go 1.26.5 or newer is required. Repository signing additionally requires a
+Go 1.27.0 or newer is required. Repository signing additionally requires a
 usable GPG installation and key.
 
 ```bash

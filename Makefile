@@ -4,8 +4,8 @@ SHELL := /bin/bash
 
 GO ?= go
 GORELEASER ?= goreleaser
-DEADCODE_VERSION ?= v0.45.0
-GOVULNCHECK_VERSION ?= v1.6.0
+DEADCODE_VERSION ?= v0.49.0
+GOVULNCHECK_VERSION ?= v1.7.0
 VERSION ?= 0.3.0
 TEST_TIMEOUT ?= 60m
 CORE_TEST_TIMEOUT ?= 20m
@@ -83,7 +83,7 @@ vet:
 
 lint:
 	@command -v staticcheck >/dev/null 2>&1 || { \
-		printf '%s\n' 'staticcheck is required: go install honnef.co/go/tools/cmd/staticcheck@v0.6.1' >&2; \
+		printf '%s\n' 'staticcheck is required: go install honnef.co/go/tools/cmd/staticcheck@v0.8.1' >&2; \
 		exit 1; \
 	}
 	staticcheck ./...
