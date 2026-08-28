@@ -1,3 +1,0 @@
-README.md
-design/README.md
-docs/README.md

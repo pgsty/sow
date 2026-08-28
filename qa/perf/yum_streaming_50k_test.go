@@ -38,7 +38,7 @@ func moduleRoot(t *testing.T) string {
 
 func loadYUMPerformanceFixture(t *testing.T) []byte {
 	t.Helper()
-	encoded, err := os.ReadFile(filepath.Join(moduleRoot(t), "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"))
+	encoded, err := os.ReadFile(filepath.Join(moduleRoot(t), "internal", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"))
 	if err != nil {
 		t.Fatal(err)
 	}

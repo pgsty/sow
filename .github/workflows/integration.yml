@@ -44,7 +44,7 @@ jobs:
           SOW_COMPAT_EL9_IMAGE: almalinux:9
           SOW_COMPAT_EL8_IMAGE: almalinux:8
         run: >-
-          go test -timeout 20m -count=1 -v ./test/compat
+          go test -timeout 20m -count=1 -v ./qa/compat
           -run '^(TestShippedExampleSupportsCleanRoomLocalMVP|TestV2APTClientCompatibility|TestYUMDetachedSignatureBridgeCompatibility)$'
 
   s3-compatible:

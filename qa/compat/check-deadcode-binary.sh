@@ -2,7 +2,7 @@
 set -euo pipefail
 
 readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-readonly allowlist="$root/test/compat/deadcode-binary-allowlist.txt"
+readonly allowlist="$root/qa/compat/deadcode-binary-allowlist.txt"
 
 cd "$root"
 diff -u "$allowlist" <(

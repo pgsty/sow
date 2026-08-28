@@ -119,7 +119,7 @@ once for each Repository before ordinary use; the
 [v0.4.0 release notes](https://sow.pgsty.com/blog/release/sow-v0.4.0/) explain what the
 migration repairs. Publication ordering, recovery, target rebinding, the one-copy boundary,
 and RPM leaf export are specified in [Commands](https://sow.pgsty.com/docs/command/) and
-[Design](https://sow.pgsty.com/docs/design/).
+[Design Records](https://sow.pgsty.com/blog/design/).
 
 
 --------
@@ -149,9 +149,10 @@ Makefile).
 
 ## About
 
-The authoritative user and design documentation lives at
-[sow.pgsty.com](https://sow.pgsty.com/docs/); the [`docs/`](docs/) tree in this repository
-only records that ownership boundary, as described in [`design/README.md`](design/README.md).
+The authoritative user documentation lives in [SOW Docs](https://sow.pgsty.com/docs/);
+dated architecture decisions live in [Design Records](https://sow.pgsty.com/blog/design/).
+Historical implementation and verification material remains attached to versioned source
+tags rather than a second documentation tree in this repository.
 
 SOW is built by the [Pigsty](https://pigsty.io) team ([pgsty](https://github.com/pgsty)), alongside:
 

@@ -247,8 +247,8 @@ func TestParseRPMPackageKeyringAuthenticatesRealHistoricalPackages(t *testing.T)
 	}{
 		{
 			name:       "pgdg",
-			packageB64: "../../testdata/pgdg-redhat-nonfree-repo.rpm.b64",
-			key:        "../../testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc",
+			packageB64: "../testdata/pgdg-redhat-nonfree-repo.rpm.b64",
+			key:        "../testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc",
 		},
 		{
 			name:       "centos4",
@@ -333,7 +333,7 @@ func TestParseRPMPackageKeyringDoesNotTrimBinaryPacketTail(t *testing.T) {
 }
 
 func TestParseRPMPackageKeyringAllowsOuterWhitespaceAroundArmor(t *testing.T) {
-	data, err := os.ReadFile("../../testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc")
+	data, err := os.ReadFile("../testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestParseRPMPackageKeyringAllowsOuterWhitespaceAroundArmor(t *testing.T) {
 }
 
 func TestParseRPMPackageKeyringRejectsTrailingPrivateArmor(t *testing.T) {
-	public, err := os.ReadFile("../../testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc")
+	public, err := os.ReadFile("../testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestParseRPMPackageKeyringRejectsTrailingMaterialAfterBinaryPublicKeyring(t
 }
 
 func TestParseRPMPackageKeyringAcceptsMultiplePublicArmorBlocks(t *testing.T) {
-	first, err := os.ReadFile("../../testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc")
+	first, err := os.ReadFile("../testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1373,7 +1373,7 @@ func TestVerifyEmbeddedRPMSignaturesRejectsHeaderOnlySignatureWithoutPayloadDige
 
 func readPGDGRPMFixture(t *testing.T) []byte {
 	t.Helper()
-	encoded, err := os.ReadFile("../../testdata/pgdg-redhat-nonfree-repo.rpm.b64")
+	encoded, err := os.ReadFile("../testdata/pgdg-redhat-nonfree-repo.rpm.b64")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1386,7 +1386,7 @@ func readPGDGRPMFixture(t *testing.T) []byte {
 
 func readPGDGPackageKeyring(t *testing.T) openpgp.KeyRing {
 	t.Helper()
-	encoded, err := os.ReadFile("../../testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc")
+	encoded, err := os.ReadFile("../testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1438,7 +1438,7 @@ func testRPMVerificationLayout(t *testing.T, data []byte) rpmVerificationLayout 
 }
 
 func TestInspectEmbeddedRPMSignaturesRecordsModernPackageMetadata(t *testing.T) {
-	encoded, err := os.ReadFile("../../testdata/pgdg-redhat-nonfree-repo.rpm.b64")
+	encoded, err := os.ReadFile("../testdata/pgdg-redhat-nonfree-repo.rpm.b64")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1731,7 +1731,7 @@ func (r *cancelAfterRead) Read(p []byte) (int, error) {
 }
 
 func TestInspectEmbeddedRPMSignaturesHonorsContextWithoutReadingPayload(t *testing.T) {
-	encoded, err := os.ReadFile("../../testdata/pgdg-redhat-nonfree-repo.rpm.b64")
+	encoded, err := os.ReadFile("../testdata/pgdg-redhat-nonfree-repo.rpm.b64")
 	if err != nil {
 		t.Fatal(err)
 	}

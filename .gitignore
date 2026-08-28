@@ -1,24 +1,25 @@
+# Local scratch and agent work
 .tmp/
 tmp/
 _bmad/
 _bmad-output/
-.bmad-loop/runs/
-.bmad-loop/cache/
-.bmad-loop/policy.toml
+.bmad-loop/
 .agents/
 .claude/
 .codex/
-.bmad-loop/
+
+# Editors and operating systems
 .idea/
 *.iml
 .DS_Store
+
+# Build and test output
 /sow
 *.test
 coverage.out
-.sow/
-.pool/
-
-/docs/*
-!/docs/README.md
 bin/
 dist/
+
+# Runtime state
+.sow/
+.pool/

@@ -38,8 +38,8 @@ const (
 )
 
 var (
-	productRoots           = []string{".github", "cmd", "internal", "test", "testdata", "third_party"}
-	deliveryRoots          = append(append([]string{}, productRoots...), "design", "docs")
+	productRoots           = []string{".github", "cmd", "internal", "qa", "third_party"}
+	deliveryRoots          = append([]string{}, productRoots...)
 	ignoredRootDirectories = []string{
 		".agents", ".bmad-loop", ".claude", ".codex", ".git", ".idea", ".pool", ".sow", ".tmp",
 		"_bmad", "_bmad-output", "bin", "dist", "tmp",
@@ -316,9 +316,9 @@ func build(root, out string) (buildResult, error) {
 			{"go", "mod", "download"},
 			{"go", "mod", "verify"},
 			{"bash", "third_party/cavaliergopher-rpm/verify-upstream.sh"},
-			{"go", "test", "-count=1", "./test/compat/cleandelivery"},
+			{"go", "test", "-count=1", "./qa/compat/cleandelivery"},
 			{"go", "test", "-count=1", "./internal/v2/config", "-run", "^TestShippedExampleUsesCurrentSchema$"},
-			{"go", "test", "-timeout", "15m", "-count=1", "./test/compat", "-run", "^TestShippedExampleSupportsCleanRoomLocalMVP$"},
+			{"go", "test", "-timeout", "15m", "-count=1", "./qa/compat", "-run", "^TestShippedExampleSupportsCleanRoomLocalMVP$"},
 			{"go", "build", "-trimpath", "-o", binary, "./cmd/sow"},
 		}
 		for _, command := range commands {

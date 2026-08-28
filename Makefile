@@ -64,11 +64,11 @@ install:
 	CGO_ENABLED=0 $(GO) install -trimpath -ldflags '$(LDFLAGS)' ./cmd/sow
 
 fmt:
-	@files="$$(find cmd internal test -type f -name '*.go' -print)"; \
+	@files="$$(find cmd internal qa -type f -name '*.go' -print)"; \
 		test -z "$$files" || gofmt -w $$files
 
 fmt-check:
-	@files="$$(find cmd internal test -type f -name '*.go' -print)"; \
+	@files="$$(find cmd internal qa -type f -name '*.go' -print)"; \
 		unformatted="$$(test -z "$$files" || gofmt -l $$files)"; \
 		test -z "$$unformatted" || { printf 'gofmt required:\n%s\n' "$$unformatted" >&2; exit 1; }
 
@@ -101,7 +101,7 @@ deadcode:
 		}
 	@output="$$(deadcode -test ./...)" || { status=$$?; printf '%s\n' "$$output" >&2; exit $$status; }; \
 		test -z "$$output" || { printf 'unreachable declarations:\n%s\n' "$$output" >&2; exit 1; }
-	bash test/compat/check-deadcode-binary.sh
+	bash qa/compat/check-deadcode-binary.sh
 
 vuln:
 	@command -v govulncheck >/dev/null 2>&1 || { \
@@ -128,7 +128,7 @@ test-core:
 test-v2: test-core
 
 test-perf-contract:
-	@output="$$( $(GO) test -v -tags perf -count=1 ./test/perf -run '^TestYUMPerformanceFixtureAvailable$$' )" || { status=$$?; printf '%s\n' "$$output" >&2; exit $$status; }; \
+	@output="$$( $(GO) test -v -tags perf -count=1 ./qa/perf -run '^TestYUMPerformanceFixtureAvailable$$' )" || { status=$$?; printf '%s\n' "$$output" >&2; exit $$status; }; \
 		printf '%s\n' "$$output"; \
 		printf '%s\n' "$$output" | grep -F -- '--- PASS: TestYUMPerformanceFixtureAvailable ' >/dev/null || { \
 			printf '%s\n' 'performance fixture contract test did not execute' >&2; \
@@ -144,7 +144,7 @@ race:
 check: fmt-check tidy-check vet lint deadcode vuln verify-rpm-upstream test-perf-contract test-core
 
 clean-delivery:
-	test/compat/test-clean-delivery.sh '$(CLEAN_DELIVERY_OUT)'
+	qa/compat/test-clean-delivery.sh '$(CLEAN_DELIVERY_OUT)'
 
 goreleaser-check:
 	@command -v '$(GORELEASER)' >/dev/null 2>&1 || { \

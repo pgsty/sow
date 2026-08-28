@@ -10,4 +10,4 @@ command -v go >/dev/null 2>&1 || {
 }
 
 cd "$ROOT"
-exec go run ./test/compat/cleandelivery --root "$ROOT" --out "$OUT_DIR"
+exec go run ./qa/compat/cleandelivery --root "$ROOT" --out "$OUT_DIR"

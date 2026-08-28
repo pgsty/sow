@@ -4,6 +4,11 @@ All notable changes to SOW are recorded here.
 
 ## Unreleased
 
+- Consolidated maintained design documentation on sow.pgsty.com, moved
+  integration/performance gates from `test/` to `qa/`, and moved shared
+  fixtures from root `testdata/` to `internal/testdata/`. Product behavior is
+  unchanged; clean-delivery manifests now reflect the organized source layout.
+
 ## 0.4.0 - 2026-08-24
 
 - Added schema v12 and operator-confirmed publication target rebinding. Target
