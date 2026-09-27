@@ -94,6 +94,9 @@ type Fault struct {
 }
 
 type Options struct {
+	// MetadataTimestamp is the explicit RPM index publication time; zero is deterministic.
+	MetadataTimestamp int64
+
 	Dir       string
 	Jobs      int
 	Pigsty    bool
@@ -133,6 +136,9 @@ func normalizeOptions(ctx context.Context, opts Options) (Options, error) {
 	}
 	if opts.Jobs < 1 {
 		return Options{}, &Error{Kind: KindUsage, Op: "create", Err: errors.New("jobs must be at least 1")}
+	}
+	if opts.MetadataTimestamp < 0 {
+		return Options{}, &Error{Kind: KindUsage, Op: "create", Err: errors.New("metadata timestamp must not be negative")}
 	}
 	if opts.Timeout < 0 {
 		return Options{}, &Error{Kind: KindUsage, Op: "create", Err: errors.New("timeout must not be negative")}

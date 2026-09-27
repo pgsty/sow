@@ -93,10 +93,12 @@ Commands:
 Use "sow help COMMAND" for command help.
 `,
 	"create": `Usage:
-  sow create [DIR] [-j N] [--pigsty] [-S KEY [--overwrite]] [-T DUR | -N] [--json]
+  sow create [DIR] [-j N] [--metadata-timestamp SECONDS] [--pigsty] [-S KEY [--overwrite]] [-T DUR | -N] [--json]
 
 Options:
   -j, --jobs N          Workers for the single content pass; defaults to CPU count
+      --metadata-timestamp SECONDS
+                         RPM data timestamps; nonnegative Unix seconds, default 0
       --pigsty          Enable Pigsty cleanup and the repo_complete gate
   -S, --sign-with KEY   Sign unsigned RPMs with a 16/40/64-hex GPG key ID
       --overwrite       Re-sign every RPM; requires --sign-with

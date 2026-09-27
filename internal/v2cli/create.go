@@ -22,7 +22,8 @@ func ExecuteCreate(ctx context.Context, inv Invocation, stdout, stderr io.Writer
 	}
 	result, err := create(ctx, plain.Options{
 		Dir: directory, Jobs: inv.Jobs, Pigsty: inv.Pigsty,
-		SignWith: inv.SignWith, Overwrite: inv.Overwrite,
+		MetadataTimestamp: inv.MetadataTimestamp,
+		SignWith:          inv.SignWith, Overwrite: inv.Overwrite,
 		Timeout: inv.Global.Timeout, NoWait: inv.Global.NoWait,
 	})
 	if err != nil {

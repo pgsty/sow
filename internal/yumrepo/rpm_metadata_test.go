@@ -287,6 +287,8 @@ func TestLegacyMissingOKRequirementProjectsAsRecommend(t *testing.T) {
 	}
 }
 
+// createrepo_c 1.1.1+ includes PRETRANS/POSTTRANS (upstream PR #427).
+// https://github.com/rpm-software-management/createrepo_c/pull/427
 func TestRequiresPreClassificationMatchesRPMMetadataConvention(t *testing.T) {
 	names := []string{"posttrans", "prereq", "pretrans", "script-pre", "script-post", "interpreter", "script-preun", "script-postun", "verify", "ordinary"}
 	flags := []int64{1 << 5, 1 << 6, 1 << 7, 1 << 9, 1 << 10, 1 << 8, 1 << 11, 1 << 12, 1 << 13, 0}
@@ -429,4 +431,46 @@ func primaryDependencyGroups(document []byte) (map[string][]map[string]string, [
 		}
 	}
 	return groups, order, nil
+}
+
+// These phase combinations were observed in the INFRA/PGSQL migration. Keep
+// modern createrepo_c semantics even when the 0.20.1 XML had more duplicate rows.
+func TestScriptInterpreterRequiresModernProjection(t *testing.T) {
+	tests := []struct {
+		name  string
+		flags []int64
+		pre   []bool
+	}{
+		{"posttrans-only", []int64{288}, []bool{true}},
+		{"pretrans-only", []int64{384}, []bool{true}},
+		{"cloudberry", []int64{288, 768, 1280}, []bool{true}},
+		{"percona", []int64{288, 768, 1280, 2304, 4352}, []bool{true, false}},
+		{"grafana", []int64{288, 1280}, []bool{true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			names := make([]string, len(tt.flags))
+			for i := range names {
+				names[i] = "/bin/sh"
+			}
+			header := &crpm.Header{Tags: map[int]*crpm.Tag{
+				tagRequireNames: {ID: tagRequireNames, Type: crpm.TagTypeStringArray, Value: names},
+				tagRequireFlags: {ID: tagRequireFlags, Type: crpm.TagTypeInt32, Value: tt.flags},
+				tagRequireEVRs:  {ID: tagRequireEVRs, Type: crpm.TagTypeStringArray, Value: make([]string, len(names))},
+			}}
+			raw, err := readDependencies(header, tagRequireNames, tagRequireFlags, tagRequireEVRs, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := normalizeRPMRequires(raw, nil, nil)
+			if len(got) != len(tt.pre) {
+				t.Fatalf("requires=%+v", got)
+			}
+			for i, d := range got {
+				if d.Name != "/bin/sh" || d.Pre != tt.pre[i] {
+					t.Fatalf("requires=%+v", got)
+				}
+			}
+		})
+	}
 }

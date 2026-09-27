@@ -48,6 +48,8 @@ type Invocation struct {
 	Hardlink    bool
 	Abort       bool
 	Rebind      bool
+
+	MetadataTimestamp int64
 }
 
 type optionUse uint16
@@ -78,10 +80,12 @@ type commandSpec struct {
 	hardlink  bool
 	abort     bool
 	rebind    bool
+
+	metadataTimestamp bool
 }
 
 var commandSpecs = map[string]commandSpec{
-	"create":          {globals: useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, pigsty: true, signWith: true, overwrite: true},
+	"create":          {globals: useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, pigsty: true, signWith: true, overwrite: true, metadataTimestamp: true},
 	"init":            {globals: useJSON, minArgs: 0, maxArgs: 1},
 	"config check":    {globals: useWorkdir | useJSON},
 	"config show":     {globals: useWorkdir | useRepo | useDist | useJSON, all: true},
@@ -343,6 +347,7 @@ func extractGlobal(args []string) ([]string, GlobalOptions, bool, bool, error) {
 func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, error) {
 	positionals := make([]string, 0, len(args))
 	stopped := false
+	metadataTimestampSet := false
 	jobsSet, pigstySet, signWithSet, overwriteSet, allSet, forceSet, formatSet := false, false, false, false, false, false, false
 	recursiveSet, skipSet, checkSet, hardlinkSet, abortSet, rebindSet := false, false, false, false, false, false
 	for i := 0; i < len(args); i++ {
@@ -371,6 +376,20 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 				return nil, usageError("--jobs must be an integer greater than or equal to 1")
 			}
 			inv.Jobs, jobsSet = n, true
+		case "--metadata-timestamp":
+			if !spec.metadataTimestamp || metadataTimestampSet {
+				return nil, usageError("option --metadata-timestamp is not allowed or is duplicated")
+			}
+			value, next, err := optionValue(args, i, name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			i = next
+			n, err := strconv.ParseUint(value, 10, 63)
+			if err != nil {
+				return nil, usageError("--metadata-timestamp must be a nonnegative Unix second (0..9223372036854775807)")
+			}
+			inv.MetadataTimestamp, metadataTimestampSet = int64(n), true
 		case "--pigsty":
 			if !spec.pigsty || pigstySet || hasInline {
 				return nil, usageError("option --pigsty is not allowed, duplicated, or has a value")

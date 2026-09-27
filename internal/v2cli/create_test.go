@@ -11,7 +11,7 @@ import (
 )
 
 func TestExecuteCreateJSONAndOptionMapping(t *testing.T) {
-	inv, err := Parse([]string{"create", "repo", "-j", "3", "--pigsty", "-S", "E7935D8DB9BD8B20", "--overwrite", "-N", "--json"})
+	inv, err := Parse([]string{"create", "repo", "-j", "3", "--pigsty", "-S", "E7935D8DB9BD8B20", "--overwrite", "--metadata-timestamp", "1790049000", "-N", "--json"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,7 +24,7 @@ func TestExecuteCreateJSONAndOptionMapping(t *testing.T) {
 	if code != ExitOK || stderr.Len() != 0 {
 		t.Fatalf("code=%d stderr=%q", code, stderr.String())
 	}
-	if got.Dir != "repo" || got.Jobs != 3 || !got.Pigsty || !got.NoWait || got.SignWith != "E7935D8DB9BD8B20" || !got.Overwrite {
+	if got.MetadataTimestamp != 1790049000 || got.Dir != "repo" || got.Jobs != 3 || !got.Pigsty || !got.NoWait || got.SignWith != "E7935D8DB9BD8B20" || !got.Overwrite {
 		t.Fatalf("options=%#v", got)
 	}
 	want := `{"schema":"sow.cli/v1","command":"create","ok":true,"repository":null,"operation":null,"result":{"dir":"/tmp/repo","rpm":2,"deb":1,"kept":null,"removed":["old.rpm"],"signed":["new.rpm"],"signer":"E7935D8DB9BD8B20","marker":true,"noop":false,"recovered":false},"errors":[]}`

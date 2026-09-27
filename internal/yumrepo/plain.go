@@ -22,7 +22,7 @@ func GenerateFlatUnsigned(ctx context.Context, dest string, revision uint64, pac
 	if packages == nil {
 		return nil, errors.New("yumrepo: nil package iterator")
 	}
-	return generateFlatUnsigned(ctx, dest, revision, func() (*packageMetadata, error) {
+	return generateFlatUnsigned(ctx, dest, revision, 0, func() (*packageMetadata, error) {
 		input, err := packages.Next(ctx)
 		if err != nil {
 			return nil, err
@@ -31,15 +31,19 @@ func GenerateFlatUnsigned(ctx context.Context, dest string, revision uint64, pac
 	})
 }
 
-// GenerateFlatUnsignedParsed renders RPM metadata from packages returned by
+// GenerateFlatUnsignedParsedAt renders RPM metadata from packages returned by
 // InspectFlatPackage. It performs no package I/O; results are consumed in the
 // provided basename order and validated exactly like GenerateFlatUnsigned.
-func GenerateFlatUnsignedParsed(ctx context.Context, dest string, revision uint64, packages []*FlatPackage) (*Generation, error) {
+// Timestamp is a nonnegative Unix second chosen by the publisher; no clock is read.
+func GenerateFlatUnsignedParsedAt(ctx context.Context, dest string, revision uint64, timestamp int64, packages []*FlatPackage) (*Generation, error) {
+	if timestamp < 0 {
+		return nil, errors.New("yumrepo: metadata timestamp must not be negative")
+	}
 	if ctx == nil {
 		return nil, errors.New("yumrepo: nil context")
 	}
 	next := 0
-	return generateFlatUnsigned(ctx, dest, revision, func() (*packageMetadata, error) {
+	return generateFlatUnsigned(ctx, dest, revision, timestamp, func() (*packageMetadata, error) {
 		if next >= len(packages) {
 			return nil, io.EOF
 		}
@@ -52,7 +56,7 @@ func GenerateFlatUnsignedParsed(ctx context.Context, dest string, revision uint6
 	})
 }
 
-func generateFlatUnsigned(ctx context.Context, dest string, revision uint64, next func() (*packageMetadata, error)) (*Generation, error) {
+func generateFlatUnsigned(ctx context.Context, dest string, revision uint64, timestamp int64, next func() (*packageMetadata, error)) (*Generation, error) {
 	dest = filepath.Clean(dest)
 	if dest == "." || dest == string(filepath.Separator) {
 		return nil, errors.New("yumrepo: unsafe flat generation destination")
@@ -130,7 +134,7 @@ func generateFlatUnsigned(ctx context.Context, dest string, revision uint64, nex
 		if err := assembleXML(rawPath, item.name, item.body, count); err != nil {
 			return nil, err
 		}
-		artifact, err := compressXML(ctx, tmp, item.name, rawPath, CompressionGzip, count, 0)
+		artifact, err := compressXML(ctx, tmp, item.name, rawPath, CompressionGzip, count, timestamp)
 		if err != nil {
 			return nil, err
 		}

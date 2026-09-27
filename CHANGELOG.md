@@ -4,6 +4,15 @@ All notable changes to SOW are recorded here.
 
 ## Unreleased
 
+- Added `sow create --metadata-timestamp SECONDS` for an explicit RPM metadata
+  publication time. Existing YUM repositories can preserve a nondecreasing
+  timestamp when switching generators, including clients with an EL7 YUM cache.
+  The default remains zero for reproducible output; package bytes, compressed
+  XML, and DEB indexes are unaffected. Publishers remain responsible for choosing
+  the timestamp and signing the resulting `repomd.xml`.
+- Added regression coverage for modern createrepo_c script dependency semantics,
+  including pre-transaction and post-transaction requirements, without changing
+  dependency projection.
 - Consolidated maintained design documentation on sow.pgsty.com, moved
   integration/performance gates from `test/` to `qa/`, and moved shared
   fixtures from root `testdata/` to `internal/testdata/`. Product behavior is

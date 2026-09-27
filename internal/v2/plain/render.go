@@ -46,7 +46,7 @@ func renderStage(ctx context.Context, dir string, scan scanResult, opts Options)
 				packages = append(packages, fact.parsedRPM)
 			}
 		}
-		if _, err := yumrepo.GenerateFlatUnsignedParsed(ctx, filepath.Join(stage, "repodata"), 0, packages); err != nil {
+		if _, err := yumrepo.GenerateFlatUnsignedParsedAt(ctx, filepath.Join(stage, "repodata"), 0, opts.MetadataTimestamp, packages); err != nil {
 			return stagedBuild{}, scanResult{}, &Error{Kind: KindRuntime, Op: "render rpm", Path: dir, Err: err}
 		}
 	}

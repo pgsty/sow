@@ -136,6 +136,7 @@ internal/v2/plain/rebuild_test.go
 internal/v2/plain/render.go
 internal/v2/plain/scan.go
 internal/v2/plain/sign.go
+internal/v2/plain/timestamp_test.go
 internal/v2/plain/types.go
 internal/v2/state/audit.go
 internal/v2/state/doc.go
@@ -190,6 +191,7 @@ internal/v2cli/output_test.go
 internal/v2cli/parse.go
 internal/v2cli/parse_test.go
 internal/v2cli/testdata/root-help.golden
+internal/v2cli/timestamp_test.go
 internal/workmetrics/metrics.go
 internal/workmetrics/metrics_test.go
 internal/yumrepo/catalog.go
