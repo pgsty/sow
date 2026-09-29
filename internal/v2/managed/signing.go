@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -364,16 +365,25 @@ func (policy rpmSigningPolicy) permitsNeutralReuseReader(ctx context.Context, re
 // fill/always record a verified primary fingerprint, and a policy transition
 // must remain legal when the immutable bytes already satisfy the new policy.
 func (policy rpmSigningPolicy) authorizeDesiredReader(ctx context.Context, reader io.ReadSeeker) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	switch policy.mode {
 	case "never":
 		return nil
 	case "fill":
 		if _, ok := verifiedRPMSignerReader(ctx, reader, policy.trusted); !ok {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			return errors.New("package is not verified by the configured trusted keys")
 		}
 		return nil
 	case "always":
 		if _, ok := verifiedRPMSignerReader(ctx, reader, policy.current); !ok {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			return errors.New("package is not verified by the configured current key")
 		}
 		return nil
@@ -405,11 +415,11 @@ func verifiedRPMSignerReader(ctx context.Context, reader io.ReadSeeker, keyring 
 	if _, err := reader.Seek(0, io.SeekStart); err != nil {
 		return "", false
 	}
-	proofs, err := yumrepo.VerifyEmbeddedRPMSignatures(ctx, reader, keyring, time.Now().UTC())
-	if err != nil || len(proofs) == 0 {
+	results, err := yumrepo.VerifyEmbeddedRPMSignaturesMulti(ctx, reader, []yumrepo.RPMSignatureTrustRing{{Identity: "desired", Keyring: keyring}}, time.Now().UTC())
+	if err != nil || len(results) != 1 || results[0].Err != nil || len(results[0].Proofs) == 0 {
 		return "", false
 	}
-	return strings.ToUpper(proofs[0].SignerPrimaryFingerprint), true
+	return strings.ToUpper(results[0].Proofs[0].SignerPrimaryFingerprint), true
 }
 
 func inspectStructuralRPMKeyID(ctx context.Context, filename string) (string, error) {
@@ -592,21 +602,40 @@ func validateGPGSecretIdentity(ctx context.Context, fingerprint string) error {
 	return nil
 }
 
-func probeGPGSigning(ctx context.Context, fingerprint string) error {
+func probeGPGSigning(ctx context.Context, fingerprint string, at time.Time) (string, error) {
 	gpg, err := exec.LookPath("gpg")
 	if err != nil {
-		return errors.New("gpg executable is required")
+		return "", metadataSigningPolicyError("gpg executable is required")
 	}
 	command := exec.CommandContext(ctx, gpg,
 		"--batch", "--no-tty", "--pinentry-mode", "error", "--local-user", strings.ToUpper(fingerprint),
-		"--armor", "--detach-sign", "--output", "-",
+		"--digest-algo", "SHA256", "--faked-system-time", strconv.FormatInt(at.UTC().Unix(), 10)+"!",
+		"--status-fd", "2", "--armor", "--detach-sign", "--output", "-",
 	)
 	command.Stdin = strings.NewReader("sow signing preflight\n")
-	command.Stdout, command.Stderr = io.Discard, io.Discard
+	var status bytes.Buffer
+	command.Stdout, command.Stderr = io.Discard, &status
 	if err := command.Run(); err != nil {
-		return errors.New("configured OpenPGP key cannot produce a non-interactive signature")
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", metadataSigningPolicyError("configured OpenPGP key cannot produce a non-interactive signature")
 	}
-	return nil
+	selected := ""
+	for _, line := range strings.Split(status.String(), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "[GNUPG:]" || fields[1] != "SIG_CREATED" {
+			continue
+		}
+		if len(fields) != 8 || selected != "" || !managedFingerprint.MatchString(strings.ToUpper(fields[7])) {
+			return "", metadataSigningPolicyError("gpg did not identify exactly one signing key")
+		}
+		selected = strings.ToUpper(fields[7])
+	}
+	if selected == "" {
+		return "", metadataSigningPolicyError("gpg did not identify its signing key")
+	}
+	return selected, nil
 }
 
 func resolveSigningPublicKey(ctx context.Context, root, reference string) ([]byte, string, error) {
@@ -783,6 +812,9 @@ func exportPublicKey(ctx context.Context, identity string) ([]byte, error) {
 	command.Stdout = &stdout
 	command.Stderr = io.Discard
 	if err := command.Run(); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("gpg public-key export failed: %w", err)
 	}
 	if stdout.Len() == 0 || stdout.Len() > maxManagedKeyBytes {

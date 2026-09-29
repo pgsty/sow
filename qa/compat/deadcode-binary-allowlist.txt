@@ -44,6 +44,11 @@ internal/yumrepo/managed.go: GenerateManagedParsed
 internal/yumrepo/plain.go: GenerateFlatUnsigned
 internal/yumrepo/rpm.go: InspectPackage
 internal/yumrepo/rpm_facts.go: InspectManagedPackageFacts
+internal/yumrepo/rpm_signature.go: VerifyEmbeddedRPMSignatures
+internal/yumrepo/rpm_signature.go: exactLengthReader.Read
+internal/yumrepo/rpm_signature.go: verifyOpenPGPV3DetachedSignature
+internal/yumrepo/rpm_signature.go: verifyOpenPGPV4DetachedSignature
+internal/yumrepo/rpm_signature.go: verifySignedRPMPayloadDigest
 internal/yumrepo/sign.go: NewOpenPGPVerifierForFingerprint
 internal/yumrepo/types.go: CompressionForEL
 internal/yumrepo/types.go: CompressionForOptions

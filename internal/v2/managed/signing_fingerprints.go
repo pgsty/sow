@@ -10,7 +10,6 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
-	"github.com/pgsty/sow/internal/yumrepo"
 )
 
 // effectiveConfigView resolves only public key fingerprints into the public
@@ -202,7 +201,7 @@ func resolveReferenceFingerprints(ctx context.Context, root, reference string) (
 
 // validateSigningApplicability is the config-check preflight. It proves that
 // configured signing keys can actually sign at the current time without
-// producing a signature or mutating any repository state.
+// mutating repository state. Agent keys use one small non-interactive probe.
 func validateSigningApplicability(ctx context.Context, root string, signing config.SigningConfig) error {
 	return validateSigningApplicabilityForFormats(ctx, root, signing, true, true)
 }
@@ -220,38 +219,10 @@ func validateSigningApplicabilityForFormats(ctx context.Context, root string, si
 		}
 	}
 	repository := config.RepositoryConfig{Signing: signing}
-	if _, err := loadMetadataSignerSnapshotForFormats(ctx, root, repository, time.Now().UTC(), wantRPM, wantDEB); err != nil {
+	at := time.Now().UTC()
+	snapshot, err := loadMetadataSignerSnapshotForFormats(ctx, root, repository, at, wantRPM, wantDEB)
+	if err != nil {
 		return err
 	}
-	references := map[string]string{}
-	if wantRPM {
-		references["rpm metadata key"] = signing.RPM.Metadata.Key
-	}
-	if wantDEB {
-		references["deb metadata key"] = signing.DEB.Metadata.Key
-	}
-	for label, reference := range references {
-		if reference == "" {
-			continue
-		}
-		_, identity, err := resolveKeyReference(root, reference)
-		if err != nil {
-			return fmt.Errorf("%s: %w", label, err)
-		}
-		if identity == "" {
-			continue
-		}
-		public, err := exportPublicKey(ctx, identity)
-		if err != nil {
-			return fmt.Errorf("%s: %w", label, err)
-		}
-		fingerprints, err := yumrepo.RPMPackageKeyringPrimaryFingerprints(public)
-		if err != nil || len(fingerprints) != 1 {
-			return fmt.Errorf("%s must resolve to exactly one primary OpenPGP key", label)
-		}
-		if err := probeGPGSigning(ctx, fingerprints[0]); err != nil {
-			return fmt.Errorf("%s is not usable for signing: %w", label, err)
-		}
-	}
-	return nil
+	return validateNewMetadataSigningKeys(snapshot, at, at)
 }

@@ -258,6 +258,9 @@ func (b *r2PublicationBackend) Put(ctx context.Context, sourceRoot string, opera
 	if exists && current.Size == operation.Size && current.SHA256 == operation.SHA256 {
 		return current.RemoteIdentity, nil
 	}
+	if strings.HasPrefix(operation.Path, "pool/") && operation.Operation == "update" {
+		return "", fmt.Errorf("%w: immutable payload %q cannot be overwritten", ErrRejected, operation.Path)
+	}
 	condition := r2.PutCondition{CacheControl: r2ImmutableCacheControl}
 	if mutableR2PublicationPath(operation) {
 		condition.CacheControl = r2PointerCacheControl

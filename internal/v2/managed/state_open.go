@@ -29,7 +29,9 @@ func openExistingState(path string) (*state.Store, error) {
 }
 
 func openExistingStateForMigration(path string) (*state.Store, error) {
-	return openStateBound(path, state.OpenExistingForMigration)
+	return openStateBound(path, func(path string) (*state.Store, error) {
+		return state.OpenExistingForMigration(path, true)
+	})
 }
 
 func openInitializingState(path string) (*state.Store, error) {

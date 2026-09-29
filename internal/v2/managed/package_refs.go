@@ -12,14 +12,25 @@ import (
 
 var errPackageReferenceNotFound = errors.New("package reference not found")
 
-func resolvePackageReference(ctx context.Context, store *state.Store, reference string, distNames []string, nameWide bool) ([]state.PackageObject, error) {
+func validatePackageReference(reference string) error {
 	if reference == "" || strings.TrimSpace(reference) != reference || strings.ContainsAny(reference, "\x00\r\n\t") {
-		return nil, fmt.Errorf("%w: invalid package reference", ErrRejected)
+		return fmt.Errorf("%w: invalid package reference", ErrRejected)
+	}
+	return nil
+}
+
+func resolvePackageReference(ctx context.Context, store *state.Store, reference string, distNames []string, nameWide bool) ([]state.PackageObject, error) {
+	if err := validatePackageReference(reference); err != nil {
+		return nil, err
 	}
 	objects, err := store.ListPackageObjects(ctx, distNames, false)
 	if err != nil {
 		return nil, err
 	}
+	return matchPackageReference(objects, reference, nameWide)
+}
+
+func matchPackageReference(objects []state.PackageObject, reference string, nameWide bool) ([]state.PackageObject, error) {
 	matches := []state.PackageObject{}
 	switch {
 	case strings.HasPrefix(reference, "sha256:"):
@@ -65,9 +76,29 @@ func resolvePackageReference(ctx context.Context, store *state.Store, reference 
 }
 
 func resolvePackageReferences(ctx context.Context, store *state.Store, references, distNames []string, nameWide bool) ([]state.PackageObject, error) {
+	return resolvePackageReferencesFrom(ctx, store.ListPackageObjects, references, distNames, nameWide)
+}
+
+func resolvePackageReferencesFrom(ctx context.Context, load func(context.Context, []string, bool) ([]state.PackageObject, error), references, distNames []string, nameWide bool) ([]state.PackageObject, error) {
 	byDigest := map[string]state.PackageObject{}
-	for _, reference := range references {
-		matches, err := resolvePackageReference(ctx, store, reference, distNames, nameWide)
+	var objects []state.PackageObject
+	for index, reference := range references {
+		if err := validatePackageReference(reference); err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if index == 0 {
+			// A batch shares one locked Desired snapshot. Keep matching in input
+			// order so missing and ambiguous references still report the first error.
+			var err error
+			objects, err = load(ctx, distNames, false)
+			if err != nil {
+				return nil, err
+			}
+		}
+		matches, err := matchPackageReference(objects, reference, nameWide)
 		if err != nil {
 			return nil, err
 		}

@@ -223,32 +223,6 @@ func (s *Store) AbandonLayoutTransition(ctx context.Context) error {
 	return s.Checkpoint(ctx)
 }
 
-func (s *Store) BeginLayoutTransition(ctx context.Context) error {
-	var controlCount int
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM layout_transition_control`).Scan(&controlCount); err != nil {
-		return err
-	}
-	if controlCount != 0 {
-		return fmt.Errorf("%w: repository has a stale layout transition control", ErrTransition)
-	}
-	result, err := s.db.ExecContext(ctx, `UPDATE repository_state SET layout_version = ?, transition_receipt_sha256 = NULL WHERE singleton = 1 AND layout_version = ?`, LayoutC2ToSingleV1, LayoutC2V1)
-	if err != nil {
-		return err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows != 1 {
-		identity, identityErr := s.RepositoryIdentity(ctx)
-		if identityErr == nil && identity.LayoutVersion == LayoutC2ToSingleV1 {
-			return nil
-		}
-		return fmt.Errorf("%w: repository cannot enter C2 transition", ErrTransition)
-	}
-	return s.Checkpoint(ctx)
-}
-
 // CompleteLayoutTransition atomically installs the first terminal manifest,
 // advances every Built projection to its new Generation, stores the exact
 // done-journal identity as receipt, and flips the layout.  Journal deletion is

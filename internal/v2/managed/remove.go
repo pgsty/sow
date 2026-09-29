@@ -22,6 +22,7 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	if ctx == nil {
 		return result, errors.New("managed: nil context")
 	}
+	ctx = withMetadataSignerCache(ctx)
 	ctx, _ = workmetrics.Ensure(ctx)
 	if len(opts.Packages) == 0 || opts.Jobs < 1 || opts.Check && opts.Skip {
 		return result, fmt.Errorf("%w: invalid remove options", ErrRejected)
@@ -52,6 +53,11 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 		return result, fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
+	defer func() {
+		if ctx.Err() != nil {
+			retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
+		}
+	}()
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
 		return result, err
 	}
@@ -94,7 +100,7 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"removed": len(removed)}}
 	var preflight *mutationBuildPreflight
 	if !opts.Skip && len(buildDists) != 0 {
-		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, nil, currentSnapshot)
+		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, nil, currentSnapshot, opts.Jobs)
 		if err != nil {
 			return result, err
 		}
@@ -295,7 +301,7 @@ func previewRemove(ctx context.Context, opts RemoveOptions) (result RemoveResult
 		}
 		predictedGeneration = nextGeneration
 		manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"removed": len(removed)}}
-		preflight, preflightErr := prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, nil, currentSnapshot)
+		preflight, preflightErr := prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, nil, currentSnapshot, opts.Jobs)
 		if preflightErr != nil {
 			return result, preflightErr
 		}
@@ -374,7 +380,7 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, distNames
 		target[file.Path] = file
 		baseByPath[file.Path] = file
 	}
-	previewRoot, err := os.MkdirTemp("", "sow-rm-check-")
+	previewRoot, err := privateTemporaryDirectory("sow-rm-check-")
 	if err != nil {
 		return nil, err
 	}
@@ -420,7 +426,7 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, distNames
 		rpmObjectList = append(rpmObjectList, object)
 	}
 	sort.Slice(rpmObjectList, func(i, j int) bool { return rpmObjectList[i].SHA256 < rpmObjectList[j].SHA256 })
-	if err := validateBuildRPMSigning(ctx, root, repoName, rpmObjectList, preflight.rpmPolicy, jobs); err != nil {
+	if _, err := authorizeBuildRPMObjects(ctx, root, repoName, rpmObjectList, preflight.rpmPolicy, jobs, preflight.rpmAuthorizations); err != nil {
 		return nil, err
 	}
 	for _, distName := range distNames {

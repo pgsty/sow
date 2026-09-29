@@ -71,6 +71,9 @@ WHERE (generation < (SELECT built_generation FROM repository_state WHERE singlet
 	if err != nil || !migrated.Complete || migrated.Phase != "done" {
 		t.Fatalf("schema migration=%#v err=%v", migrated, err)
 	}
+	if migrated.FromLayout != state.LayoutSinglePayloadV1 || migrated.ToLayout != state.LayoutSinglePayloadV1 {
+		t.Fatalf("schema migration reported a layout conversion: %#v", migrated)
+	}
 	status, err := Status(ctx, StatusOptions{WorkspaceOptions: opts, Repository: "repo"})
 	if err != nil || status.Status != "dirty" || len(status.DirtyDists) != 1 || status.DirtyDists[0] != "el9" {
 		t.Fatalf("migrated status=%#v err=%v", status, err)
@@ -87,6 +90,24 @@ WHERE (generation < (SELECT built_generation FROM repository_state WHERE singlet
 	built, err := Build(ctx, BuildOptions{WorkspaceOptions: opts, Repository: "repo", Jobs: 1})
 	if err != nil || built.Dirty || built.Noop {
 		t.Fatalf("post-migration build=%#v err=%v", built, err)
+	}
+}
+
+func TestRepositorySchemaMigrationReportsCurrentLayout(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	opts := WorkspaceOptions{Workdir: root, CWD: root}
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		migrated, err := MigrateRepository(ctx, RepositoryMigrationOptions{WorkspaceOptions: opts, Repository: "repo", Jobs: 1})
+		if err != nil || !migrated.Complete || migrated.Phase != "done" || migrated.FromLayout != state.LayoutSinglePayloadV1 || migrated.ToLayout != state.LayoutSinglePayloadV1 {
+			t.Fatalf("current-schema migration=%#v err=%v", migrated, err)
+		}
 	}
 }
 
@@ -203,6 +224,10 @@ func downgradeManagedV11FixtureToV10(t *testing.T, db *sql.DB) {
 	t.Helper()
 	_, err := db.Exec(`
 PRAGMA foreign_keys = OFF;
+DROP INDEX package_objects_pool_path_folded;
+DROP INDEX publication_inventory_payload_path_folded;
+DROP INDEX publication_abandoned_payload_path_folded;
+DELETE FROM schema_migrations WHERE version = 13;
 DROP TABLE publication_target_binding_revisions;
 DELETE FROM schema_migrations WHERE version = 12;
 CREATE TEMP TABLE generation_view_signers_fixture AS
@@ -244,7 +269,7 @@ func TestMigrateEmptyLegacyRepositoryReusesIdentityAcrossRestart(t *testing.T) {
 	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
 		t.Fatal(err)
 	}
-	base, _, repositoryID := prepareC2MigrationFixture(t, root, false)
+	base, _, repositoryID := prepareStartedC2MigrationFixture(t, root, false)
 	if base != 0 {
 		t.Fatalf("empty repository base=%s", base)
 	}
@@ -322,7 +347,7 @@ func TestMigrateRepairsFinalManifestAfterSQLiteCommitCrash(t *testing.T) {
 	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
 		t.Fatal(err)
 	}
-	base, _, repositoryID := prepareC2MigrationFixture(t, root, false)
+	base, _, repositoryID := prepareStartedC2MigrationFixture(t, root, false)
 	options := WorkspaceOptions{Workdir: root, CWD: root}
 	at := time.Date(2026, 8, 5, 12, 30, 0, 0, time.UTC)
 	injected := errors.New("crash after SQLite transition commit")
@@ -370,7 +395,7 @@ func TestMigrateDoneJournalCanSupplementPendingSQLiteCommit(t *testing.T) {
 	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
 		t.Fatal(err)
 	}
-	base, _, repositoryID := prepareC2MigrationFixture(t, root, false)
+	base, _, repositoryID := prepareStartedC2MigrationFixture(t, root, false)
 	options := WorkspaceOptions{Workdir: root, CWD: root}
 	at := time.Date(2026, 8, 5, 12, 45, 0, 0, time.UTC)
 	injected := errors.New("crash at final manifest")
@@ -441,7 +466,7 @@ func TestMigrateAPTOnlyPreservesByHashAndClassifiesNoAliases(t *testing.T) {
 	if byHash == 0 {
 		t.Fatal("APT fixture produced no by-hash closure")
 	}
-	base, aliases, _ := prepareC2MigrationFixture(t, root, false)
+	base, aliases, _ := prepareStartedC2MigrationFixture(t, root, false)
 	if len(aliases) != 0 {
 		t.Fatalf("APT by-hash was classified as C2 aliases: %v", aliases)
 	}
@@ -516,7 +541,7 @@ func TestMigrateRejectsMetadataSignerDriftOnResume(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(viewRoot, "repodata", "repomd.xml.asc"), signature.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	prepareC2MigrationFixture(t, root, true)
+	prepareStartedC2MigrationFixture(t, root, true)
 	stagedCrash := errors.New("crash after signed migration stage")
 	if _, err := MigrateRepositoryLayout(ctx, RepositoryMigrationOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1, now: func() time.Time { return at }, Fault: func(point string) error {
 		if point == "migrate.staged" {
@@ -601,7 +626,7 @@ func TestMigratePostCommitRecoveryDoesNotRequireCurrentPrivateSigner(t *testing.
 			if err := os.WriteFile(filepath.Join(viewRoot, "repodata", "repomd.xml.asc"), signature.Bytes(), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			_, aliases, _ := prepareC2MigrationFixture(t, root, true)
+			_, aliases, _ := prepareStartedC2MigrationFixture(t, root, true)
 			injected := errors.New("stop after commit intent")
 			if _, err := MigrateRepositoryLayout(ctx, RepositoryMigrationOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1, now: func() time.Time { return at }, Fault: func(point string) error {
 				if point == "migrate.commit_intent" {
@@ -692,7 +717,7 @@ func TestMigrateRejectsJournalWithMissingBuiltRPMViewsEvenWithRecomputedTarget(t
 	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
 		t.Fatal(err)
 	}
-	baseGeneration, _, _ := prepareC2MigrationFixture(t, root, false)
+	baseGeneration, _, _ := prepareStartedC2MigrationFixture(t, root, false)
 	options := WorkspaceOptions{Workdir: root, CWD: root}
 	at := time.Date(2026, 8, 5, 15, 30, 0, 0, time.UTC)
 	injected := errors.New("stop at complete stage")
@@ -801,7 +826,7 @@ func TestMigrateGraceAnchorCeilsNanosecondsWithoutShorteningThirtyDays(t *testin
 		t.Fatal(err)
 	}
 	rewriteRPMViewAsLegacyC2(t, filepath.Join(root, "repo", "dists", "el9", "x86_64"))
-	_, aliases, _ := prepareC2MigrationFixture(t, root, true)
+	_, aliases, _ := prepareStartedC2MigrationFixture(t, root, true)
 	if len(aliases) != 1 {
 		t.Fatalf("aliases=%v", aliases)
 	}
@@ -868,7 +893,7 @@ func TestMigrateMixedRepositoryRollsForwardAfterCommitAndGrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	aptBefore := manifestWithPrefix(before, "dists/noble/")
-	base, aliases, repositoryID := prepareC2MigrationFixture(t, root, true)
+	base, aliases, repositoryID := prepareStartedC2MigrationFixture(t, root, true)
 	if len(aliases) != 1 {
 		t.Fatalf("legacy aliases=%v", aliases)
 	}
@@ -1096,7 +1121,9 @@ func TestMigrateMixedRepositoryRollsForwardAfterCommitAndGrace(t *testing.T) {
 	}
 }
 
-func prepareC2MigrationFixture(t *testing.T, root string, addRPMAliases bool) (state.GenerationID, []string, string) {
+// prepareStartedC2MigrationFixture models an older binary that durably began
+// the transition before interruption. New C2 transitions are no longer started.
+func prepareStartedC2MigrationFixture(t *testing.T, root string, addRPMAliases bool) (state.GenerationID, []string, string) {
 	t.Helper()
 	ctx := context.Background()
 	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
@@ -1198,7 +1225,7 @@ func prepareC2MigrationFixture(t *testing.T, root string, addRPMAliases bool) (s
 			}
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE repository_state SET layout_version = ?, transition_receipt_sha256 = NULL WHERE singleton = 1`, state.LayoutC2V1); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE repository_state SET layout_version = ?, transition_receipt_sha256 = NULL WHERE singleton = 1`, state.LayoutC2ToSingleV1); err != nil {
 		tx.Rollback()
 		t.Fatal(err)
 	}
@@ -1351,5 +1378,72 @@ func rewriteRPMViewAsLegacyC2(t *testing.T, viewRoot string) {
 	updatedRepomd := append(append(append([]byte(nil), repomd[:start]...), []byte(segment)...), repomd[end:]...)
 	if err := os.WriteFile(repomdPath, updatedRepomd, 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMigrateRejectsFreshC2BeforeSchemaOrConfigChanges(t *testing.T) {
+	for _, version := range []int{12, state.SchemaVersion} {
+		t.Run(fmt.Sprintf("schema-%d", version), func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			cfg := config.Default()
+			cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{}}
+			writeManagedConfig(t, root, cfg)
+			if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+				t.Fatal(err)
+			}
+			dbPath := filepath.Join(root, ".sow", "repo.db")
+			store, err := state.OpenExisting(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.DB().Exec(`UPDATE repository_state SET layout_version = 'c2-v1' WHERE singleton = 1`); err != nil {
+				t.Fatal(err)
+			}
+			if version == 12 {
+				if _, err := store.DB().Exec(`DROP INDEX package_objects_pool_path_folded;
+DROP INDEX publication_inventory_payload_path_folded;
+DROP INDEX publication_abandoned_payload_path_folded;
+DELETE FROM schema_migrations WHERE version = 13;
+PRAGMA user_version = 12;`); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := errors.Join(store.Checkpoint(ctx), store.Close()); err != nil {
+				t.Fatal(err)
+			}
+			rewriteConfigAsLegacyV2(t, root)
+			configPath := filepath.Join(root, config.ConfigFilename)
+			beforeDB, err := os.ReadFile(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeConfig, err := os.ReadFile(configPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = MigrateRepository(ctx, RepositoryMigrationOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Jobs: 1})
+			if !errors.Is(err, ErrRejected) || !errors.Is(err, state.ErrLegacyLayout) || !strings.Contains(err.Error(), "import the original packages") {
+				t.Fatalf("fresh C2 migration error=%v", err)
+			}
+			afterDB, dbErr := os.ReadFile(dbPath)
+			afterConfig, configErr := os.ReadFile(configPath)
+			if dbErr != nil || configErr != nil || !bytes.Equal(beforeDB, afterDB) || !bytes.Equal(beforeConfig, afterConfig) {
+				t.Fatalf("rejection changed database or configuration: db=%v config=%v", dbErr, configErr)
+			}
+			reader, err := state.OpenReadOnly(dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reader.Close()
+			identity, err := reader.RepositoryIdentity(ctx)
+			if err != nil || reader.SchemaVersion() != version || identity.LayoutVersion != state.LayoutC2V1 {
+				t.Fatalf("rejection changed schema/layout: version=%d identity=%v err=%v", reader.SchemaVersion(), identity, err)
+			}
+			journal, _, err := loadTransitionJournal(root, "repo")
+			if err != nil || journal != nil {
+				t.Fatalf("rejection wrote transition journal: %v %v", journal, err)
+			}
+		})
 	}
 }

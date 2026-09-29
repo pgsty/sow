@@ -132,7 +132,6 @@ func (s *Store) ApplyDesiredMutationWithSigningKeys(ctx context.Context, operati
 	}
 	nextRevision := currentRevision + 1
 	newByDigest := make(map[string]PackageObject, len(objects))
-	newByPortablePath := make(map[string]PackageObject, len(objects))
 	newObjects := make([]PackageObject, 0, len(objects))
 	for _, object := range objects {
 		if _, duplicate := newByDigest[object.SHA256]; duplicate {
@@ -142,11 +141,6 @@ func (s *Store) ApplyDesiredMutationWithSigningKeys(ctx context.Context, operati
 		if _, referenced := needed[object.SHA256]; !referenced {
 			continue
 		}
-		portablePath := strings.ToLower(object.PoolPath)
-		if prior, duplicate := newByPortablePath[portablePath]; duplicate && prior.SHA256 != object.SHA256 {
-			return DesiredMutationResult{}, fmt.Errorf("%w: pool path %s collides case-insensitively with %s", ErrConflict, object.PoolPath, prior.PoolPath)
-		}
-		newByPortablePath[portablePath] = object
 		existing, found, err := packageObjectTx(ctx, tx, object.SHA256)
 		if err != nil {
 			return DesiredMutationResult{}, err
@@ -165,16 +159,25 @@ func (s *Store) ApplyDesiredMutationWithSigningKeys(ctx context.Context, operati
 		if !errors.Is(err, sql.ErrNoRows) {
 			return DesiredMutationResult{}, fmt.Errorf("inspect package coordinate: %w", err)
 		}
-		var pathSHA, pathValue string
-		err = tx.QueryRowContext(ctx, `SELECT sha256, pool_path FROM package_objects WHERE pool_path = ? COLLATE NOCASE`, object.PoolPath).Scan(&pathSHA, &pathValue)
-		if err == nil {
-			return DesiredMutationResult{}, fmt.Errorf("%w: pool path %s collides case-insensitively with %s owned by %s", ErrConflict, object.PoolPath, pathValue, pathSHA)
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return DesiredMutationResult{}, fmt.Errorf("inspect portable package pool path: %w", err)
-		}
 		object.CreatedRevision = nextRevision
 		newObjects = append(newObjects, object)
+	}
+
+	// Existing immutable objects above are replayed without applying a new
+	// admission rule. Only genuinely new referenced objects query path history.
+	paths := make([]string, 0, len(newObjects))
+	for _, object := range newObjects {
+		paths = append(paths, object.PoolPath)
+	}
+	pathOwners, err := packagePoolPathOwners(ctx, tx, paths)
+	if err != nil {
+		return DesiredMutationResult{}, err
+	}
+	for _, object := range newObjects {
+		if err := pathOwners.Check(object); err != nil {
+			return DesiredMutationResult{}, err
+		}
+		pathOwners.Add(object)
 	}
 
 	changedDists := make([]string, 0, len(distNames))

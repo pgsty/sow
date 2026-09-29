@@ -639,16 +639,19 @@ func renameRootedRegular(ctx context.Context, root, sourceRelative, targetRelati
 	closeFile := func(result error) error { return finish(errors.Join(result, file.Close())) }
 	var before unix.Stat_t
 	statErr := unix.Fstat(fd, &before)
-	if statErr != nil || uint32(before.Mode)&unix.S_IFMT != unix.S_IFREG || before.Size != expectedSize {
-		return closeFile(errors.Join(errors.New("managed: rooted rename source is not the expected regular file"), statErr))
+	if statErr != nil {
+		return closeFile(statErr)
+	}
+	if uint32(before.Mode)&unix.S_IFMT != unix.S_IFREG || before.Size != expectedSize {
+		return closeFile(fmt.Errorf("%w: rooted rename source is not the expected regular file", ErrIntegrity))
 	}
 	var sourceEntry unix.Stat_t
 	entryErr := unix.Fstatat(int(sourceParent.directory().Fd()), sourceName, &sourceEntry, unix.AT_SYMLINK_NOFOLLOW)
 	if entryErr != nil || sourceEntry.Dev != before.Dev || sourceEntry.Ino != before.Ino || sourceEntry.Size != before.Size || uint32(sourceEntry.Mode)&unix.S_IFMT != unix.S_IFREG {
 		return closeFile(errors.Join(errors.New("managed: rooted rename source entry changed while opening"), entryErr))
 	}
-	digest, err := hashRegularDescriptor(ctx, file)
-	if err != nil || digest != expectedSHA {
+	authenticated, err := authenticateRegularDescriptor(ctx, file, expectedSize, expectedSHA)
+	if err != nil {
 		return closeFile(errors.Join(errors.New("managed: rooted rename source digest differs"), err))
 	}
 	if err := errors.Join(sourceParent.verify(), targetParent.verify()); err != nil {
@@ -670,11 +673,17 @@ func renameRootedRegular(ctx context.Context, root, sourceRelative, targetRelati
 	if err := errors.Join(file.Chmod(fileMode), file.Sync()); err != nil {
 		return closeFile(err)
 	}
-	digest, err = hashRegularDescriptor(ctx, file)
-	if err != nil || digest != expectedSHA {
-		return closeFile(errors.Join(errors.New("managed: rooted rename source changed during publication"), err))
+	// Linkat and Chmod change ctime themselves. The held, authenticated inode
+	// must retain its bytes' size/mtime and acquire only the requested mode,
+	// as in pending promotion; do not reread immutable content for this step.
+	authenticated.mode = fileMode.Perm()
+	afterInfo, infoErr := file.Stat()
+	var after unix.Stat_t
+	afterErr := unix.Fstat(fd, &after)
+	if infoErr != nil || afterErr != nil || !authenticated.matchesInfo(afterInfo, after) {
+		return closeFile(errors.Join(errors.New("managed: rooted rename source changed during publication"), infoErr, afterErr))
 	}
-	if err := errors.Join(sourceParent.verify(), targetParent.verify()); err != nil {
+	if err := errors.Join(ctx.Err(), sourceParent.verify(), targetParent.verify()); err != nil {
 		return closeFile(err)
 	}
 	var sourceBeforeUnlink unix.Stat_t
@@ -712,6 +721,31 @@ func hashRegularDescriptor(ctx context.Context, file *os.File) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// authenticateRegularDescriptor binds one content read to a stable inode.
+// ctime is checked across hashing, before our own link/chmod operations can
+// change it. This detects rewrites reflected in ctime, including restored mtime.
+func authenticateRegularDescriptor(ctx context.Context, file *os.File, expectedSize int64, expectedSHA string) (rootedRegularIdentity, error) {
+	before, err := snapshotRegularDescriptorIdentity(file)
+	if err != nil {
+		return rootedRegularIdentity{}, err
+	}
+	if !before.valid(expectedSize) {
+		return rootedRegularIdentity{}, fmt.Errorf("%w: content source is not the expected regular file", ErrIntegrity)
+	}
+	digest, err := hashRegularDescriptor(ctx, file)
+	if err != nil {
+		return rootedRegularIdentity{}, err
+	}
+	after, err := snapshotRegularDescriptorIdentity(file)
+	if err != nil {
+		return rootedRegularIdentity{}, err
+	}
+	if digest != expectedSHA || !before.sameContentStat(after) || before.mode != after.mode {
+		return rootedRegularIdentity{}, fmt.Errorf("%w: regular content differs or changed while authenticating", ErrIntegrity)
+	}
+	return after, ctx.Err()
 }
 
 // linkRootedRegularDeferredTargetSync creates and authenticates one hardlink
@@ -906,8 +940,8 @@ func linkRootedRegular(ctx context.Context, sourceRoot, sourceRelative, targetRo
 		sourceRaw.Size != expectedSize || sourceEntry.Dev != sourceRaw.Dev || sourceEntry.Ino != sourceRaw.Ino || sourceEntry.Size != sourceRaw.Size || uint32(sourceEntry.Mode)&unix.S_IFMT != unix.S_IFREG {
 		return closeFile(errors.Join(errors.New("managed: rooted link source is not the expected regular file"), statErr, entryErr))
 	}
-	digest, hashErr := hashRegularDescriptor(ctx, file)
-	if hashErr != nil || digest != expectedSHA {
+	authenticated, hashErr := authenticateRegularDescriptor(ctx, file, expectedSize, expectedSHA)
+	if hashErr != nil {
 		return closeFile(errors.Join(errors.New("managed: rooted link source digest differs"), hashErr))
 	}
 	if err := errors.Join(file.Sync(), sourceParent.verify(), targetParent.verify()); err != nil {
@@ -926,11 +960,15 @@ func linkRootedRegular(ctx context.Context, sourceRoot, sourceRelative, targetRo
 		}
 		return closeFile(errors.Join(fmt.Errorf("%w: rooted hardlink target is not the source inode", ErrIntegrity), linkErr, targetErr, cleanupErr))
 	}
-	digest, hashErr = hashRegularDescriptor(ctx, file)
-	if hashErr != nil || digest != expectedSHA {
-		return closeFile(errors.Join(errors.New("managed: rooted link source changed during publication"), hashErr))
+	// Creating a hardlink changes ctime, not content. Keep the same inode,
+	// size, mtime and mode checks used by the authenticated promotion path.
+	afterInfo, infoErr := file.Stat()
+	var after unix.Stat_t
+	afterErr := unix.Fstat(fd, &after)
+	if infoErr != nil || afterErr != nil || !authenticated.matchesInfo(afterInfo, after) {
+		return closeFile(errors.Join(errors.New("managed: rooted link source changed during publication"), infoErr, afterErr))
 	}
-	return closeFile(errors.Join(file.Sync(), targetParent.directory().Sync(), sourceParent.verify(), targetParent.verify()))
+	return closeFile(errors.Join(ctx.Err(), file.Sync(), targetParent.directory().Sync(), sourceParent.verify(), targetParent.verify()))
 }
 
 func unlinkRootedEntryIfInode(parent *rootedDirectoryChain, name string, expected unix.Stat_t) error {

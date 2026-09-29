@@ -1,6 +1,7 @@
 package v2cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -13,6 +14,7 @@ func TestExitCodeTaxonomy(t *testing.T) {
 		want int
 	}{
 		{name: "success", want: ExitOK},
+		{name: "interrupted", err: context.Canceled, want: ExitInterrupted},
 		{name: "runtime", err: errors.New("disk read failed"), want: ExitRuntime},
 		{name: "parser usage", err: usageError("unknown option"), want: ExitUsage},
 		{name: "usage", err: fmt.Errorf("outer: %w", ErrUsage), want: ExitUsage},
@@ -60,7 +62,7 @@ func TestErrorfClassifiesWithoutLosingMessage(t *testing.T) {
 }
 
 func TestDocumentedExitCodeSet(t *testing.T) {
-	for _, code := range []int{ExitOK, ExitRuntime, ExitUsage, ExitPartial, ExitLock, ExitIntegrity, ExitRejected} {
+	for _, code := range []int{ExitOK, ExitRuntime, ExitUsage, ExitPartial, ExitLock, ExitIntegrity, ExitRejected, ExitInterrupted} {
 		if !validExitCode(code) {
 			t.Errorf("documented exit code %d rejected", code)
 		}

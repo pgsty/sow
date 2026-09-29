@@ -144,6 +144,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 		return result, errors.New("managed: nil context")
 	}
 	ctx, _ = workmetrics.Ensure(ctx)
+	ctx = withMetadataSignerCache(ctx)
 	if len(opts.Paths) == 0 {
 		return result, fmt.Errorf("%w: add requires at least one input path", ErrRejected)
 	}
@@ -196,6 +197,15 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	payloadData, _ := json.Marshal(payload)
 	defer func() {
 		resultErr = finalizePreApplyMutationOperation(ctx, ws.Root, repoName, id, store, resultErr, func() any {
+			// This callback only runs after the journal proves Desired was not applied.
+			for index := range result.Items {
+				item := &result.Items[index]
+				if item.Status == "accepted" || item.Status == "reused" {
+					item.Status, item.Error, item.Dists = "failed", "operation failed before Desired state was applied", nil
+					result.Failed++
+				}
+			}
+			result.Accepted, result.MembershipAdded, result.MembershipRemoved = 0, 0, 0
 			return map[string]any{
 				"accepted":            result.Accepted,
 				"failed":              result.Failed,
@@ -203,6 +213,9 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 				"memberships_removed": result.MembershipRemoved,
 			}
 		})
+		if ctx.Err() != nil {
+			retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
+		}
 	}()
 	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: "add", State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil {
 		return result, err
@@ -233,6 +246,16 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	byCoordinate := make(map[string]batchCoordinate)
 	itemObjects := make(map[int]state.PackageObject)
 	inspected := inspectInputs(ctx, inputsRoot, files, opts.Jobs)
+	candidatePaths := make([]string, 0, len(inspected))
+	for _, input := range inspected {
+		if input.Err == nil {
+			candidatePaths = append(candidatePaths, input.Object.PoolPath)
+		}
+	}
+	pathOwners, err := store.PackagePoolPathOwners(ctx, candidatePaths)
+	if err != nil {
+		return result, err
+	}
 	rpmPolicy := rpmSigningPolicy{mode: "never"}
 	needsRPMPolicy := false
 	for index := range files {
@@ -338,6 +361,12 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 						factSchema, factBlob = refreshedSchema, refreshedFacts
 					}
 				}
+				if err := pathOwners.Check(object); err != nil {
+					item.Error = err.Error()
+					result.Failed++
+					result.Items = append(result.Items, item)
+					continue
+				}
 				objectStage := filepath.Join(objectsRoot, object.SHA256)
 				if existingStage, duplicate := newObjectStage[object.SHA256]; duplicate {
 					_ = existingStage
@@ -352,6 +381,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 					newObjectFacts[object.SHA256] = state.PackageFact{PackageSHA256: object.SHA256, FactSchema: factSchema, Facts: append([]byte(nil), factBlob...)}
 					newObjectStage[object.SHA256] = objectStage
 				}
+				pathOwners.Add(object)
 				byCoordinate[coordinateKey] = batchCoordinate{inputSHA: inputSHA, payload: object.PayloadSHA256, object: object, new: true}
 			default:
 				item.Error = lookupErr.Error()
@@ -382,6 +412,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	}
 	existingByDist := packageObjectsByDist(existingObjects, distNames, false)
 	for _, distName := range distNames {
+		desired[distName] = []string{}
 		existing := existingByDist[distName]
 		candidates := append(append([]state.PackageObject(nil), existing...), accepted...)
 		policyResult, err := ApplyPolicy(candidates, effectiveDists[distName])
@@ -491,7 +522,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 		if needsRPMPolicy {
 			preparedPolicy = &rpmPolicy
 		}
-		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, payload.BuildDists, manifest, store, preparedPolicy, currentSnapshot)
+		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, payload.BuildDists, manifest, store, preparedPolicy, currentSnapshot, opts.Jobs)
 		if err != nil {
 			return result, err
 		}
@@ -518,6 +549,9 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	}
 	for _, object := range referencedNew {
 		if err := installPendingObject(ctx, ws.Root, repoName, newObjectStage[object.SHA256], object); err != nil {
+			return result, err
+		}
+		if err := rememberRPMBuildAuthorization(ws.Root, repoName, object, preflight); err != nil {
 			return result, err
 		}
 	}
@@ -610,6 +644,11 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 // or cleanliness. It is also safe before commit because it only snapshots the
 // currently committed projection.
 func retainCommittedProjection(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, generation *state.GenerationID, dirty *bool) {
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), operationFailureFinalizeTimeout)
+		defer cancel()
+	}
 	if summary, err := store.Summary(ctx); err == nil {
 		*generation = summary.BuiltGeneration
 		*dirty = summary.Status != "clean"
@@ -767,11 +806,17 @@ func desiredContains(desired map[string][]string, digest string) bool {
 }
 
 func installPendingObject(ctx context.Context, root, repoName, staged string, object state.PackageObject) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	pendingRelative := filepath.Join(".sow", repoName, "pending", object.SHA256)
 	pendingSource := ManagedPackageSource{Object: object, Owner: root, Relative: pendingRelative, Path: filepath.Join(root, pendingRelative)}
 	if opened, err := pendingSource.open(); err == nil {
 		digest, hashErr := hashOpenedFileContext(ctx, opened.file)
 		verifyErr := opened.CloseVerified()
+		if err := ctx.Err(); err != nil {
+			return errors.Join(err, verifyErr)
+		}
 		if hashErr != nil || verifyErr != nil || digest != object.SHA256 {
 			return fmt.Errorf("%w: pending object %s checksum mismatch", ErrIntegrity, object.SHA256)
 		}
@@ -787,25 +832,16 @@ func installPendingObject(ctx context.Context, root, repoName, staged string, ob
 	if err != nil {
 		return err
 	}
-	stagedSource := ManagedPackageSource{Object: object, Owner: root, Relative: stagedRelative, Path: staged}
-	opened, err := stagedSource.open()
-	if err != nil {
-		return fmt.Errorf("%w: staged object %s is missing or unsafe", ErrIntegrity, object.SHA256)
-	}
-	digest, hashErr := hashOpenedFileContext(ctx, opened.file)
-	verifyErr := opened.CloseVerified()
-	if hashErr != nil || verifyErr != nil || digest != object.SHA256 {
-		return fmt.Errorf("%w: staged object %s checksum mismatch", ErrIntegrity, object.SHA256)
-	}
 	// Pending lives below a private directory, so storing the immutable object
 	// in its final public mode does not expose it. It also avoids a second
 	// per-file chmod+fsync when a later build hardlinks it into Pool.
 	//
-	// renameRootedRegular fsyncs the payload before this pending name becomes
-	// durable. Payload promotion depends on that barrier to skip its own inode
+	// renameRootedRegular authenticates the held inode once, then fsyncs the
+	// payload before this pending name becomes durable. Payload promotion
+	// depends on that barrier to skip its own inode
 	// fsync; see managedPayloadFileMode.
 	if err := renameRootedRegular(ctx, root, stagedRelative, pendingRelative, object.Size, object.SHA256, managedPayloadFileMode, managedPendingDirectoryMode); err != nil {
-		return err
+		return fmt.Errorf("managed: staged object %s cannot be installed: %w", object.SHA256, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -846,19 +882,15 @@ func finalizePreApplyMutationOperation(parent context.Context, root, repoName, i
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), operationFailureFinalizeTimeout)
 	defer cancel()
-	detail, err := store.GetOperation(cleanupCtx, id)
+	operation, err := store.GetOperationSummary(cleanupCtx, id)
 	if errors.Is(err, state.ErrNotFound) {
 		return returned
 	}
 	if err != nil {
 		return errors.Join(returned, fmt.Errorf("managed: inspect failed operation journal: %w", err))
 	}
-	operation := detail.Operation
 	if operation.State != state.OperationPlanned && operation.State != state.OperationStaged {
 		return returned
-	}
-	if err := rollbackPreApplyMutationOperation(cleanupCtx, root, repoName, store, operation); err != nil {
-		return errors.Join(returned, fmt.Errorf("managed: retain recoverable pre-apply operation: %w", err))
 	}
 	resultJSON := `{}`
 	if result != nil {
@@ -870,28 +902,45 @@ func finalizePreApplyMutationOperation(parent context.Context, root, repoName, i
 	if err := store.FailOperation(cleanupCtx, id, class, message, resultJSON); err != nil {
 		return errors.Join(returned, fmt.Errorf("managed: persist pre-apply failure: %w", err))
 	}
+	// The terminal record is durable before deleting the only internal copy.
+	// Keep its manifest until every pending object has been cleaned, so an
+	// interrupted cleanup is retried from the directory on the next write.
+	if err := cleanupFailedMutation(cleanupCtx, root, repoName, store, operation); err != nil {
+		return errors.Join(returned, fmt.Errorf("managed: clean terminal failed operation: %w", err))
+	}
 	return returned
 }
 
-func rollbackPreApplyMutationOperation(ctx context.Context, root, repoName string, store *state.Store, operation state.Operation) error {
-	if operation.State == state.OperationStaged && operation.Kind == "add" {
+func cleanupFailedMutation(ctx context.Context, root, repoName string, store *state.Store, operation state.Operation) error {
+	if operation.Kind == "add" {
 		var payload mutationOperationPayload
-		if err := jsonUnmarshalStrict(operation.PayloadJSON, &payload); err != nil || payload.Repository != repoName || payload.Kind != "add" || !lowercaseSHA256.MatchString(payload.ManifestSHA256) {
-			return fmt.Errorf("%w: staged add payload is not rollback-safe", ErrIntegrity)
+		if err := jsonUnmarshalStrict(operation.PayloadJSON, &payload); err != nil || payload.Repository != repoName || payload.Kind != "add" {
+			return fmt.Errorf("%w: failed add payload is not cleanup-safe", ErrIntegrity)
 		}
-		manifest, err := readMutationManifest(root, repoName, operation.ID, payload.ManifestSHA256)
-		if err != nil {
-			return err
-		}
-		for _, object := range manifest.Objects {
-			if _, err := store.GetPackageObject(ctx, object.SHA256); errors.Is(err, state.ErrNotFound) {
-				if err := removePendingObject(root, repoName, object); err != nil {
+		if payload.ManifestSHA256 != "" {
+			manifest, err := readMutationManifest(root, repoName, operation.ID, payload.ManifestSHA256)
+			if err != nil {
+				// Once terminal, an absent manifest is the tail of stage removal:
+				// pending cleanup always completed before that removal started.
+				// Permission, I/O, parse and digest errors preserve the evidence.
+				if errors.Is(err, os.ErrNotExist) {
+					return cleanupMutationStage(root, repoName, operation.ID)
+				}
+				return err
+			}
+			for _, object := range manifest.Objects {
+				if err := ctx.Err(); err != nil {
 					return err
 				}
-			} else if err != nil {
-				return err
-			} else {
-				return fmt.Errorf("%w: staged add object was committed without an applied operation", ErrIntegrity)
+				if _, err := store.GetPackageObject(ctx, object.SHA256); errors.Is(err, state.ErrNotFound) {
+					if err := removePendingObject(root, repoName, object); err != nil {
+						return err
+					}
+				} else if err != nil {
+					return err
+				}
+				// A later command may have committed this digest after failure.
+				// Its present owner wins over the old cleanup journal.
 			}
 		}
 	}
@@ -936,12 +985,15 @@ func readMutationManifest(root, repoName, id, expectedSHA string) (mutationManif
 	stageOwner := filepath.Join(root, ".sow", repoName, "stage")
 	relative := filepath.Join(id, "manifest."+expectedSHA+".json")
 	data, err := readRootedPrivateRegular(stageOwner, relative, maxMutationManifestBytes, false)
-	if err != nil || bytesSHA(data) != expectedSHA {
-		return manifest, fmt.Errorf("%w: mutation manifest is missing or differs from journal", ErrIntegrity)
+	if err != nil {
+		return manifest, fmt.Errorf("%w: mutation manifest cannot be read: %w", ErrIntegrity, err)
+	}
+	if bytesSHA(data) != expectedSHA {
+		return manifest, fmt.Errorf("%w: mutation manifest differs from journal", ErrIntegrity)
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&manifest); err != nil || manifest.Version != mutationOperationVersion || len(manifest.Desired) == 0 {
+	if err := decoder.Decode(&manifest); err != nil || manifest.Version != mutationOperationVersion || manifest.Desired == nil {
 		return mutationManifest{}, fmt.Errorf("%w: invalid mutation manifest", ErrIntegrity)
 	}
 	var trailing any
@@ -995,7 +1047,7 @@ func readMutationManifest(root, repoName, id, expectedSHA string) (mutationManif
 	seenOutcomes := make(map[string]struct{}, len(manifest.Outcomes))
 	for _, outcome := range manifest.Outcomes {
 		desired, exists := desiredSets[outcome.DistName]
-		if !exists || !lowercaseSHA256.MatchString(outcome.PackageSHA256) || (outcome.Action != "keep" && outcome.Action != "exclude" && outcome.Action != "limit") {
+		if !lowercaseSHA256.MatchString(outcome.PackageSHA256) || config.ValidateName(outcome.DistName) != nil || (!exists && outcome.Action == "keep") || (outcome.Action != "keep" && outcome.Action != "exclude" && outcome.Action != "limit") {
 			return mutationManifest{}, fmt.Errorf("%w: invalid mutation policy outcome", ErrIntegrity)
 		}
 		identity := outcome.DistName + "\x00" + outcome.PackageSHA256
@@ -1009,6 +1061,68 @@ func readMutationManifest(root, repoName, id, expectedSHA string) (mutationManif
 		}
 	}
 	return manifest, nil
+}
+
+// normalizeLegacyMutationDesired restores only empty entries omitted by old
+// add journals. The original bytes/hash remain authoritative and unchanged.
+func normalizeLegacyMutationDesired(ctx context.Context, store *state.Store, operation state.Operation, payload mutationOperationPayload, manifest *mutationManifest) error {
+	for _, outcome := range manifest.Outcomes {
+		if !stringSetSubset([]string{outcome.DistName}, payload.Dists) {
+			return fmt.Errorf("%w: mutation policy outcome is outside its Dist scope", ErrIntegrity)
+		}
+	}
+	if sameStringSet(payload.Dists, mapsKeys(manifest.Desired)) {
+		return nil
+	}
+	if operation.Kind != "add" || !stringSetSubset(mapsKeys(manifest.Desired), payload.Dists) {
+		return fmt.Errorf("%w: mutation manifest Dist set differs from journal", ErrIntegrity)
+	}
+	detail, err := store.GetOperation(ctx, operation.ID)
+	if err != nil {
+		return err
+	}
+	if !mutationHasAppliedEvent(detail.Events) {
+		return fmt.Errorf("%w: legacy empty Dist journal was not applied", ErrIntegrity)
+	}
+	for _, dist := range payload.Dists {
+		if _, exists := manifest.Desired[dist]; exists {
+			continue
+		}
+		actual, err := store.MembershipDigests(ctx, dist, false)
+		if err != nil {
+			return err
+		}
+		if len(actual) != 0 {
+			return fmt.Errorf("%w: omitted Desired Dist %s is not empty", ErrIntegrity, dist)
+		}
+		manifest.Desired[dist] = []string{}
+	}
+	return nil
+}
+
+func mutationHasAppliedEvent(events []state.OperationEvent) bool {
+	for _, event := range events {
+		switch state.OperationState(event.State) {
+		case state.OperationApplied, state.OperationBuilt, state.OperationDone, state.OperationDoneDirty:
+			return true
+		}
+	}
+	return false
+}
+
+func mutationObjectCopiesMissing(root, repoName, operationID string, object state.PackageObject) (bool, error) {
+	for _, path := range []string{
+		filepath.Join(root, ".sow", repoName, "pending", object.SHA256),
+		filepath.Join(mutationStageRoot(root, repoName, operationID), "objects", object.SHA256),
+		filepath.Join(root, repoName, filepath.FromSlash(object.PoolPath)),
+	} {
+		if _, err := os.Lstat(path); err == nil {
+			return false, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func recoverMutationOperation(ctx context.Context, root, repoName string, store *state.Store, operation state.Operation) error {
@@ -1030,7 +1144,39 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 			return err
 		}
 	}
-	_, payload, manifest, err := loadMutationOperation(ctx, store, root, repoName, operation.ID)
+	// Read the bound manifest before the usual loader: v0.4.0 could omit
+	// empty Desired entries, or delete a pending copy before persisting failed.
+	detail, err := store.GetOperation(ctx, operation.ID)
+	if err != nil {
+		return err
+	}
+	applied := mutationHasAppliedEvent(detail.Events)
+	manifest, err := readMutationManifest(root, repoName, operation.ID, payload.ManifestSHA256)
+	if err != nil {
+		if operation.Kind == "add" && !applied && errors.Is(err, os.ErrNotExist) {
+			// Old cleanup could remove the entire stage before recording failure.
+			// The atomic event history proves there is no committed Desired data
+			// to reconstruct; an absent manifest is not an excuse to ignore any
+			// other read, parse, digest or permission failure.
+			return finishUnbuiltMutation(ctx, root, repoName, store, operation, mutationManifest{}, "uncommitted legacy add has no stage manifest; rerun add from the original input")
+		}
+		return err
+	}
+	if !applied && manifest.Build == nil {
+		if operation.Kind == "add" && stringSetSubset(mapsKeys(manifest.Desired), payload.Dists) && !sameStringSet(payload.Dists, mapsKeys(manifest.Desired)) {
+			return finishUnbuiltMutation(ctx, root, repoName, store, operation, manifest, "legacy add omitted an empty Dist before Desired was applied; rerun add")
+		}
+		for _, object := range manifest.Objects {
+			missing, err := mutationObjectCopiesMissing(root, repoName, operation.ID, object)
+			if err != nil {
+				return err
+			}
+			if missing {
+				return finishUnbuiltMutation(ctx, root, repoName, store, operation, manifest, "uncommitted add has no internal byte copy; rerun add from the original input")
+			}
+		}
+	}
+	_, payload, manifest, err = loadMutationJournal(ctx, store, root, repoName, operation.ID)
 	if err != nil {
 		return err
 	}
@@ -1048,6 +1194,27 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 		if !sameStringSet(buildDistNames, payload.BuildDists) {
 			return fmt.Errorf("%w: mutation build Dist set differs from operation", ErrIntegrity)
 		}
+	}
+	configSHA, configErr := config.FileSHA(filepath.Join(root, config.ConfigFilename))
+	if configErr != nil {
+		return configErr
+	}
+	if configSHA != payload.ConfigSHA256 {
+		detail, err := store.GetOperation(ctx, operation.ID)
+		if err != nil {
+			return err
+		}
+		renderingStarted := false
+		for _, event := range detail.Events {
+			var progress struct{ Kind, Phase string }
+			if json.Unmarshal([]byte(event.DetailJSON), &progress) == nil && progress.Kind == "build_progress" && progress.Phase == "rendering" {
+				renderingStarted = true
+			}
+		}
+		if manifest.Build != nil || payload.Skip || !renderingStarted {
+			return fmt.Errorf("%w: current config differs from active mutation", ErrIntegrity)
+		}
+		return finishUnbuiltMutation(ctx, root, repoName, store, operation, manifest, "configuration changed before a build plan was frozen; Desired changes preserved if already applied")
 	}
 	for _, object := range manifest.Objects {
 		if err := ensureMutationObjectAvailable(ctx, root, repoName, operation.ID, object); err != nil {
@@ -1069,6 +1236,15 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 			return requiredErr
 		}
 		if !sameStringSet(requiredBuildDists, payload.BuildDists) {
+			if manifest.Build == nil {
+				previous, previousErr := distsNeedingRecoveredBuildPrevious(ctx, root, repoName, cfg, store, manifest)
+				if previousErr != nil {
+					return previousErr
+				}
+				if sameStringSet(previous, payload.BuildDists) {
+					return finishUnbuiltMutation(ctx, root, repoName, store, operation, manifest, "metadata authentication contract changed before a build was frozen; rerun build")
+				}
+			}
 			return fmt.Errorf("%w: recovered physical build scope differs from the staged journal", ErrIntegrity)
 		}
 		noop = len(requiredBuildDists) == 0
@@ -1076,7 +1252,10 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 			return fmt.Errorf("%w: mutation journal marks a required physical build as no-op", ErrIntegrity)
 		}
 		if !noop && manifest.Build == nil {
-			preflight, err = prepareMutationBuildPreflight(ctx, root, repoName, cfg, payload.BuildDists, manifest, store, nil, nil)
+			preflight, err = prepareMutationBuildPreflight(ctx, root, repoName, cfg, payload.BuildDists, manifest, store, nil, nil, payload.Jobs)
+			if errors.Is(err, errImmutableRPMSigningPolicy) || errors.Is(err, errMetadataSigningPolicy) {
+				return finishUnbuiltMutation(ctx, root, repoName, store, operation, manifest, "signing policy rejected the operation before public build; Desired changes preserved if already applied")
+			}
 			if err != nil {
 				return err
 			}
@@ -1087,6 +1266,9 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 		return err
 	}
 	mutation, err := store.ApplyDesiredMutationWithSigningKeys(ctx, operation.ID, manifest.Objects, manifest.RPMSigningKeys, manifest.Desired, string(resultJSON))
+	if errors.Is(err, state.ErrPoolPathConflict) && manifest.Build == nil {
+		return finishUnbuiltMutation(ctx, root, repoName, store, operation, manifest, "immutable pool path conflict before Desired state was applied")
+	}
 	if err != nil {
 		return err
 	}

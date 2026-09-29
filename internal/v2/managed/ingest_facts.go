@@ -134,7 +134,6 @@ func collectInputFiles(ctx context.Context, inputs []string, recursive bool) ([]
 			failures = append(failures, MutationItem{Input: display, Status: "failed", Error: err.Error()})
 			return false
 		}
-		absolute = filepath.Clean(absolute)
 		if _, duplicate := seen[absolute]; duplicate {
 			return false
 		}
@@ -153,6 +152,11 @@ func collectInputFiles(ctx context.Context, inputs []string, recursive bool) ([]
 	}
 	for _, input := range inputs {
 		absolute, err := filepath.Abs(input)
+		if err != nil {
+			failures = append(failures, MutationItem{Input: input, Status: "failed", Error: err.Error()})
+			continue
+		}
+		absolute, err = canonicalExternalInput(absolute)
 		if err != nil {
 			failures = append(failures, MutationItem{Input: input, Status: "failed", Error: err.Error()})
 			continue
@@ -407,4 +411,22 @@ func (reader *managedContextReader) Read(buffer []byte) (int, error) {
 		return 0, err
 	}
 	return reader.reader.Read(buffer)
+}
+
+// External input ancestors may be symlinks (for example /tmp on macOS).
+// Resolve only the parent; the leaf remains subject to no-follow checks.
+func canonicalExternalInput(filename string) (string, error) {
+	parent, err := filepath.EvalSymlinks(filepath.Dir(filename))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(filename)), nil
+}
+
+func privateTemporaryDirectory(prefix string) (string, error) {
+	base, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		return "", err
+	}
+	return os.MkdirTemp(base, prefix)
 }

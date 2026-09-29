@@ -31,13 +31,17 @@ func GenerateFlatUnsigned(ctx context.Context, dest string, revision uint64, pac
 	})
 }
 
+// MaxMetadataTimestamp bounds explicit Unix seconds to 9999-12-31T23:59:59Z.
+// It also catches contemporary millisecond/microsecond inputs without a clock.
+const MaxMetadataTimestamp int64 = 253402300799
+
 // GenerateFlatUnsignedParsedAt renders RPM metadata from packages returned by
 // InspectFlatPackage. It performs no package I/O; results are consumed in the
 // provided basename order and validated exactly like GenerateFlatUnsigned.
 // Timestamp is a nonnegative Unix second chosen by the publisher; no clock is read.
 func GenerateFlatUnsignedParsedAt(ctx context.Context, dest string, revision uint64, timestamp int64, packages []*FlatPackage) (*Generation, error) {
-	if timestamp < 0 {
-		return nil, errors.New("yumrepo: metadata timestamp must not be negative")
+	if timestamp < 0 || timestamp > MaxMetadataTimestamp {
+		return nil, fmt.Errorf("yumrepo: metadata timestamp must be Unix seconds in 0..%d", MaxMetadataTimestamp)
 	}
 	if ctx == nil {
 		return nil, errors.New("yumrepo: nil context")

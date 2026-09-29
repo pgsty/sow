@@ -117,7 +117,7 @@ func TestV5MigrationFreezesExactRPMSigningCertificateSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	store, err := OpenExistingForMigration(path)
+	store, err := OpenExistingForMigration(path, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestV5MigrationAcceptsUnsignedSnapshotsAndRejectsMissingActiveCertificateAt
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			store, err := OpenExistingForMigration(path)
+			store, err := OpenExistingForMigration(path, false)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -183,7 +183,7 @@ func TestV5MigrationAcceptsUnsignedSnapshotsAndRejectsMissingActiveCertificateAt
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenExistingForMigration(path); err == nil {
+	if _, err := OpenExistingForMigration(path, false); err == nil {
 		t.Fatal("v5 active signing policy without retained certificate migrated")
 	}
 	raw, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro")

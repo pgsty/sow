@@ -123,8 +123,12 @@ func logHuman(result managed.LogResult) string {
 }
 
 func logPruneHuman(result managed.LogPruneResult) string {
-	return fmt.Sprintf("pruned log repository=%s operation=%s before=%s operations=%d\n",
+	output := fmt.Sprintf("pruned log repository=%s operation=%s before=%s operations=%d\n",
 		result.Repository, result.Operation, result.Before.UTC().Format("2006-01-02T15:04:05.000000000Z"), result.Pruned)
+	if result.CompactionDeferred {
+		output += "log deletion committed; space reclamation deferred while the database is busy\n"
+	}
+	return output
 }
 
 func packagesHuman(result managed.PackageListResult) string {

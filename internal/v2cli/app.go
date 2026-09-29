@@ -56,13 +56,16 @@ func MainContext(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	output, err := executeManaged(ctx, inv)
 	command := invocationCommand(inv)
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			err = errors.Join(context.Canceled, err)
+		}
 		classified := classifyManagedError(command, err)
-		if command == "init" {
+		if command == "init" && ExitCode(classified) != ExitInterrupted {
 			if result, ok := output.result.(managed.InitResult); ok && result.HasCommittedChanges() {
 				classified = WithExitCode(ExitPartial, classified)
 			}
 		}
-		showHumanResult := ExitCode(classified) == ExitPartial || command == "check" || command == "rm" && inv.Check
+		showHumanResult := ExitCode(classified) == ExitPartial || command == "add" || command == "check" || command == "rm" && inv.Check
 		if command == "rm" {
 			if result, ok := output.result.(managed.RemoveResult); ok && result.Revision != 0 {
 				// A non-zero Desired revision proves the mutation transaction
@@ -263,7 +266,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo,
 			Dists: inv.Global.Dists, Paths: inv.Positionals, Recursive: inv.Recursive, Skip: inv.Skip, Jobs: inv.Jobs,
 		})
-		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, preserveFailureResult: result.Operation != "", human: mutationHuman("add", result)}, err
+		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, preserveFailureResult: result.Revision != 0 || result.Failed != 0 || len(result.Items) != 0, human: mutationHuman("add", result)}, err
 
 	case "rm":
 		result, err := managed.Remove(ctx, managed.RemoveOptions{
@@ -488,6 +491,8 @@ func classifyManagedError(_ string, err error) error {
 	}
 	var partial *managed.PartialError
 	switch {
+	case errors.Is(err, context.Canceled):
+		return WithExitCode(ExitInterrupted, err)
 	case errors.As(err, &partial):
 		return WithExitCode(ExitPartial, err)
 	case errors.Is(err, ErrUsage), errors.Is(err, ErrDiscovery), errors.Is(err, ErrConfig):
@@ -616,7 +621,7 @@ func failureInvocationContext(args []string) (string, bool) {
 	}
 	command := remaining[0]
 	switch command {
-	case "create", "init", "help", "version", "add", "rm", "ls", "show", "where", "status", "build", "check", "changes", "gc":
+	case "create", "init", "help", "version", "add", "rm", "ls", "show", "where", "status", "build", "check", "changes", "gc", "publish":
 		return command, jsonOutput
 	case "export":
 		if len(remaining) > 1 && remaining[1] == "rpm-leaf" {

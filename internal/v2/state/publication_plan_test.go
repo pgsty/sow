@@ -138,3 +138,16 @@ func TestBuildPublicationPlanDeletionCandidateCarriesExactBaseEvidence(t *testin
 		t.Fatalf("deletion evidence=%#v", plan.DeleteCandidates)
 	}
 }
+
+func TestPublicationPlanRejectsPayloadOverwriteButReconcilesLegacyIdentity(t *testing.T) {
+	base := []GenerationFile{{Path: "pool/p/pkg/pkg.rpm", Phase: "payload", Size: 1, SHA256: strings.Repeat("a", 64)}}
+	target := []GenerationFile{{Path: base[0].Path, Phase: "payload", Size: 2, SHA256: strings.Repeat("b", 64)}}
+	input := PublicationPlanInput{RepositoryID: "12345678-1234-4123-8123-123456789abc", TargetIdentity: strings.Repeat("c", 64), BaseCheckpoint: strings.Repeat("d", 64), TargetGeneration: 2, BaseManifest: base, TargetManifest: target, Changes: DiffManifests(base, target)}
+	if _, err := BuildPublicationPlan(input); err == nil {
+		t.Fatal("new payload overwrite accepted")
+	}
+	legacy, err := ReconcileLegacyPublicationPlan(input)
+	if err != nil || len(legacy.Payload) != 1 || legacy.Payload[0].ExpectedOldSHA256 != base[0].SHA256 {
+		t.Fatalf("legacy=%+v err=%v", legacy, err)
+	}
+}

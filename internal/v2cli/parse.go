@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/pgsty/sow/internal/yumrepo"
 )
 
 // GlobalOptions are syntactically global but are accepted only when the
@@ -199,6 +201,9 @@ func Parse(args []string) (Invocation, error) {
 		remaining = remaining[1:]
 	} else if inv.Command == "export" {
 		if len(remaining) == 0 {
+			if help {
+				return inv, validateGlobalUse("export help", global, 0)
+			}
 			return Invocation{}, usageError("export subcommand is required")
 		}
 		inv.Subcommand = remaining[0]
@@ -386,8 +391,8 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 			}
 			i = next
 			n, err := strconv.ParseUint(value, 10, 63)
-			if err != nil {
-				return nil, usageError("--metadata-timestamp must be a nonnegative Unix second (0..9223372036854775807)")
+			if err != nil || n > uint64(yumrepo.MaxMetadataTimestamp) {
+				return nil, usageError("--metadata-timestamp must be Unix seconds in 0..%d", yumrepo.MaxMetadataTimestamp)
 			}
 			inv.MetadataTimestamp, metadataTimestampSet = int64(n), true
 		case "--pigsty":

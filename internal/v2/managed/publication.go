@@ -175,11 +175,19 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 		}
 	}
 	changes := state.DiffManifests(baseManifest, targetManifest)
-	plan, err := state.BuildPublicationPlan(state.PublicationPlanInput{
+	planInput := state.PublicationPlanInput{
 		RepositoryID: identity.RepositoryID, TargetIdentity: binding.TargetIdentity,
 		BaseCheckpoint: targetSnapshot.Head.CheckpointIdentity, TargetGeneration: targetGeneration,
 		BaseManifest: baseManifest, TargetManifest: targetManifest, Changes: changes,
-	})
+	}
+	plan, err := state.BuildPublicationPlan(planInput)
+	if errors.Is(err, state.ErrPoolPathConflict) && activeErr == nil {
+		// A prior binary may already have installed different bytes before
+		// recording commit intent. Reconstruct its bound plan to finish only
+		// if the remote already has the exact payload; backends never replace
+		// immutable payloads, and the attempt identity is checked below.
+		plan, err = state.ReconcileLegacyPublicationPlan(planInput)
+	}
 	if err != nil {
 		return result, fmt.Errorf("%w: build target publication plan: %v", ErrIntegrity, err)
 	}
@@ -200,6 +208,19 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 		if err := requireExactRemoteInventory(remoteBefore, baseInventory); err != nil {
 			return result, err
 		}
+		// Include retained payloads and known abandoned uploads, not only the
+		// current checkpoint manifest. Reject before creating an attempt.
+		occupied := make(map[string]state.PublicationInventoryObject, len(baseInventory))
+		for _, object := range baseInventory {
+			if object.Phase == "payload" {
+				occupied[object.Path] = object
+			}
+		}
+		for _, operation := range plan.Payload {
+			if prior, ok := occupied[operation.Path]; ok && (prior.SHA256 != operation.SHA256 || prior.Size != operation.Size) {
+				return result, fmt.Errorf("%w: %w: published payload path %q already contains different bytes", ErrRejected, state.ErrPoolPathConflict, operation.Path)
+			}
+		}
 		if len(changes) == 0 {
 			result.Checkpoint, result.Phase, result.Objects, result.Noop = targetSnapshot.Head.CheckpointIdentity, "applied", len(remoteBefore), true
 			return result, nil
@@ -215,6 +236,9 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 	}
 	attemptViews := publicationAttemptViews(plan, baseInventory)
 	if activeErr != nil {
+		if err := validateNewAPTPublicationMetadata(ctx, filepath.Join(ws.Root, repoName), store); err != nil {
+			return result, err
+		}
 		active = state.PublicationAttempt{
 			RepositoryID: identity.RepositoryID, TargetIdentity: binding.TargetIdentity,
 			BaseCheckpoint: plan.BaseCheckpoint, TargetGeneration: targetGeneration,
@@ -435,7 +459,7 @@ func AbandonPublication(ctx context.Context, opts PublicationAbandonOptions) (re
 			return result, err
 		}
 	}
-	plan, err := state.BuildPublicationPlan(state.PublicationPlanInput{
+	plan, err := state.ReconcileLegacyPublicationPlan(state.PublicationPlanInput{
 		RepositoryID: identity.RepositoryID, TargetIdentity: binding.TargetIdentity,
 		BaseCheckpoint: active.BaseCheckpoint, TargetGeneration: active.TargetGeneration,
 		BaseManifest: baseManifest, TargetManifest: targetManifest,
@@ -456,6 +480,11 @@ func AbandonPublication(ctx context.Context, opts PublicationAbandonOptions) (re
 	if err != nil {
 		return result, err
 	}
+	orphans, err := store.ListPublicationAbandonedObjects(ctx, binding.TargetIdentity)
+	if err != nil {
+		return result, err
+	}
+	baseInventory = recognizeRecoverablePublicationAbandonedObjects(remote, baseInventory, orphans)
 	objects, err := reconcileAbandonedPublicationInventory(remote, baseInventory, preCommit)
 	if err != nil {
 		return result, err

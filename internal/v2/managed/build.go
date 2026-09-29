@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/pgsty/sow/internal/v2/config"
@@ -40,14 +39,15 @@ func marshalMutationBaseManifestLimit(manifest []state.GenerationFile, limit int
 }
 
 type mutationBuildPreflight struct {
-	distNames        []string
-	generation       state.GenerationID
-	publicationTime  time.Time
-	baseManifest     []state.GenerationFile
-	baseSnapshot     *publicGenerationSnapshot
-	metadataSnapshot metadataSignerSnapshot
-	rpmPolicy        rpmSigningPolicy
-	projectedDists   []mutationBuildDist
+	distNames         []string
+	generation        state.GenerationID
+	publicationTime   time.Time
+	baseManifest      []state.GenerationFile
+	baseSnapshot      *publicGenerationSnapshot
+	metadataSnapshot  metadataSignerSnapshot
+	rpmPolicy         rpmSigningPolicy
+	projectedDists    []mutationBuildDist
+	rpmAuthorizations map[string]rootedRegularIdentity
 }
 
 // prepareMutationBuildPreflight freezes every signer identity used by the
@@ -55,7 +55,7 @@ type mutationBuildPreflight struct {
 // recovery artifacts fit the same bounds enforced by their readers. Pooled is
 // conservatively projected as every Desired digest; the real build can only be
 // smaller because already-public objects are omitted.
-func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, manifest mutationManifest, store *state.Store, preparedRPMPolicy *rpmSigningPolicy, current *publicGenerationSnapshot) (*mutationBuildPreflight, error) {
+func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, manifest mutationManifest, store *state.Store, preparedRPMPolicy *rpmSigningPolicy, current *publicGenerationSnapshot, workerCounts ...int) (*mutationBuildPreflight, error) {
 	if len(distNames) == 0 {
 		return nil, nil
 	}
@@ -92,6 +92,9 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 	if err != nil {
 		return nil, err
 	}
+	if err := validateNewMetadataSigningKeys(metadataSnapshot, publicationTime, time.Now().UTC()); err != nil {
+		return nil, err
+	}
 	rpmPolicy := rpmSigningPolicy{mode: "never"}
 	if formats.rpm {
 		if preparedRPMPolicy != nil {
@@ -104,7 +107,7 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 		}
 	}
 	if len(manifest.RPMSigningKeys) != 0 && !sameRetainedRPMSigningKeys(manifest.RPMSigningKeys, rpmPolicy.retainedKeys) {
-		return nil, fmt.Errorf("%w: RPM package signing certificates changed after package preparation", ErrIntegrity)
+		return nil, fmt.Errorf("%w: %w: RPM package signing certificates changed after package preparation", ErrRejected, errImmutableRPMSigningPolicy)
 	}
 	projectedDists := make([]mutationBuildDist, 0, len(distNames))
 	for _, distName := range distNames {
@@ -132,6 +135,14 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 		})
 	}
 	sort.Slice(projectedDists, func(i, j int) bool { return projectedDists[i].Name < projectedDists[j].Name })
+	jobs := 1
+	if len(workerCounts) != 0 {
+		jobs = workerCounts[0]
+	}
+	authorizations, err := prepareRPMBuildAuthorizations(ctx, root, repoName, cfg, distNames, manifest, store, rpmPolicy, projectedDists, current, preparedRPMPolicy != nil, jobs)
+	if err != nil {
+		return nil, err
+	}
 	pooledSet := map[string]struct{}{}
 	for _, digests := range manifest.Desired {
 		for _, digest := range digests {
@@ -158,7 +169,7 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 	return &mutationBuildPreflight{
 		distNames: append([]string(nil), distNames...), generation: generation, publicationTime: publicationTime,
 		baseManifest: append([]state.GenerationFile(nil), baseManifest...), baseSnapshot: baseSnapshot, metadataSnapshot: metadataSnapshot,
-		rpmPolicy: rpmPolicy, projectedDists: projectedDists,
+		rpmPolicy: rpmPolicy, projectedDists: projectedDists, rpmAuthorizations: authorizations,
 	}, nil
 }
 
@@ -483,7 +494,11 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 		rpmObjects = append(rpmObjects, object)
 	}
 	sort.Slice(rpmObjects, func(i, j int) bool { return rpmObjects[i].SHA256 < rpmObjects[j].SHA256 })
-	if err := validateBuildRPMSigning(ctx, root, repoName, rpmObjects, rpmPolicy, jobs); err != nil {
+	var priorAuthorizations map[string]rootedRegularIdentity
+	if preflight != nil {
+		priorAuthorizations = preflight.rpmAuthorizations
+	}
+	if _, err := authorizeBuildRPMObjects(ctx, root, repoName, rpmObjects, rpmPolicy, jobs, priorAuthorizations); err != nil {
 		return nil, nil, nil, err
 	}
 	retainedRPMKeys = append(retainedRPMKeys, rpmPolicy.retainedKeys...)
@@ -630,63 +645,7 @@ func recordBuildMetrics(ctx context.Context, store *state.Store, operationID str
 	return store.RecordOperationProgress(ctx, operationID, string(detail))
 }
 
-// validateBuildRPMSigning enforces the active package-signing policy only for
-// RPM objects reachable from the selected target Dists. RenderManagedDist
-// independently authenticates every source digest against immutable state;
-// DEB rendering also compares package facts. Keeping this pass signing-only
-// avoids two redundant full-repository parses before every selective build.
-func validateBuildRPMSigning(ctx context.Context, root, repoName string, objects []state.PackageObject, rpmPolicy rpmSigningPolicy, jobs int) error {
-	if jobs < 1 {
-		jobs = 1
-	}
-	if jobs > len(objects) {
-		jobs = len(objects)
-	}
-	issues := make([]error, len(objects))
-	if jobs > 0 {
-		indices := make(chan int)
-		var group sync.WaitGroup
-		group.Add(jobs)
-		for range jobs {
-			go func() {
-				defer group.Done()
-				for index := range indices {
-					object := objects[index]
-					source, err := availableManagedPackageSource(root, repoName, object)
-					if err != nil {
-						issues[index] = err
-						continue
-					}
-					opened, err := source.open()
-					if err != nil {
-						issues[index] = err
-						continue
-					}
-					if object.Format != "rpm" {
-						issues[index] = errors.Join(fmt.Errorf("%w: non-RPM object reached RPM signing validation", ErrIntegrity), opened.CloseVerified())
-						continue
-					}
-					if err := rpmPolicy.authorizeDesiredReader(ctx, opened.file); err != nil {
-						issues[index] = errors.Join(fmt.Errorf("%w: immutable RPM %s does not satisfy package signing mode %s: %v", ErrRejected, object.SHA256, rpmPolicy.mode, err), opened.CloseVerified())
-						continue
-					}
-					issues[index] = opened.CloseVerified()
-				}
-			}()
-		}
-		for index := range objects {
-			indices <- index
-		}
-		close(indices)
-		group.Wait()
-	}
-	for _, issue := range issues {
-		if issue != nil {
-			return issue
-		}
-	}
-	return ctx.Err()
-}
+var errImmutableRPMSigningPolicy = errors.New("existing RPM does not satisfy signing policy")
 
 // retainPriorRPMMetadata keeps checksum-named metadata artifacts from the
 // previous view reachable after the pointer exchange. A client that fetched
@@ -921,6 +880,18 @@ func readMutationBaseManifest(root, repoName, id, expectedSHA string) ([]state.G
 }
 
 func loadMutationOperation(ctx context.Context, store *state.Store, root, repoName, operationID string) (state.Operation, mutationOperationPayload, mutationManifest, error) {
+	operation, payload, manifest, err := loadMutationJournal(ctx, store, root, repoName, operationID)
+	if err != nil {
+		return operation, payload, manifest, err
+	}
+	configSHA, err := config.FileSHA(filepath.Join(root, config.ConfigFilename))
+	if err != nil || configSHA != payload.ConfigSHA256 {
+		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, fmt.Errorf("%w: current config differs from active mutation", ErrIntegrity)
+	}
+	return operation, payload, manifest, nil
+}
+
+func loadMutationJournal(ctx context.Context, store *state.Store, root, repoName, operationID string) (state.Operation, mutationOperationPayload, mutationManifest, error) {
 	operation, err := store.LastOperation(ctx)
 	if err != nil || operation == nil || operation.ID != operationID {
 		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, fmt.Errorf("%w: active mutation operation is not the latest journal entry", ErrIntegrity)
@@ -935,12 +906,11 @@ func loadMutationOperation(ctx context.Context, store *state.Store, root, repoNa
 	if err := validateMutationBuildDists(payload); err != nil {
 		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, err
 	}
-	configSHA, err := config.FileSHA(filepath.Join(root, config.ConfigFilename))
-	if err != nil || configSHA != payload.ConfigSHA256 {
-		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, fmt.Errorf("%w: current config differs from active mutation", ErrIntegrity)
-	}
 	manifest, err := readMutationManifest(root, repoName, operationID, payload.ManifestSHA256)
 	if err != nil {
+		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, err
+	}
+	if err := normalizeLegacyMutationDesired(ctx, store, *operation, payload, &manifest); err != nil {
 		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, err
 	}
 	return *operation, payload, manifest, nil

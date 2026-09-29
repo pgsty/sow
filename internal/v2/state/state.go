@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +24,7 @@ import (
 )
 
 const (
-	SchemaVersion            = 12
+	SchemaVersion            = 13
 	SchemaV1SHA256           = "9953cdc1f655fb03814da8b4c7a45a4a92a74e03facf03c2a45709cc860b9bc7"
 	SchemaV2SHA256           = "aea5b37365510221ab36c4f0fc9e6bc77ba825354649e1e06336b64551c14e25"
 	SchemaV3SHA256           = "9ae957e0e8d9eac21eda3929386f11d001608df5ee7feb75c44194f624f0a177"
@@ -36,6 +37,7 @@ const (
 	SchemaV10SHA256          = "9a6a64d7276ca7eb3a7579ddb55e1e9e6073baf235e0e1d1a909684783cb38dd"
 	SchemaV11SHA256          = "bda9cef7bc98d7893529724d3eb6bb87aab51c54a7b3ca5d60cf07c6e7da115c"
 	SchemaV12SHA256          = "e842671281c454d960e1ac8b4adbd26129bc46ba15369286e7a0ff2dafcb8f81"
+	SchemaV13SHA256          = "117242b1242af0e4357e4475ced89c015e82c60f2c7c37ce6e8b4993d39ea4ff"
 	MaxOperationPayloadBytes = 16 << 20
 )
 
@@ -75,12 +77,16 @@ var schemaV11SQL string
 //go:embed schema_v12.sql
 var schemaV12SQL string
 
+//go:embed schema_v13.sql
+var schemaV13SQL string
+
 var (
-	ErrSchema     = errors.New("unsupported or corrupt repository schema")
-	ErrNotFound   = errors.New("state object not found")
-	ErrExists     = errors.New("state object already exists")
-	ErrConflict   = errors.New("state object conflicts with existing identity")
-	ErrTransition = errors.New("invalid operation transition")
+	ErrSchema       = errors.New("unsupported or corrupt repository schema")
+	ErrNotFound     = errors.New("state object not found")
+	ErrExists       = errors.New("state object already exists")
+	ErrConflict     = errors.New("state object conflicts with existing identity")
+	ErrTransition   = errors.New("invalid operation transition")
+	ErrLegacyLayout = errors.New("legacy C2 layout cannot start a new migration; create a new workspace and import the original packages")
 
 	schemaV1ContractOnce     sync.Once
 	schemaV1ContractObjects  []schemaObject
@@ -118,6 +124,9 @@ var (
 	schemaV12ContractOnce    sync.Once
 	schemaV12ContractObjects []schemaObject
 	schemaV12ContractErr     error
+	schemaV13ContractOnce    sync.Once
+	schemaV13ContractObjects []schemaObject
+	schemaV13ContractErr     error
 )
 
 // Legacy lowercase hexadecimal IDs remain readable so interrupted development
@@ -248,17 +257,31 @@ func OpenExisting(path string) (*Store, error) {
 // OpenExistingForMigration is the only existing-file writer authorized to
 // advance a known predecessor schema. Ordinary mutations use OpenExisting and
 // therefore cannot silently cross the explicit Repository migration boundary.
-func OpenExistingForMigration(path string) (*Store, error) {
+// requireExistingLayout rejects untouched development-era C2 repositories before
+// any schema write; terminal layouts and already-started transitions can upgrade.
+// Internal schema migration tests can still exercise older contracts with false.
+func OpenExistingForMigration(path string, requireExistingLayout bool) (*Store, error) {
 	absolute, err := cleanDatabasePath(path, true)
 	if err != nil {
 		return nil, err
 	}
-	probe, err := openDatabaseMode(absolute, "ro", false, false)
+	probe, err := openDatabaseMode(absolute, "ro", false, requireExistingLayout)
 	if err != nil {
 		return nil, err
 	}
 	probeStore := &Store{path: absolute, db: probe}
 	probeErr := probeStore.validateUpgradeableSchema(context.Background())
+	if probeErr == nil && requireExistingLayout {
+		if probeStore.schemaVersion < 7 {
+			probeErr = ErrLegacyLayout
+		} else {
+			identity, err := probeStore.RepositoryIdentity(context.Background())
+			probeErr = err
+			if err == nil && identity.LayoutVersion == LayoutC2V1 {
+				probeErr = ErrLegacyLayout
+			}
+		}
+	}
 	closeErr := probe.Close()
 	if err := errors.Join(probeErr, closeErr); err != nil {
 		return nil, err
@@ -326,9 +349,9 @@ func OpenReadOnly(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("%w: read user_version: %v", ErrSchema, err)
 	}
-	if version != 6 && version != SchemaVersion {
+	if version != 6 && version != 12 && version != SchemaVersion {
 		db.Close()
-		return nil, fmt.Errorf("%w: read-only database version %d is neither frozen v0.2 nor current", ErrSchema, version)
+		return nil, fmt.Errorf("%w: read-only database version %d is neither frozen v0.2, v0.4, nor current", ErrSchema, version)
 	}
 	store := &Store{path: absolute, db: db, schemaVersion: version, readOnly: true}
 	if err := store.validateSchemaVersion(context.Background(), version); err != nil {
@@ -513,19 +536,15 @@ func openDatabaseMode(path, mode string, writable, physicallyReadOnly bool) (*sq
 		}
 	}
 	query.Add("_pragma", "foreign_keys(1)")
-	busyTimeout := "0"
-	if mode == "ro" {
-		// Multiple physically read-only connections may arrive immediately
-		// after a writer releases the lifecycle lock. One reader can briefly
-		// own WAL recovery while the others receive SQLITE_BUSY_RECOVERY. Give
-		// SQLite a bounded window to serialize that coordination instead of
-		// surfacing a transient repository integrity failure.
-		busyTimeout = "5000"
-	}
-	query.Add("_pragma", "busy_timeout("+busyTimeout+")")
+	// Repository writers hold an external lock, but read-only WAL recovery
+	// can still briefly hold SQLite locks. Bound that coordination wait.
+	query.Add("_pragma", "busy_timeout(5000)")
 	if writable {
 		query.Add("_pragma", "journal_mode(WAL)")
 		query.Add("_pragma", "synchronous(FULL)")
+		if runtime.GOOS == "darwin" {
+			query.Add("_pragma", "fullfsync(1)")
+		}
 	}
 	u.RawQuery = query.Encode()
 	db, err := sql.Open("sqlite", u.String())
@@ -612,7 +631,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		return s.validateSchema(ctx)
 	case version > SchemaVersion:
 		return fmt.Errorf("%w: database version %d is newer than supported version %d", ErrSchema, version, SchemaVersion)
-	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 && version != 8 && version != 9 && version != 10 && version != 11:
+	case version != 0 && version != 1 && version != 2 && version != 3 && version != 4 && version != 5 && version != 6 && version != 7 && version != 8 && version != 9 && version != 10 && version != 11 && version != 12:
 		return fmt.Errorf("%w: cannot migrate version %d", ErrSchema, version)
 	}
 	if version == 0 {
@@ -660,6 +679,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		return err
 	}
 	if err := validateEmbeddedSchema("v12", schemaV12SQL, SchemaV12SHA256); err != nil {
+		return err
+	}
+	if err := validateEmbeddedSchema("v13", schemaV13SQL, SchemaV13SHA256); err != nil {
 		return err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -782,8 +804,16 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("record schema v12: %w", err)
 		}
 	}
+	if version <= 12 {
+		if _, err := tx.ExecContext(ctx, schemaV13SQL); err != nil {
+			return fmt.Errorf("apply schema v13: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations(version, checksum, applied_at) VALUES (13, ?, ?)`, SchemaV13SHA256, nowText()); err != nil {
+			return fmt.Errorf("record schema v13: %w", err)
+		}
+	}
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit schema v12: %w", err)
+		return fmt.Errorf("commit schema v13: %w", err)
 	}
 	return s.validateSchema(ctx)
 }
@@ -834,7 +864,8 @@ func (s *Store) validateUpgradeableSchema(ctx context.Context) error {
 		return fmt.Errorf("%w: read user_version: %v", ErrSchema, err)
 	}
 	switch version {
-	case 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, SchemaVersion:
+	case 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, SchemaVersion:
+		s.schemaVersion = version
 		return s.validateSchemaVersion(ctx, version)
 	case 0:
 		return fmt.Errorf("%w: uninitialized database cannot be adopted", ErrSchema)
@@ -947,6 +978,12 @@ func (s *Store) validateSchemaVersion(ctx context.Context, expectedVersion int) 
 			version  int
 			checksum string
 		}{12, SchemaV12SHA256})
+	}
+	if expectedVersion >= 13 {
+		expectedMigrations = append(expectedMigrations, struct {
+			version  int
+			checksum string
+		}{13, SchemaV13SHA256})
 	}
 	if !reflectMigrations(migrations, expectedMigrations) {
 		return fmt.Errorf("%w: migration ledger does not exactly match schema v%d", ErrSchema, expectedVersion)
@@ -1071,6 +1108,12 @@ func expectedSchemaObjects(version int) ([]schemaObject, error) {
 			schemaV12ContractObjects, schemaV12ContractErr = buildExpectedSchemaObjects(schemaV1SQL, schemaV2SQL, schemaV3SQL, schemaV4SQL, schemaV5SQL, schemaV6SQL, schemaV7SQL, schemaV8SQL, schemaV9SQL, schemaV10SQL, schemaV11SQL, schemaV12SQL)
 		})
 		return append([]schemaObject(nil), schemaV12ContractObjects...), schemaV12ContractErr
+	}
+	if version == 13 {
+		schemaV13ContractOnce.Do(func() {
+			schemaV13ContractObjects, schemaV13ContractErr = buildExpectedSchemaObjects(schemaV1SQL, schemaV2SQL, schemaV3SQL, schemaV4SQL, schemaV5SQL, schemaV6SQL, schemaV7SQL, schemaV8SQL, schemaV9SQL, schemaV10SQL, schemaV11SQL, schemaV12SQL, schemaV13SQL)
+		})
+		return append([]schemaObject(nil), schemaV13ContractObjects...), schemaV13ContractErr
 	}
 	return nil, fmt.Errorf("unsupported schema contract version %d", version)
 }
@@ -1353,19 +1396,34 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 	return nil
 }
 
-// Checkpoint copies every committed WAL frame into the main database. A
-// concurrent read snapshot may legitimately prevent the final TRUNCATE while
-// all frames are already checkpointed; that is deferred maintenance, not a
-// failed committed mutation.
-func (s *Store) Checkpoint(ctx context.Context) error {
+// Checkpoint opportunistically drains the WAL. A reader may prevent copying
+// or truncation; either is deferred maintenance, never a failed durable commit.
+// Only this maintenance call disables waiting; ordinary SQL retains its bounded
+// busy timeout. Keeping the connection pinned also prevents leaking that setting.
+func (s *Store) Checkpoint(ctx context.Context) (resultErr error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_, restoreErr := conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA busy_timeout=5000`)
+		resultErr = errors.Join(resultErr, restoreErr, conn.Close())
+	}()
+	if _, err := conn.ExecContext(ctx, `PRAGMA busy_timeout=0`); err != nil {
+		return err
+	}
+	_, err = checkpointConnection(ctx, conn)
+	return err
+}
+
+// checkpointConnection reports whether readers deferred any WAL maintenance.
+// Callers pin the connection with busy_timeout=0 for this maintenance only.
+func checkpointConnection(ctx context.Context, conn *sql.Conn) (bool, error) {
 	var busy, logFrames, checkpointed int
-	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
-		return fmt.Errorf("checkpoint repository state: %w", err)
+	if err := conn.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return false, fmt.Errorf("checkpoint repository state: %w", err)
 	}
-	if logFrames != checkpointed {
-		return fmt.Errorf("checkpoint repository state incomplete: busy=%d log=%d checkpointed=%d", busy, logFrames, checkpointed)
-	}
-	return nil
+	return busy != 0 || logFrames != checkpointed, nil
 }
 
 func (s *Store) Summary(ctx context.Context) (RepositorySummary, error) {
@@ -1931,8 +1989,8 @@ func (s *Store) SetOperationState(ctx context.Context, id string, next Operation
 
 // FailOperation atomically records the bounded public result and terminal
 // failure reason for an operation that was rejected before any Desired or
-// public state was applied. Interrupted processes deliberately do not call
-// this path; their non-terminal journal remains available to recovery.
+// public state was applied. The terminal row must be durable before callers
+// remove the operation's only staged package bytes.
 func (s *Store) FailOperation(ctx context.Context, id, errorClass, errorMessage, resultJSON string) error {
 	if errorClass == "" || errorMessage == "" {
 		return errors.New("operation failure requires class and message")
@@ -1945,8 +2003,18 @@ func (s *Store) FailOperation(ctx context.Context, id, errorClass, errorMessage,
 		return fmt.Errorf("begin operation %q failure: %w", id, err)
 	}
 	defer tx.Rollback()
+	var applied bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM operation_events WHERE operation_id = ? AND state IN ('applied', 'built', 'done', 'done_dirty'))`, id).Scan(&applied); err != nil {
+		return fmt.Errorf("inspect operation %q failure boundary: %w", id, err)
+	}
+	if applied {
+		return fmt.Errorf("%w: operation %s already applied; cannot discard its result", ErrTransition, id)
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE operations SET result_json = ? WHERE id = ?`, resultJSON, id); err != nil {
 		return fmt.Errorf("record operation %q failure result: %w", id, err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE operation_packages SET disposition = 'failed', error_class = ?, message = ? WHERE operation_id = ? AND disposition IN ('accepted', 'reused', 'removed')`, errorClass, errorMessage, id); err != nil {
+		return fmt.Errorf("record operation %q failed packages: %w", id, err)
 	}
 	if err := setOperationStateTx(ctx, tx, id, OperationFailed, errorClass, errorMessage); err != nil {
 		return err
@@ -2105,29 +2173,6 @@ func (s *Store) PendingOperations(ctx context.Context) ([]Operation, error) {
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list pending operations: %w", err)
-	}
-	return out, nil
-}
-
-// DoneOperations returns terminal operations whose private stage or recovery
-// directories may still require idempotent cleanup after a process died
-// between SQL finalization and filesystem cleanup.
-func (s *Store) DoneOperations(ctx context.Context) ([]Operation, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, kind, state, payload_json, result_json, error_class, error_message, created_at, updated_at FROM operations WHERE state IN ('done', 'done_dirty') ORDER BY created_at, id`)
-	if err != nil {
-		return nil, fmt.Errorf("list completed operations: %w", err)
-	}
-	defer rows.Close()
-	out := []Operation{}
-	for rows.Next() {
-		operation, err := scanOperation(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, operation)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list completed operations: %w", err)
 	}
 	return out, nil
 }

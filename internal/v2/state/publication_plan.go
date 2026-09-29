@@ -56,6 +56,17 @@ type PublicationPlan struct {
 // that Changes is the exact canonical delta between two already canonical
 // Generation manifests, then derives target-scoped commit units.
 func BuildPublicationPlan(input PublicationPlanInput) (PublicationPlan, error) {
+	return buildPublicationPlan(input, false)
+}
+
+// ReconcileLegacyPublicationPlan reconstructs a previously bound plan only
+// for reconciliation/abandonment. It must not authorize a new attempt; payload
+// writes remain create-only in every backend, including recovered attempts.
+func ReconcileLegacyPublicationPlan(input PublicationPlanInput) (PublicationPlan, error) {
+	return buildPublicationPlan(input, true)
+}
+
+func buildPublicationPlan(input PublicationPlanInput, reconcileLegacy bool) (PublicationPlan, error) {
 	if !IsCanonicalRepositoryID(input.RepositoryID) || !validSHA256Text(input.TargetIdentity) || input.BaseCheckpoint != "" && !validSHA256Text(input.BaseCheckpoint) || input.TargetGeneration == 0 {
 		return PublicationPlan{}, errors.New("invalid publication plan identity")
 	}
@@ -91,6 +102,9 @@ func BuildPublicationPlan(input PublicationPlanInput) (PublicationPlan, error) {
 		}
 		switch change.Phase {
 		case "payload":
+			if change.Operation == "update" && !reconcileLegacy {
+				return PublicationPlan{}, fmt.Errorf("%w: payload URL %s cannot be reused for different content", ErrPoolPathConflict, change.Path)
+			}
 			plan.Payload = append(plan.Payload, op)
 		case "metadata":
 			if isAPTStableAlias(change.Path) {

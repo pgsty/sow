@@ -227,6 +227,17 @@ func PruneLog(ctx context.Context, opts LogPruneOptions) (result LogPruneResult,
 	if err := store.FinishPruneOperation(ctx, id); err != nil {
 		return result, err
 	}
+	operation, err := store.GetOperationSummary(ctx, id)
+	if err != nil {
+		return result, err
+	}
+	var maintenance struct {
+		Deferred bool `json:"compaction_deferred"`
+	}
+	if err := json.Unmarshal([]byte(operation.ResultJSON), &maintenance); err != nil {
+		return result, err
+	}
+	result.CompactionDeferred = maintenance.Deferred
 	if err := callFault(opts.Fault, "log.prune.done"); err != nil {
 		return result, err
 	}

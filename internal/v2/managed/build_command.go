@@ -17,6 +17,7 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 	if ctx == nil {
 		return result, errors.New("managed: nil context")
 	}
+	ctx = withMetadataSignerCache(ctx)
 	ctx, _ = workmetrics.Ensure(ctx)
 	if opts.Jobs < 1 {
 		return result, fmt.Errorf("%w: build jobs must be at least 1", ErrRejected)
@@ -38,6 +39,11 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 		return result, fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
+	defer func() {
+		if ctx.Err() != nil {
+			retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
+		}
+	}()
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
 		return result, err
 	}
@@ -88,7 +94,7 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 	manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"dists": len(distNames)}, Outcomes: outcomes}
 	var preflight *mutationBuildPreflight
 	if physicalChange {
-		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, affectedDists, manifest, store, nil, currentSnapshot)
+		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, affectedDists, manifest, store, nil, currentSnapshot, opts.Jobs)
 		if err != nil {
 			return result, err
 		}
@@ -234,6 +240,14 @@ func distsNeedingBuild(ctx context.Context, root, repoName string, cfg config.Co
 // staged scope. Before a plan exists, ordinary observed-config resolution is
 // required so recovery can safely create one.
 func distsNeedingRecoveredBuild(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, manifest mutationManifest) ([]string, error) {
+	return distsNeedingRecoveredBuildContract(ctx, root, repoName, cfg, store, manifest, false)
+}
+
+func distsNeedingRecoveredBuildPrevious(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, manifest mutationManifest) ([]string, error) {
+	return distsNeedingRecoveredBuildContract(ctx, root, repoName, cfg, store, manifest, true)
+}
+
+func distsNeedingRecoveredBuildContract(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, manifest mutationManifest, previous bool) ([]string, error) {
 	planned := map[string]mutationBuildDist{}
 	if manifest.Build != nil {
 		for _, dist := range manifest.Build.Dists {
@@ -256,7 +270,11 @@ func distsNeedingRecoveredBuild(ctx context.Context, root, repoName string, cfg 
 				configDirty = frozen.EffectiveConfigSHA256 != distState.EffectiveConfigSHA256
 			}
 		} else {
-			_, configDirty, err = observedEffectiveDistConfig(ctx, root, cfg, repoName, distName, distState)
+			if previous {
+				_, configDirty, err = observedEffectiveDistConfigPrevious(ctx, root, cfg, repoName, distName, distState)
+			} else {
+				_, configDirty, err = observedEffectiveDistConfig(ctx, root, cfg, repoName, distName, distState)
+			}
 			if err != nil {
 				return nil, err
 			}

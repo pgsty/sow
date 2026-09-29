@@ -395,6 +395,9 @@ func AddRetainedGeneration(ctx context.Context, opts RetainAddOptions) (result R
 	if err != nil {
 		return result, err
 	}
+	if err := cleanupRetainedAddStagesLocked(ctx, ws.Root, repoName, store); err != nil {
+		return result, err
+	}
 	if opts.Generation != summary.BuiltGeneration {
 		return result, fmt.Errorf("%w: retained/v1 add requires the current Built Generation", ErrRejected)
 	}
@@ -433,13 +436,6 @@ func AddRetainedGeneration(ctx context.Context, opts RetainAddOptions) (result R
 	}
 	stageOwner := filepath.Join(ws.Root, ".sow", repoName, "stage")
 	stage := filepath.Join(stageOwner, "retain-"+opts.Generation.String())
-	if _, err := os.Lstat(stage); err == nil {
-		if err := removeOwnedDirectory(stage, stageOwner); err != nil {
-			return result, err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return result, err
-	}
 	if err := durableMkdir(stage, 0o700); err != nil {
 		return result, err
 	}
@@ -492,6 +488,85 @@ func AddRetainedGeneration(ctx context.Context, opts RetainAddOptions) (result R
 		return result, err
 	}
 	return verifyRetainedGenerationLocked(ctx, ws.Root, repoName, opts.Generation, identity.RepositoryID)
+}
+
+// The repository lock excludes a live retain writer. An abandoned add stage
+// contains only disposable metadata copies, never payload or retained roots.
+// Bound its paths to the recorded Generation before deleting it; partial files
+// and partial cleanup are expected after a process exit. This visits only
+// actual retain stages, without reading package bytes or all history.
+func cleanupRetainedAddStagesLocked(ctx context.Context, root, repoName string, store *state.Store) error {
+	stageRoot := filepath.Join(root, ".sow", repoName, "stage")
+	stages, err := listRootedDirectory(stageRoot)
+	if err != nil {
+		return err
+	}
+	for _, stage := range stages {
+		if !strings.HasPrefix(stage.Name, "retain-") || strings.HasPrefix(stage.Name, "retain-remove-") {
+			continue
+		}
+		generation, err := state.ParseGenerationID(strings.TrimPrefix(stage.Name, "retain-"))
+		if err != nil || generation == 0 || uint32(stage.Stat.Mode)&unix.S_IFMT != unix.S_IFDIR {
+			return fmt.Errorf("%w: unknown retain stage %q", ErrIntegrity, stage.Name)
+		}
+		manifest, err := store.GenerationManifest(ctx, generation)
+		if err != nil {
+			return fmt.Errorf("%w: retain stage %q has no recorded Generation: %w", ErrIntegrity, stage.Name, err)
+		}
+		manifestBytes, _, err := state.ManifestBytes(manifest)
+		if err != nil {
+			return err
+		}
+		files := map[string]int64{"manifest.tsv": int64(len(manifestBytes)), "record.json": maxRetainedRecordBytes}
+		directories := map[string]bool{"metadata": true}
+		for _, file := range manifest {
+			if file.Phase == "payload" {
+				continue
+			}
+			path := "metadata/" + file.Path
+			files[path] = file.Size
+			for parent := filepath.ToSlash(filepath.Dir(path)); parent != "."; parent = filepath.ToSlash(filepath.Dir(parent)) {
+				directories[parent] = true
+			}
+		}
+		directory := filepath.Join(stageRoot, stage.Name)
+		var inspect func(string) error
+		inspect = func(relative string) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			entries, err := listRootedDirectory(filepath.Join(directory, filepath.FromSlash(relative)))
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				path := filepath.ToSlash(filepath.Join(relative, entry.Name))
+				switch uint32(entry.Stat.Mode) & unix.S_IFMT {
+				case unix.S_IFDIR:
+					if !directories[path] {
+						return fmt.Errorf("unknown directory %q", path)
+					}
+					if err := inspect(path); err != nil {
+						return err
+					}
+				case unix.S_IFREG:
+					if size, exists := files[path]; !exists || entry.Stat.Size < 0 || entry.Stat.Size > size {
+						return fmt.Errorf("unknown or oversized file %q", path)
+					}
+				default:
+					return fmt.Errorf("unsafe entry %q", path)
+				}
+			}
+			return nil
+		}
+		if err := inspect(""); err != nil {
+			return fmt.Errorf("%w: retain stage %q is unsafe: %w", ErrIntegrity, stage.Name, err)
+		}
+		if err := removeOwnedDirectory(directory, stageRoot); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func RetainAdd(ctx context.Context, opts RetainAddOptions) (RetainedGeneration, error) {

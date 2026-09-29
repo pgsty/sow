@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"crypto"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 )
@@ -202,33 +204,55 @@ func (s *Signer) Verify(release, inRelease, detached []byte, at time.Time) error
 	if s == nil {
 		return ErrSigningFailed
 	}
-	return verifyMetadataSignatures(s.entity, release, inRelease, detached, at)
+	return verifyMetadataSignatures(s.entity, release, inRelease, detached, at, false)
 }
 
 func (v *Verifier) Verify(release, inRelease, detached []byte, at time.Time) error {
 	if v == nil {
 		return ErrSigningFailed
 	}
-	return verifyMetadataSignatures(v.entity, release, inRelease, detached, at)
+	return verifyMetadataSignatures(v.entity, release, inRelease, detached, at, false)
 }
 
-func verifyMetadataSignatures(entity *openpgp.Entity, release, inRelease, detached []byte, at time.Time) error {
+// VerifyForPublication also checks the digest accepted for a new publication.
+// Verify remains suitable for historical integrity and frozen recovery.
+func (v *Verifier) VerifyForPublication(release, inRelease, detached []byte, at time.Time) error {
+	if v == nil {
+		return ErrSigningFailed
+	}
+	return verifyMetadataSignatures(v.entity, release, inRelease, detached, at, true)
+}
+
+func verifyMetadataSignatures(entity *openpgp.Entity, release, inRelease, detached []byte, at time.Time, publication bool) error {
 	if entity == nil || at.IsZero() {
 		return ErrSigningFailed
 	}
 	block, rest := clearsign.Decode(inRelease)
-	if block == nil || len(bytes.TrimSpace(rest)) != 0 || !bytes.Equal(block.Plaintext, release) {
+	if block == nil || len(bytes.TrimSpace(rest)) != 0 || !sameClearsignedRelease(block.Plaintext, release) {
 		return ErrSigningFailed
 	}
 	keyring := openpgp.EntityList{entity}
 	config := signingConfig(at)
-	if _, err := block.VerifySignature(keyring, config); err != nil {
+	clearSignature, _, err := openpgp.VerifyDetachedSignature(keyring, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, config)
+	if err != nil {
 		return ErrSigningFailed
 	}
-	if _, err := openpgp.CheckArmoredDetachedSignature(keyring, bytes.NewReader(release), bytes.NewReader(detached), config); err != nil {
+	armored, err := armor.Decode(bytes.NewReader(detached))
+	if err != nil || armored.Type != openpgp.SignatureType {
 		return ErrSigningFailed
+	}
+	detachedSignature, _, err := openpgp.VerifyDetachedSignature(keyring, bytes.NewReader(release), armored.Body, config)
+	if err != nil {
+		return ErrSigningFailed
+	}
+	if publication && (!publicationSignatureHash(clearSignature.Hash) || !publicationSignatureHash(detachedSignature.Hash)) {
+		return fmt.Errorf("%w: new APT publication requires SHA-256 or stronger metadata signatures; rebuild the Dist", ErrSigningFailed)
 	}
 	return nil
+}
+
+func publicationSignatureHash(hash crypto.Hash) bool {
+	return hash == crypto.SHA256 || hash == crypto.SHA384 || hash == crypto.SHA512
 }
 
 func signingConfig(at time.Time) *packet.Config {
@@ -248,4 +272,11 @@ func deterministicSignatureAlgorithm(algorithm packet.PublicKeyAlgorithm) bool {
 	default:
 		return false
 	}
+}
+
+// RFC 9580 excludes the final line ending before the signature delimiter.
+// GnuPG omits it from decoded Plaintext; our encoder retains it. Accept only
+// this single difference, never arbitrary whitespace normalization.
+func sameClearsignedRelease(plaintext, release []byte) bool {
+	return bytes.Equal(plaintext, release) || len(release) > 0 && release[len(release)-1] == '\n' && bytes.Equal(plaintext, release[:len(release)-1])
 }

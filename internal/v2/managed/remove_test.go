@@ -251,7 +251,7 @@ func TestRemoveOrdinaryPreApplyFailureIsTerminalAndLeavesMembership(t *testing.T
 	}
 }
 
-func TestRemoveSkipPostCommitCheckpointFailureRetainsCommittedProjection(t *testing.T) {
+func TestRemoveSkipReaderBlockedCheckpointRetainsCommittedProjection(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	cfg := config.Default()
@@ -289,8 +289,8 @@ func TestRemoveSkipPostCommitCheckpointFailureRetainsCommittedProjection(t *test
 	if release != nil {
 		release()
 	}
-	if err == nil || !strings.Contains(err.Error(), "checkpoint repository state incomplete") {
-		t.Fatalf("checkpoint fault result=%#v err=%v", result, err)
+	if err != nil {
+		t.Fatalf("reader-blocked checkpoint rejected durable mutation: result=%#v err=%v", result, err)
 	}
 	if result.Revision != before.DesiredRevision+1 || result.Generation != before.BuiltGeneration || !result.Dirty {
 		t.Fatalf("committed projection result=%#v before=%#v", result, before)
@@ -305,7 +305,7 @@ func TestRemoveSkipPostCommitCheckpointFailureRetainsCommittedProjection(t *test
 		t.Fatalf("terminal audit=%#v err=%v", detail, detailErr)
 	}
 	if _, statErr := os.Stat(mutationStageRoot(root, "repo", result.Operation)); !os.IsNotExist(statErr) {
-		t.Fatalf("terminal checkpoint error retained stage: %v", statErr)
+		t.Fatalf("terminal mutation retained stage: %v", statErr)
 	}
 }
 

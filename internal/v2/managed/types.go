@@ -348,10 +348,11 @@ type LogPruneOptions struct {
 }
 
 type LogPruneResult struct {
-	Operation  string    `json:"operation"`
-	Repository string    `json:"repository"`
-	Before     time.Time `json:"before"`
-	Pruned     int64     `json:"pruned"`
+	Operation          string    `json:"operation"`
+	Repository         string    `json:"repository"`
+	Before             time.Time `json:"before"`
+	Pruned             int64     `json:"pruned"`
+	CompactionDeferred bool      `json:"compaction_deferred"`
 }
 
 type CheckOptions struct {

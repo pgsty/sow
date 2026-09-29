@@ -91,6 +91,7 @@ func Init(ctx context.Context, opts InitOptions) (result InitResult, resultErr e
 	if ctx == nil {
 		return InitResult{}, errors.New("managed: nil context")
 	}
+	ctx = withMetadataSignerCache(ctx)
 	dir := opts.Dir
 	if dir == "" {
 		var err error

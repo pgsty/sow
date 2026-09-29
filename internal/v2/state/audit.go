@@ -9,6 +9,9 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 type OperationPackage struct {
@@ -264,14 +267,21 @@ func (s *Store) listOperations(ctx context.Context, limit int, dist string, term
 	return operations, rows.Err()
 }
 
-func (s *Store) GetOperation(ctx context.Context, id string) (OperationDetail, error) {
+// GetOperationSummary reads only the journal row, without loading package and
+// event history. Residue cleanup uses this bounded lookup for each actual entry.
+func (s *Store) GetOperationSummary(ctx context.Context, id string) (Operation, error) {
 	if !operationIDPattern.MatchString(id) {
-		return OperationDetail{}, fmt.Errorf("%w: invalid operation id", ErrNotFound)
+		return Operation{}, fmt.Errorf("%w: invalid operation id", ErrNotFound)
 	}
 	operation, err := scanOperation(s.db.QueryRowContext(ctx, `SELECT id, kind, state, payload_json, result_json, error_class, error_message, created_at, updated_at FROM operations WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
-		return OperationDetail{}, fmt.Errorf("%w: operation %s", ErrNotFound, id)
+		return Operation{}, fmt.Errorf("%w: operation %s", ErrNotFound, id)
 	}
+	return operation, err
+}
+
+func (s *Store) GetOperation(ctx context.Context, id string) (OperationDetail, error) {
+	operation, err := s.GetOperationSummary(ctx, id)
 	if err != nil {
 		return OperationDetail{}, err
 	}
@@ -387,21 +397,15 @@ WHERE state IN ('done', 'done_dirty', 'rolled_back', 'failed')
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	if err := s.Checkpoint(ctx); err != nil {
-		return count, fmt.Errorf("checkpoint pruned repository audit database after committed delete: %w", err)
-	}
-	if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
-		return count, fmt.Errorf("vacuum repository audit database after committed delete: %w", err)
-	}
-	if err := s.Checkpoint(ctx); err != nil {
-		return count, fmt.Errorf("checkpoint vacuumed repository audit database after committed delete: %w", err)
+	if _, err := s.compactAudit(ctx); err != nil {
+		return count, err
 	}
 	return count, nil
 }
 
 // ApplyPruneOperation atomically applies the audit deletion and records its
-// bounded result in the journal. Database compaction is a recoverable applied
-// phase completed separately by FinishPruneOperation.
+// bounded result in the journal. FinishPruneOperation attempts optional space
+// reclamation after this durable logical deletion.
 func (s *Store) ApplyPruneOperation(ctx context.Context, id string, before time.Time) (int64, error) {
 	if before.IsZero() || !operationIDPattern.MatchString(id) {
 		return 0, errors.New("invalid journaled prune request")
@@ -465,9 +469,8 @@ WHERE state IN ('done', 'done_dirty', 'rolled_back', 'failed')
 	return count, nil
 }
 
-// FinishPruneOperation makes the compaction phase crash-recoverable. The
-// operation remains applied until checkpoint/VACUUM/checkpoint all succeed;
-// recovery may safely repeat that maintenance before recording done.
+// FinishPruneOperation finishes a committed logical prune even when readers
+// defer space reclamation. Only actual SQL/I/O errors keep it recoverable.
 func (s *Store) FinishPruneOperation(ctx context.Context, id string) error {
 	if !operationIDPattern.MatchString(id) {
 		return errors.New("invalid journaled prune operation")
@@ -487,14 +490,55 @@ func (s *Store) FinishPruneOperation(ctx context.Context, id string) error {
 	if OperationState(current) != OperationApplied {
 		return fmt.Errorf("%w: log prune maintenance cannot finish from %s", ErrTransition, current)
 	}
-	if err := s.Checkpoint(ctx); err != nil {
-		return fmt.Errorf("checkpoint journaled audit prune before compaction: %w", err)
+	deferred, err := s.compactAudit(ctx)
+	if err != nil {
+		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `VACUUM`); err != nil {
-		return fmt.Errorf("vacuum repository audit database after committed delete: %w", err)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
 	}
-	if err := s.Checkpoint(ctx); err != nil {
-		return fmt.Errorf("checkpoint vacuumed repository audit database after committed delete: %w", err)
+	defer tx.Rollback()
+	deferredJSON := "false"
+	if deferred {
+		deferredJSON = "true"
 	}
-	return s.SetOperationState(ctx, id, OperationDone, "")
+	if _, err := tx.ExecContext(ctx, `UPDATE operations SET result_json = json_set(result_json, '$.compaction_deferred', json(?)) WHERE id = ?`, deferredJSON, id); err != nil {
+		return err
+	}
+	if err := setOperationStateTx(ctx, tx, id, OperationDone, "", ""); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.Checkpoint(ctx)
+}
+
+// compactAudit never waits for a reader. A blocked initial checkpoint skips
+// the expensive VACUUM entirely; the already committed deletion stays valid.
+// Another prune can reclaim space after readers exit, without a pending job.
+func (s *Store) compactAudit(ctx context.Context) (deferred bool, resultErr error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		_, restoreErr := conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA busy_timeout=5000`)
+		resultErr = errors.Join(resultErr, restoreErr, conn.Close())
+	}()
+	if _, err := conn.ExecContext(ctx, `PRAGMA busy_timeout=0`); err != nil {
+		return false, err
+	}
+	if deferred, err := checkpointConnection(ctx, conn); err != nil || deferred {
+		return deferred, err
+	}
+	if _, err := conn.ExecContext(ctx, `VACUUM`); err != nil {
+		var sqliteErr *sqlite.Error
+		if errors.As(err, &sqliteErr) && (sqliteErr.Code()&0xff == sqlite3.SQLITE_BUSY || sqliteErr.Code()&0xff == sqlite3.SQLITE_LOCKED) {
+			return true, nil
+		}
+		return false, fmt.Errorf("vacuum repository audit database after committed delete: %w", err)
+	}
+	return checkpointConnection(ctx, conn)
 }

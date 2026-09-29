@@ -96,22 +96,25 @@ func MigrateRepositoryLayout(ctx context.Context, opts RepositoryMigrationOption
 	if _, exists := cfg.Repositories[repoName]; !exists {
 		return result, fmt.Errorf("%w: repository %q disappeared from configuration", ErrRejected, repoName)
 	}
+	store, err := openExistingStateForMigration(filepath.Join(ws.Root, ".sow", repoName+".db"))
+	if err != nil {
+		if errors.Is(err, state.ErrLegacyLayout) {
+			return result, fmt.Errorf("%w: %w", ErrRejected, err)
+		}
+		return result, fmt.Errorf("%w: migrate repository schema: %v", ErrIntegrity, err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	privateRoot := filepath.Join(ws.Root, ".sow", repoName)
 	for _, child := range []string{"retained", "transitions"} {
 		if _, err := durableEnsureDir(filepath.Join(privateRoot, child), 0o700); err != nil {
 			return result, err
 		}
 	}
-	store, err := openExistingStateForMigration(filepath.Join(ws.Root, ".sow", repoName+".db"))
-	if err != nil {
-		return result, fmt.Errorf("%w: migrate repository schema: %v", ErrIntegrity, err)
-	}
-	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	identity, err := store.RepositoryIdentity(ctx)
 	if err != nil {
 		return result, err
 	}
-	result.RepositoryID, result.FromLayout, result.ToLayout = identity.RepositoryID, state.LayoutC2V1, state.LayoutSinglePayloadV1
+	result.RepositoryID, result.FromLayout, result.ToLayout = identity.RepositoryID, identity.LayoutVersion, state.LayoutSinglePayloadV1
 	journal, journalIdentity, err := loadTransitionJournal(ws.Root, repoName)
 	if err != nil {
 		return result, err
@@ -146,15 +149,6 @@ func MigrateRepositoryLayout(ctx context.Context, opts RepositoryMigrationOption
 		}
 		result.Phase, result.Generation, result.Complete = "done", summary.BuiltGeneration, true
 		return result, nil
-	}
-	if identity.LayoutVersion == state.LayoutC2V1 {
-		if journal != nil {
-			return result, fmt.Errorf("%w: abandoned C2 layout still has a transition journal", ErrIntegrity)
-		}
-		if err := store.BeginLayoutTransition(ctx); err != nil {
-			return result, err
-		}
-		identity.LayoutVersion = state.LayoutC2ToSingleV1
 	}
 	if identity.LayoutVersion != state.LayoutC2ToSingleV1 {
 		return result, fmt.Errorf("%w: unsupported repository layout %q", ErrIntegrity, identity.LayoutVersion)

@@ -141,7 +141,7 @@ func Discover(opts DiscoverOptions) (Workspace, error) {
 }
 
 func findWorkspaceRoot(start string) (string, bool, error) {
-	info, err := os.Lstat(start)
+	info, err := os.Stat(start)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", false, nil

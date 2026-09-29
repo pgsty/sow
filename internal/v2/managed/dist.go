@@ -17,6 +17,7 @@ import (
 	"github.com/pgsty/sow/internal/v2/state"
 	"github.com/pgsty/sow/internal/workmetrics"
 	"github.com/pgsty/sow/internal/yumrepo"
+	"golang.org/x/sys/unix"
 )
 
 const distOperationVersion = 2
@@ -253,6 +254,10 @@ func makeDistInfo(ctx context.Context, store *state.Store, root, repoName string
 }
 
 func effectiveDistConfig(ctx context.Context, root string, cfg config.Config, repoName, distName string) (string, config.EffectiveDist, error) {
+	return effectiveDistConfigContract(ctx, root, cfg, repoName, distName, false)
+}
+
+func effectiveDistConfigContract(ctx context.Context, root string, cfg config.Config, repoName, distName string, previous bool) (string, config.EffectiveDist, error) {
 	view, err := config.EffectiveView(cfg, config.ViewOptions{Repository: repoName, Dist: distName})
 	if err != nil {
 		return "", config.EffectiveDist{}, err
@@ -263,17 +268,25 @@ func effectiveDistConfig(ctx context.Context, root string, cfg config.Config, re
 	if err != nil {
 		return "", config.EffectiveDist{}, fmt.Errorf("%w: repository %q Dist %q signing: %v", ErrRejected, repoName, distName, err)
 	}
-	return hashEffectiveDist(effectiveRepo, distName)
+	return hashEffectiveDistWithContract(effectiveRepo, distName, previous)
 }
 
 func effectiveDistConfigFrozen(cfg config.Config, repoName, distName string, signing config.EffectiveSigningConfig) (string, config.EffectiveDist, error) {
+	return effectiveDistConfigFrozenContract(cfg, repoName, distName, signing, false)
+}
+
+func effectiveDistConfigFrozenPrevious(cfg config.Config, repoName, distName string, signing config.EffectiveSigningConfig) (string, config.EffectiveDist, error) {
+	return effectiveDistConfigFrozenContract(cfg, repoName, distName, signing, true)
+}
+
+func effectiveDistConfigFrozenContract(cfg config.Config, repoName, distName string, signing config.EffectiveSigningConfig, previous bool) (string, config.EffectiveDist, error) {
 	view, err := config.EffectiveView(cfg, config.ViewOptions{Repository: repoName, Dist: distName})
 	if err != nil {
 		return "", config.EffectiveDist{}, err
 	}
 	effectiveRepo := view.Repositories[repoName]
 	effectiveRepo.Signing = signing
-	return hashEffectiveDist(effectiveRepo, distName)
+	return hashEffectiveDistWithContract(effectiveRepo, distName, previous)
 }
 
 // observedEffectiveDistConfig compares Desired configuration with the retained
@@ -283,7 +296,15 @@ func effectiveDistConfigFrozen(cfg config.Config, repoName, distName string, sig
 // references changed while the new reference is unavailable, the Dist is
 // deterministically dirty without pretending to know the new fingerprint.
 func observedEffectiveDistConfig(ctx context.Context, root string, cfg config.Config, repoName, distName string, built state.Dist) (string, bool, error) {
-	currentSHA, _, currentErr := effectiveDistConfig(ctx, root, cfg, repoName, distName)
+	return observedEffectiveDistConfigContract(ctx, root, cfg, repoName, distName, built, false)
+}
+
+func observedEffectiveDistConfigPrevious(ctx context.Context, root string, cfg config.Config, repoName, distName string, built state.Dist) (string, bool, error) {
+	return observedEffectiveDistConfigContract(ctx, root, cfg, repoName, distName, built, true)
+}
+
+func observedEffectiveDistConfigContract(ctx context.Context, root string, cfg config.Config, repoName, distName string, built state.Dist, previous bool) (string, bool, error) {
+	currentSHA, _, currentErr := effectiveDistConfigContract(ctx, root, cfg, repoName, distName, previous)
 	if currentErr == nil {
 		return currentSHA, currentSHA != built.EffectiveConfigSHA256, nil
 	}
@@ -303,14 +324,19 @@ func observedEffectiveDistConfig(ctx context.Context, root string, cfg config.Co
 	if !frozenSigningReferencesMatchForFormat(cfg.Repositories[repoName].Signing, frozen, built.Format) {
 		return "", true, nil
 	}
-	frozenSHA, _, err := effectiveDistConfigFrozen(cfg, repoName, distName, frozen)
+	frozenSHA, _, err := effectiveDistConfigFrozenContract(cfg, repoName, distName, frozen, previous)
 	if err != nil {
 		return "", false, err
 	}
 	return frozenSHA, frozenSHA != built.EffectiveConfigSHA256, nil
 }
 
-func hashEffectiveDist(effectiveRepo config.EffectiveRepository, distName string) (string, config.EffectiveDist, error) {
+// Changing this contract forces one successful authentication before an old
+// Built identity can authorize the fast path for immutable RPM payloads.
+const managedRPMAuthenticationContract = "sow.rpm-auth/v1"
+const previousManagedAPTReleaseContract = "sow.apt-release/v2"
+
+func hashEffectiveDistWithContract(effectiveRepo config.EffectiveRepository, distName string, previous bool) (string, config.EffectiveDist, error) {
 	effective := effectiveRepo.Dists[distName]
 	architectures := append([]string(nil), effective.Architectures...)
 	sort.Slice(architectures, func(i, j int) bool {
@@ -332,6 +358,11 @@ func hashEffectiveDist(effectiveRepo config.EffectiveRepository, distName string
 	renderer := ""
 	if effective.Format == "deb" {
 		renderer = managedAPTReleaseContract
+		if previous {
+			renderer = previousManagedAPTReleaseContract
+		}
+	} else if !previous && (effectiveRepo.Signing.RPM.Packages.Mode == "fill" || effectiveRepo.Signing.RPM.Packages.Mode == "always") {
+		renderer = managedRPMAuthenticationContract
 	}
 	data, err := json.Marshal(struct {
 		Schema   string               `json:"schema"`
@@ -394,6 +425,7 @@ func configuredArchitectureState(cfg config.Config, repoName, distName, format s
 }
 
 func NewDist(ctx context.Context, opts DistNewOptions) (result DistInfo, resultErr error) {
+	ctx = withMetadataSignerCache(ctx)
 	if err := config.ValidateName(opts.Name); err != nil {
 		return DistInfo{}, fmt.Errorf("%w: %v", ErrRejected, err)
 	}
@@ -949,7 +981,7 @@ func executeDistRemove(ctx context.Context, root, repoName, distName string, old
 	if err := callFault(fault, "dist.rm.finalized"); err != nil {
 		return err
 	}
-	if err := cleanupDroppedPending(root, repoName, droppedPending); err != nil {
+	if err := cleanupDroppedPending(ctx, root, repoName, store, droppedPending); err != nil {
 		return err
 	}
 	return cleanupDistRecovery(root, repoName, id)
@@ -1143,7 +1175,7 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 				if err != nil {
 					return err
 				}
-				if err := cleanupDroppedPending(root, repoName, droppedPending); err != nil {
+				if err := cleanupDroppedPending(ctx, root, repoName, store, droppedPending); err != nil {
 					return err
 				}
 				if err := cleanupDistRecovery(root, repoName, operation.ID); err != nil {
@@ -1297,55 +1329,81 @@ func bootstrapLegacyGeneration(ctx context.Context, root, repoName string, store
 	return nil
 }
 
+// terminalCleanupOperations visits actual leftovers, not the entire operation
+// history. The directory remains the cleanup marker until its work is complete.
+func terminalCleanupOperations(ctx context.Context, root, repoName string, store *state.Store) ([]state.Operation, error) {
+	seen := map[string]bool{}
+	operations := []state.Operation{}
+	for _, area := range []string{"stage", "recovery"} {
+		entries, err := listRootedDirectory(filepath.Join(root, ".sow", repoName, area))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range entries {
+			if !validStoredOperationID(entry.Name) || seen[entry.Name] {
+				continue // Migration directories are owned by their own protocol.
+			}
+			if entry.Stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+				return nil, fmt.Errorf("%w: operation cleanup path %s/%s is not a real directory", ErrIntegrity, area, entry.Name)
+			}
+			seen[entry.Name] = true
+			operation, err := store.GetOperationSummary(ctx, entry.Name)
+			if errors.Is(err, state.ErrNotFound) {
+				continue // Unknown leftovers have no authority to delete anything.
+			}
+			if err != nil {
+				return nil, err
+			}
+			switch operation.State {
+			case state.OperationDone, state.OperationDoneDirty, state.OperationFailed, state.OperationRolledBack:
+				operations = append(operations, operation)
+			}
+		}
+	}
+	return operations, nil
+}
+
 func recoverDoneDistCleanup(ctx context.Context, root, repoName string, store *state.Store) error {
-	done, err := store.DoneOperations(ctx)
+	done, err := terminalCleanupOperations(ctx, root, repoName, store)
 	if err != nil {
 		return err
 	}
 	for _, operation := range done {
-		if !validStoredOperationID(operation.ID) {
-			return fmt.Errorf("%w: invalid completed operation id", ErrIntegrity)
-		}
-		if operation.Kind == "generation.bootstrap" {
-			continue
-		}
-		if operation.Kind == "log.prune" {
-			continue
-		}
-		if operation.Kind == "local.gc" {
+		switch operation.Kind {
+		case "local.gc":
 			if err := recoverDoneLocalGCCleanup(ctx, root, repoName, operation); err != nil {
 				return err
 			}
-			continue
-		}
-		if operation.Kind == "add" || operation.Kind == "rm" || operation.Kind == "build" {
-			if err := cleanupMutationStage(root, repoName, operation.ID); err != nil {
+		case "add", "rm", "build":
+			if operation.State == state.OperationFailed {
+				if err := cleanupFailedMutation(ctx, root, repoName, store, operation); err != nil {
+					return err
+				}
+			} else if err := cleanupMutationStage(root, repoName, operation.ID); err != nil {
 				return err
 			}
-			continue
-		}
-		if operation.Kind != "dist.new" && operation.Kind != "dist.init" && operation.Kind != "dist.rm" {
-			return fmt.Errorf("%w: unsupported completed operation %q", ErrIntegrity, operation.Kind)
-		}
-		payload, err := decodeDistPayload(operation.PayloadJSON)
-		if err != nil || payload.Repository != repoName {
-			return fmt.Errorf("%w: invalid completed dist payload", ErrIntegrity)
-		}
-		if operation.Kind == "dist.rm" {
+		case "dist.rm":
+			payload, err := decodeDistPayload(operation.PayloadJSON)
+			if err != nil || payload.Repository != repoName {
+				return fmt.Errorf("%w: invalid completed dist payload", ErrIntegrity)
+			}
 			droppedPending, err := decodeDroppedPendingResult(operation.ResultJSON)
 			if err != nil {
 				return fmt.Errorf("%w: invalid completed Dist removal result: %v", ErrIntegrity, err)
 			}
-			if err := cleanupDroppedPending(root, repoName, droppedPending); err != nil {
+			if err := cleanupDroppedPending(ctx, root, repoName, store, droppedPending); err != nil {
 				return err
 			}
 			if err := cleanupDistRecovery(root, repoName, operation.ID); err != nil {
 				return err
 			}
-			continue
-		}
-		if err := removeOwnedDirectory(distStageRoot(root, repoName, operation.ID), filepath.Join(root, ".sow", repoName, "stage")); err != nil {
-			return err
+		case "dist.new", "dist.init":
+			if err := cleanupMutationStage(root, repoName, operation.ID); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -1372,8 +1430,16 @@ func decodeDroppedPendingResult(data string) ([]string, error) {
 	return result.DroppedPending, nil
 }
 
-func cleanupDroppedPending(root, repoName string, digests []string) error {
+func cleanupDroppedPending(ctx context.Context, root, repoName string, store *state.Store, digests []string) error {
 	for _, digest := range digests {
+		// Completed dist.rm journals outlive the objects they removed. The same
+		// digest may now belong to a later add (pending or pooled); historical
+		// cleanup must never remove bytes owned by that current object.
+		if _, err := store.GetPackageObject(ctx, digest); err == nil {
+			continue
+		} else if !errors.Is(err, state.ErrNotFound) {
+			return err
+		}
 		if err := removePendingObject(root, repoName, state.PackageObject{SHA256: digest}); err != nil {
 			return err
 		}
@@ -1503,8 +1569,14 @@ func validateDistPayloadForRecovery(ctx context.Context, root, operationID, kind
 					return errors.New("payload effective signing references differ from the new config")
 				}
 				effectiveSHA, _, err := effectiveDistConfigFrozen(parsed, repoName, payload.Name, *payload.EffectiveSigning)
-				if err != nil || effectiveSHA != payload.EffectiveConfigSHA256 {
-					return errors.New("payload effective config digest does not match its frozen signing identity")
+				if err != nil {
+					return err
+				}
+				if effectiveSHA != payload.EffectiveConfigSHA256 {
+					previousSHA, _, err := effectiveDistConfigFrozenPrevious(parsed, repoName, payload.Name, *payload.EffectiveSigning)
+					if err != nil || previousSHA != payload.EffectiveConfigSHA256 {
+						return errors.New("payload effective config digest does not match its frozen signing identity")
+					}
 				}
 				identity, err := loadDistMetadataSignerSnapshot(root, repoName, operationID, payload.MetadataSignerSnapshotSHA256)
 				if err != nil {

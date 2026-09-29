@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/pgsty/sow/internal/yumrepo"
 )
 
 type ErrorKind string
@@ -137,8 +139,8 @@ func normalizeOptions(ctx context.Context, opts Options) (Options, error) {
 	if opts.Jobs < 1 {
 		return Options{}, &Error{Kind: KindUsage, Op: "create", Err: errors.New("jobs must be at least 1")}
 	}
-	if opts.MetadataTimestamp < 0 {
-		return Options{}, &Error{Kind: KindUsage, Op: "create", Err: errors.New("metadata timestamp must not be negative")}
+	if opts.MetadataTimestamp < 0 || opts.MetadataTimestamp > yumrepo.MaxMetadataTimestamp {
+		return Options{}, &Error{Kind: KindUsage, Op: "create", Err: fmt.Errorf("metadata timestamp must be Unix seconds in 0..%d", yumrepo.MaxMetadataTimestamp)}
 	}
 	if opts.Timeout < 0 {
 		return Options{}, &Error{Kind: KindUsage, Op: "create", Err: errors.New("timeout must not be negative")}

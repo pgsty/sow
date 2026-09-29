@@ -148,15 +148,14 @@ func TestR2PublicationBackendMapsOneCanonicalKeyAndUsesConditionalPut(t *testing
 	}
 	update := write("second")
 	update.Operation, update.ExpectedOldSHA256 = "update", add.SHA256
-	secondETag, err := backend.Put(ctx, sourceRoot, update, strings.Repeat("a", 64))
-	if err != nil || secondETag == firstETag || len(fake.objects) != 1 {
-		t.Fatalf("R2 update etag=%q err=%v", secondETag, err)
+	if _, err := backend.Put(ctx, sourceRoot, update, strings.Repeat("a", 64)); !errors.Is(err, ErrRejected) {
+		t.Fatalf("R2 payload overwrite was accepted: %v", err)
 	}
 	objects, err := backend.List(ctx, nil)
-	if err != nil || len(objects) != 1 || objects[0].Path != objectPath || objects[0].RemoteIdentity != secondETag {
+	if err != nil || len(objects) != 1 || objects[0].Path != objectPath || objects[0].RemoteIdentity != firstETag {
 		t.Fatalf("R2 list=%#v err=%v", objects, err)
 	}
-	if err := backend.VerifyPublic(ctx, state.GenerationFile{Path: objectPath, Phase: "payload", Size: update.Size, SHA256: update.SHA256}); err != nil {
+	if err := backend.VerifyPublic(ctx, state.GenerationFile{Path: objectPath, Phase: "payload", Size: add.Size, SHA256: add.SHA256}); err != nil {
 		t.Fatal(err)
 	}
 	if err := backend.DeleteConditional(ctx, state.PublicationCandidate{}); !errors.Is(err, ErrRejected) {

@@ -9,7 +9,7 @@ repos:
       el9:
         format: rpm
         exclude:
-          - kind: [debug]
+          - kind: [debuginfo, debugsource]
       noble:
         format: deb
 

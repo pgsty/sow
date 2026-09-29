@@ -1,15 +1,142 @@
 package managed
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/pgsty/sow/internal/v2/config"
+	"github.com/pgsty/sow/internal/v2/state"
 )
+
+type descriptorEOFContext struct {
+	context.Context
+	file  *os.File
+	size  int64
+	onEOF func()
+	fired bool
+}
+
+func (ctx *descriptorEOFContext) Err() error {
+	position, err := ctx.file.Seek(0, io.SeekCurrent)
+	if err == nil && position == ctx.size && !ctx.fired {
+		ctx.fired = true
+		ctx.onEOF()
+	}
+	return ctx.Context.Err()
+}
+
+func TestDescriptorAuthenticationRejectsRewriteWithRestoredMTime(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "payload")
+	body := bytes.Repeat([]byte("immutable-payload"), 4096)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeIdentity, err := snapshotRegularDescriptorIdentity(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Change the bytes only after the hasher consumed the original payload,
+	// just before its EOF read. The digest alone therefore still matches.
+	ctx := &descriptorEOFContext{Context: context.Background(), file: file, size: int64(len(body))}
+	ctx.onEOF = func() {
+		changed := append([]byte(nil), body...)
+		changed[len(changed)-1] ^= 1
+		if err := os.WriteFile(path, changed, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Filesystems such as tmpfs can keep the same ctime within one clock
+		// tick. Establish a changed ctime while retaining the original mtime;
+		// this test checks that authentication uses that recorded change.
+		deadline := time.Now().Add(time.Second)
+		for {
+			if err := os.Chtimes(path, before.ModTime(), before.ModTime()); err != nil {
+				t.Fatal(err)
+			}
+			after, err := snapshotRegularDescriptorIdentity(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.changeUnixNano != beforeIdentity.changeUnixNano {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("filesystem did not record a changed ctime within one second")
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if _, err := authenticateRegularDescriptor(ctx, file, int64(len(body)), bytesSHA(body)); err == nil || !ctx.fired {
+		t.Fatalf("post-read rewrite accepted: mutation=%t err=%v", ctx.fired, err)
+	}
+}
+
+func TestPendingInstallRejectsWrongDigestBeforePublishingName(t *testing.T) {
+	root := t.TempDir()
+	staged := filepath.Join(root, ".sow/repo/stage/op/objects/source")
+	if err := os.MkdirAll(filepath.Dir(staged), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".sow/repo/pending"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("actual")
+	if err := os.WriteFile(staged, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	object := state.PackageObject{SHA256: bytesSHA([]byte("wanted")), Size: int64(len(body))}
+	if err := installPendingObject(context.Background(), root, "repo", staged, object); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("wrong staged content: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, ".sow/repo/pending", object.SHA256)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected bytes acquired pending name: %v", err)
+	}
+	got, err := os.ReadFile(staged)
+	if err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("rejected source changed: bytes=%q err=%v", got, err)
+	}
+}
+
+func TestRenameRootedRegularReplaysExactDualLink(t *testing.T) {
+	root := t.TempDir()
+	source, target := filepath.Join(root, "source"), filepath.Join(root, "target")
+	body := []byte("durable immutable object")
+	if err := os.WriteFile(source, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(source, target); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := renameRootedRegular(context.Background(), root, "source", "target", int64(len(body)), bytesSHA(body), 0o644, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(target)
+	if err != nil || !os.SameFile(before, after) || after.Mode().Perm() != 0o644 {
+		t.Fatalf("replay lost exact inode or final mode: %v", err)
+	}
+	if _, err := os.Stat(source); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source not removed after target committed: %v", err)
+	}
+}
 
 func TestRootedRegularDetectsParentSwapAfterOpen(t *testing.T) {
 	root := t.TempDir()

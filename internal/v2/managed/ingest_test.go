@@ -109,7 +109,7 @@ func sabotageOnlyMutationStage(root, outside string) (func(), error) {
 	}, nil
 }
 
-func TestAddPostCommitCheckpointFailureRetainsCommittedProjection(t *testing.T) {
+func TestAddReaderBlockedCheckpointRetainsCommittedProjection(t *testing.T) {
 	newRepo := func(t *testing.T) (string, string) {
 		t.Helper()
 		root := t.TempDir()
@@ -149,8 +149,8 @@ func TestAddPostCommitCheckpointFailureRetainsCommittedProjection(t *testing.T) 
 		if release != nil {
 			release()
 		}
-		if err == nil || !strings.Contains(err.Error(), "checkpoint repository state incomplete") {
-			t.Fatalf("checkpoint fault result=%#v err=%v", result, err)
+		if err != nil {
+			t.Fatalf("reader-blocked checkpoint rejected durable mutation: result=%#v err=%v", result, err)
 		}
 		wantRevision := before.DesiredRevision
 		if skip {
@@ -173,7 +173,7 @@ func TestAddPostCommitCheckpointFailureRetainsCommittedProjection(t *testing.T) 
 			t.Fatalf("terminal audit=%#v err=%v", detail, detailErr)
 		}
 		if _, statErr := os.Stat(mutationStageRoot(root, "repo", result.Operation)); !os.IsNotExist(statErr) {
-			t.Fatalf("terminal checkpoint error retained stage: %v", statErr)
+			t.Fatalf("terminal mutation retained stage: %v", statErr)
 		}
 	}
 

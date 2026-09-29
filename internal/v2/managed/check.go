@@ -3,6 +3,7 @@ package managed
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -114,6 +115,51 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 	repositoryRecoveryView, recoveryErr := inspectMutationRecoveryView(ctx, ws.Root, repoName, store, summary, allPendingOperations)
 	if recoveryErr != nil {
 		stateIssues = append(stateIssues, recoveryErr.Error())
+	}
+	cleanupOperations, cleanupErr := terminalCleanupOperations(ctx, ws.Root, repoName, store)
+	if cleanupErr != nil {
+		stateIssues = append(stateIssues, cleanupErr.Error())
+	}
+	journalPending := make(map[string]state.PackageObject)
+	for _, operation := range append(allPendingOperations, cleanupOperations...) {
+		if operation.Kind == "dist.rm" || operation.Kind == "add" || operation.Kind == "rm" || operation.Kind == "build" {
+			var result struct {
+				DroppedPending []string `json:"dropped_pending"`
+			}
+			if err := json.Unmarshal([]byte(operation.ResultJSON), &result); err != nil {
+				stateIssues = append(stateIssues, "pending cleanup result is invalid")
+			} else {
+				for _, digest := range result.DroppedPending {
+					if !lowercaseSHA256.MatchString(digest) {
+						stateIssues = append(stateIssues, "pending cleanup digest is invalid")
+						continue
+					}
+					journalPending[digest] = state.PackageObject{SHA256: digest, Size: -1}
+				}
+			}
+		}
+		if operation.Kind != "add" {
+			continue
+		}
+		var payload mutationOperationPayload
+		if err := jsonUnmarshalStrict(operation.PayloadJSON, &payload); err != nil || payload.Repository != repoName || payload.Kind != "add" {
+			stateIssues = append(stateIssues, "pending cleanup journal binding is invalid")
+			continue
+		}
+		if payload.ManifestSHA256 == "" {
+			continue
+		}
+		manifest, err := readMutationManifest(ws.Root, repoName, operation.ID, payload.ManifestSHA256)
+		if errors.Is(err, os.ErrNotExist) && operation.State == state.OperationFailed {
+			continue // Pending cleanup completed; only the stage-removal tail remains.
+		}
+		if err != nil {
+			stateIssues = append(stateIssues, err.Error())
+			continue
+		}
+		for _, object := range manifest.Objects {
+			journalPending[object.SHA256] = object
+		}
 	}
 	pendingOperations := pendingOperationsForSelectedDists(allPendingOperations, distNames, scoped)
 	if len(pendingOperations) != 0 {
@@ -319,7 +365,16 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 	pendingErr := walkRootedTree(ctx, pendingRoot, func(relative string, _ *os.File, info os.FileInfo) error {
 		name := filepath.ToSlash(relative)
 		object, expected := allPendingExpected[name]
-		if strings.Contains(name, "/") || !expected || info.Size() != object.Size {
+		if !expected {
+			// Journal-owned pre-apply bytes and terminal cleanup remainders are
+			// recoverable work, not orphan corruption. Do not recommend deleting
+			// the only internal copy while its operation still owns it.
+			object, expected = journalPending[name]
+			if expected {
+				result.Status = statusAtLeast(result.Status, "recovering")
+			}
+		}
+		if strings.Contains(name, "/") || !expected || object.Size >= 0 && info.Size() != object.Size {
 			return fmt.Errorf("pending store entry %q is orphaned or unsafe", name)
 		}
 		if _, selected := pendingExpected[name]; selected {

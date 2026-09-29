@@ -80,3 +80,16 @@ func TestCreateRejectsNegativeMetadataTimestamp(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+func TestCreateRejectsOutOfRangeMetadataTimestampBeforeWriting(t *testing.T) {
+	for _, value := range []int64{253402300800, 1790049000000, 9223372036854775807} {
+		root := t.TempDir()
+		if _, err := Create(context.Background(), Options{Dir: root, MetadataTimestamp: value}); KindOf(err) != KindUsage {
+			t.Fatalf("timestamp=%d err=%v", value, err)
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("invalid timestamp wrote files: %v %v", entries, err)
+		}
+	}
+}

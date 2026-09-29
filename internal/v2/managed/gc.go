@@ -127,6 +127,9 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 	if err := validateCurrentPublicGeneration(ctx, ws.Root, repoName, store); err != nil {
 		return result, err
 	}
+	if err := cleanupRetainedAddStagesLocked(ctx, ws.Root, repoName, store); err != nil {
+		return result, err
+	}
 	if err := requireLocalGCPrivateRootsSettled(ws.Root, repoName); err != nil {
 		return result, err
 	}

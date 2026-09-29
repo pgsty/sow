@@ -40,7 +40,7 @@ type APTMetadataSigner interface {
 // every Release rendered by the current implementation. The generation field
 // makes a metadata-only APT publication physically distinct even when its
 // package indexes and whole-second publication timestamp are unchanged.
-const managedAPTReleaseContract = "sow.apt-release/v2"
+const managedAPTReleaseContract = "sow.apt-release/v3"
 
 type ManagedDistSpec struct {
 	Name          string

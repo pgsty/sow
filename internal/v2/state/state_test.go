@@ -82,7 +82,7 @@ func TestOpenExistingForMigrationAddsReverseMembershipIndexesToV8(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	store, err := OpenExistingForMigration(path)
+	store, err := OpenExistingForMigration(path, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestV11MigrationRepairsRepositoryProjectionStatus(t *testing.T) {
 	if _, err := OpenExisting(path); !errors.Is(err, ErrSchema) {
 		t.Fatalf("ordinary writer crossed explicit v10 migration boundary: %v", err)
 	}
-	migrated, err := OpenExistingForMigration(path)
+	migrated, err := OpenExistingForMigration(path, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,10 @@ func downgradeV11FixtureToV10(t *testing.T, db *sql.DB) {
 	_, err := db.Exec(`
 	PRAGMA foreign_keys = OFF;
 	DROP TABLE publication_target_binding_revisions;
-	DELETE FROM schema_migrations WHERE version = 12;
+	DROP INDEX package_objects_pool_path_folded;
+DROP INDEX publication_inventory_payload_path_folded;
+DROP INDEX publication_abandoned_payload_path_folded;
+DELETE FROM schema_migrations WHERE version IN (12, 13);
 	CREATE TEMP TABLE generation_view_signers_fixture AS
 SELECT generation, view_id, signer_identity, trusted_public_key FROM generation_view_signers;
 DROP TABLE generation_view_signers;
@@ -483,7 +486,7 @@ func TestOpenExistingForMigrationMigratesKnownV1OnlyAfterReadOnlyProbe(t *testin
 		t.Fatalf("read-only v1 probe changed database: err=%v", err)
 	}
 
-	store, err := OpenExistingForMigration(path)
+	store, err := OpenExistingForMigration(path, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -537,7 +540,21 @@ func TestFrozenV6IsReadableButOrdinaryWriterCannotMigrateIt(t *testing.T) {
 	if version != 6 {
 		t.Fatalf("ordinary writer changed schema to %d", version)
 	}
-	writer, err := OpenExistingForMigration(path)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store, err := OpenExistingForMigration(path, true); !errors.Is(err, ErrLegacyLayout) {
+		if store != nil {
+			store.Close()
+		}
+		t.Fatalf("CLI migration accepted untouched pre-v7 layout: %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || string(before) != string(after) {
+		t.Fatalf("restricted migration changed v6 bytes: %v", err)
+	}
+	writer, err := OpenExistingForMigration(path, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +588,7 @@ func TestOpenExistingForMigrationReanchorsTruncatedV2GenerationLedgerAtomically(
 	path := filepath.Join(t.TempDir(), "repo.db")
 	firstManifest, _ := createTruncatedV2GenerationLedger(t, path, false)
 
-	store, err := OpenExistingForMigration(path)
+	store, err := OpenExistingForMigration(path, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -611,7 +628,7 @@ func TestOpenExistingForMigrationReanchorsTruncatedV2GenerationLedgerAtomically(
 func TestOpenExistingRejectsCorruptTruncatedV2GenerationLedgerWithoutMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "repo.db")
 	createTruncatedV2GenerationLedger(t, path, true)
-	if _, err := OpenExistingForMigration(path); !errors.Is(err, ErrSchema) {
+	if _, err := OpenExistingForMigration(path, false); !errors.Is(err, ErrSchema) {
 		t.Fatalf("OpenExisting(corrupt v2 ledger) error=%v, want ErrSchema", err)
 	}
 	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=ro")
@@ -925,6 +942,24 @@ func TestCheckpointAcceptsReaderBlockedTruncateAfterAllFramesCopied(t *testing.T
 	}
 	if err := writer.Checkpoint(ctx); err != nil {
 		t.Fatalf("reader-blocked WAL truncate was reported as a committed mutation failure: %v", err)
+	}
+	if _, err := writer.DB().ExecContext(ctx, `UPDATE repository_state SET desired_revision = 2 WHERE singleton = 1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Checkpoint(ctx); err != nil {
+		t.Fatalf("pinned old snapshot made a new durable write fail: %v", err)
+	}
+	if err := readTx.QueryRowContext(ctx, `SELECT desired_revision FROM repository_state WHERE singleton = 1`).Scan(&revision); err != nil || revision != 1 {
+		t.Fatalf("snapshot changed: revision=%d err=%v", revision, err)
+	}
+	if err := readTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Checkpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.DB().QueryRowContext(ctx, `SELECT desired_revision FROM repository_state WHERE singleton = 1`).Scan(&revision); err != nil || revision != 2 {
+		t.Fatalf("new commit lost: revision=%d err=%v", revision, err)
 	}
 }
 
@@ -1555,7 +1590,7 @@ func assertSchemaV2(t *testing.T, db *sql.DB) {
 		t.Fatalf("user_version=%d want=%d", version, SchemaVersion)
 	}
 	var migrationCount int
-	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE (version = 1 AND checksum = ?) OR (version = 2 AND checksum = ?) OR (version = 3 AND checksum = ?) OR (version = 4 AND checksum = ?) OR (version = 5 AND checksum = ?) OR (version = 6 AND checksum = ?) OR (version = 7 AND checksum = ?) OR (version = 8 AND checksum = ?) OR (version = 9 AND checksum = ?) OR (version = 10 AND checksum = ?) OR (version = 11 AND checksum = ?) OR (version = 12 AND checksum = ?)`, SchemaV1SHA256, SchemaV2SHA256, SchemaV3SHA256, SchemaV4SHA256, SchemaV5SHA256, SchemaV6SHA256, SchemaV7SHA256, SchemaV8SHA256, SchemaV9SHA256, SchemaV10SHA256, SchemaV11SHA256, SchemaV12SHA256).Scan(&migrationCount); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM schema_migrations WHERE (version = 1 AND checksum = ?) OR (version = 2 AND checksum = ?) OR (version = 3 AND checksum = ?) OR (version = 4 AND checksum = ?) OR (version = 5 AND checksum = ?) OR (version = 6 AND checksum = ?) OR (version = 7 AND checksum = ?) OR (version = 8 AND checksum = ?) OR (version = 9 AND checksum = ?) OR (version = 10 AND checksum = ?) OR (version = 11 AND checksum = ?) OR (version = 12 AND checksum = ?) OR (version = 13 AND checksum = ?)`, SchemaV1SHA256, SchemaV2SHA256, SchemaV3SHA256, SchemaV4SHA256, SchemaV5SHA256, SchemaV6SHA256, SchemaV7SHA256, SchemaV8SHA256, SchemaV9SHA256, SchemaV10SHA256, SchemaV11SHA256, SchemaV12SHA256, SchemaV13SHA256).Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
 	if migrationCount != SchemaVersion {

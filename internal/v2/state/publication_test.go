@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func publicationStoreFixture(t *testing.T) (*Store, PublicationTargetBinding, []GenerationFile) {
+func publicationStoreFixture(t testing.TB) (*Store, PublicationTargetBinding, []GenerationFile) {
 	t.Helper()
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "repo.db"))
@@ -202,7 +202,10 @@ func TestV12MigrationBackfillsInitialPublicationTargetRevision(t *testing.T) {
 	store, binding, _ := publicationStoreFixture(t)
 	path := store.path
 	if _, err := store.DB().Exec(`DROP TABLE publication_target_binding_revisions;
-DELETE FROM schema_migrations WHERE version = 12;
+DROP INDEX package_objects_pool_path_folded;
+DROP INDEX publication_inventory_payload_path_folded;
+DROP INDEX publication_abandoned_payload_path_folded;
+DELETE FROM schema_migrations WHERE version IN (12, 13);
 PRAGMA user_version = 11;`); err != nil {
 		store.Close()
 		t.Fatal(err)
@@ -210,7 +213,7 @@ PRAGMA user_version = 11;`); err != nil {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	migrated, err := OpenExistingForMigration(path)
+	migrated, err := OpenExistingForMigration(path, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +314,7 @@ func TestFilesystemConditionalDeleteBlocksEndpointRebind(t *testing.T) {
 	}
 }
 
-func seedPublicationGrace(t *testing.T, store *Store, binding PublicationTargetBinding, manifest []GenerationFile, appliedAt time.Time) (PublicationAttempt, AppliedCheckpoint, GraceRecord) {
+func seedPublicationGrace(t testing.TB, store *Store, binding PublicationTargetBinding, manifest []GenerationFile, appliedAt time.Time) (PublicationAttempt, AppliedCheckpoint, GraceRecord) {
 	t.Helper()
 	ctx := context.Background()
 	_, manifestSHA, err := ManifestBytes(manifest)
@@ -710,7 +713,7 @@ func TestV11MigrationClearsEvidenceFromResurrectedPublication(t *testing.T) {
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	migrated, err := OpenExistingForMigration(path)
+	migrated, err := OpenExistingForMigration(path, false)
 	if err != nil {
 		t.Fatal(err)
 	}

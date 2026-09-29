@@ -1,18 +1,20 @@
 package v2cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
 
 const (
-	ExitOK        = 0
-	ExitRuntime   = 1
-	ExitUsage     = 2
-	ExitPartial   = 3
-	ExitLock      = 4
-	ExitIntegrity = 5
-	ExitRejected  = 6
+	ExitOK          = 0
+	ExitRuntime     = 1
+	ExitUsage       = 2
+	ExitPartial     = 3
+	ExitLock        = 4
+	ExitIntegrity   = 5
+	ExitRejected    = 6
+	ExitInterrupted = 130
 )
 
 // Error categories are public sentinels so domain packages can classify an
@@ -84,6 +86,8 @@ func ExitCode(err error) int {
 		return classified.Code
 	}
 	switch {
+	case errors.Is(err, context.Canceled):
+		return ExitInterrupted
 	case errors.Is(err, ErrUsage), errors.Is(err, ErrDiscovery), errors.Is(err, ErrConfig):
 		return ExitUsage
 	case errors.Is(err, ErrLock):
@@ -99,7 +103,7 @@ func ExitCode(err error) int {
 
 func validExitCode(code int) bool {
 	switch code {
-	case ExitOK, ExitRuntime, ExitUsage, ExitPartial, ExitLock, ExitIntegrity, ExitRejected:
+	case ExitOK, ExitRuntime, ExitUsage, ExitPartial, ExitLock, ExitIntegrity, ExitRejected, ExitInterrupted:
 		return true
 	default:
 		return false
@@ -118,6 +122,8 @@ func errorClass(code int) string {
 		return "integrity"
 	case ExitRejected:
 		return "rejected"
+	case ExitInterrupted:
+		return "interrupted"
 	default:
 		return "runtime"
 	}

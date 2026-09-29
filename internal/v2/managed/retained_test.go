@@ -5,13 +5,184 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"golang.org/x/sys/unix"
 )
+
+func TestRetainStageCrashAfterGenerationAdvance(t *testing.T) {
+	ctx := context.Background()
+	for _, cleanup := range []string{"gc", "retain", "partial"} {
+		t.Run(cleanup, func(t *testing.T) {
+			fixture := newLocalGCFixture(t, true)
+			before, err := RetainList(ctx, RetainListOptions{WorkspaceOptions: fixture.options, Repository: "repo"})
+			if err != nil || len(before.Generations) != 1 {
+				t.Fatalf("retained before crash=%#v err=%v", before, err)
+			}
+			command := exec.Command(os.Args[0], "-test.run=^TestRetainStageCrashHelper$")
+			command.Env = append(os.Environ(), "SOW_RETAIN_CRASH_ROOT="+fixture.root, "SOW_RETAIN_CRASH_GENERATION="+fixture.generation.String())
+			output, err := command.CombinedOutput()
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 91 {
+				t.Fatalf("retain helper error=%v output=%s", err, output)
+			}
+			stage := filepath.Join(fixture.root, ".sow", "repo", "stage", "retain-"+fixture.generation.String())
+			if _, err := os.Stat(filepath.Join(stage, "record.json")); err != nil {
+				t.Fatalf("process exit did not leave retain stage: %v", err)
+			}
+			var linkedPublic string
+			if cleanup == "gc" {
+				metadata, err := listRetainedMetadata(filepath.Join(stage, "metadata"))
+				if err != nil || len(metadata) == 0 {
+					t.Fatalf("metadata=%v err=%v", metadata, err)
+				}
+				linkedStage := filepath.Join(stage, "metadata", filepath.FromSlash(metadata[0]))
+				linkedPublic = filepath.Join(fixture.root, "repo", filepath.FromSlash(metadata[0]))
+				if err := os.Remove(linkedStage); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Link(linkedPublic, linkedStage); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if cleanup == "partial" {
+				// Exercise pre-record crashes and interrupted cleanup too. These
+				// temporary copies have no obligation to form a complete snapshot.
+				if err := os.Remove(filepath.Join(stage, "record.json")); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Truncate(filepath.Join(stage, "manifest.tsv"), 3); err != nil {
+					t.Fatal(err)
+				}
+				metadata, err := listRetainedMetadata(filepath.Join(stage, "metadata"))
+				if err != nil || len(metadata) == 0 {
+					t.Fatalf("metadata=%v err=%v", metadata, err)
+				}
+				if err := os.Truncate(filepath.Join(stage, "metadata", filepath.FromSlash(metadata[0])), 0); err != nil {
+					t.Fatal(err)
+				}
+			}
+			advanced, err := NewDist(ctx, DistNewOptions{WorkspaceOptions: fixture.options, Repository: "repo", Name: "el8", Format: "rpm"})
+			if err != nil || advanced.Generation <= fixture.generation {
+				t.Fatalf("advance=%#v err=%v", advanced, err)
+			}
+			if _, err := os.Stat(stage); err != nil {
+				t.Fatalf("unrelated Dist write unexpectedly removed retain stage: %v", err)
+			}
+			var publicMode os.FileMode
+			var publicBytes []byte
+			if linkedPublic != "" {
+				info, err := os.Stat(linkedPublic)
+				if err != nil {
+					t.Fatal(err)
+				}
+				publicMode = info.Mode()
+				publicBytes, err = os.ReadFile(linkedPublic)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if cleanup == "retain" {
+				if _, err := RetainAdd(ctx, RetainAddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Generation: advanced.Generation}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				if attempt == 1 {
+					// A crash immediately after mkdir, or after unlinking the last
+					// staged file, must also have an idempotent cleanup path.
+					if err := os.Mkdir(stage, 0o700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				result, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"})
+				if err != nil || !result.Noop {
+					t.Fatalf("gc replay %d=%#v err=%v", attempt, result, err)
+				}
+			}
+			if _, err := os.Lstat(stage); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("abandoned retain stage survived: %v", err)
+			}
+			if linkedPublic != "" {
+				info, statErr := os.Stat(linkedPublic)
+				data, readErr := os.ReadFile(linkedPublic)
+				if statErr != nil || readErr != nil || info.Mode() != publicMode || !bytes.Equal(data, publicBytes) {
+					t.Fatalf("stage cleanup changed linked public metadata: stat=%v read=%v", statErr, readErr)
+				}
+			}
+			retained, err := VerifyRetainedGeneration(ctx, RetainVerifyOptions{WorkspaceOptions: fixture.options, Repository: "repo", Generation: before.Generations[0].Record.Generation})
+			if err != nil || retained.RecordIdentity != before.Generations[0].RecordIdentity {
+				t.Fatalf("completed retained snapshot changed: %#v err=%v", retained, err)
+			}
+		})
+	}
+}
+
+func TestRetainStageCrashHelper(t *testing.T) {
+	root := os.Getenv("SOW_RETAIN_CRASH_ROOT")
+	if root == "" {
+		t.Skip("subprocess helper")
+	}
+	generation, err := state.ParseGenerationID(os.Getenv("SOW_RETAIN_CRASH_GENERATION"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = RetainAdd(context.Background(), RetainAddOptions{
+		WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Generation: generation,
+		Fault: func(point string) error {
+			if point == "retain.staged" {
+				os.Exit(91) // Do not run the in-process deferred stage cleanup.
+			}
+			return nil
+		},
+	})
+	t.Fatalf("retain crash point was not reached: %v", err)
+}
+
+func TestRetainStageCleanupRejectsUnknownEntries(t *testing.T) {
+	fixture := newLocalGCFixture(t, true)
+	stageRoot := filepath.Join(fixture.root, ".sow", "repo", "stage")
+	for _, kind := range []string{"unknown-directory", "foreign-generation", "extra-file", "symlink", "fifo", "oversized-record"} {
+		t.Run(kind, func(t *testing.T) {
+			name := "retain-" + fixture.generation.String()
+			if kind == "unknown-directory" {
+				name = "foreign"
+			} else if kind == "foreign-generation" {
+				name = "retain-" + (fixture.generation + 100).String()
+			}
+			stage := filepath.Join(stageRoot, name)
+			if err := os.Mkdir(stage, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(stage) })
+			var err error
+			switch kind {
+			case "extra-file":
+				err = os.WriteFile(filepath.Join(stage, "keep-me"), []byte("foreign"), 0o600)
+			case "symlink":
+				err = os.Symlink(filepath.Join(fixture.root, "repo"), filepath.Join(stage, "metadata"))
+			case "fifo":
+				err = unix.Mkfifo(filepath.Join(stage, "record.json"), 0o600)
+			case "oversized-record":
+				err = os.WriteFile(filepath.Join(stage, "record.json"), make([]byte, maxRetainedRecordBytes+1), 0o600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LocalGC(context.Background(), LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); !errors.Is(err, ErrIntegrity) {
+				t.Fatalf("unknown stage was accepted: %v", err)
+			}
+			if _, err := os.Lstat(stage); err != nil {
+				t.Fatalf("unknown stage was removed: %v", err)
+			}
+		})
+	}
+}
 
 func TestRetainedRecordAndManifestExactWire(t *testing.T) {
 	record := RetainedRecord{

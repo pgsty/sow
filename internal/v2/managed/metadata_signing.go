@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/pgsty/sow/internal/aptrepo"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
@@ -21,9 +23,11 @@ import (
 )
 
 type gpgSignerCore struct {
-	identity    string
-	fingerprint string
-	at          time.Time
+	identity           string
+	fingerprint        string // retained primary certificate identity
+	signingFingerprint string // actual GPG key, pinned for this in-memory signer
+	public             []byte
+	at                 time.Time
 }
 
 type gpgYUMMetadataSigner struct{ *gpgSignerCore }
@@ -34,6 +38,30 @@ type inProcessAPTMetadataVerifier struct{ verifier *aptrepo.Verifier }
 type metadataSignerIdentity struct {
 	Fingerprint string
 	PublicKey   []byte
+	// SelectedFingerprint is operation-local. Frozen trees retain the public
+	// certificate and their bytes, and never need to select a signing key again.
+	SelectedFingerprint string `json:"-"`
+}
+
+var errMetadataSigningPolicy = errors.New("metadata signing policy rejects new metadata")
+
+func metadataSigningPolicyError(reason string) error {
+	return fmt.Errorf("%w: %w: %s", ErrRejected, errMetadataSigningPolicy, reason)
+}
+
+type metadataSignerCacheKey struct{}
+type metadataSignerCache struct {
+	sync.Mutex
+	cores map[string]*gpgSignerCore
+}
+
+// The cache belongs to one command, never the process or the repository. A
+// shared certificate/time needs only one small GPG probe, regardless of Dists.
+func withMetadataSignerCache(ctx context.Context) context.Context {
+	if ctx.Value(metadataSignerCacheKey{}) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, metadataSignerCacheKey{}, &metadataSignerCache{cores: map[string]*gpgSignerCore{}})
 }
 
 type metadataSignerSnapshot struct {
@@ -61,22 +89,38 @@ type distMetadataSignerSnapshotWire struct {
 	PublicKey   []byte `json:"public_key"`
 }
 
-func (signer *gpgSignerCore) Validate(ctx context.Context, _ time.Time) error {
-	if signer == nil || signer.identity == "" || signer.fingerprint == "" {
+func (signer *gpgSignerCore) Validate(ctx context.Context, at time.Time) error {
+	if signer == nil || signer.identity == "" || signer.fingerprint == "" || signer.signingFingerprint == "" {
 		return errors.New("managed: metadata signing identity is unavailable")
 	}
 	if ctx == nil {
 		return errors.New("managed: nil metadata signing context")
 	}
-	if err := validateGPGSecretIdentity(ctx, signer.fingerprint); err != nil {
-		return errors.New("managed: configured metadata signing key is unavailable to gpg")
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return nil
+	_, err := selectedMetadataSigningKey(metadataSignerIdentity{PublicKey: signer.public, SelectedFingerprint: signer.signingFingerprint}, at)
+	return err
 }
 
 func newGPGSignerCoreWithPublic(ctx context.Context, identity string, at time.Time) (*gpgSignerCore, []byte, error) {
 	if at.IsZero() {
 		return nil, nil, errors.New("managed: gpg metadata signing time is required")
+	}
+	if ctx == nil {
+		return nil, nil, errors.New("managed: nil metadata signing context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	cache, _ := ctx.Value(metadataSignerCacheKey{}).(*metadataSignerCache)
+	cacheKey := identity + "/" + strconv.FormatInt(at.Unix(), 10)
+	if cache != nil {
+		cache.Lock()
+		defer cache.Unlock()
+		if core := cache.cores[cacheKey]; core != nil {
+			return core, core.public, nil
+		}
 	}
 	public, err := exportPublicKey(ctx, identity)
 	if err != nil {
@@ -86,21 +130,20 @@ func newGPGSignerCoreWithPublic(ctx context.Context, identity string, at time.Ti
 	if err != nil {
 		return nil, nil, err
 	}
-	entities, err := yumrepo.ParsePublicKeyring(public)
-	if err != nil || len(entities) != 1 {
-		return nil, nil, errors.New("managed: gpg identity must export exactly one valid OpenPGP entity")
-	}
-	signingKey, ok := entities[0].SigningKey(at.UTC())
-	if !ok || !yumrepo.DeterministicMetadataSignatureAlgorithm(signingKey.PublicKey.PubKeyAlgo) {
-		return nil, nil, errors.New("managed: gpg metadata signing key algorithm is not retry-deterministic")
-	}
 	fingerprints, err := yumrepo.RPMPackageKeyringPrimaryFingerprints(public)
 	if err != nil || len(fingerprints) != 1 {
-		return nil, nil, errors.New("managed: gpg identity must resolve to exactly one primary OpenPGP key")
+		return nil, nil, metadataSigningPolicyError("gpg identity must resolve to exactly one primary OpenPGP key")
 	}
-	core := &gpgSignerCore{identity: identity, fingerprint: strings.ToUpper(fingerprints[0]), at: at.UTC()}
-	if err := core.Validate(ctx, time.Now().UTC()); err != nil {
+	selected, err := probeGPGSigning(ctx, fingerprints[0], at)
+	if err != nil {
 		return nil, nil, err
+	}
+	core := &gpgSignerCore{identity: identity, fingerprint: strings.ToUpper(fingerprints[0]), signingFingerprint: selected, public: public, at: at.UTC()}
+	if err := core.Validate(ctx, at); err != nil {
+		return nil, nil, err
+	}
+	if cache != nil {
+		cache.cores[cacheKey] = core
 	}
 	return core, public, nil
 }
@@ -121,15 +164,18 @@ func (signer *gpgSignerCore) runSign(ctx context.Context, operation []string, me
 	if ctx == nil || message == nil || output == nil || at.IsZero() {
 		return errors.New("managed: invalid gpg signing request")
 	}
-	if err := signer.Validate(ctx, time.Now()); err != nil {
+	if err := signer.Validate(ctx, at); err != nil {
 		return err
 	}
 	gpg, _ := exec.LookPath("gpg")
-	args := []string{"--batch", "--no-tty", "--yes", "--faked-system-time", strconv.FormatInt(at.UTC().Unix(), 10), "--local-user", signer.fingerprint, "--output", "-"}
+	args := []string{"--batch", "--no-tty", "--yes", "--pinentry-mode", "error", "--digest-algo", "SHA256", "--faked-system-time", strconv.FormatInt(at.UTC().Unix(), 10) + "!", "--local-user", signer.signingFingerprint + "!", "--output", "-"}
 	args = append(args, operation...)
 	command := exec.CommandContext(ctx, gpg, args...)
 	command.Stdin, command.Stdout, command.Stderr = message, output, io.Discard
 	if err := command.Run(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("managed: gpg metadata signing failed: %w", err)
 	}
 	return nil
@@ -204,7 +250,7 @@ func (verifier *inProcessAPTMetadataVerifier) Verify(ctx context.Context, releas
 }
 
 func verifyGPGDetached(ctx context.Context, message, signature []byte, fingerprint string) error {
-	root, err := os.MkdirTemp("", "sow-gpg-verify-")
+	root, err := privateTemporaryDirectory("sow-gpg-verify-")
 	if err != nil {
 		return err
 	}
@@ -256,6 +302,10 @@ func gpgStatusMatchesFingerprint(status, fingerprint string) bool {
 // DEB key (and vice versa), including an unavailable env/agent reference.
 func loadMetadataSignerSnapshotForFormats(ctx context.Context, root string, repository config.RepositoryConfig, at time.Time, wantRPM, wantDEB bool) (metadataSignerSnapshot, error) {
 	var snapshot metadataSignerSnapshot
+	if ctx == nil {
+		return snapshot, errors.New("managed: nil metadata signing context")
+	}
+	ctx = withMetadataSignerCache(ctx)
 	if at.IsZero() {
 		return snapshot, errors.New("managed: metadata publication time is required")
 	}
@@ -279,11 +329,11 @@ func loadMetadataSignerSnapshotForFormats(ctx context.Context, root string, repo
 				return metadataSignerSnapshot{}, err
 			}
 			snapshot.RPMSigner = &gpgYUMMetadataSigner{gpgSignerCore: core}
-			snapshot.RPM = metadataSignerIdentity{Fingerprint: core.fingerprint, PublicKey: public}
+			snapshot.RPM = metadataSignerIdentity{Fingerprint: core.fingerprint, PublicKey: public, SelectedFingerprint: core.signingFingerprint}
 		} else {
 			signer, err := yumrepo.NewOpenPGPSigner(bytes.NewReader(material), passphrase, at)
 			if err != nil {
-				return metadataSignerSnapshot{}, fmt.Errorf("managed: load RPM metadata signing key: %w", err)
+				return metadataSignerSnapshot{}, metadataSigningPolicyError("RPM metadata key is unusable for signing at the publication time")
 			}
 			identity, err := metadataIdentityFromMaterial(material)
 			if err != nil {
@@ -311,11 +361,14 @@ func loadMetadataSignerSnapshotForFormats(ctx context.Context, root string, repo
 				return metadataSignerSnapshot{}, err
 			}
 			snapshot.APTSigner = &gpgAPTMetadataSigner{gpgSignerCore: core}
-			snapshot.DEB = metadataSignerIdentity{Fingerprint: core.fingerprint, PublicKey: public}
+			snapshot.DEB = metadataSignerIdentity{Fingerprint: core.fingerprint, PublicKey: public, SelectedFingerprint: core.signingFingerprint}
 		} else {
 			signer, err := aptrepo.NewSignerBytes(material, passphrase)
 			if err != nil {
 				return metadataSignerSnapshot{}, fmt.Errorf("managed: load DEB metadata signing key: %w", err)
+			}
+			if err := signer.Validate(at); err != nil {
+				return metadataSignerSnapshot{}, metadataSigningPolicyError("DEB metadata key is unusable for signing at the publication time")
 			}
 			identity, err := metadataIdentityFromMaterial(material)
 			if err != nil {
@@ -492,4 +545,59 @@ func loadDistMetadataSignerSnapshot(root, repoName, operationID, expectedSHA str
 		return metadataSignerIdentity{}, err
 	}
 	return identity, nil
+}
+
+// New publication must use a key usable now, even when the deterministic
+// signing timestamp is historical. Historical Generation verification and
+// recovery of a frozen build continue to use their bound signing material.
+func validateNewMetadataSigningKeys(snapshot metadataSignerSnapshot, at, now time.Time) error {
+	for _, identity := range []metadataSignerIdentity{snapshot.RPM, snapshot.DEB} {
+		if identity.Fingerprint == "" {
+			continue
+		}
+		// Validate the key selected at the deterministic signing time. Merely
+		// finding any usable key now can fall back from an expired subkey to
+		// the primary, while the historical signature still uses that subkey.
+		key, err := selectedMetadataSigningKey(identity, at)
+		if err != nil {
+			return err
+		}
+		identity.SelectedFingerprint = fmt.Sprintf("%X", key.PublicKey.Fingerprint)
+		if _, err := selectedMetadataSigningKey(identity, now); err != nil {
+			return metadataSigningPolicyError("metadata signing key is expired, revoked, or not yet valid for a new publication")
+		}
+	}
+	return nil
+}
+
+// Validate the exact key selected by the signer, not a different usable key
+// from the same certificate. GPG can legitimately have only one of several
+// signing subkeys available on this machine.
+func selectedMetadataSigningKey(identity metadataSignerIdentity, at time.Time) (openpgp.Key, error) {
+	entities, err := yumrepo.ParsePublicKeyring(identity.PublicKey)
+	if err != nil || len(entities) != 1 || at.IsZero() {
+		return openpgp.Key{}, metadataSigningPolicyError("metadata signing certificate or publication time is invalid")
+	}
+	entity := entities[0]
+	var key openpgp.Key
+	var usable bool
+	if identity.SelectedFingerprint == "" {
+		key, usable = entity.SigningKey(at)
+	} else {
+		candidates := []uint64{entity.PrimaryKey.KeyId}
+		for _, subkey := range entity.Subkeys {
+			candidates = append(candidates, subkey.PublicKey.KeyId)
+		}
+		for _, id := range candidates {
+			candidate, ok := entity.SigningKeyById(at, id)
+			if ok && fmt.Sprintf("%X", candidate.PublicKey.Fingerprint) == identity.SelectedFingerprint {
+				key, usable = candidate, true
+				break
+			}
+		}
+	}
+	if !usable || !yumrepo.DeterministicMetadataSignatureAlgorithm(key.PublicKey.PubKeyAlgo) {
+		return openpgp.Key{}, metadataSigningPolicyError("metadata signing key is unavailable, invalid at the publication time, or not retry-deterministic")
+	}
+	return key, nil
 }

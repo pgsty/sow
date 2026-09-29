@@ -350,6 +350,9 @@ func (b *filesystemPublicationBackend) Put(ctx context.Context, sourceRoot strin
 		_ = b.removeStageIfPresent(ctx, filesystemStagePath(operation.Path, attemptIdentity))
 		return current.RemoteIdentity, nil
 	}
+	if strings.HasPrefix(operation.Path, "pool/") && operation.Operation == "update" {
+		return "", fmt.Errorf("%w: immutable payload %q cannot be overwritten", ErrRejected, operation.Path)
+	}
 	if operation.Operation == "add" && exists {
 		return "", fmt.Errorf("%w: create-only object %q already exists with different identity", ErrIntegrity, operation.Path)
 	}

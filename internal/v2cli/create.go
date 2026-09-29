@@ -2,6 +2,7 @@ package v2cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -27,9 +28,16 @@ func ExecuteCreate(ctx context.Context, inv Invocation, stdout, stderr io.Writer
 		Timeout: inv.Global.Timeout, NoWait: inv.Global.NoWait,
 	})
 	if err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			err = errors.Join(context.Canceled, err)
+		}
 		classified := classifyPlainError(err)
 		if inv.Global.JSON {
-			if writeErr := WriteJSON(stdout, NewEnvelope("create", nil, nil, result, classified)); writeErr != nil {
+			var failureResult any
+			if result.Dir != "" {
+				failureResult = result
+			}
+			if writeErr := WriteJSON(stdout, NewEnvelope("create", nil, nil, failureResult, classified)); writeErr != nil {
 				fmt.Fprintln(stderr, writeErr)
 				return ExitRuntime
 			}
@@ -53,6 +61,9 @@ func ExecuteCreate(ctx context.Context, inv Invocation, stdout, stderr io.Writer
 }
 
 func classifyPlainError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return WithExitCode(ExitInterrupted, err)
+	}
 	switch plain.KindOf(err) {
 	case plain.KindUsage:
 		return Errorf(ErrUsage, "%v", err)
