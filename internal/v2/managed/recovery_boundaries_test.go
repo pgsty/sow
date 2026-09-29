@@ -332,6 +332,37 @@ func TestCheckRecognizesJournalOwnedPendingBytes(t *testing.T) {
 	}
 }
 
+// A process killed while removing a committed operation's stage leaves the
+// directory after its manifest is gone. That tail is cleanup work for the next
+// write command, not state corruption.
+func TestCheckTreatsCommittedStageTailAsCleanup(t *testing.T) {
+	ctx := context.Background()
+	root, ws := newRejectionWorkspace(t)
+	paths := collidingRPMInputs(t, root)
+	added, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"el9"}, Paths: paths[:1], Skip: true, Jobs: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(mutationStageRoot(root, "repo", added.Operation), "inputs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	checked, err := Check(ctx, CheckOptions{WorkspaceOptions: ws, Repository: "repo", Jobs: 1})
+	if checked.Status == "error" {
+		t.Fatalf("committed stage tail reported as an error: %+v err=%v", checked, err)
+	}
+	for _, layer := range checked.Layers {
+		if !layer.OK {
+			t.Fatalf("committed stage tail called corrupt: %s %v", layer.Name, layer.Issues)
+		}
+	}
+	if _, err := Build(ctx, BuildOptions{WorkspaceOptions: ws, Repository: "repo", Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(mutationStageRoot(root, "repo", added.Operation)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("next write did not remove the stage tail: %v", err)
+	}
+}
+
 func TestStagedDistAcceptsOnlyExactPreviousContract(t *testing.T) {
 	for _, kind := range []string{"dist.new", "dist.init"} {
 		for _, known := range []bool{true, false} {

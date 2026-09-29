@@ -150,7 +150,7 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 			continue
 		}
 		manifest, err := readMutationManifest(ws.Root, repoName, operation.ID, payload.ManifestSHA256)
-		if errors.Is(err, os.ErrNotExist) && operation.State == state.OperationFailed {
+		if errors.Is(err, os.ErrNotExist) && terminalOperationState(operation.State) {
 			continue // Pending cleanup completed; only the stage-removal tail remains.
 		}
 		if err != nil {
@@ -970,4 +970,12 @@ func sameGenerationManifest(left, right []state.GenerationFile) bool {
 		}
 	}
 	return true
+}
+
+func terminalOperationState(value state.OperationState) bool {
+	switch value {
+	case state.OperationDone, state.OperationDoneDirty, state.OperationFailed, state.OperationRolledBack:
+		return true
+	}
+	return false
 }
