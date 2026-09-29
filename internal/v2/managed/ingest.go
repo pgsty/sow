@@ -1162,6 +1162,22 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 		}
 		return err
 	}
+	if applied && manifest.Build == nil && operation.Kind == "add" && stringSetSubset(mapsKeys(manifest.Desired), payload.Dists) && !sameStringSet(payload.Dists, mapsKeys(manifest.Desired)) {
+		for _, dist := range payload.Dists {
+			if _, exists := manifest.Desired[dist]; exists {
+				continue
+			}
+			actual, err := store.MembershipDigests(ctx, dist, false)
+			if err != nil {
+				return err
+			}
+			if len(actual) != 0 {
+				// v0.4.0 applied this journal without the omitted Dist, so that Dist
+				// is unchanged. Preserve applied Desired; the next build applies policy.
+				return finishUnbuiltMutation(ctx, root, repoName, store, operation, manifest, "legacy add left a fully excluded Dist unchanged; run build to apply its policy")
+			}
+		}
+	}
 	if !applied && manifest.Build == nil {
 		if operation.Kind == "add" && stringSetSubset(mapsKeys(manifest.Desired), payload.Dists) && !sameStringSet(payload.Dists, mapsKeys(manifest.Desired)) {
 			return finishUnbuiltMutation(ctx, root, repoName, store, operation, manifest, "legacy add omitted an empty Dist before Desired was applied; rerun add")

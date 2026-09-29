@@ -100,7 +100,13 @@ func finishUnbuiltMutation(ctx context.Context, root, repoName string, store *st
 	if err := cleanupDroppedPending(ctx, root, repoName, store, result.DroppedPending); err != nil {
 		return err
 	}
-	if err := store.RecordOperationMembershipOutcomes(ctx, operation.ID, manifest.Outcomes); err != nil {
+	outcomes := make([]state.OperationMembership, 0, len(manifest.Outcomes))
+	for _, outcome := range manifest.Outcomes {
+		if _, applied := manifest.Desired[outcome.DistName]; applied {
+			outcomes = append(outcomes, outcome) // omitted legacy Dists were never changed
+		}
+	}
+	if err := store.RecordOperationMembershipOutcomes(ctx, operation.ID, outcomes); err != nil {
 		return err
 	}
 	detailJSON, _ := json.Marshal(map[string]string{"kind": "build_rejected", "reason": reason, "desired": "preserved"})

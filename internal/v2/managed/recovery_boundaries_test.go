@@ -263,6 +263,98 @@ func TestTerminalCleanupDoesNotReadHistoricalOperations(t *testing.T) {
 	}
 }
 
+// v0.4.0 omitted Desired for a selected Dist whose members were all excluded by
+// the current policy, applied the journal with that Dist unchanged, and then
+// failed forever re-reading it. The omitted Dist is non-empty, so it cannot be
+// normalized to empty Desired; recovery must finish without overwriting it.
+func TestLegacyAppliedAddOmittingNonEmptyDistFinishes(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{
+		"excluded": {Format: "rpm"},
+		"included": {Format: "rpm"},
+	}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	ws := WorkspaceOptions{Workdir: root, CWD: root}
+	testdata := func(name string) string {
+		path, err := filepath.Abs(filepath.Join("../../../third_party/cavaliergopher-rpm/testdata", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"excluded"}, Paths: []string{testdata("centos-release-7-2.1511.el7.centos.2.10.x86_64.rpm")}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Repositories["repo"].Dists["excluded"] = config.DistConfig{Format: "rpm", Exclude: []config.ExcludeRule{{Name: []string{"centos-release"}}}}
+	writeManagedConfig(t, root, cfg)
+	crash := errors.New("stop before apply")
+	added, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"excluded", "included"}, Paths: []string{testdata("centos-release-6-0.el6.centos.5.x86_64.rpm")}, Jobs: 1, Fault: func(point string) error {
+		if point == "add.staged" {
+			return crash
+		}
+		return nil
+	}})
+	if !errors.Is(err, crash) {
+		t.Fatal(err)
+	}
+	store, err := state.OpenExisting(filepath.Join(root, ".sow/repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, payload, manifest, err := loadMutationOperation(ctx, store, root, "repo", added.Operation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(manifest.Desired, "excluded")
+	wire, err := marshalMutationManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.ManifestSHA256 = bytesSHA(wire)
+	if err := writeAtomic(mutationManifestPath(root, "repo", added.Operation, payload.ManifestSHA256), wire, 0600); err != nil {
+		t.Fatal(err)
+	}
+	pw, _ := json.Marshal(payload)
+	if err := store.UpdateOperationPayload(ctx, added.Operation, string(pw)); err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range manifest.Objects {
+		if err := installPendingObject(ctx, root, "repo", filepath.Join(mutationStageRoot(root, "repo", added.Operation), "objects", object.SHA256), object); err != nil {
+			t.Fatal(err)
+		}
+	}
+	resultJSON, _ := json.Marshal(manifest.Result)
+	if _, err := store.ApplyDesiredMutationWithSigningKeys(ctx, added.Operation, manifest.Objects, manifest.RPMSigningKeys, manifest.Desired, string(resultJSON)); err != nil {
+		t.Fatal(err)
+	}
+	store.Close()
+	for range 2 {
+		if _, err := Build(ctx, BuildOptions{WorkspaceOptions: ws, Repository: "repo", Jobs: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readOnly, err := state.OpenReadOnly(filepath.Join(root, ".sow/repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	if members, err := readOnly.MembershipDigests(ctx, "excluded", false); err != nil || len(members) != 0 {
+		t.Fatalf("the next build did not apply the current policy: excluded=%v err=%v", members, err)
+	}
+	if members, err := readOnly.MembershipDigests(ctx, "included", false); err != nil || len(members) != 1 {
+		t.Fatalf("applied legacy Desired was not preserved: included=%v err=%v", members, err)
+	}
+	detail, err := readOnly.GetOperation(ctx, added.Operation)
+	if err != nil || detail.Operation.State != state.OperationDoneDirty {
+		t.Fatalf("legacy operation=%+v err=%v", detail.Operation, err)
+	}
+}
+
 func TestInputScanDoesNotResolveReplacedDirectory(t *testing.T) {
 	for _, recursive := range []bool{false, true} {
 		t.Run(fmt.Sprint(recursive), func(t *testing.T) {
