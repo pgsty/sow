@@ -246,12 +246,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	byCoordinate := make(map[string]batchCoordinate)
 	itemObjects := make(map[int]state.PackageObject)
 	inspected := inspectInputs(ctx, inputsRoot, files, opts.Jobs)
-	candidatePaths := make([]string, 0, len(inspected))
-	for _, input := range inspected {
-		if input.Err == nil {
-			candidatePaths = append(candidatePaths, input.Object.PoolPath)
-		}
-	}
+	lookups, candidatePaths := lookupInputCoordinates(ctx, store, inspected)
 	pathOwners, err := store.PackagePoolPathOwners(ctx, candidatePaths)
 	if err != nil {
 		return result, err
@@ -307,7 +302,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 			reused = true
 			_ = removeOwnedRegularPath(ws.Root, snapshot, -1)
 		} else {
-			existing, lookupErr := store.FindPackageByCoordinate(ctx, object.Format, object.Coordinate)
+			existing, lookupErr := lookups[sequence].object, lookups[sequence].err
 			switch {
 			case lookupErr == nil:
 				reusable := existing.SHA256 == object.SHA256
@@ -643,6 +638,31 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 // non-zero JSON output from falsely reporting pre-commit revision/generation
 // or cleanliness. It is also safe before commit because it only snapshots the
 // currently committed projection.
+type coordinateLookup struct {
+	object state.PackageObject
+	err    error
+}
+
+// lookupInputCoordinates resolves each inspected input's logical coordinate
+// once. Only a new coordinate can create a Package Object, so only its pool
+// path enters the path-owner query; re-added packages never read the
+// per-checkpoint publication history of their paths.
+func lookupInputCoordinates(ctx context.Context, store *state.Store, inspected []inspectedInput) ([]coordinateLookup, []string) {
+	lookups := make([]coordinateLookup, len(inspected))
+	candidatePaths := make([]string, 0, len(inspected))
+	for index, input := range inspected {
+		if input.Err != nil {
+			continue
+		}
+		existing, err := store.FindPackageByCoordinate(ctx, input.Object.Format, input.Object.Coordinate)
+		lookups[index] = coordinateLookup{object: existing, err: err}
+		if errors.Is(err, state.ErrNotFound) {
+			candidatePaths = append(candidatePaths, input.Object.PoolPath)
+		}
+	}
+	return lookups, candidatePaths
+}
+
 func retainCommittedProjection(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, generation *state.GenerationID, dirty *bool) {
 	if ctx.Err() != nil {
 		var cancel context.CancelFunc

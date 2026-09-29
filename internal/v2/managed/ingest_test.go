@@ -971,3 +971,29 @@ func decodeManagedFixture(t *testing.T, source, destination string) string {
 	}
 	return destination
 }
+
+func TestReAddedCoordinatesSkipPoolPathOwnerHistory(t *testing.T) {
+	ctx := context.Background()
+	root, ws := newRejectionWorkspace(t)
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"el9"}, Paths: collidingRPMInputs(t, root)[:1], Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	objects, err := store.ListPackageObjects(ctx, nil, false)
+	if err != nil || len(objects) != 1 {
+		t.Fatalf("objects=%v err=%v", objects, err)
+	}
+	existing := objects[0]
+	fresh := state.PackageObject{Format: "rpm", Coordinate: "not-present=1-1:noarch", PoolPath: "pool/n/not-present/not-present-1-1.noarch.rpm"}
+	lookups, candidates := lookupInputCoordinates(ctx, store, []inspectedInput{{Object: existing}, {Object: fresh}, {Err: errors.New("unreadable input")}})
+	if len(candidates) != 1 || candidates[0] != fresh.PoolPath {
+		t.Fatalf("path-owner candidates=%v; re-added coordinates must not query their path history", candidates)
+	}
+	if lookups[0].err != nil || lookups[0].object.SHA256 != existing.SHA256 || !errors.Is(lookups[1].err, state.ErrNotFound) {
+		t.Fatalf("coordinate lookups=%#v", lookups)
+	}
+}
