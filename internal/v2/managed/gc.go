@@ -164,7 +164,19 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 	// The state attestor is always present and is sufficient for binding-only
 	// evidence. Nonterminal attempts root their source Generation; unresolved
 	// applied/grace checkpoints additionally root their observed payload inventory.
-	if err := mergeLocalGCPayloadRoots(protected, requirement.MinimumRoots, objectByPath, "publication state"); err != nil {
+	// An observed inventory root with no local Package Object is remote-only:
+	// it was collected after its earlier checkpoints left grace and there is
+	// nothing local to protect. Generation roots and drifted bytes stay fatal.
+	stateRoots := make([]state.GenerationFile, 0, len(requirement.MinimumRoots))
+	for _, root := range requirement.MinimumRoots {
+		if _, local := objectByPath[root.Path]; !local {
+			if _, generationRoot := requirement.GenerationRootPaths[root.Path]; !generationRoot {
+				continue
+			}
+		}
+		stateRoots = append(stateRoots, root)
+	}
+	if err := mergeLocalGCPayloadRoots(protected, stateRoots, objectByPath, "publication state"); err != nil {
 		return result, err
 	}
 	if opts.PublicationRoots != nil {

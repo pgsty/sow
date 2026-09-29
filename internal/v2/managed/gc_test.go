@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -460,5 +463,81 @@ func TestLocalGCDonePlanlessRecoveryRootFailsClosedWhenNonempty(t *testing.T) {
 	}
 	if body, err := os.ReadFile(foreign); err != nil || string(body) != "not journal-owned" {
 		t.Fatalf("foreign remainder changed: body=%q err=%v", body, err)
+	}
+}
+
+// R2 target GC is report-only, so a payload collected locally after its last
+// grace window can remain in every later checkpoint inventory. Such remote-only
+// inventory roots have no local bytes to protect and must not fail local GC.
+func TestLocalGCIgnoresRemoteOnlyInventoryRoots(t *testing.T) {
+	ctx := context.Background()
+	root, ws := newRejectionWorkspace(t)
+	fake := &fakeR2PublicationClient{objects: map[string]fakeR2PublicationObject{}}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		o, ok := fake.objects["repos/prod/"+strings.TrimPrefix(r.URL.Path, "/repo/")]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(o.body)
+	}))
+	defer server.Close()
+	public, _ := url.Parse(server.URL + "/repo/")
+	backend := &r2PublicationBackend{objects: fake, prefix: "repos/prod", publicBase: public}
+	cfg, err := config.Load(filepath.Join(root, "sow.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Targets = map[string]config.TargetConfig{"prod": {Repository: "repo", Provider: "r2", Endpoint: "https://acct.r2.cloudflarestorage.com", Region: "auto", Bucket: "sow-repo", Prefix: "repos/prod", Credential: "env://SOW_TEST_UNUSED", PublicEndpoint: server.URL + "/repo/", MaxCacheTTL: "0s", AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true}}
+	writeManagedConfig(t, root, cfg)
+	testdata := func(name string) string {
+		path, err := filepath.Abs(filepath.Join("../../../third_party/cavaliergopher-rpm/testdata", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	add := func(path string) {
+		if _, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"el9"}, Paths: []string{path}, Jobs: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC()
+	publish := func() {
+		if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: ws, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	targetGC := func() {
+		if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: ws, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add(testdata("centos-release-6-0.el6.centos.5.x86_64.rpm"))
+	publish()
+	if _, err := Remove(ctx, RemoveOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"el9"}, Packages: []string{"centos-release"}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	add(testdata("epel-release-7-5.noarch.rpm"))
+	now = now.Add(time.Minute)
+	publish()
+	now = now.Add(31 * 24 * time.Hour)
+	targetGC()
+	if result, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: ws, Repository: "repo"}); err != nil || result.Objects != 1 {
+		t.Fatalf("first collection=%+v err=%v", result, err)
+	}
+	if _, ok := fake.objects["repos/prod/pool/c/centos-release/centos-release-6-0.el6.centos.5.x86_64.rpm"]; !ok {
+		t.Fatal("report-only target GC unexpectedly deleted the remote payload")
+	}
+	for _, name := range []string{"centos-release-as-2.1AS-4.noarch.rpm", "centos-release-5-0.0.el5.centos.2.x86_64.rpm"} {
+		add(testdata(name))
+		now = now.Add(time.Second)
+		publish()
+		// The new checkpoint is in grace and still inventories the remote-only payload.
+		if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: ws, Repository: "repo"}); err != nil {
+			t.Fatalf("local GC failed on a remote-only inventory root after publishing %s: %v", name, err)
+		}
+		now = now.Add(31 * 24 * time.Hour)
+		targetGC()
 	}
 }

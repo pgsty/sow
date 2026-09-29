@@ -20,6 +20,10 @@ type PublicationRootRequirement struct {
 	StateComplete    bool
 	EvidenceIdentity string
 	MinimumRoots     []GenerationFile
+	// GenerationRootPaths are the payload roots taken from nonterminal attempt
+	// source Generations; their bytes must exist locally. Every other root is
+	// only observed checkpoint inventory and may already be remote-only.
+	GenerationRootPaths map[string]struct{}
 }
 
 // PublicationRootRequirement returns a deterministic identity for all
@@ -45,7 +49,7 @@ func (s *Store) PublicationRootRequirement(ctx context.Context) (PublicationRoot
 	if evidenceCount == 0 {
 		return PublicationRootRequirement{StateComplete: true, MinimumRoots: []GenerationFile{}}, nil
 	}
-	result := PublicationRootRequirement{HasEvidence: true, StateComplete: true, MinimumRoots: []GenerationFile{}}
+	result := PublicationRootRequirement{HasEvidence: true, StateComplete: true, MinimumRoots: []GenerationFile{}, GenerationRootPaths: map[string]struct{}{}}
 	h := sha256.New()
 	queries := []struct{ label, query string }{
 		{"bindings", `SELECT target_identity, target_storage_id, repository_id, target_name, provider, endpoint, region, bucket, prefix, public_endpoint, max_cache_ttl_ns, config_identity FROM publication_target_bindings ORDER BY target_identity`},
@@ -114,6 +118,7 @@ func (s *Store) PublicationRootRequirement(ctx context.Context) (PublicationRoot
 				if err := addPublicationRoot(roots, file); err != nil {
 					return PublicationRootRequirement{}, err
 				}
+				result.GenerationRootPaths[file.Path] = struct{}{}
 			}
 		}
 	}
