@@ -73,8 +73,11 @@ func openExistingLockFile(filename string, flags int) (*os.File, error) {
 		return nil, errors.New("managed: invalid lock filename")
 	}
 	info, err := os.Lstat(parent)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	if err != nil {
 		return nil, fmt.Errorf("managed: lock parent is not a real directory: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%w: lock parent %s is not a real directory", ErrIntegrity, parent)
 	}
 	root, err := os.OpenRoot(parent)
 	if err != nil {
