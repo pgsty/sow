@@ -997,7 +997,7 @@ func finalizePreApplyMutationOperation(parent context.Context, root, repoName, i
 	// Keep its manifest until every pending object has been cleaned, so an
 	// interrupted cleanup is retried from the directory on the next write.
 	if err := cleanupFailedMutation(cleanupCtx, root, repoName, store, operation); err != nil {
-		return errors.Join(returned, fmt.Errorf("managed: clean terminal failed operation: %w", err))
+		return errors.Join(returned, fmt.Errorf("managed: clean terminal failed operation: %w; the failure is recorded and the next write command (for example sow build) removes the remaining temporary files", err))
 	}
 	return returned
 }
