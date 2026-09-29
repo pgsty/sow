@@ -104,11 +104,11 @@ PRAGMA user_version = 12;`); err != nil {
 	if err := reader.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if writer, err := OpenExisting(path); !errors.Is(err, ErrSchema) {
+	if writer, err := OpenExisting(path); !errors.Is(err, ErrSchema) || !errors.Is(err, ErrSchemaMigrationRequired) || strings.Contains(err.Error(), "corrupt") {
 		if writer != nil {
 			writer.Close()
 		}
-		t.Fatalf("ordinary writer silently crossed the migration boundary: %v", err)
+		t.Fatalf("ordinary writer did not report the explicit migration boundary: %v", err)
 	}
 	upgraded, err := OpenExistingForMigration(path, true)
 	if err != nil {

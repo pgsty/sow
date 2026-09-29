@@ -87,6 +87,9 @@ var (
 	ErrConflict     = errors.New("state object conflicts with existing identity")
 	ErrTransition   = errors.New("invalid operation transition")
 	ErrLegacyLayout = errors.New("legacy C2 layout cannot start a new migration; create a new workspace and import the original packages")
+	// ErrSchemaMigrationRequired identifies a known predecessor schema that only
+	// the explicit Repository migration may advance. It also matches ErrSchema.
+	ErrSchemaMigrationRequired = errors.New("repository schema migration required")
 
 	schemaV1ContractOnce     sync.Once
 	schemaV1ContractObjects  []schemaObject
@@ -884,6 +887,9 @@ func (s *Store) validateSchemaVersion(ctx context.Context, expectedVersion int) 
 		return fmt.Errorf("%w: read user_version: %v", ErrSchema, err)
 	}
 	if version != expectedVersion {
+		if expectedVersion == SchemaVersion && version > 0 && version < SchemaVersion {
+			return schemaMigrationRequiredError{found: version, want: expectedVersion}
+		}
 		return fmt.Errorf("%w: database version %d, expected %d", ErrSchema, version, expectedVersion)
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT version, checksum FROM schema_migrations ORDER BY version`)
@@ -2320,3 +2326,15 @@ const fixedTimestampLayout = "2006-01-02T15:04:05.000000000Z"
 func formatTimestamp(at time.Time) string { return at.UTC().Format(fixedTimestampLayout) }
 
 func nowText() string { return formatTimestamp(time.Now()) }
+
+// schemaMigrationRequiredError reports an older, known schema without calling
+// it corrupt. Only an explicit Repository migration may advance it.
+type schemaMigrationRequiredError struct{ found, want int }
+
+func (e schemaMigrationRequiredError) Error() string {
+	return fmt.Sprintf("repository schema v%d predates this binary (v%d)", e.found, e.want)
+}
+
+func (e schemaMigrationRequiredError) Is(target error) bool {
+	return target == ErrSchema || target == ErrSchemaMigrationRequired
+}

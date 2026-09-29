@@ -2,6 +2,9 @@ package managed
 
 import (
 	"errors"
+	"fmt"
+	"path/filepath"
+	"strings"
 
 	"github.com/pgsty/sow/internal/v2/state"
 )
@@ -25,7 +28,12 @@ func openState(path string) (*state.Store, error) {
 }
 
 func openExistingState(path string) (*state.Store, error) {
-	return openStateBound(path, state.OpenExisting)
+	store, err := openStateBound(path, state.OpenExisting)
+	if errors.Is(err, state.ErrSchemaMigrationRequired) {
+		repository := strings.TrimSuffix(filepath.Base(path), ".db")
+		return nil, fmt.Errorf("%w; back up the workspace, then run `sow repo migrate %s`", err, repository)
+	}
+	return store, err
 }
 
 func openExistingStateForMigration(path string) (*state.Store, error) {

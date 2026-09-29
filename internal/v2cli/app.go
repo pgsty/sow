@@ -507,6 +507,9 @@ func classifyManagedError(_ string, err error) error {
 		return Errorf(ErrRejected, "%v", err)
 	case errors.Is(err, managed.ErrNotReady):
 		return Errorf(ErrIntegrity, "%v", err)
+	case errors.Is(err, state.ErrSchema):
+		// Every write entry reports an old or unusable database schema alike.
+		return Errorf(ErrIntegrity, "%v", err)
 	default:
 		return err
 	}
