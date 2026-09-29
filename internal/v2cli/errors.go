@@ -142,6 +142,9 @@ func markCommandInterrupted(ctx context.Context, err error) error {
 	if err == nil || ctx == nil || !errors.Is(ctx.Err(), context.Canceled) {
 		return err
 	}
+	if err.Error() == context.Canceled.Error() {
+		return &commandInterrupted{err: err}
+	}
 	return &commandInterrupted{err: errors.Join(context.Canceled, err)}
 }
 

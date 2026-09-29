@@ -511,6 +511,13 @@ func TestFilesystemPublicationPreCommitAbandonUnfreezesMutationAndReusesOrphans(
 	}
 }
 
+func TestAbandonWithoutActiveAttemptIsRejected(t *testing.T) {
+	fixture, _, _ := filesystemPublishFixture(t)
+	if _, err := AbandonPublication(context.Background(), PublicationAbandonOptions{WorkspaceOptions: fixture.options, Target: "local"}); !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), "no active publication attempt") {
+		t.Fatalf("abandon without an attempt err=%v", err)
+	}
+}
+
 func TestFilesystemPublicationReabandonResurrectedAttempt(t *testing.T) {
 	ctx := context.Background()
 	fixture, _, _ := filesystemPublishFixture(t)

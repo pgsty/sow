@@ -46,6 +46,13 @@ func TestCancellationClassificationPreservesLockTimeout(t *testing.T) {
 	}
 }
 
+func TestInterruptedMessageDoesNotRepeatCancellation(t *testing.T) {
+	err := markCommandInterrupted(cancelledContext(), context.Canceled)
+	if ExitCode(err) != ExitInterrupted || err.Error() != "context canceled" {
+		t.Fatalf("interrupted error=%q code=%d", err, ExitCode(err))
+	}
+}
+
 func TestMainCancellationWhileWaitingForLock(t *testing.T) {
 	root := t.TempDir()
 	assertCLISuccess(t, []string{"init", root}, "initialized")

@@ -418,6 +418,9 @@ func AbandonPublication(ctx context.Context, opts PublicationAbandonOptions) (re
 		return result, err
 	}
 	active, err := store.GetActivePublicationAttempt(ctx, binding.TargetIdentity)
+	if errors.Is(err, state.ErrNotFound) {
+		return result, fmt.Errorf("%w: target %q has no active publication attempt to abandon", ErrRejected, opts.Target)
+	}
 	if err != nil {
 		return result, err
 	}
@@ -1127,11 +1130,11 @@ func rejectPayloadPathConflicts(base []state.PublicationInventoryObject, payload
 			continue
 		}
 		if prior, ok := folded[strings.ToLower(operation.Path)]; ok && prior != operation.Path {
-			return fmt.Errorf("%w: %w: payload path %q differs only by case from %q, the same file on this case-insensitive filesystem target", ErrRejected, state.ErrPoolPathConflict, operation.Path, prior)
+			return fmt.Errorf("%w: %w: payload path %q differs only by case from %q, the same file on this case-insensitive filesystem target; publish to a case-sensitive target, or remove one spelling and run sow gc once no Generation or grace checkpoint references it", ErrRejected, state.ErrPoolPathConflict, operation.Path, prior)
 		}
 		directory := poolSourceDirectory(operation.Path)
 		if known, ok := directories[strings.ToLower(directory)]; ok && known != directory {
-			return fmt.Errorf("%w: %w: payload directory %q differs only by case from %q, the same directory on this case-insensitive filesystem target", ErrRejected, state.ErrPoolPathConflict, strings.TrimSuffix(directory, "/"), strings.TrimSuffix(known, "/"))
+			return fmt.Errorf("%w: %w: payload directory %q differs only by case from %q, the same directory on this case-insensitive filesystem target; publish to a case-sensitive target, or remove one spelling and run sow gc once no Generation or grace checkpoint references it", ErrRejected, state.ErrPoolPathConflict, strings.TrimSuffix(directory, "/"), strings.TrimSuffix(known, "/"))
 		}
 		remember(operation.Path)
 	}
