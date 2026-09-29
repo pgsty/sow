@@ -251,6 +251,10 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	if err != nil {
 		return result, err
 	}
+	sourceDirectories, err := loadSourceDirectorySpellings(ctx, ws.Root, repoName, store, candidatePaths)
+	if err != nil {
+		return result, err
+	}
 	rpmPolicy := rpmSigningPolicy{mode: "never"}
 	needsRPMPolicy := false
 	for index := range files {
@@ -356,7 +360,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 						factSchema, factBlob = refreshedSchema, refreshedFacts
 					}
 				}
-				if err := pathOwners.Check(object); err != nil {
+				if err := errors.Join(pathOwners.Check(object), sourceDirectories.check(object)); err != nil {
 					item.Error = err.Error()
 					result.Failed++
 					result.Items = append(result.Items, item)
@@ -377,6 +381,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 					newObjectStage[object.SHA256] = objectStage
 				}
 				pathOwners.Add(object)
+				sourceDirectories.add(object)
 				byCoordinate[coordinateKey] = batchCoordinate{inputSHA: inputSHA, payload: object.PayloadSHA256, object: object, new: true}
 			default:
 				item.Error = lookupErr.Error()
@@ -638,6 +643,72 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 // non-zero JSON output from falsely reporting pre-commit revision/generation
 // or cleanliness. It is also safe before commit because it only snapshots the
 // currently committed projection.
+// sourceDirectorySpellings guards a case-insensitive workspace, where two pool
+// source directories that differ only by case are one physical directory. It is
+// nil, and every check passes, on case-sensitive filesystems.
+type sourceDirectorySpellings map[string]map[string]struct{}
+
+func poolSourceDirectory(poolPath string) string {
+	return poolPath[:strings.LastIndex(poolPath, "/")+1]
+}
+
+func loadSourceDirectorySpellings(ctx context.Context, root, repoName string, store *state.Store, candidatePaths []string) (sourceDirectorySpellings, error) {
+	if len(candidatePaths) == 0 {
+		return nil, nil
+	}
+	insensitive, err := filesystemDirectoryIsCaseInsensitive(filepath.Join(root, repoName))
+	if err != nil || !insensitive {
+		return nil, err
+	}
+	directories := make([]string, 0, len(candidatePaths))
+	for _, candidate := range candidatePaths {
+		directories = append(directories, poolSourceDirectory(candidate))
+	}
+	existing, err := store.PackagePoolDirectorySpellings(ctx, directories)
+	if err != nil {
+		return nil, err
+	}
+	spellings := sourceDirectorySpellings{}
+	for folded, exact := range existing {
+		for _, spelling := range exact {
+			spellings.remember(folded, spelling)
+		}
+	}
+	return spellings, nil
+}
+
+func (spellings sourceDirectorySpellings) remember(folded, exact string) {
+	if spellings[folded] == nil {
+		spellings[folded] = map[string]struct{}{}
+	}
+	spellings[folded][exact] = struct{}{}
+}
+
+func (spellings sourceDirectorySpellings) check(object state.PackageObject) error {
+	if spellings == nil {
+		return nil
+	}
+	directory := poolSourceDirectory(object.PoolPath)
+	known := spellings[strings.ToLower(directory)]
+	if _, same := known[directory]; same || len(known) == 0 {
+		return nil
+	}
+	others := make([]string, 0, len(known))
+	for other := range known {
+		others = append(others, strings.TrimSuffix(other, "/"))
+	}
+	sort.Strings(others)
+	return fmt.Errorf("%w: %w: package source directory %s differs only by case from %s; this workspace is on a case-insensitive filesystem where both are one directory", state.ErrConflict, state.ErrPoolPathConflict, strings.TrimSuffix(directory, "/"), others[0])
+}
+
+func (spellings sourceDirectorySpellings) add(object state.PackageObject) {
+	if spellings == nil {
+		return
+	}
+	directory := poolSourceDirectory(object.PoolPath)
+	spellings.remember(strings.ToLower(directory), directory)
+}
+
 type coordinateLookup struct {
 	object state.PackageObject
 	err    error

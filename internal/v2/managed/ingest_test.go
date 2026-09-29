@@ -997,3 +997,27 @@ func TestReAddedCoordinatesSkipPoolPathOwnerHistory(t *testing.T) {
 		t.Fatalf("coordinate lookups=%#v", lookups)
 	}
 }
+
+func TestSourceDirectorySpellingsRejectOnlyCaseAliases(t *testing.T) {
+	spellings := sourceDirectorySpellings{}
+	spellings.remember("pool/c/casedemo/", "pool/c/CaseDemo/")
+	if err := spellings.check(state.PackageObject{PoolPath: "pool/c/CaseDemo/CaseDemo-2-1.noarch.rpm"}); err != nil {
+		t.Fatalf("same source directory rejected: %v", err)
+	}
+	if err := spellings.check(state.PackageObject{PoolPath: "pool/c/casedemo/casedemo-2-1.noarch.rpm"}); !errors.Is(err, state.ErrPoolPathConflict) || !strings.Contains(err.Error(), "pool/c/CaseDemo") {
+		t.Fatalf("case alias of an existing source directory accepted: %v", err)
+	}
+	other := state.PackageObject{PoolPath: "pool/o/other/other-1-1.noarch.rpm"}
+	if err := spellings.check(other); err != nil {
+		t.Fatal(err)
+	}
+	spellings.add(other)
+	if err := spellings.check(state.PackageObject{PoolPath: "pool/o/Other/Other-1-1.noarch.rpm"}); !errors.Is(err, state.ErrPoolPathConflict) {
+		t.Fatalf("case alias within one batch accepted: %v", err)
+	}
+	var caseSensitive sourceDirectorySpellings
+	if err := caseSensitive.check(state.PackageObject{PoolPath: "pool/c/casedemo/casedemo-2-1.noarch.rpm"}); err != nil {
+		t.Fatalf("case-sensitive workspace rejected distinct directories: %v", err)
+	}
+	caseSensitive.add(other)
+}

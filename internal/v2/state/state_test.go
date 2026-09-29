@@ -396,6 +396,64 @@ func TestApplyDesiredMutationRejectsCaseInsensitivePoolCollision(t *testing.T) {
 	}
 }
 
+func TestPackagePoolDirectorySpellingsReadsOnlyTheFoldedDirectory(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.AddDist(ctx, Dist{Name: "el9", Format: "rpm", EffectiveConfigSHA256: "cfg", BuiltGeneration: 0, Architectures: []Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}}}); err != nil {
+		t.Fatal(err)
+	}
+	operationID := strings.Repeat("9", 64)
+	if err := store.BeginOperation(ctx, Operation{ID: operationID, Kind: "add", State: OperationPlanned, PayloadJSON: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetOperationState(ctx, operationID, OperationStaged, ""); err != nil {
+		t.Fatal(err)
+	}
+	object := func(digit, source, filename string) PackageObject {
+		return PackageObject{
+			SHA256: strings.Repeat(digit, 64), Format: "rpm", Coordinate: source + "-0:1-1.x86_64",
+			Architecture: "x86_64", CanonicalArch: "x86_64", PoolPath: "pool/c/" + source + "/" + filename,
+			Filename: filename, Size: 1, Name: source, Source: source, Version: "1", Release: "1", Kind: "main", Storage: "pending",
+		}
+	}
+	upper := object("a", "CaseDemo", "CaseDemo-1-1.x86_64.rpm")
+	sibling := object("b", "casedemo-extra", "casedemo-extra-1-1.x86_64.rpm")
+	if _, err := store.ApplyDesiredMutation(ctx, operationID, []PackageObject{upper, sibling}, map[string][]string{"el9": {upper.SHA256, sibling.SHA256}}, `{}`); err != nil {
+		t.Fatal(err)
+	}
+	spellings, err := store.PackagePoolDirectorySpellings(ctx, []string{"pool/c/casedemo/", "pool/c/casedemo", "pool/c/absent/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spellings["pool/c/casedemo/"]; len(got) != 1 || got[0] != "pool/c/CaseDemo/" {
+		t.Fatalf("folded directory spellings=%v", spellings)
+	}
+	if got := spellings["pool/c/absent/"]; len(got) != 0 {
+		t.Fatalf("unrelated directory matched: %v", got)
+	}
+	rows, err := store.DB().Query(`EXPLAIN QUERY PLAN SELECT DISTINCT substr(pool_path, 1, 16) FROM package_objects WHERE lower(pool_path) >= 'pool/c/casedemo/' AND lower(pool_path) < 'pool/c/casedemo0'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	plan := ""
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan += detail + "\n"
+	}
+	if !strings.Contains(plan, "SEARCH package_objects USING INDEX package_objects_pool_path_folded") {
+		t.Fatalf("directory spelling lookup does not use the folded index:\n%s", plan)
+	}
+}
+
 func TestOperationAuditPreservesPerDistPolicyOutcomesWithoutPoolObjects(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(t.TempDir(), "repo.db"))

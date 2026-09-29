@@ -93,3 +93,36 @@ func packagePoolPathOwners(ctx context.Context, db interface {
 	}
 	return owners, nil
 }
+
+// PackagePoolDirectorySpellings returns the exact source-directory spellings of
+// current Package Objects under each case-folded candidate directory. Each
+// lookup is one range on the lower(pool_path) index; objects outside the
+// candidate directories and all publication history stay unread.
+func (s *Store) PackagePoolDirectorySpellings(ctx context.Context, directories []string) (map[string][]string, error) {
+	result := make(map[string][]string, len(directories))
+	for _, directory := range directories {
+		prefix := strings.ToLower(strings.TrimSuffix(directory, "/")) + "/"
+		if _, done := result[prefix]; done {
+			continue
+		}
+		// '0' sorts immediately after '/', so the range is exactly this directory.
+		upper := strings.TrimSuffix(prefix, "/") + "0"
+		rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT substr(pool_path, 1, ?) FROM package_objects WHERE lower(pool_path) >= ? AND lower(pool_path) < ?`, len(prefix), prefix, upper)
+		if err != nil {
+			return nil, fmt.Errorf("read pool directory spellings: %w", err)
+		}
+		spellings := []string{}
+		for rows.Next() {
+			var spelling string
+			if err := rows.Scan(&spelling); err != nil {
+				return nil, errors.Join(err, rows.Close())
+			}
+			spellings = append(spellings, spelling)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return nil, err
+		}
+		result[prefix] = spellings
+	}
+	return result, nil
+}
