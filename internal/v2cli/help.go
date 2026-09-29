@@ -6,7 +6,7 @@ import (
 )
 
 // Version is a link-time replaceable binary version.
-var Version = "0.4.0"
+var Version = "0.5.0"
 
 func VersionString() string {
 	return "sow " + Version + " " + runtime.GOOS + "/" + runtime.GOARCH + " " + runtime.Version()

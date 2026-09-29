@@ -204,7 +204,7 @@ func TestShippedExampleSupportsCleanRoomLocalMVP(t *testing.T) {
 		}
 	}
 	version := runCleanRoomV2OK(ctx, t, moduleRoot, cliPath, environment, "version")
-	if !strings.HasPrefix(version, "sow 0.4.0 ") {
+	if !strings.HasPrefix(version, "sow 0.5.0 ") {
 		t.Fatalf("unexpected V2 version output: %q", version)
 	}
 }

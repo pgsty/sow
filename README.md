@@ -114,10 +114,14 @@ change set and `sow gc` collects unreachable local payloads. `sow help COMMAND` 
 authoritative CLI reference shipped with the binary; machine consumers can rely on the
 closed `--json` envelopes and the documented exit-code contract.
 
-Upgrading a workspace created by SOW v0.3? Run `sow repo migrate REPOSITORY --workdir DIR`
-once for each Repository before ordinary use; the
-[v0.4.0 release notes](https://sow.pgsty.com/blog/release/sow-v0.4.0/) explain what the
-migration repairs. Publication ordering, recovery, target rebinding, the one-copy boundary,
+Upgrading a workspace created by SOW v0.3 or v0.4? Stop writers, back up the workspace,
+and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Version 0.5 uses
+schema v13 to index pool-path ownership without scanning unrelated publication history;
+configuration and public layout stay unchanged. Then run `sow build` and `sow check`:
+the updated RPM authentication and APT metadata contracts require one rebuild of affected
+Dists. Later unchanged RPMs reuse matching Built evidence instead of repeated payload
+verification. Do not reopen the migrated database with an older binary.
+Publication ordering, recovery, target rebinding, the one-copy boundary,
 and RPM leaf export are specified in [Commands](https://sow.pgsty.com/docs/command/) and
 [Design Records](https://sow.pgsty.com/blog/design/).
 
@@ -126,7 +130,7 @@ and RPM leaf export are specified in [Commands](https://sow.pgsty.com/docs/comma
 
 ## Build
 
-Building from source requires Go 1.27.0 or newer; repository signing additionally requires
+Building from source requires Go 1.27.1 or newer; repository signing additionally requires
 a usable GPG installation and key.
 
 ```bash
@@ -141,8 +145,13 @@ GitHub Actions runs regular checks in `CI` and Docker-backed client / S3 coverag
 `Integration`. Pushing an exact semantic-version tag creates a draft GitHub release after
 the tag is validated against `main`, the source version, and the changelog; publishing that
 draft is a separate manual decision. Maintainers can also run a read-only check against
-hosted Cloudflare R2 with `make test-r2-live` (see the `SOW_REAL_R2_*` variables in the
-Makefile).
+hosted Cloudflare R2 with `make test-r2-live` (see the `SOW_REAL_R2_*` variables in
+`internal/r2/cloudflare_integration_test.go`).
+
+Before tagging, require successful `CI` and `Integration` runs for the exact
+release commit. Inspect the draft archives and packages, their checksums and
+`sow version` output before publishing the Release. Enable the website's pinned
+download links only after that Release is public and its assets are available.
 
 
 --------

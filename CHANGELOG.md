@@ -4,12 +4,69 @@ All notable changes to SOW are recorded here.
 
 ## Unreleased
 
+## 0.5.0 - 2026-09-29
+
+- Fixed historical Dist-removal cleanup deleting packages re-added to another
+  Dist. Cleanup now checks current immutable object ownership.
+- Reject incompatible signing policies and colliding pool paths before applying
+  Desired state. Recover old unbuilt signing failures and unapplied path conflicts
+  without discarding committed Desired changes or accepting altered public trees.
+- Persist failed pre-apply add operations before deleting private staged bytes;
+  recover interrupted rollback and empty, fully excluded Dist mutations. Cancelled
+  commands return 130 and report accepted items only after Desired has committed.
+- Reserve payload URLs against local and historical publication identities, and
+  prohibit overwriting immutable payloads in publication plans and backends.
+  Existing attempts may finish only when conflicting payloads already match
+  their bound new identity; unchanged pre-commit attempts can be abandoned.
+- Allow external package paths and workspace discovery through symlink ancestors,
+  while retaining no-follow checks on package leaves and private repository paths.
+- Add schema v13 path indexes and query only candidate pool paths. Existing
+  repositories require `sow repo migrate`. Reuse RPM preflight results and matching
+  Built authentication evidence; the upgraded RPM/APT contracts require one rebuild.
+  Terminal cleanup inspects actual remaining stage/recovery entries, not every old log.
+- Treat reader-blocked WAL checkpoints and post-prune space reclamation as deferred
+  maintenance, and enable fullfsync for writable SQLite connections on macOS.
+- Accept GnuPG's clear-signature final-newline convention for APT without relaxing
+  content binding, and force SHA-256 for newly generated GPG metadata signatures.
+- Check metadata-key usability at the current time before new mutation builds,
+  independently of deterministic signing timestamps and historical verification.
+  Agent signing freezes GPG time and pins the actual available signing subkey after
+  one small probe per certificate/time. New APT publications reject weak signature
+  digests; historical verification and frozen publication recovery remain compatible.
+- Show per-input errors for wholly rejected add batches; return null for create
+  failures without a result and preserve command identity on publish parse errors.
+- Include third-party license notices in archives, RPMs and DEBs, pin GoReleaser,
+  and update the build toolchain to Go 1.27.1 and x/crypto to v0.56.0.
+  Generate and check notices from all four release package graphs, including nested
+  xxhash licensing and embedded source notices.
+- Tolerate concurrent read-locked hard links while authenticating Pool payloads, so
+  parallel `export rpm-leaf --hardlink` runs and `check` no longer report unchanged
+  bytes as integrity failures.
+- Reject identical bytes added under a pool file name that differs only by case from
+  a known path. On case-insensitive workspaces also reject source directories that
+  differ only by case, and refuse such aliases on case-insensitive filesystem
+  targets before any upload.
+- Local `gc` skips publication inventory roots that exist only remotely, such as
+  payloads retained by report-only R2 maintenance, instead of failing.
+- `repo migrate` reports the schema change (`schema_from`, `schema_to`); an older
+  schema names the migration command and fails every write command with exit 5.
+- Exit 130 is reserved for the command's own SIGINT or SIGTERM; internal timeouts,
+  such as a stalled R2 upload, stay runtime errors. GPG metadata signing at the
+  current second waits until GnuPG can freeze the signing time.
+- Recover v0.4.0 adds that omitted a non-empty, fully excluded Dist. `file://` R2
+  credentials must be regular files. Re-added packages no longer read per-checkpoint
+  pool-path history.
+- `publish --abort` without an active attempt is rejected with exit 6 instead of a
+  runtime error.
+
+
 - Added `sow create --metadata-timestamp SECONDS` for an explicit RPM metadata
   publication time. Existing YUM repositories can preserve a nondecreasing
   timestamp when switching generators, including clients with an EL7 YUM cache.
-  The default remains zero for reproducible output; package bytes, compressed
-  XML, and DEB indexes are unaffected. Publishers remain responsible for choosing
-  the timestamp and signing the resulting `repomd.xml`.
+  The accepted input range is 0..253402300799 Unix seconds. The default remains
+  zero for reproducible output; package bytes, compressed XML, and DEB indexes
+  are unaffected. Publishers remain responsible for choosing the timestamp and
+  signing the resulting `repomd.xml`.
 - Added regression coverage for modern createrepo_c script dependency semantics,
   including pre-transaction and post-transaction requirements, without changing
   dependency projection.

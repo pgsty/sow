@@ -146,7 +146,7 @@ jobs:
           version: "v2.18.2"
           args: release --snapshot --clean --skip=publish
         env:
-          SOW_VERSION: 0.4.0
+          SOW_VERSION: 0.5.0
 
       - name: Install package inspection tools
         run: |
