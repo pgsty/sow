@@ -49,6 +49,7 @@ type rootedRegularIdentity struct {
 	modUnixNano    int64
 	changeUnixNano int64
 	mode           os.FileMode
+	links          uint64
 }
 
 func newRootedRegularIdentity(info os.FileInfo, raw unix.Stat_t) rootedRegularIdentity {
@@ -58,6 +59,7 @@ func newRootedRegularIdentity(info os.FileInfo, raw unix.Stat_t) rootedRegularId
 	return rootedRegularIdentity{
 		device: uint64(raw.Dev), inode: uint64(raw.Ino), size: raw.Size,
 		modUnixNano: info.ModTime().UnixNano(), changeUnixNano: statChangeTimeNano(raw), mode: info.Mode().Perm(),
+		links: uint64(raw.Nlink),
 	}
 }
 
@@ -84,6 +86,18 @@ func (identity rootedRegularIdentity) sameContentStat(other rootedRegularIdentit
 	return identity.device == other.device && identity.inode == other.inode &&
 		identity.size == other.size && identity.modUnixNano == other.modUnixNano &&
 		identity.changeUnixNano == other.changeUnixNano
+}
+
+// unchangedWhileOpen compares snapshots of one open file taken around a content
+// read, or reused within one command. Read-locked commands may hardlink the same
+// immutable inode concurrently (export --hardlink), which changes ctime together
+// with the link count. Inode, size and mtime must still match, and a ctime change
+// without a link-count change is still treated as a rewrite.
+func (identity rootedRegularIdentity) unchangedWhileOpen(other rootedRegularIdentity) bool {
+	if !identity.sameInode(other) || identity.size != other.size || identity.modUnixNano != other.modUnixNano {
+		return false
+	}
+	return identity.changeUnixNano == other.changeUnixNano || identity.links != other.links
 }
 
 func snapshotRegularDescriptorIdentity(file *os.File) (rootedRegularIdentity, error) {
@@ -742,7 +756,7 @@ func authenticateRegularDescriptor(ctx context.Context, file *os.File, expectedS
 	if err != nil {
 		return rootedRegularIdentity{}, err
 	}
-	if digest != expectedSHA || !before.sameContentStat(after) || before.mode != after.mode {
+	if digest != expectedSHA || !before.unchangedWhileOpen(after) || before.mode != after.mode {
 		return rootedRegularIdentity{}, fmt.Errorf("%w: regular content differs or changed while authenticating", ErrIntegrity)
 	}
 	return after, ctx.Err()

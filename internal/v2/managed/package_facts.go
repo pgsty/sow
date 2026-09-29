@@ -209,7 +209,7 @@ func rebuildManagedPackageFact(ctx context.Context, source ManagedPackageSource,
 func closePackageFactSource(opened *rootedRegularFile, before rootedRegularIdentity) error {
 	after, identityErr := snapshotRootedRegularIdentity(opened)
 	closeErr := opened.CloseVerified()
-	if identityErr != nil || !before.sameContentStat(after) {
+	if identityErr != nil || !before.unchangedWhileOpen(after) {
 		return errors.Join(errors.New("package fact source identity changed during inspection"), identityErr, closeErr)
 	}
 	return closeErr

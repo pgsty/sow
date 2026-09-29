@@ -123,7 +123,7 @@ func (registry *payloadEvidenceRegistry) auditObject(ctx context.Context, source
 		if slot.err != nil || closeErr != nil {
 			return nil, errors.Join(slot.err, closeErr)
 		}
-		if slot.evidence == nil || !slot.evidence.Identity.sameContentStat(before) || slot.evidence.File.Size != object.Size || slot.evidence.File.SHA256 != object.SHA256 {
+		if slot.evidence == nil || !slot.evidence.Identity.unchangedWhileOpen(before) || slot.evidence.File.Size != object.Size || slot.evidence.File.SHA256 != object.SHA256 {
 			return nil, fmt.Errorf("%w: physical payload evidence conflicts with package object %s", ErrIntegrity, object.SHA256)
 		}
 		return slot.evidence, nil
@@ -168,7 +168,7 @@ func auditOpenedPackageEvidence(ctx context.Context, opened *rootedRegularFile, 
 	}
 	after, identityErr := snapshotRootedRegularIdentity(opened)
 	closeErr := opened.CloseVerified()
-	if identityErr != nil || closeErr != nil || !before.sameContentStat(after) {
+	if identityErr != nil || closeErr != nil || !before.unchangedWhileOpen(after) {
 		return nil, errors.Join(fmt.Errorf("%w: package descriptor identity changed during audit", ErrIntegrity), identityErr, closeErr)
 	}
 	return evidence, nil
@@ -259,7 +259,7 @@ func (registry *payloadEvidenceRegistry) verifyRetainedReference(ctx context.Con
 	if !owner {
 		<-slot.done
 		closeErr := opened.CloseVerified()
-		if slot.err != nil || closeErr != nil || slot.evidence == nil || !slot.evidence.Identity.sameContentStat(identity) || slot.evidence.File.Size != file.Size || slot.evidence.File.SHA256 != file.SHA256 {
+		if slot.err != nil || closeErr != nil || slot.evidence == nil || !slot.evidence.Identity.unchangedWhileOpen(identity) || slot.evidence.File.Size != file.Size || slot.evidence.File.SHA256 != file.SHA256 {
 			return errors.Join(fmt.Errorf("%w: retained payload evidence differs for %q", ErrIntegrity, file.Path), slot.err, closeErr)
 		}
 		return nil
@@ -273,7 +273,7 @@ func (registry *payloadEvidenceRegistry) verifyRetainedReference(ctx context.Con
 	workmetrics.RecordFullPackageRead(workmetrics.WithPhase(ctx, "retained_payload"), read)
 	after, identityErr := snapshotRootedRegularIdentity(opened)
 	closeErr := opened.CloseVerified()
-	if copyErr != nil || identityErr != nil || closeErr != nil || !identity.sameContentStat(after) || read != file.Size || hex.EncodeToString(hash.Sum(nil)) != file.SHA256 {
+	if copyErr != nil || identityErr != nil || closeErr != nil || !identity.unchangedWhileOpen(after) || read != file.Size || hex.EncodeToString(hash.Sum(nil)) != file.SHA256 {
 		err = errors.Join(fmt.Errorf("%w: retained source %q differs from manifest", ErrIntegrity, file.Path), copyErr, identityErr, closeErr)
 		registry.complete(key, slot, nil, err)
 		return err
@@ -294,7 +294,7 @@ func (registry *payloadEvidenceRegistry) walkedPayload(ctx context.Context, file
 	registry.mu.Unlock()
 	if slot != nil {
 		<-slot.done
-		if slot.err != nil || slot.evidence == nil || !slot.evidence.Identity.sameContentStat(identity) {
+		if slot.err != nil || slot.evidence == nil || !slot.evidence.Identity.unchangedWhileOpen(identity) {
 			return state.GenerationFile{}, errors.Join(fmt.Errorf("%w: public payload evidence is invalid for %s", ErrIntegrity, relative), slot.err)
 		}
 		return state.GenerationFile{Path: relative, Phase: "payload", Size: slot.evidence.File.Size, SHA256: slot.evidence.File.SHA256}, nil
@@ -303,7 +303,7 @@ func (registry *payloadEvidenceRegistry) walkedPayload(ctx context.Context, file
 	read, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
 	workmetrics.RecordFullPackageRead(workmetrics.WithPhase(ctx, "public_payload_reaudit"), read)
 	after, identityErr := snapshotRegularDescriptorIdentity(file)
-	if err != nil || identityErr != nil || !identity.sameContentStat(after) || read != info.Size() {
+	if err != nil || identityErr != nil || !identity.unchangedWhileOpen(after) || read != info.Size() {
 		return state.GenerationFile{}, errors.Join(fmt.Errorf("%w: public payload changed while re-auditing %s", ErrIntegrity, relative), err, identityErr)
 	}
 	result := state.GenerationFile{Path: relative, Phase: "payload", Size: read, SHA256: hex.EncodeToString(hash.Sum(nil))}

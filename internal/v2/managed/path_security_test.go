@@ -86,6 +86,70 @@ func TestDescriptorAuthenticationRejectsRewriteWithRestoredMTime(t *testing.T) {
 	}
 }
 
+// A second read-locked export --hardlink may link the same Pool inode while this
+// process authenticates it. link(2) changes only ctime and the link count, so
+// unchanged bytes must not be reported as an integrity failure.
+func TestDescriptorAuthenticationToleratesConcurrentHardlink(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "payload")
+	body := bytes.Repeat([]byte("immutable-payload"), 4096)
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	ctx := &descriptorEOFContext{Context: context.Background(), file: file, size: int64(len(body))}
+	ctx.onEOF = func() {
+		if err := os.Link(path, filepath.Join(root, "other-export-alias")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := authenticateRegularDescriptor(ctx, file, int64(len(body)), bytesSHA(body)); err != nil || !ctx.fired {
+		t.Fatalf("unchanged bytes rejected after a concurrent hardlink: fired=%t err=%v", ctx.fired, err)
+	}
+}
+
+type firstErrContext struct {
+	context.Context
+	onFirst func()
+	fired   bool
+}
+
+func (ctx *firstErrContext) Err() error {
+	if !ctx.fired {
+		ctx.fired = true
+		ctx.onFirst()
+	}
+	return ctx.Context.Err()
+}
+
+func TestLinkRootedRegularToleratesConcurrentHardlinkExport(t *testing.T) {
+	source, targetA, targetB := t.TempDir(), t.TempDir(), t.TempDir()
+	body := bytes.Repeat([]byte("pool-payload"), 1<<16)
+	if err := os.MkdirAll(filepath.Join(source, "pool/p"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "pool/p/pkg.rpm"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The first ctx poll happens inside authentication, after its "before" snapshot.
+	ctx := &firstErrContext{Context: context.Background()}
+	ctx.onFirst = func() {
+		if err := os.MkdirAll(filepath.Join(targetB, "pool/p"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(filepath.Join(source, "pool/p/pkg.rpm"), filepath.Join(targetB, "pool/p/pkg.rpm")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := linkRootedRegular(ctx, source, "pool/p/pkg.rpm", targetA, "pool/p/pkg.rpm", int64(len(body)), bytesSHA(body), 0o755); err != nil || !ctx.fired {
+		t.Fatalf("hardlink export rejected unchanged Pool bytes: fired=%t err=%v", ctx.fired, err)
+	}
+}
+
 func TestPendingInstallRejectsWrongDigestBeforePublishingName(t *testing.T) {
 	root := t.TempDir()
 	staged := filepath.Join(root, ".sow/repo/stage/op/objects/source")
