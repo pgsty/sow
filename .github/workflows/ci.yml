@@ -36,7 +36,7 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Check formatting and module files
-        run: make fmt-check tidy-check
+        run: make fmt-check tidy-check notices-check
 
       - name: Vet
         run: go vet ./...
@@ -65,9 +65,9 @@ jobs:
         run: make test-perf-contract
 
       - name: Check GoReleaser configuration
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "~> v2"
+          version: "v2.18.2"
           args: check
 
   test:
@@ -141,9 +141,9 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Build snapshot with GoReleaser
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "~> v2"
+          version: "v2.18.2"
           args: release --snapshot --clean --skip=publish
         env:
           SOW_VERSION: 0.4.0
@@ -165,6 +165,10 @@ jobs:
           test "${#debs[@]}" -eq 2
           (cd dist && sha256sum --check SHA256SUMS)
           license_sha256="$(sha256sum LICENSE | awk '{print $1}')"
+          notices_sha256="$(sha256sum THIRD_PARTY_NOTICES | awk '{print $1}')"
+          for archive in "${archives[@]}"; do
+            test "$(tar -xOf "${archive}" THIRD_PARTY_NOTICES | sha256sum | awk '{print $1}')" = "${notices_sha256}"
+          done
           for package in "${rpms[@]}"; do
             rpm -qpl "${package}" | grep -Fx '/usr/bin/sow'
             rpm -qpl "${package}" | grep -Fx '/usr/share/licenses/sow/LICENSE'
@@ -176,6 +180,11 @@ jobs:
             )"
             test -n "${packaged_license_sha256}"
             test "${packaged_license_sha256}" = "${license_sha256}"
+            packaged_notices_sha256="$(
+              rpm -qp --queryformat '[%{FILENAMES}\t%{FILEDIGESTS}\n]' "${package}" |
+                awk -F '\t' '$1 == "/usr/share/licenses/sow/THIRD_PARTY_NOTICES" { print $2 }'
+            )"
+            test "${packaged_notices_sha256}" = "${notices_sha256}"
           done
           for package in "${debs[@]}"; do
             dpkg-deb --contents "${package}" | grep -E 'usr/bin/sow$'
@@ -184,4 +193,5 @@ jobs:
             dpkg-deb --extract "${package}" "${extract_dir}"
             packaged_license_sha256="$(sha256sum "${extract_dir}/usr/share/doc/sow/copyright" | awk '{print $1}')"
             test "${packaged_license_sha256}" = "${license_sha256}"
+            test "$(sha256sum "${extract_dir}/usr/share/doc/sow/THIRD_PARTY_NOTICES" | awk '{print $1}')" = "${notices_sha256}"
           done

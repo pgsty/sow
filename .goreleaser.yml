@@ -36,6 +36,7 @@ archives:
       - README.md
       - CHANGELOG.md
       - LICENSE
+      - THIRD_PARTY_NOTICES
 
 nfpms:
   - id: sow-packages
@@ -58,11 +59,22 @@ nfpms:
     maintainer: Ruohang Feng <rh@vonng.com>
     description: Local RPM and DEB repository manager.
     license: Apache-2.0
+    section: utils
     formats:
       - deb
       - rpm
     bindir: /usr/bin
     contents:
+      - src: THIRD_PARTY_NOTICES
+        dst: /usr/share/doc/sow/THIRD_PARTY_NOTICES
+        packager: deb
+        file_info:
+          mode: 0644
+      - src: THIRD_PARTY_NOTICES
+        dst: /usr/share/licenses/sow/THIRD_PARTY_NOTICES
+        packager: rpm
+        file_info:
+          mode: 0644
       - src: LICENSE
         dst: /usr/share/doc/sow/copyright
         packager: deb
@@ -91,7 +103,7 @@ changelog:
     exclude:
       - "^docs:"
       - "^test:"
-      - "^chore:"
+      - '^chore(\([^)]*\))?:'
       - "Merge pull request"
       - "Merge branch"
 

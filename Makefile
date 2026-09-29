@@ -20,7 +20,7 @@ CLEAN_DELIVERY_OUT ?= $(if $(TMPDIR),$(TMPDIR),/tmp)/sow-clean-delivery
 LDFLAGS := -s -w -X github.com/pgsty/sow/internal/v2cli.Version=$(VERSION)
 CORE_PACKAGES := ./internal/v2/... ./internal/v2cli ./internal/aptrepo ./internal/r2 ./internal/workmetrics ./internal/yumrepo
 
-.PHONY: all help version deadcode-version govulncheck-version build run install fmt fmt-check tidy tidy-check vet lint deadcode vuln verify-rpm-upstream \
+.PHONY: all help version deadcode-version govulncheck-version build run install fmt fmt-check tidy tidy-check notices-check vet lint deadcode vuln verify-rpm-upstream \
 	test test-go test-rpm test-core test-v2 test-perf-contract race check clean-delivery \
 	test-r2-live goreleaser-check release-local release clean clean-bin clean-dist
 
@@ -77,6 +77,9 @@ tidy:
 
 tidy-check:
 	$(GO) mod tidy -diff
+
+notices-check:
+	python3 qa/licensing/generate_notices.py --check
 
 vet:
 	$(GO) vet ./...
@@ -141,7 +144,7 @@ test-r2-live:
 race:
 	$(GO) test -race -timeout '$(RACE_TIMEOUT)' -count=1 $(CORE_PACKAGES)
 
-check: fmt-check tidy-check vet lint deadcode vuln verify-rpm-upstream test-perf-contract test-core
+check: fmt-check tidy-check notices-check vet lint deadcode vuln verify-rpm-upstream test-perf-contract test-core
 
 clean-delivery:
 	qa/compat/test-clean-delivery.sh '$(CLEAN_DELIVERY_OUT)'

@@ -7,6 +7,7 @@
 CHANGELOG.md
 LICENSE
 Makefile
+THIRD_PARTY_NOTICES
 cmd/sow/main.go
 go.mod
 go.sum
@@ -235,6 +236,7 @@ qa/compat/hostable_temp_test.go
 qa/compat/test-clean-delivery.sh
 qa/compat/v2_apt_client_test.go
 qa/compat/yum_signature_bridge_test.go
+qa/licensing/generate_notices.py
 qa/perf/yum_streaming_50k_test.go
 sow.example.yaml
 staticcheck.conf
