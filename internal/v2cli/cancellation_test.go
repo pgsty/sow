@@ -23,16 +23,25 @@ func TestCancellationClassificationPreservesLockTimeout(t *testing.T) {
 		fmt.Errorf("%w: %w", managed.ErrRejected, context.Canceled),
 		fmt.Errorf("%w: %w", managed.ErrLockUnavailable, context.Canceled),
 	} {
-		classified := classifyManagedError("add", err)
+		classified := classifyManagedError("add", markCommandInterrupted(cancelledContext(), err))
 		if ExitCode(classified) != ExitInterrupted || errorClass(ExitCode(classified)) != "interrupted" {
 			t.Fatalf("cancelled operation classified as %d: %v", ExitCode(classified), classified)
 		}
+		if !strings.HasPrefix(classified.Error(), "context canceled") {
+			t.Fatalf("interrupted diagnostic lost its cancellation cause: %v", classified)
+		}
+	}
+	// An internal cancellation (for example an R2 upload progress watchdog) is
+	// not a user interrupt while the command context itself is still live.
+	internal := fmt.Errorf("upload: %w", errors.Join(context.Canceled, errors.New("R2 upload made no progress before its idle deadline")))
+	if got := ExitCode(classifyManagedError("publish", markCommandInterrupted(context.Background(), internal))); got == ExitInterrupted {
+		t.Fatalf("internal cancellation classified as interrupted")
 	}
 	err := fmt.Errorf("%w: %w", managed.ErrLockUnavailable, context.DeadlineExceeded)
 	if got := ExitCode(classifyManagedError("add", err)); got != ExitLock {
 		t.Fatalf("lock timeout=%d, want %d", got, ExitLock)
 	}
-	if got := ExitCode(classifyPlainError(&plain.Error{Kind: plain.KindLock, Op: "lock", Err: context.Canceled})); got != ExitInterrupted {
+	if got := ExitCode(classifyPlainError(markCommandInterrupted(cancelledContext(), &plain.Error{Kind: plain.KindLock, Op: "lock", Err: context.Canceled}))); got != ExitInterrupted {
 		t.Fatalf("plain cancellation=%d", got)
 	}
 }

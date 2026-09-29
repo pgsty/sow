@@ -14,7 +14,8 @@ func TestExitCodeTaxonomy(t *testing.T) {
 		want int
 	}{
 		{name: "success", want: ExitOK},
-		{name: "interrupted", err: context.Canceled, want: ExitInterrupted},
+		{name: "interrupted", err: markCommandInterrupted(cancelledContext(), errors.New("stopped")), want: ExitInterrupted},
+		{name: "internal cancellation", err: fmt.Errorf("upload: %w", context.Canceled), want: ExitRuntime},
 		{name: "runtime", err: errors.New("disk read failed"), want: ExitRuntime},
 		{name: "parser usage", err: usageError("unknown option"), want: ExitUsage},
 		{name: "usage", err: fmt.Errorf("outer: %w", ErrUsage), want: ExitUsage},
@@ -72,4 +73,10 @@ func TestDocumentedExitCodeSet(t *testing.T) {
 			t.Errorf("out-of-scope exit code %d accepted", code)
 		}
 	}
+}
+
+func cancelledContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
 }

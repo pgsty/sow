@@ -19,7 +19,7 @@ func executeLogExport(ctx context.Context, inv Invocation, stdout, stderr io.Wri
 	}
 	if target == "-" {
 		if _, err := managed.ExportLog(ctx, opts, stdout); err != nil {
-			return writeFailure("log export", false, classifyManagedError("log export", err), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
+			return writeFailure("log export", false, classifyManagedError("log export", markCommandInterrupted(ctx, err)), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
 		}
 		return ExitOK
 	}
@@ -46,7 +46,7 @@ func executeLogExport(ctx context.Context, inv Invocation, stdout, stderr io.Wri
 	count, exportErr := managed.ExportLog(ctx, opts, tmp)
 	closeErr := errors.Join(tmp.Sync(), tmp.Close())
 	if err := errors.Join(exportErr, closeErr); err != nil {
-		return writeFailure("log export", false, classifyManagedError("log export", err), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
+		return writeFailure("log export", false, classifyManagedError("log export", markCommandInterrupted(ctx, err)), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
 	}
 	if err := os.Link(tmpName, absolute); err != nil {
 		return writeFailure("log export", false, err, nullableString(inv.Global.Repo), nil, nil, stdout, stderr)

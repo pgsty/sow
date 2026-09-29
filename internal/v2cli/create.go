@@ -2,7 +2,6 @@ package v2cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 
@@ -28,9 +27,7 @@ func ExecuteCreate(ctx context.Context, inv Invocation, stdout, stderr io.Writer
 		Timeout: inv.Global.Timeout, NoWait: inv.Global.NoWait,
 	})
 	if err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) {
-			err = errors.Join(context.Canceled, err)
-		}
+		err = markCommandInterrupted(ctx, err)
 		classified := classifyPlainError(err)
 		if inv.Global.JSON {
 			var failureResult any
@@ -61,7 +58,7 @@ func ExecuteCreate(ctx context.Context, inv Invocation, stdout, stderr io.Writer
 }
 
 func classifyPlainError(err error) error {
-	if errors.Is(err, context.Canceled) {
+	if isCommandInterrupted(err) {
 		return WithExitCode(ExitInterrupted, err)
 	}
 	switch plain.KindOf(err) {

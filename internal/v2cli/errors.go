@@ -86,7 +86,7 @@ func ExitCode(err error) int {
 		return classified.Code
 	}
 	switch {
-	case errors.Is(err, context.Canceled):
+	case isCommandInterrupted(err):
 		return ExitInterrupted
 	case errors.Is(err, ErrUsage), errors.Is(err, ErrDiscovery), errors.Is(err, ErrConfig):
 		return ExitUsage
@@ -127,4 +127,25 @@ func errorClass(code int) string {
 	default:
 		return "runtime"
 	}
+}
+
+// commandInterrupted marks an error returned after the command's own context
+// was cancelled by SIGINT or SIGTERM. Only this marker maps to ExitInterrupted:
+// an internal cancellation, such as an upload progress watchdog, keeps its
+// ordinary classification even though its chain contains context.Canceled.
+type commandInterrupted struct{ err error }
+
+func (e *commandInterrupted) Error() string { return e.err.Error() }
+func (e *commandInterrupted) Unwrap() error { return e.err }
+
+func markCommandInterrupted(ctx context.Context, err error) error {
+	if err == nil || ctx == nil || !errors.Is(ctx.Err(), context.Canceled) {
+		return err
+	}
+	return &commandInterrupted{err: errors.Join(context.Canceled, err)}
+}
+
+func isCommandInterrupted(err error) bool {
+	var interrupted *commandInterrupted
+	return errors.As(err, &interrupted)
 }

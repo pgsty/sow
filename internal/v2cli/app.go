@@ -56,9 +56,7 @@ func MainContext(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	output, err := executeManaged(ctx, inv)
 	command := invocationCommand(inv)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) {
-			err = errors.Join(context.Canceled, err)
-		}
+		err = markCommandInterrupted(ctx, err)
 		classified := classifyManagedError(command, err)
 		if command == "init" && ExitCode(classified) != ExitInterrupted {
 			if result, ok := output.result.(managed.InitResult); ok && result.HasCommittedChanges() {
@@ -491,7 +489,7 @@ func classifyManagedError(_ string, err error) error {
 	}
 	var partial *managed.PartialError
 	switch {
-	case errors.Is(err, context.Canceled):
+	case isCommandInterrupted(err):
 		return WithExitCode(ExitInterrupted, err)
 	case errors.As(err, &partial):
 		return WithExitCode(ExitPartial, err)
