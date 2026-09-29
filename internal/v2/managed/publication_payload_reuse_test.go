@@ -18,7 +18,7 @@ import (
 )
 
 func TestPublishedPayloadPathCannotBeReusedAfterGC(t *testing.T) {
-	for _, scenario := range []string{"overwrite", "create-conflict", "legacy-abort", "legacy-before-intent", "legacy-after-intent", "legacy-tamper", "legacy-frozen-mutation", "legacy-add-reject", "legacy-add-abort", "legacy-add-before-intent", "legacy-add-after-intent"} {
+	for _, scenario := range []string{"overwrite", "same-bytes-case-variant", "create-conflict", "legacy-abort", "legacy-before-intent", "legacy-after-intent", "legacy-tamper", "legacy-frozen-mutation", "legacy-add-reject", "legacy-add-abort", "legacy-add-before-intent", "legacy-add-after-intent"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.Background()
 			root, ws := newRejectionWorkspace(t)
@@ -96,6 +96,34 @@ func TestPublishedPayloadPathCannotBeReusedAfterGC(t *testing.T) {
 				if err = publish(); err != nil {
 					t.Fatal(err)
 				}
+			}
+			if scenario == "same-bytes-case-variant" {
+				// Identical bytes under a filename that differs only by case would be
+				// the same file on a case-insensitive filesystem target, yet a second
+				// URL in the manifest. Admission must reject it before any state change.
+				variant := filepath.Join(root, "variant", "CENTOS-RELEASE-LATEST.rpm")
+				data, e := os.ReadFile(filepath.Join("../../../third_party/cavaliergopher-rpm/testdata", "centos-release-6-0.el6.centos.5.x86_64.rpm"))
+				if e != nil {
+					t.Fatal(e)
+				}
+				if e = os.MkdirAll(filepath.Dir(variant), 0o755); e != nil {
+					t.Fatal(e)
+				}
+				if e = os.WriteFile(variant, data, 0o644); e != nil {
+					t.Fatal(e)
+				}
+				result, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"el9"}, Paths: []string{variant}, Jobs: 1})
+				if !errors.Is(err, ErrRejected) || result.Accepted != 0 || result.Failed != 1 || len(result.Items) != 1 || !strings.Contains(result.Items[0].Error, "differs only by case") {
+					t.Fatalf("case-variant spelling of a published path accepted: %+v err=%v", result, err)
+				}
+				now = now.Add(time.Second)
+				if err = publish(); err != nil {
+					t.Fatal(err)
+				}
+				if fake.objects[key].sha != old.sha {
+					t.Fatal("published payload changed")
+				}
+				return
 			}
 			copyVersion("centos-release-7-2.1511.el7.centos.2.10.x86_64.rpm")
 			if strings.HasPrefix(scenario, "legacy-") {

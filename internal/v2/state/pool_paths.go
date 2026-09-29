@@ -15,12 +15,20 @@ var ErrPoolPathConflict = errors.New("immutable pool path conflict")
 // PoolPathOwners retains every known byte identity, including historical
 // publications. Removing a local object or producing a report-only remote GC
 // result does not release its URL for different bytes.
-type PoolPathOwners map[string]map[string]struct{}
+type PoolPathOwners map[string]map[poolPathOwner]struct{}
 
+type poolPathOwner struct{ path, sha256 string }
+
+// Check rejects different bytes at a case-folded path, and also a different
+// spelling of a known path even for identical bytes: on a case-insensitive
+// filesystem both spellings are one file, so they cannot be two URLs.
 func (owners PoolPathOwners) Check(object PackageObject) error {
-	for digest := range owners[strings.ToLower(object.PoolPath)] {
-		if digest != object.SHA256 {
+	for owner := range owners[strings.ToLower(object.PoolPath)] {
+		if owner.sha256 != object.SHA256 {
 			return fmt.Errorf("%w: %w: %s collides case-insensitively with existing or published content; use a different package filename", ErrConflict, ErrPoolPathConflict, object.PoolPath)
+		}
+		if owner.path != object.PoolPath {
+			return fmt.Errorf("%w: %w: %s differs only by case from existing or published path %s; add the file under that exact name", ErrConflict, ErrPoolPathConflict, object.PoolPath, owner.path)
 		}
 	}
 	return nil
@@ -29,9 +37,9 @@ func (owners PoolPathOwners) Check(object PackageObject) error {
 func (owners PoolPathOwners) Add(object PackageObject) {
 	key := strings.ToLower(object.PoolPath)
 	if owners[key] == nil {
-		owners[key] = map[string]struct{}{}
+		owners[key] = map[poolPathOwner]struct{}{}
 	}
-	owners[key][object.SHA256] = struct{}{}
+	owners[key][poolPathOwner{path: object.PoolPath, sha256: object.SHA256}] = struct{}{}
 }
 
 // PackagePoolPathOwners loads only the candidate paths. An empty batch performs

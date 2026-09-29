@@ -31,6 +31,9 @@ func TestPackagePoolPathOwnersScopesCandidatesAndUsesIndexes(t *testing.T) {
 	if err := owners.Check(PackageObject{PoolPath: manifest[1].Path, SHA256: strings.Repeat("1", 64)}); err != nil {
 		t.Fatal(err)
 	}
+	if err := owners.Check(PackageObject{PoolPath: strings.ToUpper(manifest[1].Path), SHA256: strings.Repeat("1", 64)}); !errors.Is(err, ErrPoolPathConflict) {
+		t.Fatalf("same bytes under a case-variant spelling were accepted: %v", err)
+	}
 	if err := owners.Check(PackageObject{PoolPath: strings.ToUpper(abandoned), SHA256: strings.Repeat("3", 64)}); err == nil {
 		t.Fatal("abandoned URL was allowed to change bytes")
 	}
