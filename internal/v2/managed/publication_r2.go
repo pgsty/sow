@@ -17,6 +17,7 @@ import (
 	"github.com/pgsty/sow/internal/r2"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"golang.org/x/sys/unix"
 )
 
 const maxR2CredentialBytes = 64 << 10
@@ -126,9 +127,15 @@ func resolveR2Credentials(reference, region string) (r2.S3Credentials, error) {
 		body = []byte(value)
 	case strings.HasPrefix(reference, "file://"):
 		filename := strings.TrimPrefix(reference, "file://")
-		file, openErr := os.Open(filename)
+		// O_NONBLOCK keeps a FIFO or device from blocking open while the
+		// Repository lock is held. Symlinks, such as mounted secrets, still work.
+		fd, openErr := unix.Open(filename, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 		if openErr != nil {
 			return r2.S3Credentials{}, fmt.Errorf("%w: open R2 credential reference: %v", ErrNotReady, openErr)
+		}
+		file := os.NewFile(uintptr(fd), filename)
+		if info, statErr := file.Stat(); statErr != nil || !info.Mode().IsRegular() {
+			return r2.S3Credentials{}, errors.Join(fmt.Errorf("%w: R2 credential reference is not a regular file", ErrRejected), statErr, file.Close())
 		}
 		body, err = io.ReadAll(io.LimitReader(file, maxR2CredentialBytes+1))
 		closeErr := file.Close()

@@ -21,6 +21,7 @@ import (
 	"github.com/pgsty/sow/internal/r2"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"golang.org/x/sys/unix"
 )
 
 type fakeR2PublicationObject struct {
@@ -388,5 +389,25 @@ func TestR2PublishAndTargetGCRemainReportOnly(t *testing.T) {
 	noop, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: secondMaintenanceClock})
 	if err != nil || !noop.Noop {
 		t.Fatalf("R2 noop after retained report=%#v err=%v", noop, err)
+	}
+}
+
+func TestR2CredentialReferenceRejectsFIFOWithoutBlocking(t *testing.T) {
+	fifo := filepath.Join(t.TempDir(), "credential.fifo")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := resolveR2Credentials("file://"+fifo, "auto")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrRejected) {
+			t.Fatalf("FIFO credential error=%v, want rejection", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a FIFO credential blocked credential resolution")
 	}
 }
