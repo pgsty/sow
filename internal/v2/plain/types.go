@@ -149,7 +149,10 @@ func normalizeOptions(ctx context.Context, opts Options) (Options, error) {
 		return Options{}, &Error{Kind: KindUsage, Op: "create", Err: errors.New("no-wait and non-zero timeout are mutually exclusive")}
 	}
 	if opts.SignWith != "" {
-		key := strings.TrimPrefix(strings.TrimPrefix(opts.SignWith, "0x"), "0X")
+		key := opts.SignWith
+		if len(key) > 2 && key[0] == '0' && (key[1] == 'x' || key[1] == 'X') {
+			key = key[2:] // one optional prefix
+		}
 		if !signingKeyPattern.MatchString(key) {
 			return Options{}, &Error{Kind: KindUsage, Op: "create", Err: errors.New("sign-with must be a 16, 40, or 64 hexadecimal GPG key ID/fingerprint")}
 		}

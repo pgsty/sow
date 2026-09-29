@@ -409,7 +409,7 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 				return nil, err
 			}
 			i = next
-			value = strings.TrimPrefix(strings.TrimPrefix(value, "0x"), "0X")
+			value = trimHexPrefix(value)
 			if !gpgKeyIDPattern.MatchString(value) {
 				return nil, usageError("--sign-with must be a 16, 40, or 64 hexadecimal GPG key ID/fingerprint")
 			}
@@ -539,4 +539,12 @@ func argumentRange(minimum, maximum int) string {
 		return fmt.Sprintf("exactly %d positional argument(s)", minimum)
 	}
 	return fmt.Sprintf("between %d and %d positional argument(s)", minimum, maximum)
+}
+
+// trimHexPrefix removes one optional 0x or 0X prefix.
+func trimHexPrefix(value string) string {
+	if len(value) > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X') {
+		return value[2:]
+	}
+	return value
 }

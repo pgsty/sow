@@ -63,7 +63,7 @@ func TestParseLocalMatrixAndCardinality(t *testing.T) {
 	}
 	invalid := [][]string{
 		{"create", "a", "b"}, {"create", "-j", "0"}, {"create", "--all"},
-		{"create", "--overwrite"}, {"create", "--sign-with", "short"},
+		{"create", "--overwrite"}, {"create", "--sign-with", "short"}, {"create", "--sign-with", "0x0XE7935D8DB9BD8B20"}, {"create", "-S", "0X0xE7935D8DB9BD8B20"},
 		{"repo", "new"}, {"repo", "new", "one", "two"}, {"repo", "ls", "--force"},
 		{"repo", "migrate", "one", "two"}, {"repo", "migrate", "--force"}, {"repo", "migrate", "--abort", "--abort"},
 		{"dist", "new", "el9"}, {"dist", "new", "el9", "--format", "apk"},
@@ -217,6 +217,15 @@ func TestFailureInvocationContextDoesNotReinterpretOptionValues(t *testing.T) {
 		command, jsonOutput := failureInvocationContext(test.args)
 		if command != test.command || jsonOutput != test.jsonOutput {
 			t.Fatalf("failureInvocationContext(%v)=(%q,%t) want=(%q,%t)", test.args, command, jsonOutput, test.command, test.jsonOutput)
+		}
+	}
+}
+
+func TestParseSignWithStripsOneHexPrefix(t *testing.T) {
+	for _, value := range []string{"0xe7935d8db9bd8b20", "0XE7935D8DB9BD8B20", "E7935D8DB9BD8B20"} {
+		inv, err := Parse([]string{"create", "-S", value})
+		if err != nil || inv.SignWith != "E7935D8DB9BD8B20" {
+			t.Fatalf("sign-with %q parsed as %q: %v", value, inv.SignWith, err)
 		}
 	}
 }
