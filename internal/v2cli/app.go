@@ -204,8 +204,8 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		}
 		result, err := managed.MigrateRepository(ctx, migrationOptions)
 		return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: result.Phase != "", human: fmt.Sprintf(
-			"migrated repository %s: %s -> %s generation=%s phase=%s complete=%t\n",
-			result.Repository, result.FromLayout, result.ToLayout, result.Generation, result.Phase, result.Complete,
+			"migrated repository %s: %s -> %s schema=%d->%d generation=%s phase=%s complete=%t\n",
+			result.Repository, result.FromLayout, result.ToLayout, result.SchemaFrom, result.SchemaTo, result.Generation, result.Phase, result.Complete,
 		)}, err
 
 	case "repo rm":

@@ -115,8 +115,8 @@ PRAGMA user_version = 12;`); err != nil {
 		t.Fatal(err)
 	}
 	defer upgraded.Close()
-	if upgraded.SchemaVersion() != 13 {
-		t.Fatalf("writer schema=%d", upgraded.SchemaVersion())
+	if upgraded.SchemaVersion() != 13 || upgraded.OpenedSchemaVersion() != 12 {
+		t.Fatalf("writer schema=%d opened=%d", upgraded.SchemaVersion(), upgraded.OpenedSchemaVersion())
 	}
 	if err := upgraded.Check(context.Background()); err != nil {
 		t.Fatal(err)

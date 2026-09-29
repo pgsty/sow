@@ -105,7 +105,7 @@ func TestRepositorySchemaMigrationReportsCurrentLayout(t *testing.T) {
 	}
 	for range 2 {
 		migrated, err := MigrateRepository(ctx, RepositoryMigrationOptions{WorkspaceOptions: opts, Repository: "repo", Jobs: 1})
-		if err != nil || !migrated.Complete || migrated.Phase != "done" || migrated.FromLayout != state.LayoutSinglePayloadV1 || migrated.ToLayout != state.LayoutSinglePayloadV1 {
+		if err != nil || !migrated.Complete || migrated.Phase != "done" || migrated.FromLayout != state.LayoutSinglePayloadV1 || migrated.ToLayout != state.LayoutSinglePayloadV1 || migrated.SchemaFrom != state.SchemaVersion || migrated.SchemaTo != state.SchemaVersion {
 			t.Fatalf("current-schema migration=%#v err=%v", migrated, err)
 		}
 	}

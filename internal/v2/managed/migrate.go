@@ -44,6 +44,8 @@ type RepositoryMigrationResult struct {
 	RepositoryID   string             `json:"repository_id"`
 	FromLayout     string             `json:"from_layout"`
 	ToLayout       string             `json:"to_layout"`
+	SchemaFrom     int                `json:"schema_from"`
+	SchemaTo       int                `json:"schema_to"`
 	Phase          string             `json:"phase"`
 	Generation     state.GenerationID `json:"generation"`
 	GraceNotBefore *string            `json:"grace_not_before"`
@@ -104,6 +106,7 @@ func MigrateRepositoryLayout(ctx context.Context, opts RepositoryMigrationOption
 		return result, fmt.Errorf("%w: migrate repository schema: %v", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
+	result.SchemaFrom, result.SchemaTo = store.OpenedSchemaVersion(), store.SchemaVersion()
 	privateRoot := filepath.Join(ws.Root, ".sow", repoName)
 	for _, child := range []string{"retained", "transitions"} {
 		if _, err := durableEnsureDir(filepath.Join(privateRoot, child), 0o700); err != nil {

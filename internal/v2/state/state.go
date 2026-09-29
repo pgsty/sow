@@ -142,6 +142,9 @@ type Store struct {
 	db            *sql.DB
 	schemaVersion int
 	readOnly      bool
+	// openedSchema is the version OpenExistingForMigration found before it
+	// advanced the database; zero for every other opener.
+	openedSchema int
 }
 
 type Architecture struct {
@@ -293,7 +296,7 @@ func OpenExistingForMigration(path string, requireExistingLayout bool) (*Store, 
 	if err != nil {
 		return nil, err
 	}
-	store := &Store{path: absolute, db: db, schemaVersion: SchemaVersion}
+	store := &Store{path: absolute, db: db, schemaVersion: SchemaVersion, openedSchema: probeStore.schemaVersion}
 	if err := store.migrate(context.Background()); err != nil {
 		db.Close()
 		return nil, err
@@ -405,6 +408,15 @@ func (s *Store) DB() *sql.DB { return s.db }
 // SchemaVersion reports the byte-for-byte schema contract validated when the
 // Store was opened. Version 6 is the frozen v0.2 C2 read-only compatibility
 // surface; writable Stores are always current.
+// OpenedSchemaVersion reports the schema found before an explicit Repository
+// migration advanced the database. It equals SchemaVersion otherwise.
+func (s *Store) OpenedSchemaVersion() int {
+	if s.openedSchema == 0 {
+		return s.schemaVersion
+	}
+	return s.openedSchema
+}
+
 func (s *Store) SchemaVersion() int { return s.schemaVersion }
 
 // ReadOnly reports whether the Store was opened through OpenReadOnly. Cache
