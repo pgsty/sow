@@ -18,25 +18,28 @@ import (
 	"time"
 )
 
-// This digest is pinned so the integration gate is a repeatable protocol
-// fixture rather than an implicit dependency on a floating container tag.
-const minioCompatibilityImage = "minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e"
+// This digest pins PGSTY Silo RELEASE.2026-09-16T00-00-00Z for linux/amd64 and
+// linux/arm64, so the integration gate is a repeatable protocol fixture rather
+// than an implicit dependency on a floating container tag. Silo is the
+// MinIO-compatible object store maintained by PGSTY; it keeps the MINIO_*
+// variables and /minio/* routes used below.
+const siloCompatibilityImage = "pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46"
 
-func TestMinIOS3Compatibility(t *testing.T) {
-	if os.Getenv("SOW_MINIO_TEST") != "1" {
-		t.Skip("set SOW_MINIO_TEST=1 to run the pinned S3-compatible service test")
+func TestSiloS3Compatibility(t *testing.T) {
+	if os.Getenv("SOW_SILO_TEST") != "1" {
+		t.Skip("set SOW_SILO_TEST=1 to run the pinned S3-compatible service test")
 	}
 	docker, err := exec.LookPath("docker")
 	if err != nil {
-		t.Fatalf("SOW_MINIO_TEST=1 requires docker: %v", err)
+		t.Fatalf("SOW_SILO_TEST=1 requires docker: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
-	dataRoot := filepath.Join(t.TempDir(), "minio-data")
+	dataRoot := filepath.Join(t.TempDir(), "silo-data")
 	if err := os.MkdirAll(filepath.Join(dataRoot, "repo"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	container := fmt.Sprintf("sow-minio-%d", time.Now().UnixNano())
+	container := fmt.Sprintf("sow-silo-%d", time.Now().UnixNano())
 	command := exec.CommandContext(ctx, docker,
 		"run", "-d", "--rm", "--name", container,
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
@@ -45,10 +48,10 @@ func TestMinIOS3Compatibility(t *testing.T) {
 		"-e", "MINIO_BROWSER=off",
 		"-p", "127.0.0.1::9000",
 		"--mount", "type=bind,src="+dataRoot+",dst=/data",
-		minioCompatibilityImage, "server", "/data", "--address", ":9000", "--console-address", ":9001",
+		siloCompatibilityImage, "server", "/data", "--address", ":9000", "--console-address", ":9001",
 	)
 	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("start pinned MinIO fixture: %v: %s", err, strings.TrimSpace(string(output)))
+		t.Fatalf("start pinned Silo fixture: %v: %s", err, strings.TrimSpace(string(output)))
 	}
 	t.Cleanup(func() {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -57,13 +60,13 @@ func TestMinIOS3Compatibility(t *testing.T) {
 	})
 	portOutput, err := exec.CommandContext(ctx, docker, "port", container, "9000/tcp").CombinedOutput()
 	if err != nil {
-		t.Fatalf("discover MinIO port: %v: %s", err, strings.TrimSpace(string(portOutput)))
+		t.Fatalf("discover Silo port: %v: %s", err, strings.TrimSpace(string(portOutput)))
 	}
 	_, port, err := net.SplitHostPort(strings.TrimSpace(string(portOutput)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitForMinIO(t, ctx, "http://127.0.0.1:"+port+"/minio/health/ready")
+	waitForSilo(t, ctx, "http://127.0.0.1:"+port+"/minio/health/ready")
 	client, err := NewClient(Config{
 		Bucket: "repo", ObjectBaseURL: "http://127.0.0.1:" + port + "/repo", AllowInsecure: true,
 		Credentials: S3Credentials{AccessKeyID: "sowtest", SecretAccessKey: "sowtest-secret-key", Region: "us-east-1"},
@@ -114,7 +117,7 @@ func digestBytes(body []byte) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func waitForMinIO(t *testing.T, ctx context.Context, healthURL string) {
+func waitForSilo(t *testing.T, ctx context.Context, healthURL string) {
 	t.Helper()
 	client := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(45 * time.Second)
@@ -129,11 +132,11 @@ func waitForMinIO(t *testing.T, ctx context.Context, healthURL string) {
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatalf("wait for MinIO: %v", ctx.Err())
+			t.Fatalf("wait for Silo: %v", ctx.Err())
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
-	t.Fatal("MinIO readiness deadline exceeded")
+	t.Fatal("Silo readiness deadline exceeded")
 }
 
 func waitForR2(t *testing.T, ctx context.Context, client *Client) {
@@ -145,9 +148,9 @@ func waitForR2(t *testing.T, ctx context.Context, client *Client) {
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatalf("wait for MinIO object API: %v", ctx.Err())
+			t.Fatalf("wait for Silo object API: %v", ctx.Err())
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
-	t.Fatal("MinIO object API readiness deadline exceeded")
+	t.Fatal("Silo object API readiness deadline exceeded")
 }

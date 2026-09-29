@@ -74,6 +74,9 @@ All notable changes to SOW are recorded here.
   integration/performance gates from `test/` to `qa/`, and moved shared
   fixtures from root `testdata/` to `internal/testdata/`. Product behavior is
   unchanged; clean-delivery manifests now reflect the organized source layout.
+- The S3-compatible integration test now runs against a digest-pinned
+  `pgsty/silo` image, the MinIO-compatible object store maintained by PGSTY,
+  because the upstream `minio/minio` image is no longer available on Docker Hub.
 
 ## 0.4.0 - 2026-08-24
 

@@ -26,8 +26,8 @@ internal/aptrepo/testdata/libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64
 internal/r2/client.go
 internal/r2/client_test.go
 internal/r2/cloudflare_integration_test.go
-internal/r2/minio_integration_test.go
 internal/r2/r2.go
+internal/r2/silo_integration_test.go
 internal/testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc
 internal/testdata/pgdg-redhat-nonfree-repo.rpm.b64
 internal/v2/config/config.go
