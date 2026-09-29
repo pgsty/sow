@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,6 +21,22 @@ import (
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
+
+func TestWaitForFrozenGPGTimeLeavesOnlyTheCurrentSecond(t *testing.T) {
+	start := time.Now()
+	if err := waitForFrozenGPGTime(context.Background(), start.Add(-2*time.Second)); err != nil || time.Since(start) > 200*time.Millisecond {
+		t.Fatalf("a past Generation time waited %v: %v", time.Since(start), err)
+	}
+	at := time.Now()
+	if err := waitForFrozenGPGTime(context.Background(), at); err != nil || time.Now().Unix() <= at.Unix() {
+		t.Fatalf("signing would start in the faked second: now=%d at=%d err=%v", time.Now().Unix(), at.Unix(), err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitForFrozenGPGTime(cancelled, time.Now().Add(time.Second)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled wait=%v", err)
+	}
+}
 
 // This is a real agent keyring, with two public signing subkeys but only the
 // older one's secret key on this machine. Public-only selection prefers the

@@ -167,6 +167,9 @@ func (signer *gpgSignerCore) runSign(ctx context.Context, operation []string, me
 	if err := signer.Validate(ctx, at); err != nil {
 		return err
 	}
+	if err := waitForFrozenGPGTime(ctx, at); err != nil {
+		return err
+	}
 	gpg, _ := exec.LookPath("gpg")
 	args := []string{"--batch", "--no-tty", "--yes", "--pinentry-mode", "error", "--digest-algo", "SHA256", "--faked-system-time", strconv.FormatInt(at.UTC().Unix(), 10) + "!", "--local-user", signer.signingFingerprint + "!", "--output", "-"}
 	args = append(args, operation...)
@@ -179,6 +182,26 @@ func (signer *gpgSignerCore) runSign(ctx context.Context, operation []string, me
 		return fmt.Errorf("managed: gpg metadata signing failed: %w", err)
 	}
 	return nil
+}
+
+// waitForFrozenGPGTime returns once GnuPG will freeze --faked-system-time at.
+// GnuPG freezes the faked clock only when the requested second is already in the
+// past; a value equal to the current second lets its clock keep running, so a
+// slow signature can be stamped later than the published Date. Signing at an
+// earlier Generation time never waits; init and dist new wait at most a second.
+func waitForFrozenGPGTime(ctx context.Context, at time.Time) error {
+	target, now := at.Unix(), time.Now()
+	if now.Unix() > target || target-now.Unix() > 1 {
+		return nil
+	}
+	timer := time.NewTimer(time.Until(time.Unix(target+1, 0).Add(10 * time.Millisecond)))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (signer *gpgYUMMetadataSigner) Verify(ctx context.Context, message io.Reader, signature io.Reader) error {
