@@ -421,3 +421,36 @@ func TestFilesystemPublicationRejectsPayloadOverwrite(t *testing.T) {
 		t.Fatalf("exact payload replay failed: %v", err)
 	}
 }
+
+func TestRejectPayloadPathConflictsFoldsOnlyForCaseInsensitiveTargets(t *testing.T) {
+	base := []state.PublicationInventoryObject{
+		{Path: "pool/c/CaseDemo/CaseDemo-1-1.noarch.rpm", Phase: "payload", Size: 1, SHA256: strings.Repeat("a", 64)},
+		{Path: "dists/el9/x86_64/repodata/repomd.xml", Phase: "pointer", Size: 1, SHA256: strings.Repeat("b", 64)},
+	}
+	put := func(path, digit string) state.PublicationPlanOperation {
+		return state.PublicationPlanOperation{Operation: "put", Path: path, Phase: "payload", Size: 1, SHA256: strings.Repeat(digit, 64)}
+	}
+	for _, test := range []struct {
+		name                  string
+		payload               []state.PublicationPlanOperation
+		exactErr, foldedError bool
+	}{
+		{name: "same bytes, same path", payload: []state.PublicationPlanOperation{put("pool/c/CaseDemo/CaseDemo-1-1.noarch.rpm", "a")}},
+		{name: "different bytes, same path", payload: []state.PublicationPlanOperation{put("pool/c/CaseDemo/CaseDemo-1-1.noarch.rpm", "c")}, exactErr: true, foldedError: true},
+		{name: "file name case variant", payload: []state.PublicationPlanOperation{put("pool/c/CaseDemo/casedemo-1-1.noarch.rpm", "a")}, foldedError: true},
+		{name: "directory case variant", payload: []state.PublicationPlanOperation{put("pool/c/casedemo/casedemo-2-1.noarch.rpm", "d")}, foldedError: true},
+		{name: "aliases within the plan", payload: []state.PublicationPlanOperation{put("pool/o/other/other-1-1.noarch.rpm", "e"), put("pool/o/Other/Other-2-1.noarch.rpm", "f")}, foldedError: true},
+		{name: "unrelated path", payload: []state.PublicationPlanOperation{put("pool/o/other/other-1-1.noarch.rpm", "e")}},
+	} {
+		for _, caseInsensitive := range []bool{false, true} {
+			err := rejectPayloadPathConflicts(base, test.payload, caseInsensitive)
+			want := test.exactErr
+			if caseInsensitive {
+				want = test.foldedError
+			}
+			if (err != nil) != want || err != nil && !(errors.Is(err, ErrRejected) && errors.Is(err, state.ErrPoolPathConflict)) {
+				t.Fatalf("%s (case-insensitive=%t): err=%v, want error=%t", test.name, caseInsensitive, err, want)
+			}
+		}
+	}
+}

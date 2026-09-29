@@ -666,6 +666,9 @@ func renameRootedRegular(ctx context.Context, root, sourceRelative, targetRelati
 	}
 	authenticated, err := authenticateRegularDescriptor(ctx, file, expectedSize, expectedSHA)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return closeFile(ctxErr) // a cancelled read is not a digest mismatch
+		}
 		return closeFile(errors.Join(errors.New("managed: rooted rename source digest differs"), err))
 	}
 	if err := errors.Join(sourceParent.verify(), targetParent.verify()); err != nil {
@@ -826,6 +829,9 @@ func linkRootedRegularDeferredTargetSync(ctx context.Context, root, sourceRelati
 	}
 	digest, hashErr := hashRegularDescriptor(ctx, file)
 	if hashErr != nil || digest != expectedSHA {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return closeFile(ctxErr) // a cancelled read is not a digest mismatch
+		}
 		return closeFile(errors.Join(errors.New("managed: deferred rooted link source digest differs"), hashErr))
 	}
 	var authenticated, authenticatedEntry unix.Stat_t
@@ -956,6 +962,9 @@ func linkRootedRegular(ctx context.Context, sourceRoot, sourceRelative, targetRo
 	}
 	authenticated, hashErr := authenticateRegularDescriptor(ctx, file, expectedSize, expectedSHA)
 	if hashErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return closeFile(ctxErr) // a cancelled read is not a digest mismatch
+		}
 		return closeFile(errors.Join(errors.New("managed: rooted link source digest differs"), hashErr))
 	}
 	if err := errors.Join(file.Sync(), sourceParent.verify(), targetParent.verify()); err != nil {

@@ -208,18 +208,12 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 		if err := requireExactRemoteInventory(remoteBefore, baseInventory); err != nil {
 			return result, err
 		}
-		// Include retained payloads and known abandoned uploads, not only the
-		// current checkpoint manifest. Reject before creating an attempt.
-		occupied := make(map[string]state.PublicationInventoryObject, len(baseInventory))
-		for _, object := range baseInventory {
-			if object.Phase == "payload" {
-				occupied[object.Path] = object
-			}
+		caseInsensitiveTarget, err := publicationTargetCaseInsensitive(targetConfig)
+		if err != nil {
+			return result, err
 		}
-		for _, operation := range plan.Payload {
-			if prior, ok := occupied[operation.Path]; ok && (prior.SHA256 != operation.SHA256 || prior.Size != operation.Size) {
-				return result, fmt.Errorf("%w: %w: published payload path %q already contains different bytes", ErrRejected, state.ErrPoolPathConflict, operation.Path)
-			}
+		if err := rejectPayloadPathConflicts(baseInventory, plan.Payload, caseInsensitiveTarget); err != nil {
+			return result, err
 		}
 		if len(changes) == 0 {
 			result.Checkpoint, result.Phase, result.Objects, result.Noop = targetSnapshot.Head.CheckpointIdentity, "applied", len(remoteBefore), true
@@ -1087,4 +1081,59 @@ func putPublicationGrace(ctx context.Context, store *state.Store, binding state.
 		CachePolicyIdentity: hex.EncodeToString(cacheHash.Sum(nil)), State: "grace",
 	}
 	return store.PutGraceRecord(ctx, &grace)
+}
+
+// publicationTargetCaseInsensitive reports whether remote payload spellings that
+// differ only by case name one object. Only a filesystem target on a
+// case-insensitive volume does; object stores such as R2 use exact keys.
+func publicationTargetCaseInsensitive(target config.TargetConfig) (bool, error) {
+	if target.Provider != "filesystem" {
+		return false, nil
+	}
+	endpoint, _, err := filesystemConfiguredPublicationRoot(target)
+	if err != nil {
+		return false, err
+	}
+	return filesystemDirectoryIsCaseInsensitive(endpoint)
+}
+
+// rejectPayloadPathConflicts refuses a new attempt, before any remote write,
+// when a planned payload path already holds different bytes. The base includes
+// retained payloads and known abandoned uploads, not only the current manifest.
+// On a case-insensitive target a spelling that differs only by case, in the
+// file name or the source directory, is the same remote entry and is refused.
+func rejectPayloadPathConflicts(base []state.PublicationInventoryObject, payload []state.PublicationPlanOperation, caseInsensitive bool) error {
+	exact := make(map[string]state.PublicationInventoryObject, len(base))
+	folded := make(map[string]string, len(base))
+	directories := make(map[string]string)
+	remember := func(path string) {
+		folded[strings.ToLower(path)] = path
+		directory := poolSourceDirectory(path)
+		if _, known := directories[strings.ToLower(directory)]; !known {
+			directories[strings.ToLower(directory)] = directory
+		}
+	}
+	for _, object := range base {
+		if object.Phase == "payload" {
+			exact[object.Path] = object
+			remember(object.Path)
+		}
+	}
+	for _, operation := range payload {
+		if prior, ok := exact[operation.Path]; ok && (prior.SHA256 != operation.SHA256 || prior.Size != operation.Size) {
+			return fmt.Errorf("%w: %w: published payload path %q already contains different bytes", ErrRejected, state.ErrPoolPathConflict, operation.Path)
+		}
+		if !caseInsensitive {
+			continue
+		}
+		if prior, ok := folded[strings.ToLower(operation.Path)]; ok && prior != operation.Path {
+			return fmt.Errorf("%w: %w: payload path %q differs only by case from %q, the same file on this case-insensitive filesystem target", ErrRejected, state.ErrPoolPathConflict, operation.Path, prior)
+		}
+		directory := poolSourceDirectory(operation.Path)
+		if known, ok := directories[strings.ToLower(directory)]; ok && known != directory {
+			return fmt.Errorf("%w: %w: payload directory %q differs only by case from %q, the same directory on this case-insensitive filesystem target", ErrRejected, state.ErrPoolPathConflict, strings.TrimSuffix(directory, "/"), strings.TrimSuffix(known, "/"))
+		}
+		remember(operation.Path)
+	}
+	return nil
 }
