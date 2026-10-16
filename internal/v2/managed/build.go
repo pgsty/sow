@@ -41,7 +41,7 @@ func marshalMutationBaseManifestLimit(manifest []state.GenerationFile, limit int
 type mutationBuildPreflight struct {
 	distNames         []string
 	generation        state.GenerationID
-	publicationTime   time.Time
+	publication       publicationIdentity
 	baseManifest      []state.GenerationFile
 	baseSnapshot      *publicGenerationSnapshot
 	metadataSnapshot  metadataSignerSnapshot
@@ -55,7 +55,7 @@ type mutationBuildPreflight struct {
 // recovery artifacts fit the same bounds enforced by their readers. Pooled is
 // conservatively projected as every Desired digest; the real build can only be
 // smaller because already-public objects are omitted.
-func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, manifest mutationManifest, store *state.Store, preparedRPMPolicy *rpmSigningPolicy, current *publicGenerationSnapshot, workerCounts ...int) (*mutationBuildPreflight, error) {
+func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, manifest mutationManifest, store *state.Store, publication publicationIdentity, preparedRPMPolicy *rpmSigningPolicy, current *publicGenerationSnapshot, workerCounts ...int) (*mutationBuildPreflight, error) {
 	if len(distNames) == 0 {
 		return nil, nil
 	}
@@ -84,10 +84,13 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 		return nil, err
 	}
 	formats := configuredSigningFormats(cfg, repoName, distNames)
-	publicationTime, err := nextMutationPublicationTime(ctx, root, cfg.Repositories[repoName], store, summary.BuiltGeneration, formats.rpm, formats.deb)
-	if err != nil {
-		return nil, err
+	if !publication.Current {
+		publication.Time, err = nextMutationPublicationTime(ctx, root, cfg.Repositories[repoName], store, summary.BuiltGeneration, formats.rpm, formats.deb)
+		if err != nil {
+			return nil, err
+		}
 	}
+	publicationTime := publication.Time
 	metadataSnapshot, err := loadMetadataSignerSnapshotForFormats(ctx, root, cfg.Repositories[repoName], publicationTime, formats.rpm, formats.deb)
 	if err != nil {
 		return nil, err
@@ -167,7 +170,7 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 		return nil, err
 	}
 	return &mutationBuildPreflight{
-		distNames: append([]string(nil), distNames...), generation: generation, publicationTime: publicationTime,
+		distNames: append([]string(nil), distNames...), generation: generation, publication: publication,
 		baseManifest: append([]state.GenerationFile(nil), baseManifest...), baseSnapshot: baseSnapshot, metadataSnapshot: metadataSnapshot,
 		rpmPolicy: rpmPolicy, projectedDists: projectedDists, rpmAuthorizations: authorizations,
 	}, nil
@@ -210,7 +213,7 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	if err != nil {
 		return 0, fmt.Errorf("%w: %v", ErrRejected, err)
 	}
-	operation, _, manifest, err := loadMutationOperation(ctx, store, root, repoName, operationID)
+	operation, payload, manifest, err := loadMutationOperation(ctx, store, root, repoName, operationID)
 	if err != nil {
 		return 0, err
 	}
@@ -227,13 +230,13 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	var pooled []string
 	var retainedRPMKeys []state.RPMSigningKey
 	if manifest.Build == nil {
-		var publicationTime time.Time
+		publication := payload.PublicationTime.identity()
 		if preflight != nil {
-			if preflight.generation != nextGeneration || !sameStringSet(preflight.distNames, distNames) {
+			if preflight.generation != nextGeneration || preflight.publication.Current != publication.Current || publication.Current && !preflight.publication.Time.Equal(publication.Time) || !sameStringSet(preflight.distNames, distNames) {
 				return 0, fmt.Errorf("%w: mutation build preflight no longer matches repository state", ErrIntegrity)
 			}
 			generation = preflight.generation
-			publicationTime = preflight.publicationTime
+			publication = preflight.publication
 			baseManifest = append([]state.GenerationFile(nil), preflight.baseManifest...)
 		} else {
 			generation = nextGeneration
@@ -242,15 +245,17 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 				return 0, err
 			}
 			formats := configuredSigningFormats(cfg, repoName, distNames)
-			publicationTime, err = nextMutationPublicationTime(ctx, root, cfg.Repositories[repoName], store, summary.BuiltGeneration, formats.rpm, formats.deb)
-			if err != nil {
-				return 0, err
+			if !publication.Current {
+				publication.Time, err = nextMutationPublicationTime(ctx, root, cfg.Repositories[repoName], store, summary.BuiltGeneration, formats.rpm, formats.deb)
+				if err != nil {
+					return 0, err
+				}
 			}
 		}
 		if err := recordBuildProgress(ctx, store, operationID, "rendering", 0, len(distNames), jobs); err != nil {
 			return 0, err
 		}
-		buildDists, pooled, retainedRPMKeys, err = stageMutationBuild(ctx, root, repoName, cfg, distNames, generation, publicationTime, buildRoot, operationID, store, jobs, fault, preflight)
+		buildDists, pooled, retainedRPMKeys, err = stageMutationBuild(ctx, root, repoName, cfg, distNames, generation, publication, buildRoot, operationID, store, jobs, fault, preflight)
 		if err != nil {
 			return 0, err
 		}
@@ -410,7 +415,8 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	return generation, nil
 }
 
-func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, generation state.GenerationID, publicationTime time.Time, buildRoot, operationID string, store *state.Store, jobs int, fault func(string) error, preflight *mutationBuildPreflight) (buildDists []mutationBuildDist, pooled []string, retainedRPMKeys []state.RPMSigningKey, resultErr error) {
+func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, generation state.GenerationID, publication publicationIdentity, buildRoot, operationID string, store *state.Store, jobs int, fault func(string) error, preflight *mutationBuildPreflight) (buildDists []mutationBuildDist, pooled []string, retainedRPMKeys []state.RPMSigningKey, resultErr error) {
+	publicationTime := publication.Time
 	// A build plan is journaled only after every Dist has rendered and synced.
 	// Therefore an existing build root while manifest.Build is still nil is
 	// necessarily an incomplete prior attempt (ordinary error or process
@@ -472,7 +478,7 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 	var metadataSnapshot metadataSignerSnapshot
 	rpmPolicy := rpmSigningPolicy{mode: "never"}
 	if preflight != nil {
-		if preflight.generation != generation || !preflight.publicationTime.Equal(publicationTime) || !sameStringSet(preflight.distNames, distNames) {
+		if preflight.generation != generation || preflight.publication.Current != publication.Current || !preflight.publication.Time.Equal(publicationTime) || !sameStringSet(preflight.distNames, distNames) {
 			return nil, nil, nil, fmt.Errorf("%w: mutation signing preflight does not match the staged build", ErrIntegrity)
 		}
 		metadataSnapshot = preflight.metadataSnapshot
@@ -536,7 +542,7 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		spec := ManagedDistSpec{Name: distName, Format: distState.Format, Architectures: architectures, Generation: generation, Jobs: jobs, PublishedAt: publicationTime, Packages: sources}
+		spec := ManagedDistSpec{Name: distName, Format: distState.Format, Architectures: architectures, Generation: generation, Jobs: jobs, PublishedAt: publicationTime, RPMMetadataTimestamp: publication.rpmTimestamp(), Packages: sources}
 		if distState.Format == "rpm" {
 			spec.RPMSigner = metadataSnapshot.RPMSigner
 		} else {
@@ -911,6 +917,9 @@ func loadMutationJournal(ctx context.Context, store *state.Store, root, repoName
 		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, err
 	}
 	if err := normalizeLegacyMutationDesired(ctx, store, *operation, payload, &manifest); err != nil {
+		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, err
+	}
+	if err := validateMutationPublicationTime(ctx, root, repoName, operationID, store, payload.PublicationTime.identity(), manifest); err != nil {
 		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, err
 	}
 	return *operation, payload, manifest, nil

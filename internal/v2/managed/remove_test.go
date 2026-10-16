@@ -3,19 +3,27 @@ package managed
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/sha256"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
 	"golang.org/x/sys/unix"
@@ -95,15 +103,18 @@ func TestRemovePreviewAndBuildPreserveGenerationAboveMaxInt64(t *testing.T) {
 	if err != nil || !checked.ReadyToCopy || checked.Generation != high {
 		t.Fatalf("high Generation check=%#v err=%v", checked, err)
 	}
+	previewStarted := time.Now()
 	preview, err := Remove(ctx, RemoveOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Packages: []string{"pgdg-redhat-nonfree-repo"}, Check: true, Jobs: 1})
+	previewFinished := time.Now()
 	want, nextErr := high.Next()
 	if err != nil || nextErr != nil || preview.Generation != want || len(preview.Changes) == 0 {
 		t.Fatalf("high Generation preview=%#v want=%s err=%v nextErr=%v", preview, want, err, nextErr)
 	}
 	actual, err := Remove(ctx, RemoveOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Packages: []string{"pgdg-redhat-nonfree-repo"}, Jobs: 1})
-	if err != nil || actual.Generation != want || !reflect.DeepEqual(actual.Changes, preview.Changes) {
+	if err != nil || actual.Generation != want || !sameRemovalChangeSemantics(actual.Changes, preview.Changes) {
 		t.Fatalf("high Generation remove=%#v preview=%#v err=%v", actual, preview, err)
 	}
+	assertRemovalPreviewMetadata(t, root, preview, previewStarted, previewFinished, nil)
 }
 
 func TestRemoveCheckSkipAndDefaultBuild(t *testing.T) {
@@ -353,7 +364,7 @@ func TestRemoveSkipCleanupFailureRetainsCommittedProjection(t *testing.T) {
 	}
 }
 
-func TestRemoveCheckPredictsExactImmediateBuild(t *testing.T) {
+func TestRemoveCheckPredictsSemanticImmediateBuild(t *testing.T) {
 	tests := []struct {
 		name      string
 		format    string
@@ -366,8 +377,8 @@ func TestRemoveCheckPredictsExactImmediateBuild(t *testing.T) {
 	}{
 		{name: "rpm", format: "rpm", dist: "el9", fixture: filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filename: "pgdg-redhat-nonfree-repo.rpm", reference: "pgdg-redhat-nonfree-repo"},
 		{name: "deb across wall-clock second", format: "deb", dist: "jammy", fixture: filepath.Join("..", "..", "aptrepo", "testdata", "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64"), filename: "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb", reference: "libpqtypes0", wait: true},
-		{name: "signed rpm", format: "rpm", dist: "el9", fixture: filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filename: "pgdg-redhat-nonfree-repo.rpm", reference: "pgdg-redhat-nonfree-repo", signed: true},
-		{name: "signed deb", format: "deb", dist: "jammy", fixture: filepath.Join("..", "..", "aptrepo", "testdata", "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64"), filename: "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb", reference: "libpqtypes0", signed: true},
+		{name: "signed rpm", format: "rpm", dist: "el9", fixture: filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filename: "pgdg-redhat-nonfree-repo.rpm", reference: "pgdg-redhat-nonfree-repo", wait: true, signed: true},
+		{name: "signed deb", format: "deb", dist: "jammy", fixture: filepath.Join("..", "..", "aptrepo", "testdata", "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64"), filename: "libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb", reference: "libpqtypes0", wait: true, signed: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -375,8 +386,10 @@ func TestRemoveCheckPredictsExactImmediateBuild(t *testing.T) {
 			root := t.TempDir()
 			cfg := config.Default()
 			cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{test.dist: {Format: test.format}}}
+			var signingKey []byte
 			if test.signed {
 				key, _ := managedTestPrivateKey(t, "remove-check-"+test.format)
+				signingKey = key
 				t.Setenv("SOW_TEST_REMOVE_METADATA_KEY", string(key))
 				repository := cfg.Repositories["repo"]
 				if test.format == "rpm" {
@@ -399,7 +412,9 @@ func TestRemoveCheckPredictsExactImmediateBuild(t *testing.T) {
 			if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{test.dist}, Paths: []string{input}, Jobs: 1}); err != nil {
 				t.Fatal(err)
 			}
+			previewStarted := time.Now()
 			preview, err := Remove(ctx, RemoveOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{test.dist}, Packages: []string{test.reference}, Check: true, Jobs: 1})
+			previewFinished := time.Now()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -410,8 +425,13 @@ func TestRemoveCheckPredictsExactImmediateBuild(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if preview.Generation != actual.Generation || preview.Revision != actual.Revision || !reflect.DeepEqual(preview.Removed, actual.Removed) || !reflect.DeepEqual(preview.Changes, actual.Changes) {
+			if preview.Generation != actual.Generation || preview.Revision != actual.Revision || !reflect.DeepEqual(preview.Removed, actual.Removed) || !sameRemovalChangeSemantics(preview.Changes, actual.Changes) {
 				t.Fatalf("preview does not equal actual build\npreview=%#v\nactual=%#v", preview, actual)
+			}
+			assertRemovalPreviewMetadata(t, root, preview, previewStarted, previewFinished, signingKey)
+			checked, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})
+			if err != nil || !checked.ReadyToCopy {
+				t.Fatalf("actual signed metadata check=%+v err=%v", checked, err)
 			}
 		})
 	}
@@ -458,7 +478,9 @@ func TestRemoveCheckIncludesPendingPayloadPromotion(t *testing.T) {
 	}
 	previewOptions := removeOptions
 	previewOptions.Check = true
+	previewStarted := time.Now()
 	preview, err := Remove(ctx, previewOptions)
+	previewFinished := time.Now()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,9 +494,10 @@ func TestRemoveCheckIncludesPendingPayloadPromotion(t *testing.T) {
 		t.Fatalf("preview omitted pending Pool promotion for %s: %#v", pendingObject.PoolPath, preview.Changes)
 	}
 	actual, err := Remove(ctx, removeOptions)
-	if err != nil || !reflect.DeepEqual(preview.Changes, actual.Changes) {
+	if err != nil || !sameRemovalChangeSemantics(preview.Changes, actual.Changes) {
 		t.Fatalf("pending promotion preview differs\npreview=%#v\nactual=%#v\nerr=%v", preview, actual, err)
 	}
+	assertRemovalPreviewMetadata(t, root, preview, previewStarted, previewFinished, nil)
 }
 
 func TestRemoveCheckMatchesBuildWhenPriorRPMMetadataIsAbsent(t *testing.T) {
@@ -500,14 +523,17 @@ func TestRemoveCheckMatchesBuildWhenPriorRPMMetadataIsAbsent(t *testing.T) {
 	}
 	previewOptions := removeOptions
 	previewOptions.Check = true
+	previewStarted := time.Now()
 	preview, err := Remove(ctx, previewOptions)
+	previewFinished := time.Now()
 	if err != nil {
 		t.Fatal(err)
 	}
 	actual, err := Remove(ctx, removeOptions)
-	if err != nil || !reflect.DeepEqual(preview.Changes, actual.Changes) {
+	if err != nil || !sameRemovalChangeSemantics(preview.Changes, actual.Changes) {
 		t.Fatalf("missing prior metadata preview differs\npreview=%#v\nactual=%#v\nerr=%v", preview, actual, err)
 	}
+	assertRemovalPreviewMetadata(t, root, preview, previewStarted, previewFinished, nil)
 }
 
 func TestPreviewRPMDistRejectsUnsafePriorMetadataRoot(t *testing.T) {
@@ -521,7 +547,7 @@ func TestPreviewRPMDistRejectsUnsafePriorMetadataRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := previewRPMDist(
-		ctx, repositoryRoot, t.TempDir(), "el9", 1, time.Unix(1_700_000_000, 0).UTC(),
+		ctx, repositoryRoot, t.TempDir(), "el9", 1, publicationIdentity{Time: time.Unix(1_700_000_000, 0).UTC()},
 		nil, []state.Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}}, nil, nil, 1, nil, map[string]state.GenerationFile{},
 	)
 	if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "metadata root is unsafe") {
@@ -557,7 +583,7 @@ func TestPreviewRPMDistRejectsRenderedMetadataCollision(t *testing.T) {
 	retained.SHA256 = strings.Repeat("f", 64)
 	target := map[string]state.GenerationFile{retained.Path: retained}
 	err = previewRPMDist(
-		ctx, t.TempDir(), t.TempDir(), "el9", 1, publishedAt,
+		ctx, t.TempDir(), t.TempDir(), "el9", 1, publicationIdentity{Time: publishedAt},
 		architectures, nil, nil, nil, 1, nil, target,
 	)
 	if !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "collision differs by content") {
@@ -848,7 +874,9 @@ func TestRemoveCheckIncludesSelectedConfigDirtyDist(t *testing.T) {
 	}
 	previewOptions := removeOptions
 	previewOptions.Check = true
+	previewStarted := time.Now()
 	preview, err := Remove(ctx, previewOptions)
+	previewFinished := time.Now()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -863,9 +891,10 @@ func TestRemoveCheckIncludesSelectedConfigDirtyDist(t *testing.T) {
 		t.Fatalf("preview omitted selected config-dirty el10: %#v", preview.Changes)
 	}
 	actual, err := Remove(ctx, removeOptions)
-	if err != nil || preview.Generation != actual.Generation || preview.Revision != actual.Revision || !reflect.DeepEqual(preview.Changes, actual.Changes) {
+	if err != nil || preview.Generation != actual.Generation || preview.Revision != actual.Revision || !sameRemovalChangeSemantics(preview.Changes, actual.Changes) {
 		t.Fatalf("mixed-scope preview differs\npreview=%#v\nactual=%#v\nerr=%v", preview, actual, err)
 	}
+	assertRemovalPreviewMetadata(t, root, preview, previewStarted, previewFinished, nil)
 }
 
 func TestRemovePreviewMatchesArchitectureDriftGuards(t *testing.T) {
@@ -939,7 +968,9 @@ func TestRemovePreviewMatchesArchitectureDriftGuards(t *testing.T) {
 			if temporary := differentDeviceTMP(t, root); temporary != "" {
 				t.Setenv("TMPDIR", temporary)
 			}
+			previewStarted := time.Now()
 			preview, err := Remove(ctx, RemoveOptions{WorkspaceOptions: opts, Repository: "repo", Dists: []string{test.dist}, Packages: []string{test.reference}, Check: true, Jobs: 1})
+			previewFinished := time.Now()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -947,9 +978,10 @@ func TestRemovePreviewMatchesArchitectureDriftGuards(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if preview.Generation != actual.Generation || !reflect.DeepEqual(preview.Changes, actual.Changes) {
+			if preview.Generation != actual.Generation || !sameRemovalChangeSemantics(preview.Changes, actual.Changes) {
 				t.Fatalf("expanded architecture preview differs\npreview=%#v\nactual=%#v", preview, actual)
 			}
+			assertRemovalPreviewMetadata(t, root, preview, previewStarted, previewFinished, nil)
 		})
 
 		t.Run(test.format+" architecture removal", func(t *testing.T) {
@@ -1322,6 +1354,169 @@ func assertRemovePolicyAudit(t *testing.T, root, operation string, digests map[s
 		objects, err := store.ListPackageObjects(ctx, nil, false)
 		if err != nil || len(objects) != 2 {
 			t.Fatalf("dropped pending objects remain: objects=%+v err=%v", objects, err)
+		}
+	}
+}
+
+// Metadata and signatures belong to separate operation times. The paired
+// assertRemovalPreviewMetadata assertion binds their non-time contents to the
+// real preview hashes; all other file bytes (including deletions) remain exact.
+func sameRemovalChangeSemantics(left, right []state.FileChange) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index, a := range left {
+		b := right[index]
+		if a.Operation != b.Operation || a.Path != b.Path || a.Phase != b.Phase {
+			return false
+		}
+		if a.Operation == "delete" {
+			if a.Size != b.Size || a.SHA256 != b.SHA256 {
+				return false
+			}
+			continue
+		}
+		switch filepath.Base(a.Path) {
+		case "repomd.xml", "repomd.xml.asc", "Release", "Release.gpg", "InRelease":
+			// These files embed the operation's time or its signature.
+		default:
+			if a.Size != b.Size || a.SHA256 != b.SHA256 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// rm --check removes its temporary files. Recover their exact pointer bytes by
+// replacing only the actual build's timestamp/Date with a second from the
+// independently measured preview window, then require the preview's SHA and
+// size. This preserves every other byte, including revision, checksums,
+// locations, sizes, architectures and Release fields. These fixtures' prior
+// publications and key activation times precede the measured window.
+func assertRemovalPreviewMetadata(t *testing.T, root string, preview RemoveResult, started, finished time.Time, signingKey []byte) {
+	t.Helper()
+	bodies := map[string][]byte{}
+	var publication time.Time
+	for _, change := range preview.Changes {
+		name := filepath.Base(change.Path)
+		if change.Operation == "delete" || name != "repomd.xml" && name != "Release" {
+			continue
+		}
+		actual, err := os.ReadFile(filepath.Join(root, "repo", filepath.FromSlash(change.Path)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var oldTime []byte
+		if name == "repomd.xml" {
+			var document struct {
+				Revision uint64 `xml:"revision"`
+				Data     []struct {
+					Timestamp int64 `xml:"timestamp"`
+				} `xml:"data"`
+			}
+			if err := xml.Unmarshal(actual, &document); err != nil || document.Revision != uint64(preview.Generation) || len(document.Data) != 3 {
+				t.Fatalf("actual repomd revision=%d, want=%d, records=%d, err=%v", document.Revision, preview.Generation, len(document.Data), err)
+			}
+			oldTime = []byte(fmt.Sprintf("<timestamp>%d</timestamp>", document.Data[0].Timestamp))
+			if bytes.Count(actual, oldTime) != len(document.Data) {
+				t.Fatal("actual repomd timestamps differ")
+			}
+		} else {
+			for _, line := range bytes.Split(actual, []byte("\n")) {
+				if bytes.HasPrefix(line, []byte("Date: ")) {
+					if oldTime != nil {
+						t.Fatal("duplicate Release Date")
+					}
+					if _, err := time.Parse(time.RFC1123, string(line[len("Date: "):])); err != nil {
+						t.Fatal(err)
+					}
+					oldTime = append(append([]byte{}, line...), '\n')
+				}
+			}
+			generationLine := []byte("X-SOW-Generation: " + strconv.FormatUint(uint64(preview.Generation), 10) + "\n")
+			if oldTime == nil || bytes.Count(actual, generationLine) != 1 {
+				t.Fatal("actual Release lacks its Date or expected Generation")
+			}
+		}
+		for at := started.UTC().Truncate(time.Second); !at.After(finished.UTC().Truncate(time.Second)); at = at.Add(time.Second) {
+			var replacement []byte
+			if name == "repomd.xml" {
+				replacement = []byte(fmt.Sprintf("<timestamp>%d</timestamp>", at.Unix()))
+			} else {
+				replacement = []byte("Date: " + at.Format(time.RFC1123) + "\n")
+			}
+			candidate := bytes.ReplaceAll(actual, oldTime, replacement)
+			if int64(len(candidate)) == change.Size && fmt.Sprintf("%x", sha256.Sum256(candidate)) == change.SHA256 {
+				if !publication.IsZero() && !publication.Equal(at) {
+					t.Fatal("preview metadata uses different publication times")
+				}
+				publication, bodies[change.Path] = at, candidate
+				break
+			}
+		}
+		if bodies[change.Path] == nil {
+			t.Fatalf("preview %s differs from actual metadata beyond timestamp/Date within [%s, %s]", change.Path, started, finished)
+		}
+	}
+
+	// Deterministic signatures let us bind the recovered preview body to the
+	// public preview's signature hashes too, using the fixture's expected key.
+	// Verify with OpenPGP directly, independently of managed signing validators.
+	for _, change := range preview.Changes {
+		name := filepath.Base(change.Path)
+		if change.Operation == "delete" || name != "repomd.xml.asc" && name != "Release.gpg" && name != "InRelease" {
+			continue
+		}
+		keys, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(signingKey))
+		if err != nil || len(keys) != 1 {
+			t.Fatalf("expected preview signing key: %v", err)
+		}
+		bodyPath := filepath.Join(filepath.Dir(change.Path), "Release")
+		if name == "repomd.xml.asc" {
+			bodyPath = strings.TrimSuffix(change.Path, ".asc")
+		}
+		body := bodies[bodyPath]
+		if body == nil {
+			t.Fatalf("preview signature %s lacks its hash-bound body", change.Path)
+		}
+		randomizedNotation := false
+		cfg := &packet.Config{DefaultHash: crypto.SHA256, Time: func() time.Time { return publication }, NonDeterministicSignaturesViaNotation: &randomizedNotation}
+		cfg.InsecureGenerateNonCriticalKeyFlags = name == "repomd.xml.asc"
+		cfg.InsecureGenerateNonCriticalSignatureCreationTime = name == "repomd.xml.asc"
+		var output bytes.Buffer
+		var issuer *openpgp.Entity
+		if name == "InRelease" {
+			key, ok := keys[0].SigningKey(publication)
+			if !ok {
+				t.Fatal("expected key cannot sign preview")
+			}
+			writer, encodeErr := clearsign.Encode(&output, key.PrivateKey, cfg)
+			if encodeErr != nil {
+				t.Fatal(encodeErr)
+			}
+			if _, err := writer.Write(body); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			block, rest := clearsign.Decode(output.Bytes())
+			if block == nil || len(rest) != 0 || !bytes.Equal(bytes.TrimSuffix(block.Plaintext, []byte("\n")), bytes.TrimSuffix(body, []byte("\n"))) {
+				t.Fatal("preview InRelease body differs from Release")
+			}
+			issuer, err = openpgp.CheckDetachedSignature(keys, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, cfg)
+		} else {
+			if err := openpgp.ArmoredDetachSign(&output, keys[0], bytes.NewReader(body), cfg); err != nil {
+				t.Fatal(err)
+			}
+			issuer, err = openpgp.CheckArmoredDetachedSignature(keys, bytes.NewReader(body), bytes.NewReader(output.Bytes()), cfg)
+		}
+		if err != nil || issuer == nil || !bytes.Equal(issuer.PrimaryKey.Fingerprint, keys[0].PrimaryKey.Fingerprint) {
+			t.Fatalf("preview signature %s is not bound to expected key: %v", change.Path, err)
+		}
+		if int64(output.Len()) != change.Size || fmt.Sprintf("%x", sha256.Sum256(output.Bytes())) != change.SHA256 {
+			t.Fatalf("preview signature %s differs from expected body, time or key", change.Path)
 		}
 	}
 }

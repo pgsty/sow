@@ -96,8 +96,13 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	}
 	manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"removed": len(removed)}, Outcomes: outcomes}
 	var preflight *mutationBuildPreflight
+	var publication publicationIdentity
 	if !opts.Skip && len(buildDists) != 0 {
-		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, nil, currentSnapshot, opts.Jobs)
+		publication, err = selectMutationPublicationTime(ctx, ws.Root, repoName, cfg, store, buildDists, time.Now())
+		if err != nil {
+			return result, err
+		}
+		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, publication, nil, currentSnapshot, opts.Jobs)
 		if err != nil {
 			return result, err
 		}
@@ -113,7 +118,8 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	}
 	result.Operation = id
 	payload := mutationOperationPayload{
-		Version: mutationOperationVersion, Repository: repoName, Kind: "rm", ConfigSHA256: configSHA,
+		PublicationTime: publication.wire(),
+		Version:         mutationOperationVersion, Repository: repoName, Kind: "rm", ConfigSHA256: configSHA,
 		Skip: opts.Skip, Noop: !opts.Skip && len(buildDists) == 0, Jobs: opts.Jobs,
 		Dists: distNames, BuildDists: buildDists,
 	}
@@ -299,7 +305,11 @@ func previewRemove(ctx context.Context, opts RemoveOptions) (result RemoveResult
 		}
 		predictedGeneration = nextGeneration
 		manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"removed": len(removed)}, Outcomes: outcomes}
-		preflight, preflightErr := prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, nil, currentSnapshot, opts.Jobs)
+		publication, err := selectMutationPublicationTime(ctx, ws.Root, repoName, cfg, store, buildDists, time.Now())
+		if err != nil {
+			return result, err
+		}
+		preflight, preflightErr := prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, publication, nil, currentSnapshot, opts.Jobs)
 		if preflightErr != nil {
 			return result, preflightErr
 		}
@@ -383,7 +393,7 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, distNames
 		return nil, err
 	}
 	defer func() { _ = removeOwnedDirectory(previewRoot, filepath.Dir(previewRoot)) }()
-	publicationTime := preflight.publicationTime
+	publicationTime := preflight.publication.Time
 	rpmSigner, debSigner := preflight.metadataSnapshot.RPMSigner, preflight.metadataSnapshot.APTSigner
 	allSources := make(map[string]ManagedPackageSource)
 	rpmObjects := make(map[string]state.PackageObject)
@@ -448,7 +458,7 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, distNames
 			}
 		}
 		if dist.Format == "rpm" {
-			if err := previewRPMDist(ctx, filepath.Join(root, repoName), previewRoot, distName, nextGeneration, publicationTime, architectures, dist.Architectures, sources, rpmSigner, jobs, base, target); err != nil {
+			if err := previewRPMDist(ctx, filepath.Join(root, repoName), previewRoot, distName, nextGeneration, preflight.publication, architectures, dist.Architectures, sources, rpmSigner, jobs, base, target); err != nil {
 				return nil, err
 			}
 			continue
@@ -489,7 +499,7 @@ func previewRemovalChanges(ctx context.Context, root, repoName string, distNames
 	return state.DiffManifests(base, targetManifest), nil
 }
 
-func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName string, generation state.GenerationID, publicationTime time.Time, architectures, builtArchitectures []state.Architecture, sources []ManagedPackageSource, signer yumrepo.DetachedSigner, jobs int, base []state.GenerationFile, target map[string]state.GenerationFile) error {
+func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName string, generation state.GenerationID, publication publicationIdentity, architectures, builtArchitectures []state.Architecture, sources []ManagedPackageSource, signer yumrepo.DetachedSigner, jobs int, base []state.GenerationFile, target map[string]state.GenerationFile) error {
 	baseByPath := make(map[string]state.GenerationFile, len(base))
 	for _, file := range base {
 		baseByPath[file.Path] = file
@@ -531,7 +541,7 @@ func previewRPMDist(ctx context.Context, repositoryRoot, previewRoot, distName s
 	}
 	if _, err := RenderManagedDist(ctx, previewRoot, ManagedDistSpec{
 		Name: distName, Format: "rpm", Architectures: architectures, Generation: generation,
-		Jobs: jobs, PublishedAt: publicationTime, Packages: sources, RPMSigner: signer,
+		Jobs: jobs, PublishedAt: publication.Time, RPMMetadataTimestamp: publication.rpmTimestamp(), Packages: sources, RPMSigner: signer,
 	}); err != nil {
 		return err
 	}

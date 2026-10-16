@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"time"
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
@@ -90,8 +91,13 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 	physicalChange := len(affectedDists) != 0
 	manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"dists": len(distNames)}, Outcomes: outcomes}
 	var preflight *mutationBuildPreflight
+	var publication publicationIdentity
 	if physicalChange {
-		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, affectedDists, manifest, store, nil, currentSnapshot, opts.Jobs)
+		publication, err = selectMutationPublicationTime(ctx, ws.Root, repoName, cfg, store, affectedDists, time.Now())
+		if err != nil {
+			return result, err
+		}
+		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, affectedDists, manifest, store, publication, nil, currentSnapshot, opts.Jobs)
 		if err != nil {
 			return result, err
 		}
@@ -107,7 +113,8 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 	}
 	result.Operation = id
 	payload := mutationOperationPayload{
-		Version: mutationOperationVersion, Repository: repoName, Kind: "build", ConfigSHA256: configSHA,
+		PublicationTime: publication.wire(),
+		Version:         mutationOperationVersion, Repository: repoName, Kind: "build", ConfigSHA256: configSHA,
 		Jobs: opts.Jobs, Dists: distNames, BuildDists: affectedDists, Noop: !physicalChange,
 	}
 	payloadData, _ := json.Marshal(payload)

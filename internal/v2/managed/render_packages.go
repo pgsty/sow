@@ -49,9 +49,11 @@ type ManagedDistSpec struct {
 	Generation    state.GenerationID
 	Jobs          int
 	PublishedAt   time.Time
-	Packages      []ManagedPackageSource
-	RPMSigner     yumrepo.DetachedSigner
-	APTSigner     APTMetadataSigner
+	// RPMMetadataTimestamp is explicit; zero preserves legacy rendering.
+	RPMMetadataTimestamp int64
+	Packages             []ManagedPackageSource
+	RPMSigner            yumrepo.DetachedSigner
+	APTSigner            APTMetadataSigner
 }
 
 type ManagedPackageSource struct {
@@ -281,8 +283,14 @@ func renderManagedRPMDist(ctx context.Context, repositoryRoot, distRoot string, 
 		for index := range parsed {
 			packages[index] = parsed[index].pkg
 		}
-		if _, err := yumrepo.GenerateManagedParsedConcurrent(ctx, filepath.Join(view, "repodata"), uint64(spec.Generation), packages, spec.RPMSigner, spec.Jobs); err != nil {
-			return fmt.Errorf("managed: render RPM view %s: %w", architecture.Family, err)
+		var renderErr error
+		if spec.RPMMetadataTimestamp == 0 {
+			_, renderErr = yumrepo.GenerateManagedParsedConcurrent(ctx, filepath.Join(view, "repodata"), uint64(spec.Generation), packages, spec.RPMSigner, spec.Jobs)
+		} else {
+			_, renderErr = yumrepo.GenerateManagedParsedConcurrentAt(ctx, filepath.Join(view, "repodata"), uint64(spec.Generation), spec.RPMMetadataTimestamp, packages, spec.RPMSigner, spec.Jobs)
+		}
+		if renderErr != nil {
+			return fmt.Errorf("managed: render RPM view %s: %w", architecture.Family, renderErr)
 		}
 	}
 	return nil

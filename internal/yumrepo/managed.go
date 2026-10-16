@@ -87,7 +87,7 @@ func GenerateManagedConcurrent(ctx context.Context, dest string, revision uint64
 		queued = queued[1:]
 		return metadata, nil
 	}
-	return generateManagedMetadata(ctx, dest, revision, signer, workers, next)
+	return generateManagedMetadata(ctx, dest, revision, 0, signer, workers, next)
 }
 
 // GenerateManagedParsed renders package facts that were authenticated and
@@ -97,6 +97,15 @@ func GenerateManagedParsed(ctx context.Context, dest string, revision uint64, pa
 }
 
 func GenerateManagedParsedConcurrent(ctx context.Context, dest string, revision uint64, packages []*ParsedManagedPackage, signer DetachedSigner, workers int) (*Generation, error) {
+	return GenerateManagedParsedConcurrentAt(ctx, dest, revision, 0, packages, signer, workers)
+}
+
+// GenerateManagedParsedConcurrentAt uses an explicit publication timestamp for
+// repomd data records. Package file times and the revision remain unchanged.
+func GenerateManagedParsedConcurrentAt(ctx context.Context, dest string, revision uint64, timestamp int64, packages []*ParsedManagedPackage, signer DetachedSigner, workers int) (*Generation, error) {
+	if timestamp < 0 || timestamp > MaxMetadataTimestamp {
+		return nil, fmt.Errorf("yumrepo: metadata timestamp must be Unix seconds in 0..%d", MaxMetadataTimestamp)
+	}
 	if ctx == nil {
 		return nil, errors.New("yumrepo: nil context")
 	}
@@ -115,10 +124,10 @@ func GenerateManagedParsedConcurrent(ctx context.Context, dest string, revision 
 		}
 		return pkg.metadata, nil
 	}
-	return generateManagedMetadata(ctx, dest, revision, signer, workers, next)
+	return generateManagedMetadata(ctx, dest, revision, timestamp, signer, workers, next)
 }
 
-func generateManagedMetadata(ctx context.Context, dest string, revision uint64, signer DetachedSigner, workers int, next func(context.Context) (*packageMetadata, error)) (*Generation, error) {
+func generateManagedMetadata(ctx context.Context, dest string, revision uint64, timestamp int64, signer DetachedSigner, workers int, next func(context.Context) (*packageMetadata, error)) (*Generation, error) {
 	if signer != nil {
 		if err := preflightSigner(ctx, signer); err != nil {
 			return nil, err
@@ -215,7 +224,7 @@ func generateManagedMetadata(ctx context.Context, dest string, revision uint64, 
 					artifactErrors[index] = err
 					continue
 				}
-				generation.Artifacts[index], artifactErrors[index] = compressXML(ctx, tmp, item.name, rawPath, CompressionGzip, count, 0)
+				generation.Artifacts[index], artifactErrors[index] = compressXML(ctx, tmp, item.name, rawPath, CompressionGzip, count, timestamp)
 			}
 		}()
 	}

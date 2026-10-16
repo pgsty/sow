@@ -29,16 +29,17 @@ const (
 var errMutationRecoveryArtifactTooLarge = errors.New("managed: mutation recovery artifact exceeds its bounded wire format")
 
 type mutationOperationPayload struct {
-	Version        int      `json:"version"`
-	Repository     string   `json:"repository"`
-	Kind           string   `json:"kind"`
-	ConfigSHA256   string   `json:"config_sha256"`
-	Skip           bool     `json:"skip"`
-	Noop           bool     `json:"noop,omitempty"`
-	Jobs           int      `json:"jobs,omitempty"`
-	Dists          []string `json:"dists"`
-	BuildDists     []string `json:"build_dists"`
-	ManifestSHA256 string   `json:"manifest_sha256,omitempty"`
+	PublicationTime publicationTime `json:"publication_time,omitempty"`
+	Version         int             `json:"version"`
+	Repository      string          `json:"repository"`
+	Kind            string          `json:"kind"`
+	ConfigSHA256    string          `json:"config_sha256"`
+	Skip            bool            `json:"skip"`
+	Noop            bool            `json:"noop,omitempty"`
+	Jobs            int             `json:"jobs,omitempty"`
+	Dists           []string        `json:"dists"`
+	BuildDists      []string        `json:"build_dists"`
+	ManifestSHA256  string          `json:"manifest_sha256,omitempty"`
 }
 
 func changedDesiredDists(ctx context.Context, store *state.Store, desired map[string][]string) ([]string, error) {
@@ -519,7 +520,16 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 		if needsRPMPolicy {
 			preparedPolicy = &rpmPolicy
 		}
-		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, payload.BuildDists, manifest, store, preparedPolicy, currentSnapshot, opts.Jobs)
+		detail, err := store.GetOperation(ctx, id)
+		if err != nil {
+			return result, err
+		}
+		publication, err := selectMutationPublicationTime(ctx, ws.Root, repoName, cfg, store, payload.BuildDists, detail.Operation.CreatedAt)
+		if err != nil {
+			return result, err
+		}
+		payload.PublicationTime = publication.wire()
+		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, payload.BuildDists, manifest, store, publication, preparedPolicy, currentSnapshot, opts.Jobs)
 		if err != nil {
 			return result, err
 		}
@@ -1356,7 +1366,7 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 			return fmt.Errorf("%w: mutation journal marks a required physical build as no-op", ErrIntegrity)
 		}
 		if !noop && manifest.Build == nil {
-			preflight, err = prepareMutationBuildPreflight(ctx, root, repoName, cfg, payload.BuildDists, manifest, store, nil, nil, payload.Jobs)
+			preflight, err = prepareMutationBuildPreflight(ctx, root, repoName, cfg, payload.BuildDists, manifest, store, payload.PublicationTime.identity(), nil, nil, payload.Jobs)
 			if errors.Is(err, errImmutableRPMSigningPolicy) || errors.Is(err, errMetadataSigningPolicy) {
 				return finishUnbuiltMutation(ctx, root, repoName, store, operation, manifest, "signing policy rejected the operation before public build; Desired changes preserved if already applied")
 			}

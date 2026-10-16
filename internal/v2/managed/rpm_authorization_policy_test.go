@@ -84,7 +84,7 @@ func TestRPMPolicyCacheAlwaysHotAndTrustContraction(t *testing.T) {
 				t.Fatal(err)
 			}
 			hot, metrics := workmetrics.Ensure(ctx)
-			preflight, err := prepareMutationBuildPreflight(hot, root, "repo", cfg, []string{"el9"}, manifest, store, nil, snapshot, 2)
+			preflight, err := prepareMutationBuildPreflight(hot, root, "repo", cfg, []string{"el9"}, manifest, store, publicationIdentity{}, nil, snapshot, 2)
 			if err != nil {
 				t.Fatal(err)
 			}

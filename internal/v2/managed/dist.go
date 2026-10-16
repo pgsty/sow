@@ -23,6 +23,7 @@ import (
 const distOperationVersion = 2
 
 type distOperationPayload struct {
+	PublicationTime              publicationTime                `json:"publication_time,omitempty"`
 	Version                      int                            `json:"version"`
 	Repository                   string                         `json:"repository"`
 	Name                         string                         `json:"name"`
@@ -769,8 +770,16 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 		return DistInfo{}, fmt.Errorf("%w: new Dist operation has no publication identity", ErrIntegrity)
 	}
 	operation := detail.Operation
-	metadataSnapshot, err := loadMetadataSignerSnapshotForFormats(ctx, root, repo, operation.CreatedAt, distCfg.Format == "rpm", distCfg.Format == "deb")
+	publication, err := selectMutationPublicationTime(ctx, root, repoName, cfg, store, []string{distName}, operation.CreatedAt)
 	if err != nil {
+		return DistInfo{}, err
+	}
+	payload.PublicationTime = publication.wire()
+	metadataSnapshot, err := loadMetadataSignerSnapshotForFormats(ctx, root, repo, publication.Time, distCfg.Format == "rpm", distCfg.Format == "deb")
+	if err != nil {
+		return DistInfo{}, err
+	}
+	if err := validateNewMetadataSigningKeys(metadataSnapshot, publication.Time, time.Now().UTC()); err != nil {
 		return DistInfo{}, err
 	}
 	rpmPolicy := rpmSigningPolicy{mode: "never"}
@@ -799,7 +808,7 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 	payload.EffectiveConfigSHA256 = effectiveSHA
 	payload.EffectiveSigning = &frozenSigning
 	payload.MetadataSignerSnapshotSHA256 = snapshotSHA
-	spec := ManagedDistSpec{Name: distName, Format: distCfg.Format, Architectures: payload.Architectures, Generation: generation, PublishedAt: operation.CreatedAt}
+	spec := ManagedDistSpec{Name: distName, Format: distCfg.Format, Architectures: payload.Architectures, Generation: generation, PublishedAt: publication.Time, RPMMetadataTimestamp: publication.rpmTimestamp()}
 	if distCfg.Format == "rpm" {
 		spec.RPMSigner = metadataSnapshot.RPMSigner
 	} else {
@@ -1172,6 +1181,19 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 			if operation.Kind == "dist.rm" {
 				err = moveDistToRecovery(ctx, root, repoName, payload.Name, operation.ID, payload.TreeSHA256)
 			} else {
+				if publication := payload.PublicationTime.identity(); publication.Current {
+					tree, treeErr := frozenPublicationTree(ctx, filepath.Join(root, repoName, "dists", payload.Name), filepath.Join(distStageRoot(root, repoName, operation.ID), "dists", payload.Name), payload.TreeSHA256)
+					if treeErr != nil {
+						return treeErr
+					}
+					identity, err := loadDistMetadataSignerSnapshot(root, repoName, operation.ID, payload.MetadataSignerSnapshotSHA256)
+					if err != nil {
+						return err
+					}
+					if err := validateDistPublicationTime(tree, payload.Format, payload.Architectures, identity.Fingerprint != "", publication); err != nil {
+						return err
+					}
+				}
 				err = installStagedDist(ctx, root, repoName, payload.Name, operation.ID, payload.TreeSHA256)
 			}
 			if err != nil {
@@ -1547,7 +1569,7 @@ func validateDistPayloadForRecovery(ctx context.Context, root, operationID, kind
 		if _, exists := repo.Dists[payload.Name]; exists {
 			return errors.New("dist.rm new config still contains the target Dist")
 		}
-		if payload.Format != "" || len(payload.Architectures) != 0 || payload.EffectiveConfigSHA256 != "" || payload.EffectiveSigning != nil || payload.MetadataSignerSnapshotSHA256 != "" {
+		if payload.PublicationTime != "" || payload.Format != "" || len(payload.Architectures) != 0 || payload.EffectiveConfigSHA256 != "" || payload.EffectiveSigning != nil || payload.MetadataSignerSnapshotSHA256 != "" {
 			return errors.New("dist.rm payload contains fields outside its closed schema")
 		}
 		if !lowercaseSHA256.MatchString(payload.TreeSHA256) {

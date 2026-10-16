@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,8 @@ import (
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"github.com/pgsty/sow/internal/aptrepo"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
@@ -403,11 +406,223 @@ func loadMetadataSignerSnapshotForFormats(ctx context.Context, root string, repo
 	return snapshot, nil
 }
 
-// nextMutationPublicationTime is derived only from committed repository state
-// and the exact configured metadata certificates. Consequently rm --check and
-// an immediately following rm render byte-identical timestamped metadata while
-// a retry of the same journal remains reproducible. Key activation times raise
-// the floor so a newly rotated certificate is never backdated before it exists.
+// publicationTime is absent only in legacy journals. Its decoder rejects a
+// present null or empty value, so malformed new journals cannot opt into the
+// legacy rendering contract. The wire value is UTC with whole-second precision.
+type publicationTime string
+
+func (value *publicationTime) UnmarshalJSON(data []byte) error {
+	var encoded string
+	if err := json.Unmarshal(data, &encoded); err != nil || encoded == "" {
+		return fmt.Errorf("%w: publication_time must be a UTC whole-second string", ErrIntegrity)
+	}
+	at, err := time.Parse(time.RFC3339, encoded)
+	if err != nil || at.IsZero() || at.Unix() < 0 || at.Unix() > yumrepo.MaxMetadataTimestamp || at.UTC().Format(time.RFC3339) != encoded {
+		return fmt.Errorf("%w: invalid publication_time", ErrIntegrity)
+	}
+	*value = publicationTime(encoded)
+	return nil
+}
+
+type publicationIdentity struct {
+	Time    time.Time
+	Current bool // present publication_time enables timestamped RPM metadata
+}
+
+func (value publicationTime) identity() publicationIdentity {
+	if value == "" {
+		return publicationIdentity{}
+	}
+	// Values come only from the strict JSON decoder or the validated chooser.
+	at, _ := time.Parse(time.RFC3339, string(value))
+	return publicationIdentity{Time: at, Current: true}
+}
+
+func (identity publicationIdentity) wire() publicationTime {
+	if !identity.Current {
+		return ""
+	}
+	return publicationTime(identity.Time.UTC().Format(time.RFC3339))
+}
+
+func (identity publicationIdentity) rpmTimestamp() int64 {
+	if !identity.Current {
+		return 0
+	}
+	return identity.Time.Unix()
+}
+
+func retainedPublicationIdentity(operation state.Operation) (publicationIdentity, error) {
+	var payload struct {
+		PublicationTime publicationTime `json:"publication_time,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(operation.PayloadJSON), &payload); err != nil {
+		return publicationIdentity{}, fmt.Errorf("%w: invalid retained publication identity: %v", ErrIntegrity, err)
+	}
+	return payload.PublicationTime.identity(), nil
+}
+
+// Selection happens only after the physical build scope is known. A preview
+// chooses its own in-memory time; only the actual operation persists a value.
+func selectMutationPublicationTime(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, distNames []string, candidate time.Time) (publicationIdentity, error) {
+	if candidate.IsZero() {
+		return publicationIdentity{}, fmt.Errorf("%w: operation publication time is unavailable", ErrIntegrity)
+	}
+	summary, err := store.Summary(ctx)
+	if err != nil {
+		return publicationIdentity{}, err
+	}
+	generations := map[state.GenerationID]struct{}{summary.BuiltGeneration: {}}
+	dists, err := store.ListDists(ctx)
+	if err != nil {
+		return publicationIdentity{}, err
+	}
+	// A dist.rm or a partial build may leave live Dists from earlier
+	// generations. Their retained publication times still bound a successor.
+	for _, dist := range dists {
+		generations[dist.BuiltGeneration] = struct{}{}
+	}
+	for generation := range generations {
+		if generation == 0 {
+			continue
+		}
+		at, err := builtGenerationPublicationTime(ctx, store, generation)
+		if err != nil {
+			return publicationIdentity{}, err
+		}
+		if at.After(candidate) {
+			candidate = at
+		}
+	}
+	formats := configuredSigningFormats(cfg, repoName, distNames)
+	at, err := metadataPublicationFloor(ctx, root, cfg.Repositories[repoName], candidate, formats.rpm, formats.deb)
+	if err != nil {
+		return publicationIdentity{}, err
+	}
+	identity := publicationIdentity{Time: at, Current: true}
+	var validated publicationTime
+	if err := validated.UnmarshalJSON([]byte(strconv.Quote(string(identity.wire())))); err != nil {
+		return publicationIdentity{}, err
+	}
+	return identity, nil
+}
+
+// validateDistPublicationTime compares payload identity with small metadata
+// files in an already hash-bound tree. It does not reselect keys or timestamps.
+func validateDistPublicationTime(distRoot, format string, architectures []state.Architecture, signed bool, publication publicationIdentity) error {
+	if !publication.Current {
+		return nil
+	}
+	read := func(relative string) ([]byte, error) {
+		return readRootedRegular(distRoot, filepath.FromSlash(relative), 16<<20, false)
+	}
+	checkSignature := func(relative string) error {
+		data, err := read(relative)
+		if err != nil {
+			return err
+		}
+		at, err := yumrepo.DetachedSignatureCreationTime(bytes.NewReader(data))
+		if err != nil || !at.Equal(publication.Time) {
+			return fmt.Errorf("%w: %s signature time differs from publication_time", ErrIntegrity, relative)
+		}
+		return nil
+	}
+	if format == "rpm" {
+		for _, architecture := range architectures {
+			prefix := architecture.Family + "/repodata/"
+			data, err := read(prefix + "repomd.xml")
+			if err != nil {
+				return err
+			}
+			var document struct {
+				Data []struct {
+					Timestamp int64 `xml:"timestamp"`
+				} `xml:"data"`
+			}
+			if err := xml.Unmarshal(data, &document); err != nil || len(document.Data) == 0 {
+				return fmt.Errorf("%w: invalid timestamped repomd", ErrIntegrity)
+			}
+			for _, record := range document.Data {
+				if record.Timestamp != publication.Time.Unix() {
+					return fmt.Errorf("%w: repomd timestamp differs from publication_time", ErrIntegrity)
+				}
+			}
+			if signed {
+				if err := checkSignature(prefix + "repomd.xml.asc"); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	data, err := read("Release")
+	if err != nil {
+		return err
+	}
+	at, err := parseReleaseDate(data)
+	if err != nil || !at.Equal(publication.Time) {
+		return fmt.Errorf("%w: Release Date differs from publication_time", ErrIntegrity)
+	}
+	if !signed {
+		return nil
+	}
+	if err := checkSignature("Release.gpg"); err != nil {
+		return err
+	}
+	data, err = read("InRelease")
+	if err != nil {
+		return err
+	}
+	block, rest := clearsign.Decode(data)
+	if block == nil || len(bytes.TrimSpace(rest)) != 0 {
+		return fmt.Errorf("%w: invalid timestamped InRelease", ErrIntegrity)
+	}
+	reader := packet.NewReader(block.ArmoredSignature.Body)
+	parsed, err := reader.Next()
+	signature, ok := parsed.(*packet.Signature)
+	if err != nil || !ok || !signature.CreationTime.Equal(publication.Time) {
+		return fmt.Errorf("%w: InRelease signature time differs from publication_time", ErrIntegrity)
+	}
+	if _, err := reader.Next(); err != io.EOF {
+		return fmt.Errorf("%w: trailing InRelease signature packets", ErrIntegrity)
+	}
+	return nil
+}
+
+// frozenPublicationTree selects the exact journaled tree before any promotion
+// or pointer exchange. Legacy plans retain their original hash-only contract.
+func frozenPublicationTree(ctx context.Context, live, staged, expected string) (string, error) {
+	for _, candidate := range []string{live, staged} {
+		sha, _, err := digestTree(ctx, candidate)
+		if err == nil && sha == expected {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("%w: neither live nor staged tree matches the publication journal", ErrIntegrity)
+}
+
+func validateMutationPublicationTime(ctx context.Context, root, repoName, operationID string, store *state.Store, publication publicationIdentity, manifest mutationManifest) error {
+	if !publication.Current || manifest.Build == nil {
+		return nil
+	}
+	for _, build := range manifest.Build.Dists {
+		dist, err := store.GetDist(ctx, build.Name)
+		if err != nil {
+			return err
+		}
+		tree, err := frozenPublicationTree(ctx, filepath.Join(root, repoName, "dists", build.Name), filepath.Join(mutationStageRoot(root, repoName, operationID), "build", "dists", build.Name), build.TreeSHA256)
+		if err != nil {
+			return err
+		}
+		if err := validateDistPublicationTime(tree, dist.Format, build.Architectures, build.MetadataSignerFingerprint != "", publication); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// nextMutationPublicationTime preserves the deterministic chooser for journals
+// without publication_time. Never use the current wall clock on this path.
 func nextMutationPublicationTime(ctx context.Context, root string, repository config.RepositoryConfig, store *state.Store, generation state.GenerationID, wantRPM, wantDEB bool) (time.Time, error) {
 	floor := time.Unix(0, 0).UTC()
 	if generation > 0 {
@@ -421,6 +636,10 @@ func nextMutationPublicationTime(ctx context.Context, root string, repository co
 		}
 		floor = detail.Operation.CreatedAt.UTC()
 	}
+	return metadataPublicationFloor(ctx, root, repository, floor, wantRPM, wantDEB)
+}
+
+func metadataPublicationFloor(ctx context.Context, root string, repository config.RepositoryConfig, floor time.Time, wantRPM, wantDEB bool) (time.Time, error) {
 	references := []string{}
 	if wantRPM {
 		references = append(references, repository.Signing.RPM.Metadata.Key)
@@ -470,9 +689,8 @@ func nextMutationPublicationTime(ctx context.Context, root string, repository co
 		}
 	}
 	// APT Release and OpenPGP creation times have one-second resolution. Using
-	// the containing second keeps the deterministic identity no later than the
-	// actual operation that follows a preview, while still including a key whose
-	// activation packet has that same whole-second timestamp.
+	// the containing second preserves the selected operation identity and key
+	// activation packet precision.
 	return floor.UTC().Truncate(time.Second), nil
 }
 

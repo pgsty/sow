@@ -478,10 +478,35 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 			validationObjects = desiredByDist[distName]
 			validationArchitectures = recoveringTarget.Architectures
 		}
+		var publication publicationIdentity
+		var publicationErr error
+		if targetIsPublic {
+			publication, publicationErr = retainedPublicationIdentity(recoveryView.operation)
+		} else {
+			publication, publicationErr = builtGenerationPublicationIdentity(ctx, store, dist.BuiltGeneration)
+			if errors.Is(publicationErr, state.ErrNotFound) {
+				// Legacy layouts without a physical ledger are reported below.
+				publicationErr = nil
+			}
+		}
+		if publicationErr == nil && publication.Current {
+			signed := dist.MetadataSignerFingerprint != ""
+			if targetIsPublic {
+				signed = recoveringTarget.MetadataSignerFingerprint != ""
+			}
+			publicationErr = validateDistPublicationTime(filepath.Join(repositoryRoot, "dists", distName), dist.Format, validationArchitectures, signed, publication)
+		}
+		if publicationErr != nil {
+			indexIssues = append(indexIssues, fmt.Sprintf("Dist %s publication identity differs: %v", distName, publicationErr))
+		}
 		if dist.Format == "rpm" {
 			verifier, signed, verifierErr := builtRPMMetadataVerifier(ctx, store, dist)
 			if targetIsPublic {
-				verifier, signed, verifierErr = recoveringRPMMetadataVerifier(recoveringTarget, recoveryView.operation)
+				operation := recoveryView.operation
+				if publication.Current {
+					operation.CreatedAt = publication.Time
+				}
+				verifier, signed, verifierErr = recoveringRPMMetadataVerifier(recoveringTarget, operation)
 			}
 			if verifierErr != nil {
 				signatureIssues = append(signatureIssues, fmt.Sprintf("Dist %s retained metadata signer is invalid: %v", distName, verifierErr))
@@ -837,16 +862,28 @@ func validatePublicPoolObjectBijection(ctx context.Context, repositoryRoot strin
 	return issues, checked
 }
 
-func builtGenerationPublicationTime(ctx context.Context, store *state.Store, generation state.GenerationID) (time.Time, error) {
+func builtGenerationPublicationIdentity(ctx context.Context, store *state.Store, generation state.GenerationID) (publicationIdentity, error) {
 	info, err := store.GetGeneration(ctx, generation)
 	if err != nil {
-		return time.Time{}, err
+		return publicationIdentity{}, err
 	}
 	detail, err := store.GetOperation(ctx, info.OperationID)
 	if err != nil || detail.Operation.CreatedAt.IsZero() {
-		return time.Time{}, errors.New("built Generation has no retained publication identity")
+		return publicationIdentity{}, errors.New("built Generation has no retained publication identity")
 	}
-	return detail.Operation.CreatedAt.UTC(), nil
+	publication, err := retainedPublicationIdentity(detail.Operation)
+	if err != nil {
+		return publicationIdentity{}, err
+	}
+	if !publication.Current {
+		publication.Time = detail.Operation.CreatedAt.UTC()
+	}
+	return publication, nil
+}
+
+func builtGenerationPublicationTime(ctx context.Context, store *state.Store, generation state.GenerationID) (time.Time, error) {
+	publication, err := builtGenerationPublicationIdentity(ctx, store, generation)
+	return publication.Time, err
 }
 
 func builtMetadataIdentityAndTime(ctx context.Context, store *state.Store, dist state.Dist) (metadataSignerIdentity, time.Time, bool, error) {

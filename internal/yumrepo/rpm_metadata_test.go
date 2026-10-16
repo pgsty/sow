@@ -474,3 +474,48 @@ func TestScriptInterpreterRequiresModernProjection(t *testing.T) {
 		})
 	}
 }
+
+func TestManagedExplicitPublicationTimestamp(t *testing.T) {
+	ctx := context.Background()
+	const timestamp int64 = 1792152000
+	var baseline *Generation
+	for _, workers := range []int{1, 4} {
+		generation, err := GenerateManagedParsedConcurrentAt(ctx, filepath.Join(t.TempDir(), "repodata"), math.MaxUint64, timestamp, nil, nil, workers)
+		if err != nil || generation.Revision != math.MaxUint64 {
+			t.Fatalf("generation=%+v err=%v", generation, err)
+		}
+		for _, artifact := range generation.Artifacts {
+			if artifact.Timestamp != timestamp {
+				t.Fatalf("timestamp=%d want=%d", artifact.Timestamp, timestamp)
+			}
+		}
+		if baseline != nil && (baseline.RepomdSHA256 != generation.RepomdSHA256 || !reflect.DeepEqual(baseline.Artifacts, generation.Artifacts)) {
+			t.Fatal("workers changed timestamped metadata")
+		}
+		baseline = generation
+	}
+	legacy, err := GenerateManagedParsedConcurrent(ctx, filepath.Join(t.TempDir(), "repodata"), math.MaxUint64, nil, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero, err := GenerateManagedParsedConcurrentAt(ctx, filepath.Join(t.TempDir(), "repodata"), math.MaxUint64, 0, nil, nil, 1)
+	if err != nil || legacy.RepomdSHA256 != zero.RepomdSHA256 || !reflect.DeepEqual(legacy.Artifacts, zero.Artifacts) {
+		t.Fatalf("default legacy bytes changed: %v", err)
+	}
+	for index, artifact := range legacy.Artifacts {
+		current := baseline.Artifacts[index]
+		if artifact.Timestamp != 0 || artifact.SHA256 != current.SHA256 || artifact.OpenSHA256 != current.OpenSHA256 || artifact.Size != current.Size || artifact.OpenSize != current.OpenSize {
+			t.Fatalf("timestamp changed index content: legacy=%+v current=%+v", artifact, current)
+		}
+	}
+	for _, timestamp := range []int64{-1, MaxMetadataTimestamp + 1, math.MaxInt64} {
+		parent := t.TempDir()
+		if _, err := GenerateManagedParsedConcurrentAt(ctx, filepath.Join(parent, "repodata"), 1, timestamp, nil, nil, 1); err == nil {
+			t.Fatalf("accepted timestamp %d", timestamp)
+		}
+		entries, err := os.ReadDir(parent)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("invalid timestamp wrote output: %v", err)
+		}
+	}
+}

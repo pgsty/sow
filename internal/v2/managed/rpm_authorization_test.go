@@ -67,7 +67,7 @@ func TestRPMBuildAuthorizationReusesVerifiedBytesAndInvalidatesProof(t *testing.
 		t.Fatal(err)
 	}
 	hot, hotMetrics := workmetrics.Ensure(ctx)
-	preflight, err := prepareMutationBuildPreflight(hot, root, "repo", cfg, []string{"el9"}, manifest, store, nil, snapshot, 3)
+	preflight, err := prepareMutationBuildPreflight(hot, root, "repo", cfg, []string{"el9"}, manifest, store, publicationIdentity{}, nil, snapshot, 3)
 	if err != nil {
 		t.Fatal(err)
 	}

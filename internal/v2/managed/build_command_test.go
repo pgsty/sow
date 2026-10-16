@@ -14,7 +14,7 @@ import (
 	"github.com/pgsty/sow/internal/v2/state"
 )
 
-func TestAPTConfigOnlyBuildAdvancesGenerationWithinSameReleaseSecondAndRecovers(t *testing.T) {
+func TestAPTConfigOnlyBuildAdvancesGenerationAndRecovers(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	options := WorkspaceOptions{Workdir: root, CWD: root}
@@ -57,8 +57,8 @@ func TestAPTConfigOnlyBuildAdvancesGenerationWithinSameReleaseSecondAndRecovers(
 		t.Fatalf("config-only build=%#v err=%v", built, err)
 	}
 	secondTime, secondGeneration := readReleaseIdentity()
-	if !secondTime.Equal(initialTime) || secondGeneration != built.Generation {
-		t.Fatalf("second Release time=%s generation=%d, want same time=%s generation=%d", secondTime, secondGeneration, initialTime, built.Generation)
+	if secondTime.Before(initialTime) || secondGeneration != built.Generation {
+		t.Fatalf("second Release time=%s generation=%d, want time >= %s generation=%d", secondTime, secondGeneration, initialTime, built.Generation)
 	}
 	checked, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})
 	if err != nil || checked.Status != "clean" || !checked.ReadyToCopy {

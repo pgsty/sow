@@ -5,6 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/pgsty/sow/internal/v2/state"
 
 	"github.com/pgsty/sow/internal/yumrepo"
 )
@@ -64,5 +67,55 @@ func TestRenderEmptyDistRejectsUnknownNeutralAndDuplicateFamilies(t *testing.T) 
 		if _, err := RenderEmptyDist(context.Background(), t.TempDir(), EmptyDistSpec{Name: "test", Format: "rpm", Architectures: architectures, Generation: 1}); err == nil {
 			t.Fatalf("architectures %v succeeded", architectures)
 		}
+	}
+}
+
+func TestManagedRendererRequiresExplicitRPMTimestamp(t *testing.T) {
+	ctx := context.Background()
+	at := time.Unix(1792152000, 0).UTC()
+	for _, timestamp := range []int64{0, at.Unix()} {
+		root := t.TempDir()
+		rendered, err := RenderManagedDist(ctx, root, ManagedDistSpec{Name: "el9", Format: "rpm", Architectures: []state.Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}}, Generation: 1, PublishedAt: at, RPMMetadataTimestamp: timestamp})
+		if err != nil {
+			t.Fatal(err)
+		}
+		generation, err := yumrepo.ValidateManagedUnsignedDirectory(ctx, filepath.Join(rendered.Path, "x86_64", "repodata"), yumrepo.CompressionGzip)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, artifact := range generation.Artifacts {
+			if artifact.Timestamp != timestamp {
+				t.Fatalf("PublishedAt implicitly changed timestamp: %+v", artifact)
+			}
+		}
+	}
+}
+
+func TestAPTGenerationsRemainDistinctWithinOnePublicationSecond(t *testing.T) {
+	ctx := context.Background()
+	at := time.Unix(1792152000, 0).UTC()
+	var previous []byte
+	for _, generation := range []state.GenerationID{1, 2} {
+		root := t.TempDir()
+		_, err := RenderManagedDist(ctx, root, ManagedDistSpec{Name: "noble", Format: "deb", Architectures: []state.Architecture{{Family: "aarch64", EcosystemArch: "arm64"}}, Generation: generation, PublishedAt: at})
+		if err != nil {
+			t.Fatal(err)
+		}
+		release, err := os.ReadFile(filepath.Join(root, "dists", "noble", "Release"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, present, err := parseReleaseGeneration(release)
+		if err != nil || !present || got != generation {
+			t.Fatalf("generation=%d present=%t err=%v", got, present, err)
+		}
+		date, err := parseReleaseDate(release)
+		if err != nil || !date.Equal(at) {
+			t.Fatalf("Date=%s want=%s err=%v", date, at, err)
+		}
+		if previous != nil && string(previous) == string(release) {
+			t.Fatal("same-second Generation did not change Release")
+		}
+		previous = release
 	}
 }
