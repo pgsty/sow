@@ -94,7 +94,7 @@ func (s *Store) RetainRPMSigningKeys(ctx context.Context, input []RPMSigningKey)
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func (s *Store) ListRPMSigningKeys(ctx context.Context) ([]RPMSigningKey, error) {

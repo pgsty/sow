@@ -43,8 +43,8 @@ func recoverLogPruneOperation(ctx context.Context, repoName string, store *state
 		return err
 	}
 	if operation.State == state.OperationPlanned {
-		if err := store.SetOperationState(ctx, operation.ID, state.OperationStaged, ""); err != nil {
-			return err
+		if err := store.SetOperationState(ctx, operation.ID, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
+			return errors.Join(err, ctx.Err())
 		}
 		operation.State = state.OperationStaged
 	}
@@ -205,14 +205,14 @@ func PruneLog(ctx context.Context, opts LogPruneOptions) (result LogPruneResult,
 		failure := fmt.Sprintf(`{"before":%q,"pruned":0}`, payload.Before)
 		resultErr = errors.Join(resultErr, store.FailOperation(cleanupCtx, id, class, message, failure))
 	}()
-	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: "log.prune", State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil {
-		return result, err
+	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: "log.prune", State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(opts.Fault, "log.prune.planned"); err != nil {
 		return result, err
 	}
-	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil {
-		return result, err
+	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(opts.Fault, "log.prune.staged"); err != nil {
 		return result, err
@@ -224,24 +224,27 @@ func PruneLog(ctx context.Context, opts LogPruneOptions) (result LogPruneResult,
 	if err := callFault(opts.Fault, "log.prune.applied"); err != nil {
 		return result, err
 	}
-	if err := store.FinishPruneOperation(ctx, id); err != nil {
-		return result, err
+	finalizeErr := store.FinishPruneOperation(ctx, id)
+	if !stateTransactionCommitted(finalizeErr) {
+		return result, finalizeErr
 	}
+	ctx, cancel := operationCompletionContext(ctx)
+	defer cancel()
 	operation, err := store.GetOperationSummary(ctx, id)
 	if err != nil {
-		return result, err
+		return result, errors.Join(finalizeErr, err)
 	}
 	var maintenance struct {
 		Deferred bool `json:"compaction_deferred"`
 	}
 	if err := json.Unmarshal([]byte(operation.ResultJSON), &maintenance); err != nil {
-		return result, err
+		return result, errors.Join(finalizeErr, err)
 	}
 	result.CompactionDeferred = maintenance.Deferred
 	if err := callFault(opts.Fault, "log.prune.done"); err != nil {
-		return result, err
+		return result, errors.Join(finalizeErr, err)
 	}
-	return result, nil
+	return result, finalizeErr
 }
 
 func oneLogDist(cfg config.Config, repoName string, dists []string) (string, error) {

@@ -273,7 +273,7 @@ SELECT ?, view_id, signer_identity, trusted_public_key FROM generation_view_sign
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit local GC finalization: %w", err)
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func getPackageObjectTx(ctx context.Context, tx *sql.Tx, digest string) (PackageObject, error) {

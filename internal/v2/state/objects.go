@@ -278,7 +278,7 @@ func (s *Store) ApplyDesiredMutationWithSigningKeys(ctx context.Context, operati
 		return DesiredMutationResult{}, fmt.Errorf("commit desired mutation: %w", err)
 	}
 	result := DesiredMutationResult{Revision: nextRevision, Changed: changed, ChangedDists: changedDists, DroppedPending: cleanup}
-	if err := s.Checkpoint(ctx); err != nil {
+	if err := s.checkpointAfterCommit(ctx); err != nil {
 		return result, err
 	}
 	return result, nil

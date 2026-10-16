@@ -215,8 +215,8 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 			retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
 		}
 	}()
-	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: "add", State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil {
-		return result, err
+	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: "add", State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(opts.Fault, "add.planned"); err != nil {
 		return result, err
@@ -463,8 +463,8 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 			item.Status = "excluded"
 		}
 	}
-	if err := store.RecordOperationPackages(ctx, id, mutationPackageRecords(result.Items)); err != nil {
-		return result, err
+	if err := store.RecordOperationPackages(ctx, id, mutationPackageRecords(result.Items)); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
 	if result.Failed != 0 && result.Accepted == 0 {
 		resultData, marshalErr := json.Marshal(map[string]int{"accepted": result.Accepted, "failed": result.Failed})
@@ -545,11 +545,11 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 		return result, err
 	}
 	payloadData, _ = json.Marshal(payload)
-	if err := store.UpdateOperationPayload(ctx, id, string(payloadData)); err != nil {
-		return result, err
+	if err := store.UpdateOperationPayload(ctx, id, string(payloadData)); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
-	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil {
-		return result, err
+	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(opts.Fault, "add.staged"); err != nil {
 		return result, err
@@ -571,6 +571,10 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 		}
 		return result, err
 	}
+	if err := ctx.Err(); err != nil {
+		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
+		return result, err
+	}
 	facts := make([]state.PackageFact, 0, len(referencedNew))
 	for _, object := range referencedNew {
 		fact, exists := newObjectFacts[object.SHA256]
@@ -585,9 +589,13 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	if !sameStringSet(mutationResult.ChangedDists, desiredChangedDists) {
 		return result, fmt.Errorf("%w: applied add Dist changes differ from its staged Desired change set", ErrIntegrity)
 	}
-	if err := store.RecordOperationMembershipOutcomes(ctx, id, manifest.Outcomes); err != nil {
+	if err := ctx.Err(); err != nil {
 		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
 		return result, err
+	}
+	if err := store.RecordOperationMembershipOutcomes(ctx, id, manifest.Outcomes); err != nil || ctx.Err() != nil {
+		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
+		return result, errors.Join(err, ctx.Err())
 	}
 	for _, object := range mutationResult.DroppedPending {
 		if err := removePendingObject(ws.Root, repoName, object); err != nil {
@@ -597,59 +605,43 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	if err := callFault(opts.Fault, "add.applied"); err != nil {
 		return result, err
 	}
+	var completionErr error
 	if opts.Skip {
 		terminal, err := mutationTerminalStateForProjection(ctx, ws.Root, repoName, cfg, store)
 		if err != nil {
 			return result, err
 		}
-		if err := store.SetOperationState(ctx, id, terminal, ""); err != nil {
-			if retainCommittedTerminalProjection(ctx, ws.Root, repoName, cfg, store, id, terminal, &result.Generation, &result.Dirty) {
-				err = errors.Join(err, cleanupMutationStage(ws.Root, repoName, id))
-			}
-			return result, err
-		}
-		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
-		if err := cleanupMutationStage(ws.Root, repoName, id); err != nil {
+		if err := completeMutation(ctx, ws.Root, repoName, cfg, store, id, store.SetOperationState(ctx, id, terminal, ""), &result.Generation, &result.Dirty); err != nil {
 			return result, err
 		}
 	} else if len(payload.BuildDists) != 0 {
 		generation, err := buildAppliedMutation(ctx, ws.Root, repoName, cfg, payload.BuildDists, id, store, opts.Jobs, opts.Fault, preflight)
 		result.Generation = generation
-		if err != nil {
+		if err != nil && generation == 0 {
 			retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
 			return result, err
+		}
+		completionErr = err
+		completionCtx, cancel := operationCompletionContext(ctx)
+		result.Dirty, err = observedRepositoryDirty(completionCtx, ws.Root, repoName, cfg, store)
+		cancel()
+		if err != nil {
+			return result, errors.Join(completionErr, err)
 		}
 	} else {
 		if _, err := normalizeCurrentPublicTreeWithSnapshot(ctx, ws.Root, repoName, id, store, opts.Fault, currentSnapshot); err != nil {
 			return result, err
 		}
-		if err := store.FinalizeNoopBuild(ctx, id); err != nil {
-			if retainCommittedTerminalProjection(ctx, ws.Root, repoName, cfg, store, id, state.OperationDone, &result.Generation, &result.Dirty) {
-				err = errors.Join(err, cleanupMutationStage(ws.Root, repoName, id))
-			}
+		if err := completeMutation(ctx, ws.Root, repoName, cfg, store, id, store.FinalizeNoopBuild(ctx, id), &result.Generation, &result.Dirty); err != nil {
 			return result, err
 		}
-		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
-		if err := cleanupMutationStage(ws.Root, repoName, id); err != nil {
-			return result, err
-		}
-	}
-	result.Dirty, err = observedRepositoryDirty(ctx, ws.Root, repoName, cfg, store)
-	if err != nil {
-		return result, err
 	}
 	if result.Failed != 0 && result.Accepted != 0 {
-		return result, &PartialError{Result: result}
+		return result, errors.Join(completionErr, &PartialError{Result: result})
 	}
-	return result, nil
+	return result, completionErr
 }
 
-// retainCommittedProjection preserves the externally observable repository
-// result when a SQLite transaction committed but its following WAL checkpoint
-// failed. The original error remains authoritative; this helper only prevents
-// non-zero JSON output from falsely reporting pre-commit revision/generation
-// or cleanliness. It is also safe before commit because it only snapshots the
-// currently committed projection.
 // sourceDirectorySpellings guards a case-insensitive workspace, where two pool
 // source directories that differ only by case are one physical directory. It is
 // nil, and every check passes, on case-sensitive filesystems.
@@ -741,25 +733,54 @@ func lookupInputCoordinates(ctx context.Context, store *state.Store, inspected [
 	return lookups, candidatePaths
 }
 
+// stateTransactionCommitted is valid only for the error returned directly by
+// the state method at the current boundary, never for a multi-stage operation.
+func stateTransactionCommitted(err error) bool {
+	var maintenance *state.CommittedMaintenanceError
+	return err == nil || errors.As(err, &maintenance)
+}
+
+func operationCompletionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), operationFailureFinalizeTimeout)
+}
+
+// retainCommittedProjection preserves the externally observable repository
+// result when a SQLite transaction committed but its following WAL checkpoint
+// failed. The original error remains authoritative; this helper only prevents
+// non-zero JSON output from falsely reporting pre-commit revision/generation
+// or cleanliness. It is also safe before commit because it only snapshots the
+// currently committed projection.
 func retainCommittedProjection(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, generation *state.GenerationID, dirty *bool) {
-	if ctx.Err() != nil {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), operationFailureFinalizeTimeout)
-		defer cancel()
-	}
-	if summary, err := store.Summary(ctx); err == nil {
+	completionCtx, cancel := operationCompletionContext(ctx)
+	defer cancel()
+	if summary, err := store.Summary(completionCtx); err == nil {
 		*generation = summary.BuiltGeneration
 		*dirty = summary.Status != "clean"
 	}
-	if observed, err := observedRepositoryDirty(ctx, root, repoName, cfg, store); err == nil {
+	if observed, err := observedRepositoryDirty(completionCtx, root, repoName, cfg, store); err == nil {
 		*dirty = observed
 	}
 }
 
-func retainCommittedTerminalProjection(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, operationID string, terminal state.OperationState, generation *state.GenerationID, dirty *bool) bool {
-	retainCommittedProjection(ctx, root, repoName, cfg, store, generation, dirty)
-	detail, err := store.GetOperation(ctx, operationID)
-	return err == nil && detail.Operation.State == terminal
+// completeMutation runs only result reads and owned stage cleanup after this
+// exact finalizer committed. Preserve any maintenance error alongside failures
+// in the completion tail; never start another business phase here.
+func completeMutation(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, operationID string, finalizeErr error, generation *state.GenerationID, dirty *bool) error {
+	if !stateTransactionCommitted(finalizeErr) {
+		return finalizeErr
+	}
+	completionCtx, cancel := operationCompletionContext(ctx)
+	defer cancel()
+	summary, summaryErr := store.Summary(completionCtx)
+	if summaryErr == nil {
+		*generation = summary.BuiltGeneration
+		*dirty = summary.Status != "clean"
+	}
+	observed, observedErr := observedRepositoryDirty(completionCtx, root, repoName, cfg, store)
+	if observedErr == nil {
+		*dirty = observed
+	}
+	return errors.Join(finalizeErr, summaryErr, observedErr, cleanupMutationStage(root, repoName, operationID))
 }
 
 func mutationTerminalStateForProjection(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store) (state.OperationState, error) {
@@ -1238,8 +1259,8 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 		return store.SetOperationState(ctx, operation.ID, state.OperationRolledBack, "")
 	}
 	if operation.State != state.OperationRecovering {
-		if err := store.SetOperationState(ctx, operation.ID, state.OperationRecovering, ""); err != nil {
-			return err
+		if err := store.SetOperationState(ctx, operation.ID, state.OperationRecovering, ""); err != nil || ctx.Err() != nil {
+			return errors.Join(err, ctx.Err())
 		}
 	}
 	// Read the bound manifest before the usual loader: v0.4.0 could omit
@@ -1389,8 +1410,8 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 	if payload.Skip && !stringSetSubset(mutation.ChangedDists, payload.BuildDists) {
 		return fmt.Errorf("%w: recovered Desired changes exceed the staged build scope", ErrIntegrity)
 	}
-	if err := store.RecordOperationMembershipOutcomes(ctx, operation.ID, manifest.Outcomes); err != nil {
-		return err
+	if err := store.RecordOperationMembershipOutcomes(ctx, operation.ID, manifest.Outcomes); err != nil || ctx.Err() != nil {
+		return errors.Join(err, ctx.Err())
 	}
 	for _, object := range mutation.DroppedPending {
 		if err := removePendingObject(root, repoName, object); err != nil {
@@ -1402,19 +1423,17 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 		if err != nil {
 			return err
 		}
-		if err := store.SetOperationState(ctx, operation.ID, terminal, ""); err != nil {
-			return err
-		}
-		return cleanupMutationStage(root, repoName, operation.ID)
+		var generation state.GenerationID
+		var dirty bool
+		return completeMutation(ctx, root, repoName, cfg, store, operation.ID, store.SetOperationState(ctx, operation.ID, terminal, ""), &generation, &dirty)
 	}
 	if noop {
 		if _, err := normalizeCurrentPublicTree(ctx, root, repoName, operation.ID, store, nil); err != nil {
 			return err
 		}
-		if err := store.FinalizeNoopBuild(ctx, operation.ID); err != nil {
-			return err
-		}
-		return cleanupMutationStage(root, repoName, operation.ID)
+		var generation state.GenerationID
+		var dirty bool
+		return completeMutation(ctx, root, repoName, cfg, store, operation.ID, store.FinalizeNoopBuild(ctx, operation.ID), &generation, &dirty)
 	}
 	jobs, err := mutationRecoveryJobs(payload)
 	if err != nil {

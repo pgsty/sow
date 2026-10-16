@@ -767,7 +767,7 @@ func (s *Store) BootstrapLegacyGeneration(ctx context.Context, operationID strin
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit legacy generation bootstrap: %w", err)
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func (s *Store) GetGeneration(ctx context.Context, generation GenerationID) (GenerationInfo, error) {
@@ -1352,7 +1352,7 @@ func (s *Store) FinalizeBuild(ctx context.Context, input FinalizeBuildInput) err
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit build finalization: %w", err)
 	}
-	if err := s.Checkpoint(ctx); err != nil {
+	if err := s.checkpointAfterCommit(ctx); err != nil {
 		return fmt.Errorf("checkpoint committed build Generation %d: %w", input.Generation, err)
 	}
 	return nil
@@ -1391,7 +1391,7 @@ func (s *Store) FinalizeNoopBuild(ctx context.Context, operationID string) error
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit no-op build finalization: %w", err)
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func replaceDistArchitecturesTx(ctx context.Context, tx *sql.Tx, distName string, architectures []Architecture, generation GenerationID) error {

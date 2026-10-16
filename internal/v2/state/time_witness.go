@@ -40,5 +40,5 @@ func (s *Store) ObserveRepositoryTime(ctx context.Context, observed time.Time) e
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }

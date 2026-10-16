@@ -755,8 +755,8 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 			return map[string]any{"name": result.Name, "format": result.Format, "generation": result.Generation}
 		})
 	}()
-	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: kind, State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil {
-		return DistInfo{}, err
+	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: kind, State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil || ctx.Err() != nil {
+		return DistInfo{}, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(fault, kind+".planned"); err != nil {
 		return DistInfo{}, err
@@ -820,11 +820,11 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 	}
 	payload.TreeSHA256 = rendered.TreeSHA256
 	payloadData, _ = json.Marshal(payload)
-	if err := store.UpdateOperationPayload(ctx, id, string(payloadData)); err != nil {
-		return DistInfo{}, err
+	if err := store.UpdateOperationPayload(ctx, id, string(payloadData)); err != nil || ctx.Err() != nil {
+		return DistInfo{}, errors.Join(err, ctx.Err())
 	}
-	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil {
-		return DistInfo{}, err
+	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
+		return DistInfo{}, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(fault, kind+".staged"); err != nil {
 		return DistInfo{}, err
@@ -842,8 +842,8 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 			return DistInfo{}, err
 		}
 	}
-	if err := store.SetOperationState(ctx, id, state.OperationApplied, ""); err != nil {
-		return DistInfo{}, err
+	if err := store.SetOperationState(ctx, id, state.OperationApplied, ""); err != nil || ctx.Err() != nil {
+		return DistInfo{}, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(fault, kind+".applied"); err != nil {
 		return DistInfo{}, err
@@ -868,8 +868,8 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 	if err := callFault(fault, kind+".modes"); err != nil {
 		return DistInfo{}, err
 	}
-	if err := store.SetOperationState(ctx, id, state.OperationBuilt, ""); err != nil {
-		return DistInfo{}, err
+	if err := store.SetOperationState(ctx, id, state.OperationBuilt, ""); err != nil || ctx.Err() != nil {
+		return DistInfo{}, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(fault, kind+".built"); err != nil {
 		return DistInfo{}, err
@@ -884,29 +884,20 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 	if err != nil {
 		return DistInfo{}, err
 	}
-	if err := store.FinalizeDistAdd(ctx, id, dist, manifest, changes); err != nil {
-		if committed, getErr := store.GetDist(ctx, distName); getErr == nil && committed.BuiltGeneration == generation {
-			if complete, infoErr := makeDistInfo(ctx, store, root, repoName, cfg, committed); infoErr == nil {
-				result = complete
-			} else {
-				err = errors.Join(err, infoErr)
-			}
-			return result, err
-		}
-		return DistInfo{}, err
+	finalizeErr := store.FinalizeDistAdd(ctx, id, dist, manifest, changes)
+	if !stateTransactionCommitted(finalizeErr) {
+		return DistInfo{}, finalizeErr
 	}
-	if complete, infoErr := makeDistInfo(ctx, store, root, repoName, cfg, dist); infoErr == nil {
+	completionCtx, cancel := operationCompletionContext(ctx)
+	defer cancel()
+	complete, infoErr := makeDistInfo(completionCtx, store, root, repoName, cfg, dist)
+	if infoErr == nil {
 		result = complete
-	} else {
-		return result, infoErr
 	}
 	if err := callFault(fault, kind+".finalized"); err != nil {
-		return result, err
+		return result, errors.Join(finalizeErr, infoErr, err)
 	}
-	if err := removeOwnedDirectory(stageRoot, filepath.Join(root, ".sow", repoName, "stage")); err != nil {
-		return result, err
-	}
-	return result, nil
+	return result, errors.Join(finalizeErr, infoErr, removeOwnedDirectory(stageRoot, filepath.Join(root, ".sow", repoName, "stage")))
 }
 
 func executeDistRemove(ctx context.Context, root, repoName, distName string, oldData, newData []byte, force bool, fault func(string) error, store *state.Store, result *RemovalResult) (resultErr error) {
@@ -942,14 +933,14 @@ func executeDistRemove(ctx context.Context, root, repoName, distName string, old
 			return map[string]any{"removed": result != nil && result.Removed, "name": distName}
 		})
 	}()
-	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: "dist.rm", State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil {
-		return err
+	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: "dist.rm", State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil || ctx.Err() != nil {
+		return errors.Join(err, ctx.Err())
 	}
 	if err := callFault(fault, "dist.rm.planned"); err != nil {
 		return err
 	}
-	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil {
-		return err
+	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
+		return errors.Join(err, ctx.Err())
 	}
 	if err := callFault(fault, "dist.rm.staged"); err != nil {
 		return err
@@ -964,8 +955,8 @@ func executeDistRemove(ctx context.Context, root, repoName, distName string, old
 		return err
 	}
 	result.Removed = true
-	if err := store.SetOperationState(ctx, id, state.OperationApplied, ""); err != nil {
-		return err
+	if err := store.SetOperationState(ctx, id, state.OperationApplied, ""); err != nil || ctx.Err() != nil {
+		return errors.Join(err, ctx.Err())
 	}
 	if err := callFault(fault, "dist.rm.applied"); err != nil {
 		return err
@@ -990,8 +981,8 @@ func executeDistRemove(ctx context.Context, root, repoName, distName string, old
 	if err := callFault(fault, "dist.rm.modes"); err != nil {
 		return err
 	}
-	if err := store.SetOperationState(ctx, id, state.OperationBuilt, ""); err != nil {
-		return err
+	if err := store.SetOperationState(ctx, id, state.OperationBuilt, ""); err != nil || ctx.Err() != nil {
+		return errors.Join(err, ctx.Err())
 	}
 	if err := callFault(fault, "dist.rm.built"); err != nil {
 		return err
@@ -1000,17 +991,19 @@ func executeDistRemove(ctx context.Context, root, repoName, distName string, old
 	if err != nil {
 		return err
 	}
-	droppedPending, err := store.FinalizeDistRemovalAndCollect(ctx, id, distName, payload.Generation, manifest, changes)
-	if err != nil {
-		return err
+	droppedPending, finalizeErr := store.FinalizeDistRemovalAndCollect(ctx, id, distName, payload.Generation, manifest, changes)
+	if !stateTransactionCommitted(finalizeErr) {
+		return finalizeErr
 	}
 	if err := callFault(fault, "dist.rm.finalized"); err != nil {
-		return err
+		return errors.Join(finalizeErr, err)
 	}
-	if err := cleanupDroppedPending(ctx, root, repoName, store, droppedPending); err != nil {
-		return err
+	completionCtx, cancel := operationCompletionContext(ctx)
+	defer cancel()
+	if err := cleanupDroppedPending(completionCtx, root, repoName, store, droppedPending); err != nil {
+		return errors.Join(finalizeErr, err)
 	}
-	return cleanupDistRecovery(root, repoName, id)
+	return errors.Join(finalizeErr, cleanupDistRecovery(root, repoName, id))
 }
 
 // finalizePreApplyDistOperation terminalizes an ordinary Dist failure only
@@ -1169,8 +1162,8 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 			if operation.State == state.OperationPlanned {
 				return fmt.Errorf("%w: planned operation has committed config without staged evidence", ErrIntegrity)
 			}
-			if err := store.SetOperationState(ctx, operation.ID, state.OperationApplied, ""); err != nil {
-				return err
+			if err := store.SetOperationState(ctx, operation.ID, state.OperationApplied, ""); err != nil || ctx.Err() != nil {
+				return errors.Join(err, ctx.Err())
 			}
 			operation.State = state.OperationApplied
 		}
@@ -1200,8 +1193,8 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 				return err
 			}
 			if operation.State == state.OperationApplied {
-				if err := store.SetOperationState(ctx, operation.ID, state.OperationBuilt, ""); err != nil {
-					return err
+				if err := store.SetOperationState(ctx, operation.ID, state.OperationBuilt, ""); err != nil || ctx.Err() != nil {
+					return errors.Join(err, ctx.Err())
 				}
 				operation.State = state.OperationBuilt
 			}
@@ -1222,14 +1215,17 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 				if err != nil {
 					return err
 				}
-				droppedPending, err := store.FinalizeDistRemovalAndCollect(ctx, operation.ID, payload.Name, payload.Generation, manifest, changes)
-				if err != nil {
-					return err
+				droppedPending, finalizeErr := store.FinalizeDistRemovalAndCollect(ctx, operation.ID, payload.Name, payload.Generation, manifest, changes)
+				if !stateTransactionCommitted(finalizeErr) {
+					return finalizeErr
 				}
-				if err := cleanupDroppedPending(ctx, root, repoName, store, droppedPending); err != nil {
-					return err
+				completionCtx, cancel := operationCompletionContext(ctx)
+				cleanupErr := cleanupDroppedPending(completionCtx, root, repoName, store, droppedPending)
+				cancel()
+				if cleanupErr != nil {
+					return errors.Join(finalizeErr, cleanupErr)
 				}
-				if err := cleanupDistRecovery(root, repoName, operation.ID); err != nil {
+				if err := errors.Join(finalizeErr, cleanupDistRecovery(root, repoName, operation.ID)); err != nil {
 					return err
 				}
 			} else {
@@ -1246,10 +1242,11 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 				if err != nil {
 					return err
 				}
-				if err := store.FinalizeDistAdd(ctx, operation.ID, dist, manifest, changes); err != nil {
-					return err
+				finalizeErr := store.FinalizeDistAdd(ctx, operation.ID, dist, manifest, changes)
+				if !stateTransactionCommitted(finalizeErr) {
+					return finalizeErr
 				}
-				if err := removeOwnedDirectory(distStageRoot(root, repoName, operation.ID), filepath.Join(root, ".sow", repoName, "stage")); err != nil {
+				if err := errors.Join(finalizeErr, removeOwnedDirectory(distStageRoot(root, repoName, operation.ID), filepath.Join(root, ".sow", repoName, "stage"))); err != nil {
 					return err
 				}
 			}

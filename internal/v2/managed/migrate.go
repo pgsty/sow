@@ -57,6 +57,8 @@ func MigrateRepositoryLayout(ctx context.Context, opts RepositoryMigrationOption
 	if ctx == nil {
 		return result, errors.New("managed: nil migration context")
 	}
+	var maintenanceErr error
+	defer func() { resultErr = errors.Join(maintenanceErr, resultErr) }()
 	if opts.Jobs < 1 {
 		opts.Jobs = runtime.GOMAXPROCS(0)
 	}
@@ -305,9 +307,13 @@ func MigrateRepositoryLayout(ctx context.Context, opts RepositoryMigrationOption
 			}
 			generation, err := store.CompleteLayoutTransition(ctx, migrationOperationID, journal.BaseGeneration, terminal, receipt)
 			result.Generation = generation
-			if err != nil {
+			if !stateTransactionCommitted(err) {
 				return result, err
 			}
+			maintenanceErr = err
+			var cancel context.CancelFunc
+			ctx, cancel = operationCompletionContext(ctx)
+			defer cancel()
 			// SQLite terminal state and its done-record digest commit first.  A
 			// crash here leaves final_manifest on disk, which the terminal-entry
 			// repair above can deterministically advance to the exact done bytes.
@@ -336,9 +342,13 @@ func MigrateRepositoryLayout(ctx context.Context, opts RepositoryMigrationOption
 					return result, idErr
 				}
 				result.Generation, err = store.CompleteLayoutTransition(ctx, migrationOperationID, journal.BaseGeneration, binding.target, receipt)
-				if err != nil {
+				if !stateTransactionCommitted(err) {
 					return result, err
 				}
+				maintenanceErr = err
+				var cancel context.CancelFunc
+				ctx, cancel = operationCompletionContext(ctx)
+				defer cancel()
 				identity, err = store.RepositoryIdentity(ctx)
 				if err != nil {
 					return result, err

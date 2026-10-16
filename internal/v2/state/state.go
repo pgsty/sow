@@ -1609,6 +1609,49 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 	return nil
 }
 
+// CommittedMaintenanceError proves that this state method committed its SQLite
+// transaction before maintenance failed. It says nothing about whether the
+// enclosing multi-stage operation finished. Callers must not retry the write
+// merely because maintenance failed.
+type CommittedMaintenanceError struct {
+	Err error
+}
+
+func (e *CommittedMaintenanceError) Error() string {
+	return fmt.Sprintf("SQLite transaction committed; maintenance failed: %v", e.Err)
+}
+
+func (e *CommittedMaintenanceError) Unwrap() error { return e.Err }
+
+func (s *Store) checkpointAfterCommit(ctx context.Context) error {
+	maintenanceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := s.Checkpoint(maintenanceCtx); err != nil {
+		return &CommittedMaintenanceError{Err: err}
+	}
+	return nil
+}
+
+// releaseMaintenanceConnection restores the ordinary SQL timeout, or discards
+// the connection so that busy_timeout=0 can never escape into the pool.
+func releaseMaintenanceConnection(ctx context.Context, conn *sql.Conn) error {
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+	defer cancel()
+	_, restoreErr := conn.ExecContext(restoreCtx, `PRAGMA busy_timeout=5000`)
+	if restoreErr != nil {
+		discardErr := conn.Raw(func(any) error { return driver.ErrBadConn })
+		if errors.Is(discardErr, driver.ErrBadConn) {
+			discardErr = nil
+		}
+		closeErr := conn.Close()
+		if errors.Is(closeErr, sql.ErrConnDone) {
+			closeErr = nil
+		}
+		return errors.Join(fmt.Errorf("restore repository busy timeout: %w", restoreErr), discardErr, closeErr)
+	}
+	return conn.Close()
+}
+
 // Checkpoint opportunistically drains the WAL. A reader may prevent copying
 // or truncation; either is deferred maintenance, never a failed durable commit.
 // Only this maintenance call disables waiting; ordinary SQL retains its bounded
@@ -1619,8 +1662,7 @@ func (s *Store) Checkpoint(ctx context.Context) (resultErr error) {
 		return err
 	}
 	defer func() {
-		_, restoreErr := conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA busy_timeout=5000`)
-		resultErr = errors.Join(resultErr, restoreErr, conn.Close())
+		resultErr = errors.Join(resultErr, releaseMaintenanceConnection(ctx, conn))
 	}()
 	if _, err := conn.ExecContext(ctx, `PRAGMA busy_timeout=0`); err != nil {
 		return err
@@ -1777,7 +1819,7 @@ func (s *Store) AddDist(ctx context.Context, dist Dist) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit dist add: %w", err)
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func (s *Store) RemoveDist(ctx context.Context, name string) error {
@@ -1792,7 +1834,7 @@ func (s *Store) RemoveDist(ctx context.Context, name string) error {
 	if count == 0 {
 		return fmt.Errorf("%w: dist %q", ErrNotFound, name)
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func (s *Store) CountsForDist(ctx context.Context, name string) (DistCounts, error) {
@@ -1858,7 +1900,7 @@ func (s *Store) FinalizeDistAdd(ctx context.Context, operationID string, dist Di
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit dist add finalization: %w", err)
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 // FinalizeDistRemoval preserves the original error-only API used by P1 state
@@ -1972,8 +2014,8 @@ func (s *Store) FinalizeDistRemovalAndCollect(ctx context.Context, operationID, 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit dist removal finalization: %w", err)
 	}
-	if err := s.Checkpoint(ctx); err != nil {
-		return nil, err
+	if err := s.checkpointAfterCommit(ctx); err != nil {
+		return droppedPending, err
 	}
 	return droppedPending, nil
 }
@@ -2182,7 +2224,7 @@ func (s *Store) BeginOperation(ctx context.Context, operation Operation) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit operation %q start: %w", operation.ID, err)
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func (s *Store) SetOperationState(ctx context.Context, id string, next OperationState, errorClass string) error {
@@ -2197,7 +2239,7 @@ func (s *Store) SetOperationState(ctx context.Context, id string, next Operation
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit operation %q transition: %w", id, err)
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 // FailOperation atomically records the bounded public result and terminal
@@ -2235,7 +2277,7 @@ func (s *Store) FailOperation(ctx context.Context, id, errorClass, errorMessage,
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit operation %q failure: %w", id, err)
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func setOperationStateTx(ctx context.Context, tx *sql.Tx, id string, next OperationState, errorClass, errorMessage string) error {
@@ -2284,7 +2326,7 @@ func (s *Store) UpdateOperationResult(ctx context.Context, id, resultJSON string
 	if count, err := result.RowsAffected(); err != nil || count != 1 {
 		return fmt.Errorf("%w: operation %q", ErrNotFound, id)
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 // RecordOperationProgress appends an audit event without changing the durable
@@ -2357,7 +2399,7 @@ func (s *Store) UpdateOperationPayload(ctx context.Context, id, payloadJSON stri
 	if _, err := s.db.ExecContext(ctx, `UPDATE operations SET payload_json = ?, updated_at = ? WHERE id = ?`, payloadJSON, nowText(), id); err != nil {
 		return fmt.Errorf("update operation %q payload: %w", id, err)
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func validateOperationPayload(payloadJSON string) error {

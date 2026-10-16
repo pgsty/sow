@@ -123,8 +123,8 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 			return map[string]any{"dists": len(result.Dists), "desired_revision": result.Revision, "built_generation": result.Generation}
 		})
 	}()
-	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: "build", State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil {
-		return result, err
+	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: "build", State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(opts.Fault, "build.command.planned"); err != nil {
 		return result, err
@@ -138,11 +138,11 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 		return result, err
 	}
 	payloadData, _ = json.Marshal(payload)
-	if err := store.UpdateOperationPayload(ctx, id, string(payloadData)); err != nil {
-		return result, err
+	if err := store.UpdateOperationPayload(ctx, id, string(payloadData)); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
-	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil {
-		return result, err
+	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(opts.Fault, "build.command.staged"); err != nil {
 		return result, err
@@ -155,9 +155,13 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 		}
 		return result, err
 	}
-	if err := store.RecordOperationMembershipOutcomes(ctx, id, manifest.Outcomes); err != nil {
+	if err := ctx.Err(); err != nil {
 		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
 		return result, err
+	}
+	if err := store.RecordOperationMembershipOutcomes(ctx, id, manifest.Outcomes); err != nil || ctx.Err() != nil {
+		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
+		return result, errors.Join(err, ctx.Err())
 	}
 	for _, object := range mutation.DroppedPending {
 		if err := removePendingObject(ws.Root, repoName, object); err != nil {
@@ -183,33 +187,27 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 		if err := recordBuildMetrics(ctx, store, id); err != nil {
 			return result, err
 		}
-		if err := store.FinalizeNoopBuild(ctx, id); err != nil {
-			if summary, summaryErr := store.Summary(ctx); summaryErr == nil {
-				result.Generation = summary.BuiltGeneration
-				if operation, operationErr := store.GetOperation(ctx, id); operationErr == nil && operation.Operation.State == state.OperationDone {
-					result.Noop = true
-				}
-			}
-			return result, err
+		finalizeErr := store.FinalizeNoopBuild(ctx, id)
+		if stateTransactionCommitted(finalizeErr) {
+			result.Noop = true
 		}
-		result.Noop = true
-		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
-		if err := cleanupMutationStage(ws.Root, repoName, id); err != nil {
-			return result, err
-		}
-		return result, nil
+		completionErr := completeMutation(ctx, ws.Root, repoName, cfg, store, id, finalizeErr, &result.Generation, &result.Dirty)
+		return result, completionErr
 	}
 	generation, err := buildAppliedMutation(ctx, ws.Root, repoName, cfg, affectedDists, id, store, opts.Jobs, opts.Fault, preflight)
 	result.Generation = generation
-	if err != nil {
+	if err != nil && generation == 0 {
 		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
 		return result, err
 	}
-	result.Dirty, err = observedRepositoryDirty(ctx, ws.Root, repoName, cfg, store)
+	completionErr := err
+	completionCtx, cancel := operationCompletionContext(ctx)
+	defer cancel()
+	result.Dirty, err = observedRepositoryDirty(completionCtx, ws.Root, repoName, cfg, store)
 	if err != nil {
-		return result, err
+		return result, errors.Join(completionErr, err)
 	}
-	return result, nil
+	return result, completionErr
 }
 
 func distsNeedingBuild(ctx context.Context, root, repoName string, cfg config.Config, store *state.Store, desired map[string][]string) ([]string, error) {

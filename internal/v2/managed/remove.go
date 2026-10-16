@@ -129,15 +129,15 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 			return map[string]any{"removed": len(result.Removed), "dists": len(result.Dists)}
 		})
 	}()
-	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: "rm", State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil {
-		return result, err
+	if err := store.BeginOperation(ctx, state.Operation{ID: id, Kind: "rm", State: state.OperationPlanned, PayloadJSON: string(payloadData)}); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
 	auditPackages := make([]state.OperationPackage, 0, len(removed))
 	for _, item := range removed {
 		auditPackages = append(auditPackages, state.OperationPackage{InputPath: item.Name, PackageSHA256: item.SHA256, Coordinate: item.Coordinate, Disposition: "removed"})
 	}
-	if err := store.RecordOperationPackages(ctx, id, auditPackages); err != nil {
-		return result, err
+	if err := store.RecordOperationPackages(ctx, id, auditPackages); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(opts.Fault, "rm.planned"); err != nil {
 		return result, err
@@ -151,11 +151,11 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 		return result, err
 	}
 	payloadData, _ = json.Marshal(payload)
-	if err := store.UpdateOperationPayload(ctx, id, string(payloadData)); err != nil {
-		return result, err
+	if err := store.UpdateOperationPayload(ctx, id, string(payloadData)); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
-	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil {
-		return result, err
+	if err := store.SetOperationState(ctx, id, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
 	if err := callFault(opts.Fault, "rm.staged"); err != nil {
 		return result, err
@@ -172,9 +172,13 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	if !sameStringSet(mutation.ChangedDists, desiredChangedDists) {
 		return result, fmt.Errorf("%w: applied remove Dist changes differ from its staged Desired change set", ErrIntegrity)
 	}
-	if err := store.RecordOperationMembershipOutcomes(ctx, id, manifest.Outcomes); err != nil {
+	if err := ctx.Err(); err != nil {
 		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
 		return result, err
+	}
+	if err := store.RecordOperationMembershipOutcomes(ctx, id, manifest.Outcomes); err != nil || ctx.Err() != nil {
+		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
+		return result, errors.Join(err, ctx.Err())
 	}
 	for _, object := range mutation.DroppedPending {
 		if err := removePendingObject(ws.Root, repoName, object); err != nil {
@@ -189,14 +193,7 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 		if err != nil {
 			return result, err
 		}
-		if err := store.SetOperationState(ctx, id, terminal, ""); err != nil {
-			if retainCommittedTerminalProjection(ctx, ws.Root, repoName, cfg, store, id, terminal, &result.Generation, &result.Dirty) {
-				err = errors.Join(err, cleanupMutationStage(ws.Root, repoName, id))
-			}
-			return result, err
-		}
-		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
-		if err := cleanupMutationStage(ws.Root, repoName, id); err != nil {
+		if err := completeMutation(ctx, ws.Root, repoName, cfg, store, id, store.SetOperationState(ctx, id, terminal, ""), &result.Generation, &result.Dirty); err != nil {
 			return result, err
 		}
 		return result, nil
@@ -205,33 +202,29 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 		if _, err := normalizeCurrentPublicTreeWithSnapshot(ctx, ws.Root, repoName, id, store, opts.Fault, currentSnapshot); err != nil {
 			return result, err
 		}
-		if err := store.FinalizeNoopBuild(ctx, id); err != nil {
-			if retainCommittedTerminalProjection(ctx, ws.Root, repoName, cfg, store, id, state.OperationDone, &result.Generation, &result.Dirty) {
-				err = errors.Join(err, cleanupMutationStage(ws.Root, repoName, id))
-			}
-			return result, err
-		}
-		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
-		if err := cleanupMutationStage(ws.Root, repoName, id); err != nil {
+		if err := completeMutation(ctx, ws.Root, repoName, cfg, store, id, store.FinalizeNoopBuild(ctx, id), &result.Generation, &result.Dirty); err != nil {
 			return result, err
 		}
 		return result, nil
 	}
 	generation, err := buildAppliedMutation(ctx, ws.Root, repoName, cfg, payload.BuildDists, id, store, opts.Jobs, opts.Fault, preflight)
 	result.Generation = generation
-	if err != nil {
+	if err != nil && generation == 0 {
 		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
 		return result, err
 	}
-	result.Changes, err = store.GenerationChanges(ctx, generation)
+	completionErr := err
+	completionCtx, cancel := operationCompletionContext(ctx)
+	defer cancel()
+	result.Changes, err = store.GenerationChanges(completionCtx, generation)
 	if err != nil {
-		return result, err
+		return result, errors.Join(completionErr, err)
 	}
-	result.Dirty, err = observedRepositoryDirty(ctx, ws.Root, repoName, cfg, store)
+	result.Dirty, err = observedRepositoryDirty(completionCtx, ws.Root, repoName, cfg, store)
 	if err != nil {
-		return result, err
+		return result, errors.Join(completionErr, err)
 	}
-	return result, nil
+	return result, completionErr
 }
 
 func previewRemove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resultErr error) {

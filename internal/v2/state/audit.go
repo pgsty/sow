@@ -91,7 +91,7 @@ EXISTS(SELECT 1 FROM package_objects WHERE sha256 = ?)
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 type operationPackageMessage struct {
@@ -187,7 +187,7 @@ func (s *Store) RecordOperationPackages(ctx context.Context, operationID string,
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func (s *Store) ListOperations(ctx context.Context, limit int, dist string) ([]Operation, error) {
@@ -397,8 +397,10 @@ WHERE state IN ('done', 'done_dirty', 'rolled_back', 'failed')
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	if _, err := s.compactAudit(ctx); err != nil {
-		return count, err
+	maintenanceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if _, err := s.compactAudit(maintenanceCtx); err != nil {
+		return count, &CommittedMaintenanceError{Err: err}
 	}
 	return count, nil
 }
@@ -463,7 +465,7 @@ WHERE state IN ('done', 'done_dirty', 'rolled_back', 'failed')
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	if err := s.Checkpoint(ctx); err != nil {
+	if err := s.checkpointAfterCommit(ctx); err != nil {
 		return count, fmt.Errorf("checkpoint journaled audit prune after committed delete: %w", err)
 	}
 	return count, nil
@@ -512,7 +514,7 @@ func (s *Store) FinishPruneOperation(ctx context.Context, id string) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 // compactAudit never waits for a reader. A blocked initial checkpoint skips
@@ -524,8 +526,7 @@ func (s *Store) compactAudit(ctx context.Context) (deferred bool, resultErr erro
 		return false, err
 	}
 	defer func() {
-		_, restoreErr := conn.ExecContext(context.WithoutCancel(ctx), `PRAGMA busy_timeout=5000`)
-		resultErr = errors.Join(resultErr, restoreErr, conn.Close())
+		resultErr = errors.Join(resultErr, releaseMaintenanceConnection(ctx, conn))
 	}()
 	if _, err := conn.ExecContext(ctx, `PRAGMA busy_timeout=0`); err != nil {
 		return false, err

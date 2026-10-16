@@ -380,8 +380,8 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 		return 0, err
 	}
 	if operation.State != state.OperationBuilt {
-		if err := store.SetOperationState(ctx, operationID, state.OperationBuilt, ""); err != nil {
-			return 0, err
+		if err := store.SetOperationState(ctx, operationID, state.OperationBuilt, ""); err != nil || ctx.Err() != nil {
+			return 0, errors.Join(err, ctx.Err())
 		}
 	}
 	if err := callFault(fault, "build.built"); err != nil {
@@ -397,22 +397,14 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	if len(changes) == 0 {
 		return 0, fmt.Errorf("%w: changed Desired State produced no physical Generation change", ErrIntegrity)
 	}
-	if err := store.FinalizeBuild(ctx, state.FinalizeBuildInput{OperationID: operationID, Generation: generation, Dists: stateBuilds, Pooled: pooled, RPMSigningKeys: retainedRPMKeys, Manifest: targetManifest, Changes: changes}); err != nil {
-		// FinalizeBuild commits SQLite before its WAL checkpoint. If that
-		// durability-maintenance step alone fails, report both the committed
-		// Generation identity and the error instead of falsely returning 0.
-		if after, summaryErr := store.Summary(ctx); summaryErr == nil && after.BuiltGeneration == generation {
-			return generation, err
-		}
-		return 0, err
+	finalizeErr := store.FinalizeBuild(ctx, state.FinalizeBuildInput{OperationID: operationID, Generation: generation, Dists: stateBuilds, Pooled: pooled, RPMSigningKeys: retainedRPMKeys, Manifest: targetManifest, Changes: changes})
+	if !stateTransactionCommitted(finalizeErr) {
+		return 0, finalizeErr
 	}
 	if err := callFault(fault, "build.finalized"); err != nil {
-		return generation, err
+		return generation, errors.Join(finalizeErr, err)
 	}
-	if err := cleanupMutationStage(root, repoName, operationID); err != nil {
-		return generation, err
-	}
-	return generation, nil
+	return generation, errors.Join(finalizeErr, cleanupMutationStage(root, repoName, operationID))
 }
 
 func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.Config, distNames []string, generation state.GenerationID, publication publicationIdentity, buildRoot, operationID string, store *state.Store, jobs int, fault func(string) error, preflight *mutationBuildPreflight) (buildDists []mutationBuildDist, pooled []string, retainedRPMKeys []state.RPMSigningKey, resultErr error) {

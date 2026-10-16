@@ -234,8 +234,8 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 	if err != nil {
 		return result, err
 	}
-	if err := store.BeginOperation(ctx, state.Operation{ID: plan.OperationID, Kind: "local.gc", State: state.OperationPlanned, PayloadJSON: string(payloadBytes)}); err != nil {
-		return result, err
+	if err := store.BeginOperation(ctx, state.Operation{ID: plan.OperationID, Kind: "local.gc", State: state.OperationPlanned, PayloadJSON: string(payloadBytes)}); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
 	recoveryRoot := localGCRecoveryRoot(ws.Root, repoName, plan.OperationID)
 	if err := durableMkdir(recoveryRoot, 0o700); err != nil {
@@ -247,14 +247,14 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 	if err := callFault(opts.Fault, "gc.planned"); err != nil {
 		return result, err
 	}
-	if err := store.SetOperationState(ctx, plan.OperationID, state.OperationStaged, ""); err != nil {
-		return result, err
+	if err := store.SetOperationState(ctx, plan.OperationID, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
+		return result, errors.Join(err, ctx.Err())
 	}
-	if err := applyLocalGCPlan(ctx, ws.Root, repoName, store, plan, opts.Fault); err != nil {
-		return result, err
+	committed, err := applyLocalGCPlan(ctx, ws.Root, repoName, store, plan, opts.Fault)
+	if committed {
+		result = localGCResult(plan)
 	}
-	result = localGCResult(plan)
-	return result, nil
+	return result, err
 }
 
 func buildLocalGCPlan(repoName string, inventory state.LocalGCInventory, candidates []state.PackageObject, base []state.GenerationFile) (localGCPlan, []byte, error) {
@@ -363,61 +363,64 @@ func validateLocalGCPlan(plan localGCPlan) error {
 	return nil
 }
 
-func applyLocalGCPlan(ctx context.Context, root, repoName string, store *state.Store, plan localGCPlan, fault func(string) error) error {
+func applyLocalGCPlan(ctx context.Context, root, repoName string, store *state.Store, plan localGCPlan, fault func(string) error) (terminalCommitted bool, resultErr error) {
 	if err := validateLocalGCRecoveryInventory(ctx, root, repoName, plan); err != nil {
-		return err
+		return false, err
 	}
 	for _, entry := range plan.Entries {
 		public := filepath.Join(repoName, filepath.FromSlash(entry.Path))
 		tombstone := filepath.Join(".sow", repoName, "recovery", plan.OperationID, localGCPayloadDir, filepath.FromSlash(entry.Path))
 		publicOK, err := exactLocalGCFile(ctx, root, public, entry.Size, entry.SHA256)
 		if err != nil {
-			return err
+			return false, err
 		}
 		tombstoneOK, err := exactLocalGCFile(ctx, root, tombstone, entry.Size, entry.SHA256)
 		if err != nil {
-			return err
+			return false, err
 		}
 		switch {
 		case publicOK && !tombstoneOK:
 			if err := renameRootedRegular(ctx, root, public, tombstone, entry.Size, entry.SHA256, 0o600, 0o700); err != nil {
-				return err
+				return false, err
 			}
 		case publicOK && tombstoneOK:
 			if err := removeRootedRegularExact(ctx, root, public, entry.Size, entry.SHA256); err != nil {
-				return err
+				return false, err
 			}
 		case !publicOK && tombstoneOK:
 			// Already detached by an interrupted invocation.
 		default:
-			return fmt.Errorf("%w: local GC payload %q is absent from both public and recovery paths", ErrIntegrity, entry.Path)
+			return false, fmt.Errorf("%w: local GC payload %q is absent from both public and recovery paths", ErrIntegrity, entry.Path)
 		}
 		if err := callFault(fault, "gc.detached."+entry.Path); err != nil {
-			return err
+			return false, err
 		}
 	}
 	operation, err := store.GetOperation(ctx, plan.OperationID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if operation.Operation.State == state.OperationStaged || operation.Operation.State == state.OperationRecovering {
-		if err := store.SetOperationState(ctx, plan.OperationID, state.OperationApplied, ""); err != nil {
-			return err
+		if err := store.SetOperationState(ctx, plan.OperationID, state.OperationApplied, ""); err != nil || ctx.Err() != nil {
+			return false, errors.Join(err, ctx.Err())
 		}
 	}
 	if err := callFault(fault, "gc.applied"); err != nil {
-		return err
+		return false, err
 	}
-	if err := store.FinalizeLocalGC(ctx, state.FinalizeLocalGCInput{
+	finalizeErr := store.FinalizeLocalGC(ctx, state.FinalizeLocalGCInput{
 		OperationID: plan.OperationID, RepositoryID: plan.RepositoryID, BaseGeneration: plan.BaseGeneration,
 		Generation: plan.Generation, Objects: plan.Objects, Manifest: plan.Manifest, Changes: plan.Changes,
-	}); err != nil {
-		return err
+	})
+	if !stateTransactionCommitted(finalizeErr) {
+		return false, finalizeErr
 	}
 	if err := callFault(fault, "gc.committed"); err != nil {
-		return err
+		return true, errors.Join(finalizeErr, err)
 	}
-	return cleanupLocalGCPlan(ctx, root, repoName, plan, fault)
+	completionCtx, cancel := operationCompletionContext(ctx)
+	defer cancel()
+	return true, errors.Join(finalizeErr, cleanupLocalGCPlan(completionCtx, root, repoName, plan, fault))
 }
 
 func recoverLocalGCOperation(ctx context.Context, root, repoName string, store *state.Store, operation state.Operation) error {
@@ -461,11 +464,12 @@ func recoverLocalGCOperation(ctx context.Context, root, repoName string, store *
 		return errors.Join(fmt.Errorf("%w: local GC plan differs from operation journal", ErrIntegrity), err)
 	}
 	if operation.State == state.OperationPlanned {
-		if err := store.SetOperationState(ctx, operation.ID, state.OperationStaged, ""); err != nil {
-			return err
+		if err := store.SetOperationState(ctx, operation.ID, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
+			return errors.Join(err, ctx.Err())
 		}
 	}
-	return applyLocalGCPlan(ctx, root, repoName, store, plan, nil)
+	_, err = applyLocalGCPlan(ctx, root, repoName, store, plan, nil)
+	return err
 }
 
 func recoverDoneLocalGCCleanup(ctx context.Context, root, repoName string, operation state.Operation) error {

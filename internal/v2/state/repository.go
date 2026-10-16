@@ -109,7 +109,7 @@ func (s *Store) AnchorLayoutTransitionPlan(ctx context.Context, repositoryID str
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func (s *Store) CommitLayoutTransitionPlan(ctx context.Context, planIdentitySHA256, commitIntentAt, notBefore string) error {
@@ -147,7 +147,7 @@ func (s *Store) CommitLayoutTransitionPlan(ctx context.Context, planIdentitySHA2
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 func IsCanonicalRepositoryID(value string) bool {
@@ -220,7 +220,7 @@ func (s *Store) AbandonLayoutTransition(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	return s.Checkpoint(ctx)
+	return s.checkpointAfterCommit(ctx)
 }
 
 // CompleteLayoutTransition atomically installs the first terminal manifest,
@@ -358,7 +358,7 @@ WHERE d.format = 'rpm'`); err != nil {
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	if err := s.Checkpoint(ctx); err != nil {
+	if err := s.checkpointAfterCommit(ctx); err != nil {
 		return next, err
 	}
 	return next, nil
