@@ -63,6 +63,33 @@ func newPayloadEvidenceRegistry() *payloadEvidenceRegistry {
 	return &payloadEvidenceRegistry{slots: make(map[physicalPayloadIdentity]*payloadEvidenceSlot)}
 }
 
+// payloadEvidenceForMutationSnapshot preserves the ordinary-write contract:
+// the complete current Generation was validated using SHA-256 or a matching
+// persisted fingerprint. Every reused reference still rebinds its descriptor.
+// Check must use a fresh, empty registry instead: it authenticates all payload
+// bytes independently of persisted fingerprints on every invocation.
+func payloadEvidenceForMutationSnapshot(snapshot *publicGenerationSnapshot) (*payloadEvidenceRegistry, error) {
+	if snapshot == nil {
+		return nil, fmt.Errorf("%w: mutation public snapshot is unavailable", ErrIntegrity)
+	}
+	registry := newPayloadEvidenceRegistry()
+	for _, file := range snapshot.Manifest {
+		if file.Phase != "payload" {
+			continue
+		}
+		identity, exists := snapshot.Identities[file.Path]
+		if !exists || !identity.valid(file.Size) || !lowercaseSHA256.MatchString(file.SHA256) {
+			return nil, fmt.Errorf("%w: mutation payload identity is unavailable for %s", ErrIntegrity, file.Path)
+		}
+		key := physicalPayloadIdentityFrom(identity)
+		if previous := registry.slots[key]; previous != nil && (previous.evidence.File.Size != file.Size || previous.evidence.File.SHA256 != file.SHA256) {
+			return nil, fmt.Errorf("%w: mutation payload identities conflict at %s", ErrIntegrity, file.Path)
+		}
+		registry.slots[key] = &payloadEvidenceSlot{done: closedEvidenceChannel(), evidence: &checkPayloadEvidence{Identity: identity, File: file}}
+	}
+	return registry, nil
+}
+
 type checkVerificationSnapshot struct {
 	Public   *publicGenerationSnapshot
 	Evidence *payloadEvidenceRegistry
@@ -246,9 +273,16 @@ func authenticatePackageDescriptor(ctx context.Context, reader *os.File, object 
 }
 
 func (registry *payloadEvidenceRegistry) verifyRetainedReference(ctx context.Context, root string, file state.GenerationFile) error {
+	return registry.verifyPayloadReference(workmetrics.WithPhase(ctx, "retained_payload"), root, file)
+}
+
+// verifyPayloadReference binds an index or manifest reference to an opened
+// descriptor. Its evidence is command-local; a changed inode, mtime or ctime
+// requires authentication again even when the requested digest is unchanged.
+func (registry *payloadEvidenceRegistry) verifyPayloadReference(ctx context.Context, root string, file state.GenerationFile) error {
 	opened, err := openRootedRegular(root, filepath.FromSlash(strings.TrimPrefix(file.Path, "/")))
 	if err != nil {
-		return fmt.Errorf("%w: retained source %q is missing or unsafe: %v", ErrIntegrity, file.Path, err)
+		return fmt.Errorf("%w: payload source %q is missing or unsafe: %v", ErrIntegrity, file.Path, err)
 	}
 	identity, err := snapshotRootedRegularIdentity(opened)
 	if err != nil {
@@ -258,9 +292,10 @@ func (registry *payloadEvidenceRegistry) verifyRetainedReference(ctx context.Con
 	slot, owner := registry.claim(key)
 	if !owner {
 		<-slot.done
+		after, identityErr := snapshotRootedRegularIdentity(opened)
 		closeErr := opened.CloseVerified()
-		if slot.err != nil || closeErr != nil || slot.evidence == nil || !slot.evidence.Identity.unchangedWhileOpen(identity) || slot.evidence.File.Size != file.Size || slot.evidence.File.SHA256 != file.SHA256 {
-			return errors.Join(fmt.Errorf("%w: retained payload evidence differs for %q", ErrIntegrity, file.Path), slot.err, closeErr)
+		if slot.err != nil || identityErr != nil || closeErr != nil || !identity.unchangedWhileOpen(after) || slot.evidence == nil || !slot.evidence.Identity.unchangedWhileOpen(identity) || slot.evidence.File.Size != file.Size || slot.evidence.File.SHA256 != file.SHA256 {
+			return errors.Join(fmt.Errorf("%w: payload evidence differs for %q", ErrIntegrity, file.Path), slot.err, identityErr, closeErr)
 		}
 		return nil
 	}
@@ -270,11 +305,11 @@ func (registry *payloadEvidenceRegistry) verifyRetainedReference(ctx context.Con
 	}
 	hash := sha256.New()
 	read, copyErr := io.Copy(hash, &retainedContextReader{ctx: ctx, reader: opened.file})
-	workmetrics.RecordFullPackageRead(workmetrics.WithPhase(ctx, "retained_payload"), read)
+	workmetrics.RecordFullPackageRead(ctx, read)
 	after, identityErr := snapshotRootedRegularIdentity(opened)
 	closeErr := opened.CloseVerified()
 	if copyErr != nil || identityErr != nil || closeErr != nil || !identity.unchangedWhileOpen(after) || read != file.Size || hex.EncodeToString(hash.Sum(nil)) != file.SHA256 {
-		err = errors.Join(fmt.Errorf("%w: retained source %q differs from manifest", ErrIntegrity, file.Path), copyErr, identityErr, closeErr)
+		err = errors.Join(fmt.Errorf("%w: payload source %q differs from reference", ErrIntegrity, file.Path), copyErr, identityErr, closeErr)
 		registry.complete(key, slot, nil, err)
 		return err
 	}

@@ -26,17 +26,18 @@ type publicPayloadExpectation struct {
 // and metadata hashing of ordinary writes, but accepts an immutable package
 // payload from its persisted descriptor fingerprint. A mismatch or missing
 // fingerprint is a cache miss: the package SHA-256 authority is checked once
-// and the fingerprint is then repaired. Changed bytes remain an integrity
-// failure.
-func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string, retained []state.GenerationFile, store *state.Store) (*publicGenerationSnapshot, error) {
+// and the fingerprint repair is returned to the caller. Callers persist those
+// repairs only after any remaining validation succeeds. Changed bytes remain
+// an integrity failure.
+func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string, retained []state.GenerationFile, store *state.Store) (*publicGenerationSnapshot, []state.PackageFact, error) {
 	workmetrics.RecordMetadataTreeHash(ctx)
 	objects, err := store.ListPackageObjects(ctx, nil, false)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	fingerprints, err := store.ListPackageFingerprints(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	fingerprintByDigest := make(map[string]state.PackageFingerprintRecord, len(fingerprints))
 	for _, fingerprint := range fingerprints {
@@ -50,7 +51,7 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 	payloads := make(map[string]publicPayloadExpectation)
 	for _, file := range retained {
 		if _, duplicate := expected[file.Path]; duplicate {
-			return nil, fmt.Errorf("%w: retained Generation repeats path %s", ErrIntegrity, file.Path)
+			return nil, nil, fmt.Errorf("%w: retained Generation repeats path %s", ErrIntegrity, file.Path)
 		}
 		expected[file.Path] = file
 		if file.Phase != "payload" {
@@ -58,7 +59,7 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 		}
 		object, exists := objectByPath[file.Path]
 		if !exists || object.SHA256 != file.SHA256 || object.Size != file.Size {
-			return nil, fmt.Errorf("%w: retained payload %s differs from PackageObject", ErrIntegrity, file.Path)
+			return nil, nil, fmt.Errorf("%w: retained payload %s differs from PackageObject", ErrIntegrity, file.Path)
 		}
 		fingerprint, factExists := fingerprintByDigest[object.SHA256]
 		payloads[file.Path] = publicPayloadExpectation{file: file, object: object, fingerprint: fingerprint.Fingerprint, factExists: factExists}
@@ -147,7 +148,7 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 		return nil
 	}, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(seen) != len(expected) {
 		missing := make([]string, 0, len(expected)-len(seen))
@@ -157,16 +158,10 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 			}
 		}
 		sort.Strings(missing)
-		return nil, fmt.Errorf("%w: retained public delivery path is missing: %s", ErrIntegrity, missing[0])
-	}
-	if !store.ReadOnly() {
-		err = store.UpdatePackageFingerprints(ctx, backfill)
-	}
-	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("%w: retained public delivery path is missing: %s", ErrIntegrity, missing[0])
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
-	return &publicGenerationSnapshot{Manifest: files, Identities: identities, AuthenticatedPayloads: authenticated}, nil
+	return &publicGenerationSnapshot{Manifest: files, Identities: identities, AuthenticatedPayloads: authenticated}, backfill, nil
 }
 
 func packageFingerprint(identity rootedRegularIdentity) *state.PackageFingerprint {

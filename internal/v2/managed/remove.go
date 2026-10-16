@@ -68,10 +68,7 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	if err != nil {
 		return result, err
 	}
-	if _, err := checkConfigAtRootForLockedRepository(ctx, ws.Root, cfg, repoName, signingFormatMask{}); err != nil {
-		return result, err
-	}
-	currentSnapshot, err := validateCurrentPublicGenerationSnapshot(ctx, ws.Root, repoName, store)
+	currentSnapshot, err := validateMutationRepositorySnapshot(ctx, ws.Root, cfg, repoName, signingFormatMask{}, store)
 	if err != nil {
 		return result, err
 	}
@@ -252,9 +249,6 @@ func previewRemove(ctx context.Context, opts RemoveOptions) (result RemoveResult
 		return result, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
-	if _, err := checkConfigAtRootForLockedRepository(ctx, ws.Root, cfg, repoName, signingFormatMask{}); err != nil {
-		return result, err
-	}
 	pending, err := store.PendingOperations(ctx)
 	if err != nil || len(pending) != 0 {
 		return result, fmt.Errorf("%w: repository has an operation pending recovery", ErrIntegrity)
@@ -262,7 +256,7 @@ func previewRemove(ctx context.Context, opts RemoveOptions) (result RemoveResult
 	if err := requireNoWriteActivePublication(ctx, store); err != nil {
 		return result, err
 	}
-	currentSnapshot, err := validateCurrentPublicGenerationSnapshot(ctx, ws.Root, repoName, store)
+	currentSnapshot, err := validateMutationRepositorySnapshot(ctx, ws.Root, cfg, repoName, signingFormatMask{}, store)
 	if err != nil {
 		return result, err
 	}

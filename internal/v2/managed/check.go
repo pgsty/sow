@@ -600,7 +600,7 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 			if targetIsPublic && recoveryView != nil && recoveryView.manifest.Build != nil {
 				expectedGeneration = recoveryView.manifest.Build.Generation
 			}
-			validateErr = validateManagedAPTIndex(ctx, filepath.Join(ws.Root, repoName), distName, validationArchitectures, expectedPackages, &expectedGeneration)
+			validateErr = validateManagedAPTIndexWithEvidence(ctx, filepath.Join(ws.Root, repoName), distName, validationArchitectures, expectedPackages, &expectedGeneration, evidenceRegistry)
 			if validateErr != nil {
 				indexIssues = append(indexIssues, fmt.Sprintf("Dist %s APT index differs: %v", distName, validateErr))
 			}

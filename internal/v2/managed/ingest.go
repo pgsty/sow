@@ -181,10 +181,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	if err != nil {
 		return result, err
 	}
-	if _, err := checkConfigAtRootForLockedRepository(ctx, ws.Root, cfg, repoName, signingFormatMask{}); err != nil {
-		return result, err
-	}
-	currentSnapshot, err := validateCurrentPublicGenerationSnapshot(ctx, ws.Root, repoName, store)
+	currentSnapshot, err := validateMutationRepositorySnapshot(ctx, ws.Root, cfg, repoName, signingFormatMask{}, store)
 	if err != nil {
 		return result, err
 	}

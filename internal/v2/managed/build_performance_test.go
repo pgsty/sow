@@ -689,6 +689,7 @@ func TestWarmManagedBuildUsesFactsAndStatWithoutPayloadReads(t *testing.T) {
 		if metrics.StatHits != 1 || metrics.StatMisses != 0 || metrics.FactCacheHits != 1 || metrics.FactCacheMisses != 0 {
 			t.Fatalf("warm build did not use one stat/fact cache hit: %#v", metrics)
 		}
+		t.Logf("warm Build: %d full reads, %d bytes", metrics.FullPackageReads, metrics.PayloadBytesRead)
 		return
 	}
 	t.Fatalf("warm build omitted build_metrics: events=%#v", detail.Events)
@@ -916,6 +917,147 @@ func TestManagedFingerprintDriftRehashesOnceAndSelfHeals(t *testing.T) {
 	}
 }
 
+func TestMutationValidationRejectsBeforeFingerprintRepair(t *testing.T) {
+	for _, rejection := range []string{"config", "metadata", "payload"} {
+		t.Run(rejection, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			options := WorkspaceOptions{Workdir: root, CWD: root}
+			cfg := config.Default()
+			cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"noble": {Format: "deb"}}}
+			writeManagedConfig(t, root, cfg)
+			if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+				t.Fatal(err)
+			}
+			body, err := managedBenchmarkDEBBytes("sow-validation")
+			if err != nil {
+				t.Fatal(err)
+			}
+			input := filepath.Join(root, "sow-validation_1.0-1_amd64.deb")
+			if err := os.WriteFile(input, body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Paths: []string{input}, Jobs: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			database := filepath.Join(root, ".sow", "repo.db")
+			store, err := state.OpenExisting(database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			object, err := store.GetPackageObject(ctx, added.Items[0].SHA256)
+			if err != nil {
+				store.Close()
+				t.Fatal(err)
+			}
+			switch rejection {
+			case "config":
+				repository := cfg.Repositories["repo"]
+				dist := repository.Dists["noble"]
+				dist.Format = "rpm"
+				repository.Dists["noble"] = dist
+				cfg.Repositories["repo"] = repository
+				writeManagedConfig(t, root, cfg)
+			case "metadata":
+				// Make the physical manifest self-consistent but the Release
+				// semantically invalid, so rejection follows snapshot hashing.
+				const relative = "dists/noble/Release"
+				filename := filepath.Join(root, "repo", filepath.FromSlash(relative))
+				data, err := os.ReadFile(filename)
+				if err != nil {
+					store.Close()
+					t.Fatal(err)
+				}
+				data = bytes.Replace(data, []byte("Origin: SOW"), []byte("Origin: Bad"), 1)
+				if err := os.WriteFile(filename, data, 0o644); err != nil {
+					store.Close()
+					t.Fatal(err)
+				}
+				manifest, err := store.GenerationManifest(ctx, added.Generation)
+				if err != nil {
+					store.Close()
+					t.Fatal(err)
+				}
+				for index := range manifest {
+					if manifest[index].Path == relative {
+						manifest[index].Size, manifest[index].SHA256 = int64(len(data)), bytesSHA(data)
+					}
+				}
+				_, manifestSHA, err := state.ManifestBytes(manifest)
+				if err != nil {
+					store.Close()
+					t.Fatal(err)
+				}
+				for _, update := range []struct {
+					sql  string
+					args []any
+				}{
+					{`UPDATE generation_files SET size = ?, sha256 = ? WHERE generation = ? AND path = ?`, []any{len(data), bytesSHA(data), added.Generation, relative}},
+					{`UPDATE generations SET manifest_sha256 = ? WHERE generation = ?`, []any{manifestSHA, added.Generation}},
+					{`UPDATE operation_files SET size = ?, sha256 = ? WHERE operation_id = ? AND path = ?`, []any{len(data), bytesSHA(data), added.Operation, relative}},
+				} {
+					if _, err := store.DB().ExecContext(ctx, update.sql, update.args...); err != nil {
+						store.Close()
+						t.Fatal(err)
+					}
+				}
+				if err := store.ValidateGenerationLedger(ctx); err != nil {
+					store.Close()
+					t.Fatalf("metadata rejection fixture ledger: %v", err)
+				}
+			case "payload":
+				filename := filepath.Join(root, "repo", filepath.FromSlash(object.PoolPath))
+				before, err := os.Stat(filename)
+				if err != nil {
+					store.Close()
+					t.Fatal(err)
+				}
+				time.Sleep(2 * time.Millisecond)
+				body[len(body)-1] ^= 1
+				if err := os.WriteFile(filename, body, 0o644); err != nil {
+					store.Close()
+					t.Fatal(err)
+				}
+				if err := os.Chtimes(filename, before.ModTime(), before.ModTime()); err != nil {
+					store.Close()
+					t.Fatal(err)
+				}
+			}
+			if rejection != "payload" {
+				if _, err := store.DB().ExecContext(ctx, `UPDATE package_facts SET device = NULL, inode = NULL, size = NULL, mtime_ns = NULL, ctime_ns = NULL WHERE package_sha256 = ?`, object.SHA256); err != nil {
+					store.Close()
+					t.Fatal(err)
+				}
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			beforeDB, err := os.ReadFile(database)
+			if err != nil {
+				t.Fatal(err)
+			}
+			buildCtx, collector := workmetrics.Ensure(ctx)
+			if _, err := Build(buildCtx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1}); !errors.Is(err, ErrIntegrity) {
+				t.Fatalf("%s Build error=%v", rejection, err)
+			} else if rejection == "metadata" && !strings.Contains(err.Error(), "Origin") {
+				t.Fatalf("metadata fixture failed before semantic validation: %v", err)
+			}
+			afterDB, err := os.ReadFile(database)
+			if err != nil || !bytes.Equal(beforeDB, afterDB) {
+				t.Fatalf("rejected %s changed database: read err=%v", rejection, err)
+			}
+			wantReads := int64(1)
+			if rejection == "config" {
+				wantReads = 0
+			}
+			if metrics := collector.Snapshot(); metrics.FullPackageReads != wantReads || metrics.PayloadByPhase["apt_index_payload"].Full != 0 {
+				t.Fatalf("rejected %s metrics=%#v", rejection, metrics)
+			}
+		})
+	}
+}
+
 func TestManagedMissingAndPoisonedFactsLazilyRebuild(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -980,6 +1122,7 @@ func TestManagedMissingAndPoisonedFactsLazilyRebuild(t *testing.T) {
 	if metrics.FactCacheMisses != 1 || metrics.FullPackageReads != 1 || metrics.PayloadByPhase["current_public_generation"].Full != 1 || metrics.PayloadByPhase["facts_backfill"].Full != 0 {
 		t.Fatalf("missing facts were not lazily rebuilt: %#v", metrics)
 	}
+	t.Logf("missing-facts Build: %d full read, %d bytes, phases=%v", metrics.FullPackageReads, metrics.PayloadBytesRead, metrics.PayloadByPhase)
 	store, err = state.Open(database)
 	if err != nil {
 		t.Fatal(err)
@@ -1331,7 +1474,11 @@ func managedBenchmarkDEBBytes(packageName string) ([]byte, error) {
 }
 
 func managedBenchmarkDEBBytesWithPayload(packageName string, payloadBytes int) ([]byte, error) {
-	control := []byte(fmt.Sprintf("Package: %s\nVersion: 1.0-1\nArchitecture: amd64\nMaintainer: SOW Performance <sow@example.invalid>\nSection: utils\nPriority: optional\nDescription: managed build performance fixture\n", packageName))
+	return managedBenchmarkDEBBytesForArchitecture(packageName, "amd64", payloadBytes)
+}
+
+func managedBenchmarkDEBBytesForArchitecture(packageName, architecture string, payloadBytes int) ([]byte, error) {
+	control := []byte(fmt.Sprintf("Package: %s\nVersion: 1.0-1\nArchitecture: %s\nMaintainer: SOW Performance <sow@example.invalid>\nSection: utils\nPriority: optional\nDescription: managed build performance fixture\n", packageName, architecture))
 	var controlTar bytes.Buffer
 	tw := tar.NewWriter(&controlTar)
 	if err := tw.WriteHeader(&tar.Header{Name: "control", Mode: 0o644, Size: int64(len(control))}); err != nil {

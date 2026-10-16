@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pgsty/sow/internal/v2/config"
+	"github.com/pgsty/sow/internal/v2/state"
 	"golang.org/x/sys/unix"
 )
 
@@ -394,12 +395,42 @@ func checkConfigAtRootWithLockedRepositories(ctx context.Context, root string, c
 	return checkConfigAtRootMode(ctx, root, cfg, configInspectionMode{lockedRepositories: lockedRepositories})
 }
 
-func checkConfigAtRootForLockedRepository(ctx context.Context, root string, cfg config.Config, repository string, formats signingFormatMask) (ConfigCheckResult, error) {
-	return checkConfigAtRootMode(ctx, root, cfg, configInspectionMode{
-		lockedRepositories: map[string]struct{}{repository: {}},
-		repositories:       map[string]struct{}{repository: {}},
-		signingFormats:     map[string]signingFormatMask{repository: formats},
-	})
+// validateMutationRepositorySnapshot keeps configuration and path rejection
+// ahead of any cache write. Once the current Generation is descriptor-bound,
+// live APT indexes can reuse its payload proof across every Dist/architecture.
+// Fingerprint repairs remain pending until metadata validation also succeeds.
+func validateMutationRepositorySnapshot(ctx context.Context, root string, cfg config.Config, repository string, formats signingFormatMask, store *state.Store) (*publicGenerationSnapshot, error) {
+	if _, err := checkConfigAtRootMode(ctx, root, cfg, configInspectionMode{
+		lockedRepositories:           map[string]struct{}{repository: {}},
+		repositories:                 map[string]struct{}{repository: {}},
+		signingFormats:               map[string]signingFormatMask{repository: formats},
+		skipLiveMetadataRepositories: map[string]struct{}{repository: {}},
+	}); err != nil {
+		return nil, err
+	}
+	snapshot, fingerprints, err := inspectCurrentPublicGenerationSnapshot(ctx, root, repository, store, "")
+	if err != nil {
+		return nil, err
+	}
+	evidence, err := payloadEvidenceForMutationSnapshot(snapshot)
+	if err != nil {
+		return nil, err
+	}
+	dists, err := store.ListDists(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, dist := range dists {
+		if err := validateLiveDistViewsWithEvidence(ctx, root, repository, dist.Format, dist.Name, dist.Architectures, evidence); err != nil {
+			return nil, err
+		}
+	}
+	if !store.ReadOnly() {
+		if err := store.UpdatePackageFingerprints(ctx, fingerprints); err != nil {
+			return nil, err
+		}
+	}
+	return snapshot, nil
 }
 
 func configuredSigningFormats(cfg config.Config, repository string, names []string) signingFormatMask {

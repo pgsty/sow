@@ -1239,49 +1239,59 @@ func validateCurrentPublicGenerationSnapshot(ctx context.Context, root, repoName
 // so the operator can remove it, while every other public path must still
 // match the retained Generation exactly.
 func validateCurrentPublicGenerationSnapshotExceptDist(ctx context.Context, root, repoName string, store *state.Store, ignoredDist string) (*publicGenerationSnapshot, error) {
+	snapshot, fingerprints, err := inspectCurrentPublicGenerationSnapshot(ctx, root, repoName, store, ignoredDist)
+	if err == nil && !store.ReadOnly() {
+		err = store.UpdatePackageFingerprints(ctx, fingerprints)
+	}
+	return snapshot, err
+}
+
+// inspectCurrentPublicGenerationSnapshot leaves fingerprint repairs pending so
+// a caller can finish semantic metadata validation before writing any cache.
+func inspectCurrentPublicGenerationSnapshot(ctx context.Context, root, repoName string, store *state.Store, ignoredDist string) (*publicGenerationSnapshot, []state.PackageFact, error) {
 	// Recovery is complete before ordinary writers reach this predicate.  At
 	// that point every semantic cross-table relation is part of the retained
 	// Generation contract, not merely the ledger and public bytes.  Refuse to
 	// append even a no-op audit record to corrupt state: doing so would both
 	// obscure the original defect and make later recovery reasoning ambiguous.
 	if err := store.Check(ctx); err != nil {
-		return nil, fmt.Errorf("%w: current repository state is invalid: %v", ErrIntegrity, err)
+		return nil, nil, fmt.Errorf("%w: current repository state is invalid: %v", ErrIntegrity, err)
 	}
 	if err := store.ValidateGenerationLedger(ctx); err != nil {
-		return nil, fmt.Errorf("%w: current Generation ledger is invalid: %v", ErrIntegrity, err)
+		return nil, nil, fmt.Errorf("%w: current Generation ledger is invalid: %v", ErrIntegrity, err)
 	}
 	summary, err := store.Summary(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if summary.BuiltGeneration == 0 {
 		snapshot, err := scanPublicGenerationSnapshot(workmetrics.WithPhase(ctx, "current_public_generation"), filepath.Join(root, repoName))
 		if err != nil {
-			return nil, fmt.Errorf("%w: current public delivery tree cannot be scanned: %v", ErrIntegrity, err)
+			return nil, nil, fmt.Errorf("%w: current public delivery tree cannot be scanned: %v", ErrIntegrity, err)
 		}
 		physical := snapshot.Manifest
 		if len(physical) != 0 {
-			return nil, fmt.Errorf("%w: Generation 0 public delivery tree is not empty", ErrIntegrity)
+			return nil, nil, fmt.Errorf("%w: Generation 0 public delivery tree is not empty", ErrIntegrity)
 		}
-		return snapshot, nil
+		return snapshot, nil, nil
 	}
 	retained, err := store.GenerationManifest(ctx, summary.BuiltGeneration)
 	if err != nil {
-		return nil, fmt.Errorf("%w: current Generation manifest is unavailable: %v", ErrIntegrity, err)
+		return nil, nil, fmt.Errorf("%w: current Generation manifest is unavailable: %v", ErrIntegrity, err)
 	}
 	if ignoredDist == "" {
-		snapshot, err := scanCurrentPublicGenerationFast(workmetrics.WithPhase(ctx, "current_public_generation"), filepath.Join(root, repoName), retained, store)
+		snapshot, fingerprints, err := scanCurrentPublicGenerationFast(workmetrics.WithPhase(ctx, "current_public_generation"), filepath.Join(root, repoName), retained, store)
 		if err != nil {
-			return nil, fmt.Errorf("%w: current public delivery tree cannot be validated: %v", ErrIntegrity, err)
+			return nil, nil, fmt.Errorf("%w: current public delivery tree cannot be validated: %v", ErrIntegrity, err)
 		}
-		return snapshot, nil
+		return snapshot, fingerprints, nil
 	}
 	// Forced Dist withdrawal is an exceptional repair path: its ignored
 	// subtree cannot be matched against the retained manifest, so keep the
 	// conservative full scan used by that operation.
 	snapshot, err := scanPublicGenerationSnapshot(workmetrics.WithPhase(ctx, "current_public_generation"), filepath.Join(root, repoName))
 	if err != nil {
-		return nil, fmt.Errorf("%w: current public delivery tree cannot be scanned: %v", ErrIntegrity, err)
+		return nil, nil, fmt.Errorf("%w: current public delivery tree cannot be scanned: %v", ErrIntegrity, err)
 	}
 	physical := snapshot.Manifest
 	if ignoredDist != "" {
@@ -1290,9 +1300,9 @@ func validateCurrentPublicGenerationSnapshotExceptDist(ctx context.Context, root
 		physical = filterGenerationManifestPrefix(physical, prefix)
 	}
 	if !sameGenerationManifest(retained, physical) {
-		return nil, fmt.Errorf("%w: current public delivery tree differs from Generation %d", ErrIntegrity, summary.BuiltGeneration)
+		return nil, nil, fmt.Errorf("%w: current public delivery tree differs from Generation %d", ErrIntegrity, summary.BuiltGeneration)
 	}
-	return snapshot, nil
+	return snapshot, nil, nil
 }
 
 func filterGenerationManifestPrefix(manifest []state.GenerationFile, prefix string) []state.GenerationFile {
@@ -1907,6 +1917,10 @@ func liveArchitectureView(root, repoName, distName, format string, architecture 
 }
 
 func validateLiveDistViews(ctx context.Context, root, repoName, format, distName string, architectures []state.Architecture) error {
+	return validateLiveDistViewsWithEvidence(ctx, root, repoName, format, distName, architectures, newPayloadEvidenceRegistry())
+}
+
+func validateLiveDistViewsWithEvidence(ctx context.Context, root, repoName, format, distName string, architectures []state.Architecture, evidence *payloadEvidenceRegistry) error {
 	if ctx == nil {
 		return fmt.Errorf("%w: nil validation context", ErrIntegrity)
 	}
@@ -1930,7 +1944,7 @@ func validateLiveDistViews(ctx context.Context, root, repoName, format, distName
 			}
 		}
 	case "deb":
-		if err := validateManagedAPTDist(ctx, filepath.Join(root, repoName), distName, architectures, nil, nil, nil); err != nil {
+		if err := validateManagedAPTDistWithEvidence(ctx, filepath.Join(root, repoName), distName, architectures, nil, nil, nil, evidence); err != nil {
 			return fmt.Errorf("%w: invalid managed DEB Dist: %v", ErrIntegrity, err)
 		}
 	default:

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 	"pault.ag/go/debian/control"
 	debversion "pault.ag/go/debian/version"
 )
@@ -25,12 +26,12 @@ type releaseChecksum struct {
 	size   int64
 }
 
-// validateManagedAPTDist is retained for lifecycle path validation, where the
+// validateManagedAPTDistWithEvidence is used for lifecycle path validation, where the
 // caller may not yet have a frozen verifier but must still reject a partial
 // InRelease/Release.gpg pair. Full `sow check` reports index and signature as
 // separate layers through the two narrower validators below.
-func validateManagedAPTDist(ctx context.Context, repositoryRoot, distName string, architectures []state.Architecture, verifier APTMetadataVerifier, expectedSigning *bool, expectedPackages map[string]map[string]state.PackageObject) error {
-	if err := validateManagedAPTIndex(ctx, repositoryRoot, distName, architectures, expectedPackages, nil); err != nil {
+func validateManagedAPTDistWithEvidence(ctx context.Context, repositoryRoot, distName string, architectures []state.Architecture, verifier APTMetadataVerifier, expectedSigning *bool, expectedPackages map[string]map[string]state.PackageObject, evidence *payloadEvidenceRegistry) error {
+	if err := validateManagedAPTIndexWithEvidence(ctx, repositoryRoot, distName, architectures, expectedPackages, nil, evidence); err != nil {
 		return err
 	}
 	if expectedSigning != nil {
@@ -50,6 +51,10 @@ func validateManagedAPTDist(ctx context.Context, repositoryRoot, distName string
 }
 
 func validateManagedAPTIndex(ctx context.Context, repositoryRoot, distName string, architectures []state.Architecture, expectedPackages map[string]map[string]state.PackageObject, expectedGeneration *state.GenerationID) error {
+	return validateManagedAPTIndexWithEvidence(ctx, repositoryRoot, distName, architectures, expectedPackages, expectedGeneration, newPayloadEvidenceRegistry())
+}
+
+func validateManagedAPTIndexWithEvidence(ctx context.Context, repositoryRoot, distName string, architectures []state.Architecture, expectedPackages map[string]map[string]state.PackageObject, expectedGeneration *state.GenerationID, evidence *payloadEvidenceRegistry) error {
 	releaseRelative := filepath.ToSlash(filepath.Join("dists", distName, "Release"))
 	release, err := readRootedRegular(repositoryRoot, releaseRelative, 16<<20, false)
 	if err != nil {
@@ -109,7 +114,7 @@ func validateManagedAPTIndex(ctx context.Context, repositoryRoot, distName strin
 				return fmt.Errorf("by-hash entry for %s is not its regular hardlink", relative)
 			}
 		}
-		if err := validateManagedPackagesParagraphs(ctx, repositoryRoot, plainRelativeRoot, architecture.EcosystemArch, expectedPackages[architecture.EcosystemArch]); err != nil {
+		if err := validateManagedPackagesParagraphs(ctx, repositoryRoot, plainRelativeRoot, architecture.EcosystemArch, expectedPackages[architecture.EcosystemArch], evidence); err != nil {
 			return err
 		}
 	}
@@ -329,7 +334,7 @@ func digestManagedIndex(ctx context.Context, root, relative string, compressed b
 	return hex.EncodeToString(hash.Sum(nil)), size, nil
 }
 
-func validateManagedPackagesParagraphs(ctx context.Context, repositoryRoot, relative, nativeArch string, expected map[string]state.PackageObject) error {
+func validateManagedPackagesParagraphs(ctx context.Context, repositoryRoot, relative, nativeArch string, expected map[string]state.PackageObject, evidence *payloadEvidenceRegistry) error {
 	opened, err := openRootedRegular(repositoryRoot, relative)
 	if err != nil {
 		return err
@@ -385,19 +390,6 @@ func validateManagedPackagesParagraphs(ctx context.Context, repositoryRoot, rela
 		if err != nil || want != values["Filename"] {
 			return finish(errors.New("invalid managed Packages Filename"))
 		}
-		pool, err := openRootedRegular(repositoryRoot, want)
-		if err != nil || pool.before.Size() != size {
-			if pool != nil {
-				_ = pool.CloseVerified()
-			}
-			return finish(errors.New("managed Packages references missing Pool bytes"))
-		}
-		poolHash := sha256.New()
-		_, hashErr := io.Copy(poolHash, &managedContextReader{ctx: ctx, reader: pool.file})
-		poolErr := pool.CloseVerified()
-		if hashErr != nil || poolErr != nil || hex.EncodeToString(poolHash.Sum(nil)) != values["SHA256"] {
-			return finish(errors.New("managed Packages checksum differs from Pool bytes"))
-		}
 		coordinate := name + "\x00" + canonicalVersion + "\x00" + arch
 		if _, duplicate := seen[coordinate]; duplicate {
 			return finish(errors.New("duplicate managed Packages coordinate"))
@@ -408,6 +400,13 @@ func validateManagedPackagesParagraphs(ctx context.Context, repositoryRoot, rela
 			if !ok || object.Name != name || object.Version != canonicalVersion || object.Architecture != arch || object.Size != size || object.PoolPath != want || object.Source != sourceName {
 				return finish(errors.New("managed Packages facts differ from Built state"))
 			}
+		}
+		// Each index entry must still name the same safe regular file and match
+		// its authenticated bytes. Shared Dists/architectures can reuse evidence
+		// from this command only while the opened physical identity is unchanged.
+		file := state.GenerationFile{Path: want, Phase: "payload", Size: size, SHA256: values["SHA256"]}
+		if err := evidence.verifyPayloadReference(workmetrics.WithPhase(ctx, "apt_index_payload"), repositoryRoot, file); err != nil {
+			return finish(fmt.Errorf("managed Packages checksum or path differs from Pool bytes: %w", err))
 		}
 		if _, duplicate := seenSHA[values["SHA256"]]; duplicate {
 			return finish(errors.New("managed Packages repeats a package object"))

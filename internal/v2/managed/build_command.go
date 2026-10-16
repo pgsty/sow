@@ -55,10 +55,7 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 		return result, err
 	}
 	selectedFormats := configuredSigningFormats(cfg, repoName, distNames)
-	if _, err := checkConfigAtRootForLockedRepository(ctx, ws.Root, cfg, repoName, selectedFormats); err != nil {
-		return result, err
-	}
-	currentSnapshot, err := validateCurrentPublicGenerationSnapshot(ctx, ws.Root, repoName, store)
+	currentSnapshot, err := validateMutationRepositorySnapshot(ctx, ws.Root, cfg, repoName, selectedFormats, store)
 	if err != nil {
 		return result, err
 	}

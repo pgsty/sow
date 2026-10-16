@@ -117,7 +117,12 @@ func TestCheckMissingFactsUsesAuthenticatedKnownHeaderWithoutSecondPayloadRead(t
 	root := t.TempDir()
 	options := WorkspaceOptions{Workdir: root, CWD: root}
 	cfg := config.Default()
-	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"noble": {Format: "deb"}}}
+	dists := []string{"bookworm", "jammy", "noble"}
+	repository := config.RepositoryConfig{Dists: make(map[string]config.DistConfig)}
+	for _, name := range dists {
+		repository.Dists[name] = config.DistConfig{Format: "deb", Architectures: []string{"x86_64", "aarch64"}}
+	}
+	cfg.Repositories["repo"] = repository
 	writeManagedConfig(t, root, cfg)
 	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
 		t.Fatal(err)
@@ -126,18 +131,49 @@ func TestCheckMissingFactsUsesAuthenticatedKnownHeaderWithoutSecondPayloadRead(t
 	if err := os.Mkdir(inputs, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	body, err := managedBenchmarkDEBBytesWithPayload("sow-check-facts", 1<<20)
+	body, err := managedBenchmarkDEBBytesForArchitecture("sow-check-facts", "all", 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := filepath.Join(inputs, "sow-check-facts_1.0-1_amd64.deb")
+	input := filepath.Join(inputs, "sow-check-facts_1.0-1_all.deb")
 	if err := os.WriteFile(input, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble"}, Paths: []string{input}, Jobs: 1})
+	added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: dists, Paths: []string{input}, Jobs: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := RetainAdd(ctx, RetainAddOptions{WorkspaceOptions: options, Repository: "repo", Generation: added.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	for revision := 1; revision <= 2; revision++ {
+		for name, dist := range repository.Dists {
+			dist.Exclude = []config.ExcludeRule{{Name: []string{fmt.Sprintf("__retained_deb_%d__", revision)}}}
+			repository.Dists[name] = dist
+		}
+		cfg.Repositories["repo"] = repository
+		writeManagedConfig(t, root, cfg)
+		built, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := RetainAdd(ctx, RetainAddOptions{WorkspaceOptions: options, Repository: "repo", Generation: built.Generation}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkOnce := func(name string, wantFactRows int64) {
+		t.Helper()
+		checkCtx, collector := workmetrics.Ensure(context.Background())
+		if checked, err := Check(checkCtx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 2}); err != nil || !checked.ReadyToCopy {
+			t.Fatalf("%s check=%#v err=%v", name, checked, err)
+		}
+		metrics := collector.Snapshot()
+		if metrics.FullPackageReads != 1 || metrics.PayloadBytesRead != int64(len(body)) || metrics.SignatureStreams != 0 || metrics.FactRowsRead != wantFactRows || metrics.PayloadByPhase["check_authenticity"].Full != 1 {
+			t.Fatalf("%s check metrics=%#v", name, metrics)
+		}
+		t.Logf("%s: 3 Dists, 2 architectures, 3 retained Generations, %d full read, %d bytes, phases=%v", name, metrics.FullPackageReads, metrics.PayloadBytesRead, metrics.PayloadByPhase)
+	}
+	checkOnce("cached facts", 1)
 	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -149,12 +185,21 @@ func TestCheckMissingFactsUsesAuthenticatedKnownHeaderWithoutSecondPayloadRead(t
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	checkCtx, collector := workmetrics.Ensure(context.Background())
-	if _, err := Check(checkCtx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1}); err != nil {
+	checkOnce("missing facts", 0)
+	store, err = state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if metrics := collector.Snapshot(); metrics.FullPackageReads != 1 || metrics.SignatureStreams != 0 || metrics.FactRowsRead != 0 {
-		t.Fatalf("missing-facts check metrics=%#v", metrics)
+	facts, factsErr := store.ListPackageFacts(ctx)
+	if err := errors.Join(factsErr, store.Close()); err != nil || len(facts) != 0 {
+		t.Fatalf("read-only Check persisted facts: facts=%#v err=%v", facts, err)
+	}
+	changesCtx, changesCollector := workmetrics.Ensure(context.Background())
+	if _, err := Changes(changesCtx, ChangesOptions{WorkspaceOptions: options, Repository: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	if metrics := changesCollector.Snapshot(); metrics.FullPackageReads != 1 || metrics.PayloadBytesRead != int64(len(body)) {
+		t.Fatalf("Changes rehashed shared DEB: %#v", metrics)
 	}
 }
 
