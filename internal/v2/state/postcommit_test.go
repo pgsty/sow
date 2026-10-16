@@ -542,3 +542,114 @@ func TestPostcommitCheckpointDeadlineAndRestoreDiagnostics(t *testing.T) {
 		})
 	}
 }
+
+func TestAbandonLayoutTransitionRetainsExistingEligibility(t *testing.T) {
+	for _, layout := range []string{LayoutC2V1, LayoutC2ToSingleV1, LayoutSinglePayloadV1} {
+		t.Run(layout, func(t *testing.T) {
+			ctx := context.Background()
+			s, _ := postcommitOpen(t, func(s *Store) {
+				if _, err := s.DB().Exec(`UPDATE repository_state SET layout_version = ?`, layout); err != nil {
+					t.Fatal(err)
+				}
+			})
+			before, err := s.RepositoryIdentity(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if layout == LayoutC2ToSingleV1 {
+				if err := s.AnchorLayoutTransitionPlan(ctx, before.RepositoryID, 0, strings.Repeat("a", 64), strings.Repeat("b", 64), "2026-08-05T12:00:00Z"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for attempt := range 2 {
+				err := s.AbandonLayoutTransition(ctx)
+				if layout == LayoutC2ToSingleV1 && err != nil || layout != LayoutC2ToSingleV1 && !errors.Is(err, ErrTransition) {
+					t.Fatalf("attempt=%d layout=%s err=%v", attempt, layout, err)
+				}
+				after, err := s.RepositoryIdentity(ctx)
+				if err != nil || before != after {
+					t.Fatalf("abort rewrote identity/layout/receipt: before=%+v after=%+v err=%v", before, after, err)
+				}
+				if n := postcommitCount(t, s, `SELECT count(*) FROM layout_transition_control`); n != 0 {
+					t.Fatalf("control remains: %d", n)
+				}
+			}
+		})
+	}
+}
+
+func TestPostcommitAbandonLayoutTransitionBoundary(t *testing.T) {
+	for _, mode := range []string{"canceled-before", "after", "io", "checkpoint_timeout", "committed-intent"} {
+		t.Run(mode, func(t *testing.T) {
+			s, hook := postcommitOpen(t, func(s *Store) {
+				if _, err := s.DB().Exec(`UPDATE repository_state SET layout_version = ?`, LayoutC2ToSingleV1); err != nil {
+					t.Fatal(err)
+				}
+				identity, err := s.RepositoryIdentity(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := s.AnchorLayoutTransitionPlan(context.Background(), identity.RepositoryID, 0, strings.Repeat("a", 64), strings.Repeat("b", 64), "2026-08-05T12:00:00Z"); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "committed-intent" {
+					if err := s.CommitLayoutTransitionPlan(context.Background(), strings.Repeat("b", 64), "2026-08-05T12:00:00Z", "2026-09-05T12:00:00Z"); err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
+			before, err := s.RepositoryIdentity(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			postcommitArm(hook, mode, cancel)
+			if mode == "canceled-before" {
+				cancel()
+			}
+			started := time.Now()
+			err = s.AbandonLayoutTransition(ctx)
+			wantControl := mode == "canceled-before" || mode == "committed-intent"
+			switch mode {
+			case "canceled-before":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatal(err)
+				}
+			case "committed-intent":
+				if !errors.Is(err, ErrTransition) {
+					t.Fatal(err)
+				}
+			case "after":
+				if err != nil || ctx.Err() == nil {
+					t.Fatalf("durable reset err=%v context=%v", err, ctx.Err())
+				}
+			case "io":
+				assertPostcommitError(t, err, true)
+				if !errors.Is(err, syscall.EIO) {
+					t.Fatal(err)
+				}
+			case "checkpoint_timeout":
+				assertPostcommitError(t, err, true)
+				if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > 6*time.Second {
+					t.Fatalf("unbounded/reset diagnostic: %v duration=%v", err, time.Since(started))
+				}
+			}
+			control, readErr := s.LayoutTransitionControl(context.Background())
+			if readErr != nil || (control != nil) != wantControl {
+				t.Fatalf("durable control=%+v want=%t err=%v", control, wantControl, readErr)
+			}
+			after, readErr := s.RepositoryIdentity(context.Background())
+			if readErr != nil || before != after {
+				t.Fatalf("identity changed: before=%+v after=%+v err=%v", before, after, readErr)
+			}
+			postcommitArm(hook, "", nil)
+			if !wantControl {
+				if err := s.AbandonLayoutTransition(context.Background()); err != nil {
+					t.Fatalf("repeat reset: %v", err)
+				}
+			}
+			t.Logf("mode=%s error=%v control_retained=%t layout=%s", mode, err, wantControl, after.LayoutVersion)
+		})
+	}
+}

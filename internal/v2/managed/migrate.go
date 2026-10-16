@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -1463,6 +1464,9 @@ func deleteLegacyAliases(ctx context.Context, root, repoName string, journal *C2
 }
 
 func AbandonRepositoryMigration(ctx context.Context, opts RepositoryMigrationOptions) (result RepositoryMigrationResult, resultErr error) {
+	if ctx == nil {
+		return result, errors.New("managed: nil migration context")
+	}
 	ws, cfg, _, rootGuard, err := migrationWorkspace(opts.WorkspaceOptions)
 	if err != nil {
 		return result, err
@@ -1501,45 +1505,278 @@ func AbandonRepositoryMigration(ctx context.Context, opts RepositoryMigrationOpt
 	if journal != nil && journal.CommitIntent || control != nil && control.CommitIntentAt != "" {
 		return result, fmt.Errorf("%w: migration can be abandoned only before commit_intent", ErrRejected)
 	}
-	if identity.LayoutVersion == state.LayoutSinglePayloadV1 {
-		return result, fmt.Errorf("%w: terminal Repository has no migration to abandon", ErrRejected)
+	if identity.LayoutVersion != state.LayoutC2ToSingleV1 {
+		return result, fmt.Errorf("%w: Repository has no resumable C2 transition to abandon", ErrRejected)
 	}
-	if journal != nil && control != nil {
-		planIdentity, planErr := transitionPlanIdentity(*journal)
-		if planErr != nil || journal.RepositoryID != control.RepositoryID || journal.BaseGeneration != control.BaseGeneration || journal.TargetManifestSHA256 != control.TargetManifestSHA256 || planIdentity != control.PlanIdentitySHA256 {
-			return result, fmt.Errorf("%w: journal and migration control differ", ErrIntegrity)
+	stageFiles, stagePresent, err := validateMigrationAbandon(ctx, ws.Root, repoName, store, identity, summary.BuiltGeneration, journal, control)
+	if err != nil {
+		return result, err
+	}
+	if err := callFault(opts.Fault, "migrate.abort_validated"); err != nil {
+		return result, err
+	}
+	if stagePresent {
+		stage := migrationStageRoot(ws.Root, repoName)
+		// Unlink only verified plan bytes and their exact parent directories.
+		// Even empty unknown directories appearing during cleanup survive.
+		directories := map[string]struct{}{}
+		for _, pointer := range journal.Pointers {
+			for parent := path.Dir(pointer.Path); parent != "."; parent = path.Dir(parent) {
+				directories[parent] = struct{}{}
+			}
 		}
-	}
-	repositoryID, base := identity.RepositoryID, summary.BuiltGeneration
-	if journal != nil {
-		repositoryID, base = journal.RepositoryID, journal.BaseGeneration
-	} else if control != nil {
-		repositoryID, base = control.RepositoryID, control.BaseGeneration
-	}
-	stage := migrationStageRoot(ws.Root, repoName)
-	if _, err := os.Lstat(stage); err == nil {
-		if err := removeOwnedDirectory(stage, filepath.Join(ws.Root, ".sow", repoName, "stage")); err != nil {
+		for _, file := range stageFiles {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
+			if err := removeRootedRegularExact(ctx, stage, filepath.FromSlash(file.Path), file.Size, file.SHA256); err != nil {
+				return result, err
+			}
+			if err := callFault(opts.Fault, "migrate.abort_file."+file.Path); err != nil {
+				return result, err
+			}
+		}
+		ordered := make([]string, 0, len(directories))
+		for directory := range directories {
+			ordered = append(ordered, directory)
+		}
+		sort.Sort(sort.Reverse(sort.StringSlice(ordered)))
+		for _, directory := range ordered {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
+			if err := removeRootedEmptyDirectory(stage, filepath.FromSlash(directory)); err != nil {
+				return result, err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		if err := removeRootedEmptyDirectory(filepath.Dir(stage), filepath.Base(stage)); err != nil {
 			return result, err
 		}
 	}
-	if identity.LayoutVersion == state.LayoutC2ToSingleV1 {
-		// SQLite authority is rolled back before the filesystem journal is
-		// removed.  A crash at this seam leaves a readable C2 Repository plus a
-		// stale precommit journal that the next --abort can safely clear.
+	if err := callFault(opts.Fault, "migrate.abort_stage"); err != nil {
+		return result, err
+	}
+	if control != nil {
+		// Retain the transition marker, even after the plan is reset. If
+		// checkpoint maintenance fails, keep the journal for a repeated abort.
 		if err := store.AbandonLayoutTransition(ctx); err != nil {
 			return result, err
 		}
-		if err := callFault(opts.Fault, "migrate.abort_state"); err != nil {
-			return result, err
-		}
-	} else if identity.LayoutVersion != state.LayoutC2V1 {
-		return result, fmt.Errorf("%w: unsupported Repository layout %q", ErrIntegrity, identity.LayoutVersion)
+	}
+	if err := callFault(opts.Fault, "migrate.abort_state"); err != nil {
+		return result, err
+	}
+	if err := ctx.Err(); err != nil {
+		return result, err
 	}
 	if journal != nil {
 		if err := clearTransitionJournal(ws.Root, repoName); err != nil {
 			return result, err
 		}
 	}
-	result = RepositoryMigrationResult{Repository: repoName, RepositoryID: repositoryID, FromLayout: state.LayoutC2V1, ToLayout: state.LayoutSinglePayloadV1, Phase: "abandoned", Generation: base}
+	result = RepositoryMigrationResult{Repository: repoName, RepositoryID: identity.RepositoryID, FromLayout: state.LayoutC2V1, ToLayout: state.LayoutSinglePayloadV1, Phase: "abandoned", Generation: summary.BuiltGeneration}
 	return result, nil
+}
+
+// validateMigrationAbandon proves that public bytes still match the old Built
+// generation. Unlike resume, discarding an uncommitted plan needs no private
+// signer. A missing control is accepted only for cleanup after the stage and
+// SQLite plan were already removed; a journal alone never authorizes deletion.
+func validateMigrationAbandon(ctx context.Context, root, repoName string, store *state.Store, identity state.RepositoryIdentity, generation state.GenerationID, journal *C2ToSingleTransition, control *state.LayoutTransitionControl) ([]state.GenerationFile, bool, error) {
+	if identity.TransitionReceiptSHA256 != "" {
+		return nil, false, fmt.Errorf("%w: precommit transition has a completion receipt", ErrIntegrity)
+	}
+	base := []state.GenerationFile{}
+	var err error
+	if generation > 0 {
+		base, err = store.GenerationManifest(ctx, generation)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+	_, baseDigest, err := state.ManifestBytesForLayout(base, state.LayoutC2V1)
+	if err != nil {
+		return nil, false, err
+	}
+	if journal != nil && (journal.RepositoryID != identity.RepositoryID || journal.BaseGeneration != generation || journal.BaseManifestSHA256 != baseDigest) {
+		return nil, false, fmt.Errorf("%w: abandoned plan differs from Repository identity/base", ErrIntegrity)
+	}
+	if journal != nil {
+		baseByPath := generationFilesByPath(base)
+		for _, pointer := range journal.Pointers {
+			if old, exists := baseByPath[pointer.Path]; !exists || pointer.State != "old" || old.SHA256 != pointer.OldSHA256 {
+				return nil, false, fmt.Errorf("%w: abandoned pointer differs from old Built state", ErrIntegrity)
+			}
+		}
+		for _, alias := range journal.LegacyAliases {
+			if old, exists := baseByPath[alias.Path]; !exists || alias.State != "present" || old.Size != int64(alias.Size) || old.SHA256 != alias.SHA256 {
+				return nil, false, fmt.Errorf("%w: abandoned alias differs from old Built state", ErrIntegrity)
+			}
+		}
+	}
+	if control != nil {
+		if control.RepositoryID != identity.RepositoryID || control.BaseGeneration != generation {
+			return nil, false, fmt.Errorf("%w: abandoned control differs from Repository identity/base", ErrIntegrity)
+		}
+		if journal != nil {
+			planIdentity, planErr := transitionPlanIdentity(*journal)
+			if planErr != nil || journal.TargetManifestSHA256 != control.TargetManifestSHA256 || planIdentity != control.PlanIdentitySHA256 {
+				return nil, false, fmt.Errorf("%w: journal and migration control differ: %v", ErrIntegrity, planErr)
+			}
+		}
+	}
+	physical, err := scanPublicManifestForLayout(ctx, filepath.Join(root, repoName), state.LayoutC2V1)
+	if err != nil {
+		return nil, false, err
+	}
+	if !sameGenerationManifest(base, physical) {
+		return nil, false, fmt.Errorf("%w: public tree changed before migration abort", ErrIntegrity)
+	}
+	if err := store.ValidateGenerationLedger(ctx); err != nil {
+		return nil, false, fmt.Errorf("%w: migration base ledger is invalid: %w", ErrIntegrity, err)
+	}
+	if err := validateC2MigrationSource(ctx, root, repoName, store); err != nil {
+		return nil, false, fmt.Errorf("%w: migration source is invalid: %w", ErrIntegrity, err)
+	}
+	stage := migrationStageRoot(root, repoName)
+	info, err := os.Lstat(stage)
+	if errors.Is(err, os.ErrNotExist) {
+		// Lstat follows ancestor symlinks. Prove absence beneath the workspace
+		// with no-follow lookup before treating cleanup as already complete.
+		owner, ownerErr := openRootedDirectoryChain(root, filepath.Join(".sow", repoName, "stage"), false, 0)
+		if errors.Is(ownerErr, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		if ownerErr != nil {
+			return nil, false, fmt.Errorf("%w: migration stage owner is unsafe: %w", ErrIntegrity, ownerErr)
+		}
+		var entry unix.Stat_t
+		entryErr := unix.Fstatat(int(owner.directory().Fd()), filepath.Base(stage), &entry, unix.AT_SYMLINK_NOFOLLOW)
+		if !errors.Is(entryErr, os.ErrNotExist) {
+			return nil, false, errors.Join(fmt.Errorf("%w: migration stage reappeared during absence check", ErrIntegrity), entryErr, owner.close(true))
+		}
+		if closeErr := owner.close(true); closeErr != nil {
+			return nil, false, closeErr
+		}
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, false, fmt.Errorf("%w: migration stage is not a real directory", ErrIntegrity)
+	}
+	if journal == nil || control == nil {
+		return nil, false, fmt.Errorf("%w: cannot authenticate migration stage without its journal and SQLite plan; retain it for inspection", ErrIntegrity)
+	}
+	expectedViews, err := expectedMigrationRPMViews(ctx, store)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := validateMigrationRPMViewSet(expectedViews, journal.Pointers); err != nil {
+		return nil, false, err
+	}
+	// The anchored repomd digest authenticates its artifact inventory even
+	// after abort has removed some artifacts. Pointer/signature digests are
+	// directly bound by the SQL plan; no absent file must be reconstructed.
+	actualStage, err := scanPublicManifest(ctx, stage)
+	if err != nil {
+		return nil, false, err
+	}
+	actualByPath := generationFilesByPath(actualStage)
+	pointers := map[string]bool{}
+	authorized := map[string]state.GenerationFile{}
+	// File manifests do not cover empty directories. Preserve unexpected
+	// directories too, even when they contain no regular files.
+	directories := map[string]bool{"": true}
+	for _, pointer := range journal.Pointers {
+		pointers[pointer.Path] = true
+		for parent := path.Dir(pointer.Path); parent != "."; parent = path.Dir(parent) {
+			directories[parent] = true
+		}
+		file, exists := actualByPath[pointer.Path]
+		if !exists {
+			continue
+		}
+		if file.SHA256 != pointer.NewSHA256 {
+			return nil, false, fmt.Errorf("%w: migration stage pointer differs from anchored plan", ErrIntegrity)
+		}
+		authorized[file.Path] = file
+		if pointer.Kind != "commit_pointer" {
+			continue
+		}
+		data, err := readRootedRegular(stage, pointer.Path, 4<<20, false)
+		if err != nil {
+			return nil, false, err
+		}
+		if bytesSHA(data) != pointer.NewSHA256 || int64(len(data)) != file.Size {
+			return nil, false, fmt.Errorf("%w: migration stage pointer changed while reading", ErrIntegrity)
+		}
+		artifacts, err := migrationAbandonArtifacts(data, pointer.ViewID)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, artifact := range artifacts {
+			authorized[artifact.Path] = artifact
+		}
+	}
+	for _, file := range actualStage {
+		if expected, exists := authorized[file.Path]; !exists || expected != file {
+			return nil, false, fmt.Errorf("%w: migration stage file %q lacks its anchored identity", ErrIntegrity, file.Path)
+		}
+	}
+	if err := walkRootedTree(ctx, stage, nil, func(relative string, _ *os.File, _ os.FileInfo) error {
+		if !directories[relative] {
+			return fmt.Errorf("%w: migration stage contains unknown directory %q", ErrIntegrity, relative)
+		}
+		return nil
+	}); err != nil {
+		return nil, false, err
+	}
+	// Remove all artifacts before any repomd pointer so every remaining
+	// artifact stays provable across a file unlink failure or cancellation.
+	sort.SliceStable(actualStage, func(i, j int) bool {
+		return !pointers[actualStage[i].Path] && pointers[actualStage[j].Path]
+	})
+	return actualStage, true, nil
+}
+
+// migrationAbandonArtifacts reads only a repomd whose complete bytes already
+// match the SQL-anchored journal pointer. The path/checksum contract matches
+// yumrepo's managed gzip artifact format; it does not accept arbitrary hrefs.
+func migrationAbandonArtifacts(data []byte, viewID string) ([]state.GenerationFile, error) {
+	var document struct {
+		XMLName xml.Name `xml:"http://linux.duke.edu/metadata/repo repomd"`
+		Data    []struct {
+			Type     string `xml:"type,attr"`
+			Checksum struct {
+				Type  string `xml:"type,attr"`
+				Value string `xml:",chardata"`
+			} `xml:"checksum"`
+			Location struct {
+				Href string `xml:"href,attr"`
+			} `xml:"location"`
+			Size int64 `xml:"size"`
+		} `xml:"data"`
+	}
+	if err := xml.Unmarshal(data, &document); err != nil {
+		return nil, fmt.Errorf("%w: decode anchored migration repomd: %w", ErrIntegrity, err)
+	}
+	remaining := map[string]bool{"primary": true, "filelists": true, "other": true}
+	files := make([]state.GenerationFile, 0, len(remaining))
+	for _, record := range document.Data {
+		if !remaining[record.Type] || record.Checksum.Type != "sha256" || !lowercaseSHA256.MatchString(record.Checksum.Value) || record.Size < 0 ||
+			record.Location.Href != "repodata/"+record.Checksum.Value+"-"+record.Type+".xml.gz" {
+			return nil, fmt.Errorf("%w: invalid anchored migration artifact", ErrIntegrity)
+		}
+		delete(remaining, record.Type)
+		files = append(files, state.GenerationFile{Path: path.Join(viewID, record.Location.Href), Phase: "metadata", Size: record.Size, SHA256: record.Checksum.Value})
+	}
+	if len(remaining) != 0 {
+		return nil, fmt.Errorf("%w: incomplete anchored migration repomd inventory", ErrIntegrity)
+	}
+	return files, nil
 }

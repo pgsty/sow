@@ -199,15 +199,22 @@ func requireTerminalLayoutOn(ctx context.Context, q schemaQuerier) error {
 	return nil
 }
 
-// AbandonLayoutTransition is legal only before a migration persists commit
-// intent.  The managed journal validator owns that proof; this state primitive
-// merely performs the serialized layout rollback requested by it.
+// AbandonLayoutTransition discards an uncommitted plan, retaining the existing
+// transition layout so a later explicit migration can safely plan again. The
+// managed layer verifies the old public tree and cleans the owned stage first.
 func (s *Store) AbandonLayoutTransition(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	var layout string
+	if err := tx.QueryRowContext(ctx, `SELECT layout_version FROM repository_state WHERE singleton = 1`).Scan(&layout); err != nil {
+		return err
+	}
+	if layout != LayoutC2ToSingleV1 {
+		return fmt.Errorf("%w: repository is not in the C2 transition layout", ErrTransition)
+	}
 	var committed int
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM layout_transition_control WHERE singleton = 1 AND commit_intent_at IS NOT NULL)`).Scan(&committed); err != nil {
 		return err
@@ -217,17 +224,6 @@ func (s *Store) AbandonLayoutTransition(ctx context.Context) error {
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM layout_transition_control WHERE singleton = 1`); err != nil {
 		return err
-	}
-	result, err := tx.ExecContext(ctx, `UPDATE repository_state SET layout_version = ?, transition_receipt_sha256 = NULL WHERE singleton = 1 AND layout_version = ?`, LayoutC2V1, LayoutC2ToSingleV1)
-	if err != nil {
-		return err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows != 1 {
-		return fmt.Errorf("%w: repository is not in the C2 transition layout", ErrTransition)
 	}
 	if err := tx.Commit(); err != nil {
 		return err
