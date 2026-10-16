@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -233,28 +235,106 @@ func Open(path string) (*Store, error) {
 // permitting SQLite to create a replacement file. Lifecycle operations must
 // use this path so a missing state database is an integrity failure, never an
 // implicit reset beside an existing Pool.
-func OpenExisting(path string) (*Store, error) {
+func OpenExisting(path string) (_ *Store, err error) {
 	absolute, err := cleanDatabasePath(path, true)
 	if err != nil {
 		return nil, err
 	}
-	probe, err := openDatabaseMode(absolute, "ro", false, false)
+	probe, err := openDatabaseModeDetailed(absolute, "ro", false, false, false)
 	if err != nil {
 		return nil, err
 	}
-	probeStore := &Store{path: absolute, db: probe, schemaVersion: SchemaVersion}
-	probeErr := probeStore.validateSchema(context.Background())
-	closeErr := probe.Close()
-	if err := errors.Join(probeErr, closeErr); err != nil {
+	var probeConn, writerConn *sql.Conn
+	var db *sql.DB
+	closeProbe := func() error {
+		var closeErr error
+		if probeConn != nil {
+			closeErr = probeConn.Close()
+			probeConn = nil
+		}
+		if probe.db != nil {
+			closeErr = errors.Join(closeErr, probe.db.Close())
+			probe.db = nil
+		}
+		return closeErr
+	}
+	defer func() {
+		if err != nil {
+			// A live RO SQLite connection prevents the last RW close from
+			// checkpointing a rejected hot WAL. The inode-binding guard alone
+			// has never read SQL and cannot provide that protection.
+			if writerConn != nil {
+				err = errors.Join(err, writerConn.Close())
+			}
+			if db != nil {
+				err = errors.Join(err, db.Close())
+			}
+		}
+		err = errors.Join(err, closeProbe())
+	}()
+	// Conn pins the physical connection; run every probe query through it,
+	// never through the single-connection pool while it is reserved.
+	// https://pkg.go.dev/database/sql#DB.Conn
+	probeConn, err = probe.db.Conn(context.Background())
+	if err != nil {
 		return nil, err
 	}
-	db, err := openDatabaseMode(absolute, "rw", true, false)
+	ctx := context.Background()
+	if err := validateSchemaShape(ctx, probeConn, SchemaVersion); err != nil {
+		return nil, err
+	}
+	if probe.wal != nil {
+		var journal string
+		if err := probeConn.QueryRowContext(ctx, `PRAGMA journal_mode`).Scan(&journal); err != nil {
+			return nil, fmt.Errorf("%w: read journal mode: %v", ErrSchema, err)
+		}
+		if journal == "wal" {
+			if err := probe.wal.check(absolute); err != nil {
+				return nil, err
+			}
+			opened, openErr := openDatabaseModeDetailed(absolute, "rw", false, false, true)
+			if openErr != nil {
+				return nil, openErr
+			}
+			db = opened.db
+			writerConn, err = db.Conn(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if err := validateSchemaOn(ctx, writerConn, SchemaVersion); err != nil {
+				return nil, err
+			}
+			if err := probe.wal.check(absolute); err != nil {
+				return nil, err
+			}
+			if err := configureDatabaseWriter(ctx, writerConn); err != nil {
+				return nil, err
+			}
+			opened.connector.ready.Store(true)
+			if err := writerConn.Close(); err != nil {
+				return nil, err
+			}
+			writerConn = nil
+			if err := closeProbe(); err != nil {
+				return nil, err
+			}
+			return &Store{path: absolute, db: db, schemaVersion: SchemaVersion}, nil
+		}
+	}
+	// Sidecar-free, DELETE, and uncertain layouts retain the original full
+	// read-only preflight before any writable connection can change files.
+	if err := validateSchemaData(ctx, probeConn, SchemaVersion); err != nil {
+		return nil, err
+	}
+	if err := closeProbe(); err != nil {
+		return nil, err
+	}
+	db, err = openDatabaseMode(absolute, "rw", true, false)
 	if err != nil {
 		return nil, err
 	}
 	store := &Store{path: absolute, db: db, schemaVersion: SchemaVersion}
-	if err := store.validateSchema(context.Background()); err != nil {
-		db.Close()
+	if err := store.validateSchema(ctx); err != nil {
 		return nil, err
 	}
 	return store, nil
@@ -507,13 +587,124 @@ func openDatabase(path string, readOnly bool) (*sql.DB, error) {
 }
 
 func openDatabaseMode(path, mode string, writable, physicallyReadOnly bool) (*sql.DB, error) {
+	opened, err := openDatabaseModeDetailed(path, mode, writable, physicallyReadOnly, false)
+	if err != nil {
+		return nil, err
+	}
+	return opened.db, nil
+}
+
+// walReadFiles records only the identity of the normal WAL layout selected by
+// the RO opener. It is never evidence that database contents are unchanged.
+// All data checks still run on the actual writable connection.
+type walReadFiles struct {
+	files  [3]os.FileInfo
+	parent string
+}
+
+func (w *walReadFiles) check(path string) error {
+	if err := requireDatabasePrivateFiles(path); err != nil {
+		return err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil || parent != w.parent {
+		return fmt.Errorf("database parent changed during WAL validation: %w", errors.Join(err, ErrSchema))
+	}
+	for i, suffix := range []string{"", "-wal", "-shm"} {
+		info, err := os.Lstat(path + suffix)
+		if err != nil || !os.SameFile(w.files[i], info) {
+			return fmt.Errorf("database WAL layout changed during validation: %s: %w", path+suffix, errors.Join(err, ErrSchema))
+		}
+	}
+	return nil
+}
+
+type openedDatabase struct {
+	db        *sql.DB
+	wal       *walReadFiles
+	connector *validatedWriterConnector
+}
+
+// The first connection is query-only until its full validation succeeds. Later
+// pool reconnects need the ordinary writer DSN, including all durable settings.
+// Connector is the public per-pool driver extension point, not a global hook.
+// https://pkg.go.dev/database/sql/driver#Connector
+// https://pkg.go.dev/modernc.org/sqlite#NewConnector
+type validatedWriterConnector struct {
+	initial driver.Connector
+	writer  driver.Connector
+	ready   atomic.Bool
+}
+
+func (c *validatedWriterConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	if c.ready.Load() {
+		conn, err := c.writer.Connect(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := persistDatabaseWAL(conn); err != nil {
+			return nil, errors.Join(err, conn.Close())
+		}
+		return conn, nil
+	}
+	return c.initial.Connect(ctx)
+}
+
+func (c *validatedWriterConnector) Driver() driver.Driver { return c.initial.Driver() }
+
+func addDatabaseWriterPragmas(query url.Values) {
+	query.Add("_pragma", "journal_mode(WAL)")
+	query.Add("_pragma", "synchronous(FULL)")
+	if runtime.GOOS == "darwin" {
+		query.Add("_pragma", "fullfsync(1)")
+	}
+}
+
+func persistDatabaseWAL(driverConn any) error {
+	control, ok := driverConn.(sqlite.FileControl)
+	if !ok {
+		return errors.New("sqlite driver does not expose persistent WAL control")
+	}
+	mode, err := control.FileControlPersistWAL("main", 1)
+	if err != nil {
+		return err
+	}
+	if mode != 1 {
+		return fmt.Errorf("sqlite persistent WAL mode=%d", mode)
+	}
+	return nil
+}
+
+func configureDatabaseWriter(ctx context.Context, connection *sql.Conn) error {
+	pragmas := []string{"query_only(0)", "journal_mode(WAL)", "synchronous(FULL)"}
+	if runtime.GOOS == "darwin" {
+		pragmas = append(pragmas, "fullfsync(1)")
+	}
+	for _, pragma := range pragmas {
+		if _, err := connection.ExecContext(ctx, "PRAGMA "+pragma); err != nil {
+			return fmt.Errorf("configure repository sqlite writer: %w", err)
+		}
+	}
+	if err := connection.Raw(persistDatabaseWAL); err != nil {
+		return fmt.Errorf("enable persistent repository sqlite WAL: %w", err)
+	}
+	return nil
+}
+
+func openDatabaseModeDetailed(path, mode string, writable, physicallyReadOnly, staged bool) (_ *openedDatabase, err error) {
 	probe, probeInfo, existed, err := bindDatabaseFile(path, mode != "rwc")
 	if err != nil {
 		return nil, err
 	}
-	if probe != nil {
-		defer probe.Close()
-	}
+	opened := &openedDatabase{}
+	defer func() {
+		if probe != nil {
+			err = errors.Join(err, probe.Close())
+		}
+		if err != nil && opened.db != nil {
+			err = errors.Join(err, opened.db.Close())
+		}
+	}()
 	u := &url.URL{Scheme: "file", Path: filepath.ToSlash(path)}
 	query := url.Values{}
 	query.Set("mode", mode)
@@ -522,8 +713,7 @@ func openDatabaseMode(path, mode string, writable, physicallyReadOnly bool) (*sq
 		// COMMIT and the application's explicit checkpoint. immutable=1 would
 		// silently ignore that WAL and misreport a recovering Repository as
 		// clean. Use immutable for the settled, sidecar-free case so reads cannot
-		// create SQLite files; only an already-existing non-empty WAL selects the
-		// normal read-only WAL path.
+		// create SQLite files. Existing WAL/SHM use the normal read-only path.
 		query.Add("_pragma", "query_only(1)")
 		walInfo, statErr := os.Lstat(path + "-wal")
 		switch {
@@ -541,6 +731,13 @@ func openDatabaseMode(path, mode string, writable, physicallyReadOnly bool) (*sq
 			// authorized current writer enables persistent WAL.
 			shmInfo, shmErr := os.Lstat(path + "-shm")
 			usableSHM := shmErr == nil && shmInfo.Mode().IsRegular() && shmInfo.Mode()&os.ModeSymlink == 0 && shmInfo.Size() != 0
+			if usableSHM {
+				parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+				if err != nil {
+					return nil, err
+				}
+				opened.wal = &walReadFiles{files: [3]os.FileInfo{probeInfo, walInfo, shmInfo}, parent: parent}
+			}
 			if physicallyReadOnly && !usableSHM {
 				if walInfo.Size() == 0 && errors.Is(shmErr, os.ErrNotExist) {
 					query.Set("immutable", "1")
@@ -550,26 +747,45 @@ func openDatabaseMode(path, mode string, writable, physicallyReadOnly bool) (*sq
 			}
 		}
 	}
+	if staged {
+		query.Add("_pragma", "query_only(1)")
+	}
 	query.Add("_pragma", "foreign_keys(1)")
 	// Repository writers hold an external lock, but read-only WAL recovery
 	// can still briefly hold SQLite locks. Bound that coordination wait.
 	query.Add("_pragma", "busy_timeout(5000)")
 	if writable {
-		query.Add("_pragma", "journal_mode(WAL)")
-		query.Add("_pragma", "synchronous(FULL)")
-		if runtime.GOOS == "darwin" {
-			query.Add("_pragma", "fullfsync(1)")
-		}
+		addDatabaseWriterPragmas(query)
 	}
 	u.RawQuery = query.Encode()
-	db, err := sql.Open("sqlite", u.String())
-	if err != nil {
-		return nil, fmt.Errorf("open repository sqlite: %w", err)
+	if staged {
+		initial, err := sqlite.NewConnector(u.String())
+		if err != nil {
+			return nil, fmt.Errorf("open repository sqlite: %w", err)
+		}
+		// Build the reconnect DSN separately so query_only never survives a
+		// successful promotion to the public writable Store.
+		query.Del("_pragma")
+		query.Add("_pragma", "foreign_keys(1)")
+		query.Add("_pragma", "busy_timeout(5000)")
+		addDatabaseWriterPragmas(query)
+		u.RawQuery = query.Encode()
+		writer, err := sqlite.NewConnector(u.String())
+		if err != nil {
+			return nil, fmt.Errorf("open repository sqlite: %w", err)
+		}
+		opened.connector = &validatedWriterConnector{initial: initial, writer: writer}
+		opened.db = sql.OpenDB(opened.connector)
+	} else {
+		opened.db, err = sql.Open("sqlite", u.String())
+		if err != nil {
+			return nil, fmt.Errorf("open repository sqlite: %w", err)
+		}
 	}
+	db := opened.db
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	if err := db.Ping(); err != nil {
-		db.Close()
 		return nil, fmt.Errorf("open repository sqlite: %w", err)
 	}
 	if writable {
@@ -578,37 +794,21 @@ func openDatabaseMode(path, mode string, writable, physicallyReadOnly bool) (*sq
 		// creating Workspace files or hot-switching to immutable mode.
 		connection, connErr := db.Conn(context.Background())
 		if connErr == nil {
-			connErr = connection.Raw(func(driverConn any) error {
-				control, ok := driverConn.(sqlite.FileControl)
-				if !ok {
-					return errors.New("sqlite driver does not expose persistent WAL control")
-				}
-				mode, err := control.FileControlPersistWAL("main", 1)
-				if err != nil {
-					return err
-				}
-				if mode != 1 {
-					return fmt.Errorf("sqlite persistent WAL mode=%d", mode)
-				}
-				return nil
-			})
+			connErr = connection.Raw(persistDatabaseWAL)
 			connErr = errors.Join(connErr, connection.Close())
 		}
 		if connErr != nil {
-			db.Close()
 			return nil, fmt.Errorf("enable persistent repository sqlite WAL: %w", connErr)
 		}
 	}
 	if err := requireDatabasePrivateFiles(path); err != nil {
-		db.Close()
 		return nil, fmt.Errorf("open repository sqlite: %w", err)
 	}
 	current, err := os.Lstat(path)
 	if err != nil || !current.Mode().IsRegular() || current.Mode()&os.ModeSymlink != 0 || (existed && !os.SameFile(probeInfo, current)) {
-		db.Close()
 		return nil, fmt.Errorf("open repository sqlite: database path changed while opening: %w", errors.Join(err, errors.New("database inode binding failed")))
 	}
-	return db, nil
+	return opened, nil
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -868,9 +1068,25 @@ func (s *Store) validateSchema(ctx context.Context) error {
 	return s.validateSchemaVersion(ctx, SchemaVersion)
 }
 
+type schemaQuerier interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 func (s *Store) validateSchemaVersion(ctx context.Context, expectedVersion int) error {
+	return validateSchemaOn(ctx, s.db, expectedVersion)
+}
+
+func validateSchemaOn(ctx context.Context, db schemaQuerier, expectedVersion int) error {
+	if err := validateSchemaShape(ctx, db, expectedVersion); err != nil {
+		return err
+	}
+	return validateSchemaData(ctx, db, expectedVersion)
+}
+
+func validateSchemaShape(ctx context.Context, db schemaQuerier, expectedVersion int) error {
 	var version int
-	if err := s.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+	if err := db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
 		return fmt.Errorf("%w: read user_version: %v", ErrSchema, err)
 	}
 	if version != expectedVersion {
@@ -879,7 +1095,7 @@ func (s *Store) validateSchemaVersion(ctx context.Context, expectedVersion int) 
 		}
 		return fmt.Errorf("%w: database version %d, expected %d", ErrSchema, version, expectedVersion)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT version, checksum FROM schema_migrations ORDER BY version`)
+	rows, err := db.QueryContext(ctx, `SELECT version, checksum FROM schema_migrations ORDER BY version`)
 	if err != nil {
 		return fmt.Errorf("%w: read schema migration ledger: %v", ErrSchema, err)
 	}
@@ -985,22 +1201,26 @@ func (s *Store) validateSchemaVersion(ctx context.Context, expectedVersion int) 
 	if err != nil {
 		return fmt.Errorf("%w: build schema v%d contract: %v", ErrSchema, expectedVersion, err)
 	}
-	gotObjects, err := readSchemaObjects(ctx, s.db)
+	gotObjects, err := readSchemaObjects(ctx, db)
 	if err != nil {
 		return fmt.Errorf("%w: read installed schema objects: %v", ErrSchema, err)
 	}
 	if !sameSchemaObjects(gotObjects, wantObjects) {
 		return fmt.Errorf("%w: installed sqlite schema differs from schema v%d", ErrSchema, expectedVersion)
 	}
+	return nil
+}
+
+func validateSchemaData(ctx context.Context, db schemaQuerier, expectedVersion int) error {
 	var result string
-	if err := s.db.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&result); err != nil {
+	if err := db.QueryRowContext(ctx, `PRAGMA quick_check`).Scan(&result); err != nil {
 		return fmt.Errorf("%w: sqlite quick_check: %v", ErrSchema, err)
 	}
 	if result != "ok" {
 		return fmt.Errorf("%w: sqlite quick_check: %s", ErrSchema, result)
 	}
 	if expectedVersion >= 4 {
-		if err := validateOperationTimestamps(ctx, s.db); err != nil {
+		if err := validateOperationTimestamps(ctx, db); err != nil {
 			return fmt.Errorf("%w: %v", ErrSchema, err)
 		}
 	}
@@ -1126,7 +1346,7 @@ func buildExpectedSchemaObjects(schemas ...string) ([]schemaObject, error) {
 	return readSchemaObjects(context.Background(), db)
 }
 
-func readSchemaObjects(ctx context.Context, db *sql.DB) ([]schemaObject, error) {
+func readSchemaObjects(ctx context.Context, db schemaQuerier) ([]schemaObject, error) {
 	rows, err := db.QueryContext(ctx, `
 SELECT type, name, tbl_name, COALESCE(sql, '')
 FROM sqlite_master
@@ -2288,7 +2508,7 @@ func normalizeOperationTimestamps(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-func validateOperationTimestamps(ctx context.Context, db *sql.DB) error {
+func validateOperationTimestamps(ctx context.Context, db schemaQuerier) error {
 	rows, err := db.QueryContext(ctx, `SELECT id, created_at, updated_at FROM operations`)
 	if err != nil {
 		return err

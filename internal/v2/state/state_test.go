@@ -3,6 +3,8 @@ package state
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,12 +13,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 func TestOpenMigratesAndIsIdempotent(t *testing.T) {
@@ -1854,5 +1857,268 @@ func assertMembershipReverseIndexes(t *testing.T, db *sql.DB) {
 		if !used {
 			t.Errorf("reverse lookup on %s did not use %s", test.table, test.index)
 		}
+	}
+}
+
+func TestOpenExistingWALReconnectKeepsWriterConfiguration(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "repo.db")
+	initial, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenExisting(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for attempt := 0; attempt < 3; attempt++ {
+		conn, err := store.DB().Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for pragma, want := range map[string]string{"query_only": "0", "journal_mode": "wal", "synchronous": "2", "foreign_keys": "1", "busy_timeout": "5000"} {
+			var value string
+			if err := conn.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&value); err != nil || value != want {
+				t.Fatalf("reconnect %d %s=%s want=%s err=%v", attempt, pragma, value, want, err)
+			}
+		}
+		if runtime.GOOS == "darwin" {
+			var fullfsync int
+			if err := conn.QueryRowContext(ctx, `PRAGMA fullfsync`).Scan(&fullfsync); err != nil || fullfsync != 1 {
+				t.Fatalf("fullfsync=%d err=%v", fullfsync, err)
+			}
+		}
+		if err := conn.Raw(func(dc any) error {
+			persist, err := dc.(sqlite.FileControl).FileControlPersistWAL("main", -1)
+			if err != nil || persist != 1 {
+				return fmt.Errorf("persist_wal=%d err=%v", persist, err)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE repository_state SET desired_revision=desired_revision+1`); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		// Raw's documented ErrBadConn result discards this exact physical
+		// connection, forcing the next iteration through the pool connector.
+		if err := conn.Raw(func(any) error { return driver.ErrBadConn }); !errors.Is(err, driver.ErrBadConn) {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
+	}
+	cancelCtx, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	defer cancel()
+	var total int64
+	err = store.DB().QueryRowContext(cancelCtx, `WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n`).Scan(&total)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("long query cancellation: %v", err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE repository_state SET desired_revision=4`); err != nil {
+		t.Fatalf("writer after canceled query: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	var revision int
+	if err := reader.DB().QueryRow(`SELECT desired_revision FROM repository_state`).Scan(&revision); err != nil || revision != 4 {
+		t.Fatalf("revision=%d err=%v", revision, err)
+	}
+}
+
+func TestStagedWriterReconnectRemainsQueryOnly(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "repo.db")
+	initial, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := openDatabaseModeDetailed(path, "rw", false, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.db.Close()
+	for attempt := 0; attempt < 3; attempt++ {
+		conn, err := opened.db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var queryOnly int
+		if err := conn.QueryRowContext(ctx, `PRAGMA query_only`).Scan(&queryOnly); err != nil || queryOnly != 1 {
+			t.Fatalf("staged reconnect query_only=%d err=%v", queryOnly, err)
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE repository_state SET desired_revision=1`); err == nil {
+			t.Fatal("unvalidated writer accepted mutation")
+		}
+		if opened.connector.ready.Load() {
+			t.Fatal("unvalidated writer promoted")
+		}
+		if err := conn.Raw(func(any) error { return driver.ErrBadConn }); !errors.Is(err, driver.ErrBadConn) {
+			t.Fatal(err)
+		}
+		_ = conn.Close()
+	}
+}
+
+func TestOpenExistingHotWALValidation(t *testing.T) {
+	const helper = "SOW_STATE_VALIDATE_WAL"
+	const pathEnv = "SOW_STATE_VALIDATE_WAL_PATH"
+	ctx := context.Background()
+	if kind := os.Getenv(helper); kind != "" {
+		path := os.Getenv(pathEnv)
+		writer, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.DB().Exec(`INSERT INTO operations(id,kind,state,payload_json,created_at,updated_at) VALUES ('1','dist.new','done','{}','2026-08-01T00:00:00.000000000Z','2026-08-01T00:00:00.000000000Z')`); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Checkpoint(ctx); err != nil {
+			t.Fatal(err)
+		}
+		var change string
+		switch kind {
+		case "timestamp":
+			change = `UPDATE operations SET created_at='x026-08-01T00:00:00.000000000Z'`
+		case "constraint":
+			change = `PRAGMA ignore_check_constraints=ON; UPDATE repository_state SET desired_revision=-1`
+		case "future":
+			change = `PRAGMA user_version=99`
+		case "old":
+			change = `PRAGMA user_version=12`
+		case "uninitialized":
+			change = `PRAGMA user_version=0`
+		case "ledger":
+			change = `UPDATE schema_migrations SET checksum='incorrect' WHERE version=13`
+		case "ddl":
+			change = `CREATE TABLE unwanted(value)`
+		case "physical":
+			var page int
+			if err := writer.DB().QueryRow(`SELECT rootpage FROM sqlite_master WHERE name='operations'`).Scan(&page); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path+".page", []byte(strconv.Itoa(page)), 0600); err != nil {
+				t.Fatal(err)
+			}
+			change = `UPDATE repository_state SET desired_revision=1`
+		case "valid":
+			change = `UPDATE repository_state SET desired_revision=1`
+		default:
+			t.Fatal(kind)
+		}
+		if _, err := writer.DB().Exec(change); err != nil {
+			t.Fatal(err)
+		}
+		// The child exits after COMMIT without closing SQLite or checkpointing.
+		os.Exit(0)
+	}
+	for _, kind := range []string{"valid", "timestamp", "constraint", "physical", "future", "old", "uninitialized", "ledger", "ddl"} {
+		t.Run(kind, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "repo.db")
+			child := exec.Command(os.Args[0], "-test.run=^TestOpenExistingHotWALValidation$")
+			child.Env = append(os.Environ(), helper+"="+kind, pathEnv+"="+path)
+			if out, err := child.CombinedOutput(); err != nil {
+				t.Fatalf("crash fixture: %v %s", err, out)
+			}
+			if kind == "physical" {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				pageText, err := os.ReadFile(path + ".page")
+				if err != nil {
+					t.Fatal(err)
+				}
+				page, err := strconv.Atoi(string(pageText))
+				if err != nil {
+					t.Fatal(err)
+				}
+				pageSize := int(binary.BigEndian.Uint16(data[16:18]))
+				if pageSize == 1 {
+					pageSize = 65536
+				}
+				data[(page-1)*pageSize] = 0 // Invalid btree page type, outside sqlite_master.
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			type fileState struct {
+				Data     string
+				Size     int64
+				Modified time.Time
+			}
+			snapshot := func() map[string]fileState {
+				files := map[string]fileState{}
+				for _, suffix := range []string{"", "-wal"} {
+					data, err := os.ReadFile(path + suffix)
+					if err != nil {
+						t.Fatal(err)
+					}
+					info, err := os.Stat(path + suffix)
+					if err != nil {
+						t.Fatal(err)
+					}
+					files[suffix] = fileState{string(data), info.Size(), info.ModTime()}
+				}
+				return files
+			}
+			before := snapshot()
+			if before["-wal"].Size == 0 {
+				t.Fatal("fixture is not a hot WAL")
+			}
+			store, err := OpenExisting(path)
+			if kind == "valid" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close()
+				var revision int
+				if err := store.DB().QueryRow(`SELECT desired_revision FROM repository_state`).Scan(&revision); err != nil || revision != 1 {
+					t.Fatalf("latest WAL revision=%d err=%v", revision, err)
+				}
+				if _, err := store.DB().Exec(`UPDATE repository_state SET desired_revision=2`); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if store != nil {
+				_ = store.Close()
+				t.Fatal("corrupt store returned")
+			}
+			if !errors.Is(err, ErrSchema) {
+				t.Fatalf("corrupt hot WAL accepted: %v", err)
+			}
+			if kind == "timestamp" && !strings.Contains(err.Error(), "non-canonical timestamps") {
+				t.Fatal(err)
+			}
+			if kind == "constraint" && !strings.Contains(err.Error(), "CHECK constraint failed") {
+				t.Fatal(err)
+			}
+			if kind == "old" && !errors.Is(err, ErrSchemaMigrationRequired) {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(before, snapshot()) {
+				t.Fatal("rejected hot WAL was checkpointed or changed main/WAL bytes, size, or mtime")
+			}
+		})
 	}
 }
