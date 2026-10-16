@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/workmetrics"
@@ -1322,6 +1323,21 @@ func readRootedPrivateRegular(root, relative string, maximum int64, allowEmpty b
 	return data, nil
 }
 
+// A held child descriptor survives rename. Check its name in the held parent
+// after visiting it as well: parent size/mtime can stay unchanged across a swap.
+func verifyTraversedEntry(parent *os.File, name string, opened os.FileInfo) error {
+	expected, ok := opened.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("managed: traversed entry identity is unavailable")
+	}
+	var entry unix.Stat_t
+	err := unix.Fstatat(int(parent.Fd()), name, &entry, unix.AT_SYMLINK_NOFOLLOW)
+	if err != nil || uint64(entry.Dev) != uint64(expected.Dev) || uint64(entry.Ino) != uint64(expected.Ino) || uint32(entry.Mode)&unix.S_IFMT != uint32(expected.Mode)&unix.S_IFMT {
+		return errors.Join(errors.New("managed: rooted entry name changed during traversal"), err)
+	}
+	return nil
+}
+
 // walkRootedTree enumerates through held directory descriptors and opens every
 // child with O_NOFOLLOW. Directory modification during traversal and entry
 // replacement between readdir and open are both rejected.
@@ -1380,6 +1396,9 @@ func walkRootedTree(ctx context.Context, root string, visitFile func(string, *os
 				}
 			} else {
 				err = errors.New("managed: rooted tree contains a non-regular entry")
+			}
+			if err == nil {
+				err = verifyTraversedEntry(directory, name, opened)
 			}
 			closeErr := child.Close()
 			if err = errors.Join(err, closeErr); err != nil {
@@ -1460,6 +1479,9 @@ func walkRootedInputFiles(ctx context.Context, root string, visit func(string, *
 			after, afterErr := child.Stat()
 			if err == nil && (afterErr != nil || !os.SameFile(opened, after) || after.Size() != opened.Size() || !after.ModTime().Equal(opened.ModTime())) {
 				err = errors.Join(errors.New("managed: input entry changed during scan"), afterErr)
+			}
+			if err == nil {
+				err = verifyTraversedEntry(directory, name, opened)
 			}
 			if err = errors.Join(err, child.Close()); err != nil {
 				return err

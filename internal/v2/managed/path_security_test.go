@@ -298,6 +298,68 @@ func TestWalkRootedTreeRejectsDirectoryMutationDuringVisit(t *testing.T) {
 	}
 }
 
+func TestWalkRootedDirectoriesRejectChildReplacementWithRestoredParentMTime(t *testing.T) {
+	for _, input := range []bool{false, true} {
+		for _, symlink := range []bool{false, true} {
+			name := map[bool]string{false: "tree", true: "input"}[input] + "/" + map[bool]string{false: "directory", true: "symlink"}[symlink]
+			t.Run(name, func(t *testing.T) {
+				base := t.TempDir()
+				root := filepath.Join(base, "root")
+				child := filepath.Join(root, "safe")
+				outside := filepath.Join(base, "outside")
+				for _, directory := range []string{child, outside} {
+					if err := os.MkdirAll(directory, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(directory, "value"), []byte("contents"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before, err := os.Stat(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				mutated := false
+				visit := func(relative string, _ *os.File, _ os.FileInfo) error {
+					if relative != "safe/value" || mutated {
+						return nil
+					}
+					mutated = true
+					if err := os.Rename(child, filepath.Join(base, "original")); err != nil {
+						return err
+					}
+					if symlink {
+						if err := os.Symlink(outside, child); err != nil {
+							return err
+						}
+					} else if err := os.Rename(outside, child); err != nil {
+						return err
+					}
+					if err := os.Chtimes(root, before.ModTime(), before.ModTime()); err != nil {
+						return err
+					}
+					after, err := os.Stat(root)
+					if err != nil {
+						return err
+					}
+					if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || !os.SameFile(before, after) {
+						t.Fatal("fixture must preserve the parent identity, size and mtime")
+					}
+					return nil
+				}
+				if input {
+					err = walkRootedInputFiles(context.Background(), root, visit)
+				} else {
+					err = walkRootedTree(context.Background(), root, visit, nil)
+				}
+				if !mutated || err == nil {
+					t.Fatalf("child replacement with unchanged parent metadata accepted: mutated=%t err=%v", mutated, err)
+				}
+			})
+		}
+	}
+}
+
 func TestWalkRootedTreeRejectsOwnerRootReplacement(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "owner")
@@ -777,5 +839,179 @@ func TestBuildRejectsHardlinkedPrivatePendingObjectWithoutPublicEffect(t *testin
 	}
 	if aliasInfo, err := os.Lstat(alias); err != nil || aliasInfo.Mode().Perm() != 0o644 {
 		t.Fatalf("external hardlink changed: info=%#v err=%v", aliasInfo, err)
+	}
+}
+
+func TestWalkRootedFilesRejectReplacementWithRestoredParentMTime(t *testing.T) {
+	for _, input := range []bool{false, true} {
+		for _, symlink := range []bool{false, true} {
+			name := map[bool]string{false: "tree", true: "input"}[input] + "/" + map[bool]string{false: "regular", true: "symlink"}[symlink]
+			t.Run(name, func(t *testing.T) {
+				base := t.TempDir()
+				root := filepath.Join(base, "root")
+				if err := os.Mkdir(root, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				entry := filepath.Join(root, "value")
+				replacement := filepath.Join(base, "replacement")
+				if err := os.WriteFile(entry, []byte("original-data"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(replacement, []byte("replaced-data"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				parentBefore, err := os.Stat(root)
+				if err != nil {
+					t.Fatal(err)
+				}
+				original, err := os.Stat(entry)
+				if err != nil {
+					t.Fatal(err)
+				}
+				visited := false
+				visit := func(relative string, file *os.File, info os.FileInfo) error {
+					if relative != "value" {
+						t.Fatalf("unexpected visit %q", relative)
+					}
+					if err := os.Rename(entry, filepath.Join(base, "held-original")); err != nil {
+						return err
+					}
+					if symlink {
+						if err := os.Symlink(replacement, entry); err != nil {
+							return err
+						}
+					} else if err := os.Rename(replacement, entry); err != nil {
+						return err
+					}
+					if err := os.Chtimes(root, parentBefore.ModTime(), parentBefore.ModTime()); err != nil {
+						return err
+					}
+					parentAfter, err := os.Stat(root)
+					if err != nil {
+						return err
+					}
+					if !os.SameFile(parentBefore, parentAfter) || parentAfter.Size() != parentBefore.Size() || !parentAfter.ModTime().Equal(parentBefore.ModTime()) {
+						t.Fatal("fixture failed to preserve parent identity, size and mtime")
+					}
+					after, err := file.Stat()
+					if err != nil {
+						return err
+					}
+					if !os.SameFile(info, after) || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
+						t.Fatal("fixture unexpectedly modified held file")
+					}
+					body, err := io.ReadAll(file)
+					if err != nil {
+						return err
+					}
+					if string(body) != "original-data" {
+						t.Fatalf("descriptor read = %q", body)
+					}
+					visited = true
+					return nil
+				}
+				if input {
+					err = walkRootedInputFiles(context.Background(), root, visit)
+				} else {
+					err = walkRootedTree(context.Background(), root, visit, nil)
+				}
+				replacementInfo, statErr := os.Lstat(entry)
+				if statErr != nil {
+					t.Fatal(statErr)
+				}
+				current, readErr := os.ReadFile(entry)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				t.Logf("visited=%t path_binding_changed=%t current_path_body=%q traversal_error=%v", visited, !os.SameFile(original, replacementInfo), current, err)
+				if !visited || os.SameFile(original, replacementInfo) {
+					t.Fatal("fixture did not replace the visited entry")
+				}
+				if err == nil {
+					t.Fatal("regular-file replacement accepted after callback with restored parent mtime")
+				}
+			})
+		}
+	}
+}
+
+type digestFirstEOFContext struct {
+	context.Context
+	calls      int
+	onFirstEOF func()
+}
+
+func (ctx *digestFirstEOFContext) Err() error {
+	ctx.calls++
+	// One walker cancellation check, one pre-read check, then pre-EOF check.
+	if ctx.calls == 3 {
+		ctx.onFirstEOF()
+	}
+	return ctx.Context.Err()
+}
+
+func TestDigestTreeRejectsFileReplacementAfterRead(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "root")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	entry := filepath.Join(root, "value")
+	replacement := filepath.Join(base, "replacement")
+	if err := os.WriteFile(entry, []byte("original-data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(replacement, []byte("replaced-data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalDigest, _, err := digestTree(context.Background(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentBefore, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fired := false
+	ctx := &digestFirstEOFContext{Context: context.Background()}
+	ctx.onFirstEOF = func() {
+		fired = true
+		if err := os.Rename(entry, filepath.Join(base, "held-original")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(replacement, entry); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(root, parentBefore.ModTime(), parentBefore.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+		parentAfter, err := os.Stat(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(parentBefore, parentAfter) || parentAfter.Size() != parentBefore.Size() || !parentAfter.ModTime().Equal(parentBefore.ModTime()) {
+			t.Fatal("fixture failed to preserve parent identity, size and mtime")
+		}
+	}
+	acceptedDigest, count, err := digestTree(ctx, root)
+	currentDigest, _, currentErr := digestTree(context.Background(), root)
+	if currentErr != nil {
+		t.Fatal(currentErr)
+	}
+	t.Logf("fired=%t ctx_checks=%d files=%d accepted_digest=%s original_digest=%s current_digest=%s err=%v", fired, ctx.calls, count, acceptedDigest, originalDigest, currentDigest, err)
+	if !fired {
+		t.Fatal("post-read hook did not execute")
+	}
+	if originalDigest == currentDigest {
+		t.Fatal("fixture failed to change the tree digest")
+	}
+	if err == nil && acceptedDigest == originalDigest && acceptedDigest != currentDigest {
+		t.Fatal("digestTree authenticated original bytes for a path now containing different regular-file bytes")
+	}
+	if err == nil {
+		t.Fatalf("unexpected success: accepted=%s current=%s", acceptedDigest, currentDigest)
+	}
+	if acceptedDigest != "" || count != 0 {
+		t.Fatalf("rejected tree returned digest=%q files=%d", acceptedDigest, count)
 	}
 }
