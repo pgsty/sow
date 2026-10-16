@@ -13,8 +13,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -409,5 +412,561 @@ func TestR2CredentialReferenceRejectsFIFOWithoutBlocking(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("a FIFO credential blocked credential resolution")
+	}
+}
+
+type inventoryR2PublicationClient struct {
+	r2PublicationObjectClient
+	list func(context.Context, string, string) (r2.ObjectListPage, error)
+	head func(context.Context, string) (r2.ObjectInfo, error)
+}
+
+func (c *inventoryR2PublicationClient) ListObjectsV2Prefix(ctx context.Context, prefix, token string) (r2.ObjectListPage, error) {
+	return c.list(ctx, prefix, token)
+}
+
+func (c *inventoryR2PublicationClient) Head(ctx context.Context, key string) (r2.ObjectInfo, error) {
+	return c.head(ctx, key)
+}
+
+func r2InventoryFixture(count int) ([]r2.ListedObject, map[string]r2.ObjectInfo) {
+	listed := make([]r2.ListedObject, count)
+	infos := make(map[string]r2.ObjectInfo, count)
+	for index := range count {
+		key := fmt.Sprintf("repos/prod/pool/p/%04d.rpm", index)
+		info := r2.ObjectInfo{Exists: true, Size: int64(index + 1), SHA256: bytesSHA([]byte(key)), ETag: fmt.Sprintf(`"etag-%d"`, index)}
+		listed[index] = r2.ListedObject{Key: key, Size: info.Size, ETag: info.ETag}
+		infos[key] = info
+	}
+	return listed, infos
+}
+
+func awaitR2Inventory[T any](t *testing.T, channel <-chan T) T {
+	t.Helper()
+	select {
+	case value := <-channel:
+		return value
+	case <-time.After(10 * time.Second):
+		t.Fatal("R2 inventory did not finish its controlled operation")
+		var zero T
+		return zero
+	}
+}
+
+func TestR2InventoryBoundedOrderedHeadsAcrossPages(t *testing.T) {
+	const count = 1003
+	listed, infos := r2InventoryFixture(count)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan int, r2InventoryHeadWorkers)
+	finished := make(chan int, r2InventoryHeadWorkers)
+	release := make([]chan struct{}, r2InventoryHeadWorkers)
+	for index := range release {
+		release[index] = make(chan struct{})
+	}
+	var heads, active, maximum atomic.Int32
+	lists := 0
+	client := &inventoryR2PublicationClient{
+		list: func(_ context.Context, prefix, token string) (r2.ObjectListPage, error) {
+			lists++
+			if prefix != "repos/prod/" {
+				return r2.ObjectListPage{}, fmt.Errorf("unexpected prefix %q", prefix)
+			}
+			switch token {
+			case "":
+				return r2.ObjectListPage{Objects: listed[:1000], NextContinuationToken: "second"}, nil
+			case "second":
+				if active.Load() != 0 || heads.Load() != 1000 {
+					return r2.ObjectListPage{}, errors.New("next page started before the first page was verified")
+				}
+				return r2.ObjectListPage{Objects: listed[1000:]}, nil
+			default:
+				return r2.ObjectListPage{}, fmt.Errorf("unexpected token %q", token)
+			}
+		},
+		head: func(ctx context.Context, key string) (r2.ObjectInfo, error) {
+			heads.Add(1)
+			current := active.Add(1)
+			defer active.Add(-1)
+			for old := maximum.Load(); current > old && !maximum.CompareAndSwap(old, current); old = maximum.Load() {
+			}
+			index := int(infos[key].Size - 1)
+			if index < len(release) {
+				started <- index
+				select {
+				case <-release[index]:
+					finished <- index
+				case <-ctx.Done():
+					return r2.ObjectInfo{}, ctx.Err()
+				}
+			}
+			return infos[key], nil
+		},
+	}
+	backend := &r2PublicationBackend{objects: client, prefix: "repos/prod"}
+	type outcome struct {
+		objects []publicationRemoteObject
+		err     error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		objects, err := backend.List(ctx, nil)
+		done <- outcome{objects, err}
+	}()
+	seen := map[int]bool{}
+	for range r2InventoryHeadWorkers {
+		seen[awaitR2Inventory(t, started)] = true
+	}
+	if len(seen) != r2InventoryHeadWorkers || maximum.Load() != r2InventoryHeadWorkers {
+		t.Fatalf("first wave=%v max_inflight=%d", seen, maximum.Load())
+	}
+	for index := r2InventoryHeadWorkers - 1; index > 0; index-- {
+		close(release[index])
+		if got := awaitR2Inventory(t, finished); got != index {
+			t.Fatalf("completion=%d want=%d", got, index)
+		}
+	}
+	if got := heads.Load(); got != r2InventoryHeadWorkers {
+		t.Fatalf("slow first HEAD allowed an unbounded result queue: heads=%d", got)
+	}
+	close(release[0])
+	result := awaitR2Inventory(t, done)
+	if result.err != nil || len(result.objects) != count || heads.Load() != count || maximum.Load() != r2InventoryHeadWorkers || active.Load() != 0 || lists != 2 {
+		t.Fatalf("objects=%d heads=%d max_inflight=%d active=%d lists=%d err=%v", len(result.objects), heads.Load(), maximum.Load(), active.Load(), lists, result.err)
+	}
+	baseline := make([]publicationRemoteObject, count)
+	for index, object := range listed {
+		info := infos[object.Key]
+		baseline[index] = publicationRemoteObject{Path: strings.TrimPrefix(object.Key, "repos/prod/"), Size: info.Size, SHA256: info.SHA256, RemoteIdentity: info.ETag}
+	}
+	if !reflect.DeepEqual(result.objects, baseline) {
+		t.Fatal("parallel inventory differs from the serial baseline")
+	}
+	manifest := make([]state.GenerationFile, count)
+	for index, object := range baseline {
+		manifest[index] = state.GenerationFile{Path: object.Path, Phase: "payload", Size: object.Size, SHA256: object.SHA256}
+	}
+	inventory, err := publicationInventory(result.objects, manifest, nil)
+	wantInventory, baselineErr := publicationInventory(baseline, manifest, nil)
+	if err != nil || baselineErr != nil || !reflect.DeepEqual(inventory, wantInventory) {
+		t.Fatalf("publication evidence differs from serial baseline: err=%v baseline=%v", err, baselineErr)
+	}
+	t.Logf("objects=%d HEAD_requests=%d max_inflight=%d pending_result_limit=%d list_pages=%d", count, heads.Load(), maximum.Load(), r2InventoryHeadWorkers, lists)
+}
+
+func TestR2InventoryCancellationAndFailureJoinWorkers(t *testing.T) {
+	for _, failure := range []bool{false, true} {
+		t.Run(fmt.Sprintf("head_failure=%t", failure), func(t *testing.T) {
+			listed, _ := r2InventoryFixture(1003)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			started := make(chan string, r2InventoryHeadWorkers)
+			fail := make(chan struct{})
+			var heads, active atomic.Int32
+			lists := 0
+			client := &inventoryR2PublicationClient{
+				list: func(context.Context, string, string) (r2.ObjectListPage, error) {
+					lists++
+					return r2.ObjectListPage{Objects: listed[:1000], NextContinuationToken: "second"}, nil
+				},
+				head: func(ctx context.Context, key string) (r2.ObjectInfo, error) {
+					heads.Add(1)
+					active.Add(1)
+					defer active.Add(-1)
+					started <- key
+					if failure && key == listed[0].Key {
+						select {
+						case <-fail:
+							return r2.ObjectInfo{}, r2.ErrConflict
+						case <-ctx.Done():
+						}
+					}
+					<-ctx.Done()
+					return r2.ObjectInfo{}, ctx.Err()
+				},
+			}
+			backend := &r2PublicationBackend{objects: client, prefix: "repos/prod"}
+			done := make(chan error, 1)
+			go func() {
+				objects, err := backend.List(ctx, nil)
+				if objects != nil {
+					err = errors.New("failed inventory returned partial evidence")
+				}
+				done <- err
+			}()
+			for range r2InventoryHeadWorkers {
+				awaitR2Inventory(t, started)
+			}
+			cause := error(context.Canceled)
+			if failure {
+				cause = r2.ErrConflict
+				close(fail)
+			} else {
+				cancel()
+			}
+			err := awaitR2Inventory(t, done)
+			if !errors.Is(err, ErrIntegrity) || !errors.Is(err, cause) || heads.Load() != r2InventoryHeadWorkers || active.Load() != 0 || lists != 1 {
+				t.Fatalf("err=%v heads=%d active=%d lists=%d", err, heads.Load(), active.Load(), lists)
+			}
+		})
+	}
+}
+
+func TestR2InventorySelectsFirstErrorInKeyOrder(t *testing.T) {
+	listed, infos := r2InventoryFixture(16)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan string, 16)
+	finished := make(chan string, 16)
+	release := make(map[string]chan struct{}, len(listed))
+	for _, object := range listed {
+		release[object.Key] = make(chan struct{})
+	}
+	var active atomic.Int32
+	client := &inventoryR2PublicationClient{
+		list: func(context.Context, string, string) (r2.ObjectListPage, error) {
+			return r2.ObjectListPage{Objects: listed}, nil
+		},
+		head: func(ctx context.Context, key string) (r2.ObjectInfo, error) {
+			active.Add(1)
+			defer active.Add(-1)
+			started <- key
+			select {
+			case <-release[key]:
+				finished <- key
+			case <-ctx.Done():
+				return r2.ObjectInfo{}, ctx.Err()
+			}
+			if key == listed[2].Key {
+				return r2.ObjectInfo{}, r2.ErrConflict
+			}
+			if key == listed[5].Key {
+				return r2.ObjectInfo{}, r2.ErrCapability
+			}
+			return infos[key], nil
+		},
+	}
+	backend := &r2PublicationBackend{objects: client, prefix: "repos/prod"}
+	done := make(chan error, 1)
+	go func() {
+		_, err := backend.List(ctx, nil)
+		done <- err
+	}()
+	for range r2InventoryHeadWorkers {
+		awaitR2Inventory(t, started)
+	}
+	for _, index := range []int{5, 2, 1, 0} {
+		close(release[listed[index].Key])
+		awaitR2Inventory(t, finished)
+	}
+	err := awaitR2Inventory(t, done)
+	if !errors.Is(err, ErrIntegrity) || !errors.Is(err, r2.ErrConflict) || errors.Is(err, r2.ErrCapability) || !strings.Contains(err.Error(), "0002.rpm") || active.Load() != 0 {
+		t.Fatalf("completion order changed first error or leaked workers: err=%v active=%d", err, active.Load())
+	}
+}
+
+func TestR2InventoryRequiresExactHeadEvidence(t *testing.T) {
+	listed, infos := r2InventoryFixture(1)
+	exact := infos[listed[0].Key]
+	for _, scenario := range []struct {
+		name   string
+		mutate func(*r2.ObjectInfo)
+	}{
+		{"missing", func(info *r2.ObjectInfo) { info.Exists = false }},
+		{"size changed", func(info *r2.ObjectInfo) { info.Size++ }},
+		{"etag absent", func(info *r2.ObjectInfo) { info.ETag = "" }},
+		{"etag changed", func(info *r2.ObjectInfo) { info.ETag = `"changed"` }},
+		{"digest absent", func(info *r2.ObjectInfo) { info.SHA256 = "" }},
+		{"digest uppercase", func(info *r2.ObjectInfo) { info.SHA256 = strings.ToUpper(info.SHA256) }},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			info := exact
+			scenario.mutate(&info)
+			client := &inventoryR2PublicationClient{
+				list: func(context.Context, string, string) (r2.ObjectListPage, error) {
+					return r2.ObjectListPage{Objects: listed}, nil
+				},
+				head: func(context.Context, string) (r2.ObjectInfo, error) { return info, nil },
+			}
+			backend := &r2PublicationBackend{objects: client, prefix: "repos/prod"}
+			objects, err := backend.List(context.Background(), nil)
+			if objects != nil || !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), "lacks exact HEAD evidence") {
+				t.Fatalf("unproven inventory accepted: objects=%v err=%v", objects, err)
+			}
+		})
+	}
+}
+
+func TestR2InventoryRetainsListingGuards(t *testing.T) {
+	listed, infos := r2InventoryFixture(2)
+	for _, scenario := range []struct {
+		name  string
+		pages []r2.ObjectListPage
+		want  string
+	}{
+		{"empty", []r2.ObjectListPage{{}}, ""},
+		{"same page order", []r2.ObjectListPage{{Objects: []r2.ListedObject{listed[1], listed[0]}}}, "globally key-sorted"},
+		{"cross page order", []r2.ObjectListPage{{Objects: listed[1:], NextContinuationToken: "next"}, {Objects: listed[:1]}}, "globally key-sorted"},
+		{"duplicate key", []r2.ObjectListPage{{Objects: []r2.ListedObject{listed[0], listed[0]}}}, "globally key-sorted"},
+		{"foreign prefix", []r2.ObjectListPage{{Objects: []r2.ListedObject{{Key: "repos/other/pool/p/0000.rpm"}}}}, "escaped configured prefix"},
+		{"foreign object", []r2.ObjectListPage{{Objects: []r2.ListedObject{{Key: "repos/prod/private/object"}}}}, "foreign object"},
+		{"repeated token", []r2.ObjectListPage{{NextContinuationToken: "next"}, {NextContinuationToken: "next"}}, "repeated a continuation token"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			calls := 0
+			client := &inventoryR2PublicationClient{
+				list: func(context.Context, string, string) (r2.ObjectListPage, error) {
+					if calls >= len(scenario.pages) {
+						return r2.ObjectListPage{}, errors.New("unexpected extra page")
+					}
+					page := scenario.pages[calls]
+					calls++
+					return page, nil
+				},
+				head: func(_ context.Context, key string) (r2.ObjectInfo, error) {
+					info, ok := infos[key]
+					if !ok {
+						t.Errorf("invalid inventory key reached HEAD: %q", key)
+					}
+					return info, nil
+				},
+			}
+			backend := &r2PublicationBackend{objects: client, prefix: "repos/prod"}
+			objects, err := backend.List(context.Background(), nil)
+			if scenario.want == "" {
+				if err != nil || len(objects) != 0 {
+					t.Fatalf("empty inventory=%v err=%v", objects, err)
+				}
+			} else if objects != nil || !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), scenario.want) {
+				t.Fatalf("inventory guard lost: objects=%v err=%v", objects, err)
+			}
+		})
+	}
+}
+
+func TestR2InventoryHTTPPreservesSDKFailuresAndRetries(t *testing.T) {
+	for _, scenario := range []struct {
+		name     string
+		status   int
+		failures int32
+		attempts int32
+		wantErr  bool
+	}{
+		{"hit", http.StatusOK, 0, 1, false},
+		{"missing", http.StatusNotFound, 1, 1, true},
+		{"forbidden", http.StatusForbidden, 1, 1, true},
+		// A bodyless HEAD 429 carries no SDK throttle error code. Preserve the
+		// transport's current terminal classification instead of adding retries.
+		{"rate limited", http.StatusTooManyRequests, 1, 1, true},
+		{"service retry", http.StatusServiceUnavailable, 1, 2, false},
+		{"service exhausted", http.StatusInternalServerError, 3, 3, true},
+		{"conflict", http.StatusPreconditionFailed, 1, 1, true},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			listed, infos := r2InventoryFixture(1)
+			info := infos[listed[0].Key]
+			var heads atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if !strings.HasPrefix(request.Header.Get("Authorization"), "AWS4-HMAC-SHA256 ") {
+					t.Error("inventory request was not signed")
+				}
+				switch request.Method {
+				case http.MethodGet:
+					if request.URL.Query().Get("prefix") != "repos/prod/" || request.URL.Query().Get("max-keys") != "1000" {
+						t.Errorf("unexpected list query: %s", request.URL.RawQuery)
+					}
+					writer.Header().Set("Content-Type", "application/xml")
+					_, _ = io.WriteString(writer, `<ListBucketResult><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated><Contents><Key>repos%2Fprod%2Fpool%2Fp%2F0000.rpm</Key><Size>1</Size><ETag>&quot;etag-0&quot;</ETag></Contents></ListBucketResult>`)
+				case http.MethodHead:
+					if heads.Add(1) <= scenario.failures {
+						writer.WriteHeader(scenario.status)
+						return
+					}
+					writer.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+					writer.Header().Set("ETag", info.ETag)
+					writer.Header().Set("X-Amz-Meta-Sow-Sha256", info.SHA256)
+				default:
+					t.Errorf("inventory performed unexpected %s", request.Method)
+					writer.WriteHeader(http.StatusMethodNotAllowed)
+				}
+			}))
+			defer server.Close()
+			client, err := r2.NewClient(r2.Config{
+				Bucket: "bucket", ObjectBaseURL: server.URL + "/bucket", Client: server.Client(), AllowInsecure: true,
+				Credentials: r2.S3Credentials{AccessKeyID: "access", SecretAccessKey: "secret", Region: "auto"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend := &r2PublicationBackend{objects: client, prefix: "repos/prod"}
+			objects, err := backend.List(context.Background(), nil)
+			if heads.Load() != scenario.attempts || (err != nil) != scenario.wantErr || scenario.wantErr && (!errors.Is(err, ErrIntegrity) || objects != nil) {
+				t.Fatalf("objects=%v HEAD_attempts=%d want=%d err=%v", objects, heads.Load(), scenario.attempts, err)
+			}
+			if scenario.wantErr && scenario.status != http.StatusNotFound {
+				var status interface{ HTTPStatusCode() int }
+				if !errors.As(err, &status) || status.HTTPStatusCode() != scenario.status {
+					t.Fatalf("transport error classification lost: %v", err)
+				}
+			}
+			t.Logf("objects=1 HEAD_attempts=%d HTTP_status=%d error=%t", heads.Load(), scenario.status, err != nil)
+		})
+	}
+}
+
+func TestR2InventoryHTTPCancellationAndDeadline(t *testing.T) {
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadline=%t", deadline), func(t *testing.T) {
+			count := r2InventoryHeadWorkers
+			if deadline {
+				count = 1
+			}
+			listed, _ := r2InventoryFixture(count * 2)
+			if deadline {
+				listed = listed[:1]
+			}
+			started := make(chan struct{}, count*2)
+			finished := make(chan struct{}, count*2)
+			var heads, active atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.Method != http.MethodHead {
+					t.Errorf("unexpected request method %s", request.Method)
+					writer.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+				heads.Add(1)
+				active.Add(1)
+				started <- struct{}{}
+				<-request.Context().Done()
+				active.Add(-1)
+				finished <- struct{}{}
+			}))
+			defer server.Close()
+			client, err := r2.NewClient(r2.Config{
+				Bucket: "bucket", ObjectBaseURL: server.URL + "/bucket", Client: server.Client(), AllowInsecure: true,
+				Credentials: r2.S3Credentials{AccessKeyID: "access", SecretAccessKey: "secret", Region: "auto"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			if deadline {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+			}
+			defer cancel()
+			backend := &r2PublicationBackend{objects: client, prefix: "repos/prod"}
+			done := make(chan error, 1)
+			go func() {
+				_, err := backend.headInventoryPage(ctx, listed, "")
+				done <- err
+			}()
+			for range count {
+				awaitR2Inventory(t, started)
+			}
+			cause := error(context.DeadlineExceeded)
+			if !deadline {
+				cause = context.Canceled
+				cancel()
+			}
+			err = awaitR2Inventory(t, done)
+			for range count {
+				awaitR2Inventory(t, finished)
+			}
+			if !errors.Is(err, ErrIntegrity) || !errors.Is(err, cause) || heads.Load() != int32(count) || active.Load() != 0 {
+				t.Fatalf("cancellation not propagated through SDK: heads=%d active=%d err=%v", heads.Load(), active.Load(), err)
+			}
+		})
+	}
+}
+
+func TestR2InventoryCanceledBeforeListStartsNoRequests(t *testing.T) {
+	client := &inventoryR2PublicationClient{
+		list: func(context.Context, string, string) (r2.ObjectListPage, error) {
+			t.Error("canceled inventory started a list request")
+			return r2.ObjectListPage{}, nil
+		},
+		head: func(context.Context, string) (r2.ObjectInfo, error) {
+			t.Error("canceled inventory started a HEAD request")
+			return r2.ObjectInfo{}, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	backend := &r2PublicationBackend{objects: client, prefix: "repos/prod"}
+	if objects, err := backend.List(ctx, nil); objects != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled inventory=%v err=%v", objects, err)
+	}
+}
+
+func BenchmarkR2InventoryHeadLatency(b *testing.B) {
+	const count = 128
+	const latency = 2 * time.Millisecond
+	listed, infos := r2InventoryFixture(count)
+	for _, parallel := range []bool{false, true} {
+		b.Run(fmt.Sprintf("parallel=%t", parallel), func(b *testing.B) {
+			var heads, active, maximum atomic.Int64
+			var waitNS atomic.Int64
+			client := &inventoryR2PublicationClient{
+				list: func(context.Context, string, string) (r2.ObjectListPage, error) {
+					return r2.ObjectListPage{Objects: listed}, nil
+				},
+				head: func(ctx context.Context, key string) (r2.ObjectInfo, error) {
+					heads.Add(1)
+					current := active.Add(1)
+					defer active.Add(-1)
+					for old := maximum.Load(); current > old && !maximum.CompareAndSwap(old, current); old = maximum.Load() {
+					}
+					start := time.Now()
+					timer := time.NewTimer(latency)
+					defer timer.Stop()
+					select {
+					case <-timer.C:
+						waitNS.Add(int64(time.Since(start)))
+						return infos[key], nil
+					case <-ctx.Done():
+						return r2.ObjectInfo{}, ctx.Err()
+					}
+				},
+			}
+			backend := &r2PublicationBackend{objects: client, prefix: "repos/prod"}
+			ctx := context.Background()
+			baseline := make([]publicationRemoteObject, count)
+			for index, object := range listed {
+				info := infos[object.Key]
+				baseline[index] = publicationRemoteObject{Path: strings.TrimPrefix(object.Key, "repos/prod/"), Size: info.Size, SHA256: info.SHA256, RemoteIdentity: info.ETag}
+			}
+			b.ResetTimer()
+			for range b.N {
+				var objects []publicationRemoteObject
+				if parallel {
+					var err error
+					objects, err = backend.List(ctx, nil)
+					if err != nil {
+						b.Fatal(err)
+					}
+				} else {
+					// Reproduce the old serial List loop with identical evidence checks.
+					previous := ""
+					for _, object := range listed {
+						verified, err := backend.headInventoryObject(ctx, object, previous)
+						if err != nil {
+							b.Fatal(err)
+						}
+						objects = append(objects, verified)
+						previous = object.Key
+					}
+				}
+				if !reflect.DeepEqual(objects, baseline) {
+					b.Fatal("measured inventory differs from serial baseline")
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(count, "objects/op")
+			b.ReportMetric(float64(heads.Load())/float64(b.N), "HEADs/op")
+			b.ReportMetric(float64(maximum.Load()), "max_inflight")
+			b.ReportMetric(float64(waitNS.Load())/float64(b.N)/float64(time.Millisecond), "HEAD_wait_ms/op")
+			b.ReportMetric(float64(latency)/float64(time.Millisecond), "latency_ms/HEAD")
+		})
 	}
 }

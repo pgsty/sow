@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pgsty/sow/internal/r2"
@@ -25,6 +26,7 @@ const maxR2CredentialBytes = 64 << 10
 const (
 	r2ImmutableCacheControl = "public, max-age=31536000, immutable"
 	r2PointerCacheControl   = "no-cache, must-revalidate"
+	r2InventoryHeadWorkers  = 8
 )
 
 type r2CredentialDocument struct {
@@ -200,24 +202,20 @@ func (b *r2PublicationBackend) List(ctx context.Context, _ map[string]struct{}) 
 	seenTokens := map[string]struct{}{}
 	previousKey := ""
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		page, err := b.objects.ListObjectsV2Prefix(ctx, listPrefix, continuation)
 		if err != nil {
 			return nil, err
 		}
-		for _, listed := range page.Objects {
-			if previousKey != "" && listed.Key <= previousKey {
-				return nil, fmt.Errorf("%w: R2 inventory is not globally key-sorted", ErrIntegrity)
-			}
-			previousKey = listed.Key
-			relative, err := b.relativeKey(listed.Key)
-			if err != nil {
-				return nil, err
-			}
-			info, err := b.objects.Head(ctx, listed.Key)
-			if err != nil || !info.Exists || info.Size != listed.Size || info.ETag == "" || info.ETag != listed.ETag || !lowercaseSHA256.MatchString(info.SHA256) {
-				return nil, errors.Join(fmt.Errorf("%w: R2 listed object %q lacks exact HEAD evidence", ErrIntegrity, relative), err)
-			}
-			objects = append(objects, publicationRemoteObject{Path: relative, Size: info.Size, SHA256: info.SHA256, RemoteIdentity: info.ETag})
+		pageObjects, err := b.headInventoryPage(ctx, page.Objects, previousKey)
+		if err != nil {
+			return nil, err
+		}
+		objects = append(objects, pageObjects...)
+		if len(page.Objects) > 0 {
+			previousKey = page.Objects[len(page.Objects)-1].Key
 		}
 		if page.NextContinuationToken == "" {
 			break
@@ -230,6 +228,81 @@ func (b *r2PublicationBackend) List(ctx context.Context, _ map[string]struct{}) 
 	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].Path < objects[j].Path })
 	return objects, nil
+}
+
+func (b *r2PublicationBackend) headInventoryPage(ctx context.Context, listed []r2.ListedObject, previousKey string) ([]publicationRemoteObject, error) {
+	objects := make([]publicationRemoteObject, len(listed))
+	workers := min(r2InventoryHeadWorkers, len(listed))
+	if workers == 0 {
+		return objects, nil
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	type result struct {
+		object publicationRemoteObject
+		err    error
+	}
+	jobs := make(chan int, workers)
+	results := make([]chan result, workers)
+	var group sync.WaitGroup
+	defer func() {
+		cancel()
+		close(jobs)
+		group.Wait()
+	}()
+	for worker := range workers {
+		results[worker] = make(chan result, 1)
+	}
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			for sequence := range jobs {
+				previous := previousKey
+				if sequence > 0 {
+					previous = listed[sequence-1].Key
+				}
+				object, err := b.headInventoryObject(ctx, listed[sequence], previous)
+				// Each outstanding job owns one buffered slot, including during
+				// cancellation, so workers never wait for an abandoned receiver.
+				results[sequence%workers] <- result{object: object, err: err}
+			}
+		}()
+	}
+	for sequence := range workers {
+		jobs <- sequence
+	}
+	for sequence := range listed {
+		// Consume in list order to retain the serial inventory and first error.
+		// A slot is reused only after consumption, bounding queued work and
+		// completed results to the worker count even when an early HEAD is slow.
+		result := <-results[sequence%workers]
+		if result.err != nil {
+			return nil, result.err
+		}
+		objects[sequence] = result.object
+		if next := sequence + workers; next < len(listed) {
+			jobs <- next
+		}
+	}
+	return objects, nil
+}
+
+func (b *r2PublicationBackend) headInventoryObject(ctx context.Context, listed r2.ListedObject, previousKey string) (publicationRemoteObject, error) {
+	if previousKey != "" && listed.Key <= previousKey {
+		return publicationRemoteObject{}, fmt.Errorf("%w: R2 inventory is not globally key-sorted", ErrIntegrity)
+	}
+	relative, err := b.relativeKey(listed.Key)
+	if err != nil {
+		return publicationRemoteObject{}, err
+	}
+	var info r2.ObjectInfo
+	if err = ctx.Err(); err == nil {
+		info, err = b.objects.Head(ctx, listed.Key)
+	}
+	if err != nil || !info.Exists || info.Size != listed.Size || info.ETag == "" || info.ETag != listed.ETag || !lowercaseSHA256.MatchString(info.SHA256) {
+		return publicationRemoteObject{}, errors.Join(fmt.Errorf("%w: R2 listed object %q lacks exact HEAD evidence", ErrIntegrity, relative), err)
+	}
+	return publicationRemoteObject{Path: relative, Size: info.Size, SHA256: info.SHA256, RemoteIdentity: info.ETag}, nil
 }
 
 func (b *r2PublicationBackend) Head(ctx context.Context, objectPath string) (publicationRemoteObject, bool, error) {
