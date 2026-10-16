@@ -20,6 +20,9 @@ internal/v2/managed/signing_fingerprints.go: validateSigningApplicability
 internal/v2/state/audit.go: Store.PruneTerminalOperations
 internal/v2/state/facts.go: Store.ListPackageFacts
 internal/v2/state/publication_plan.go: PublicationPlanBytes
+internal/v2/state/publication_read.go: Store.GetPublicationAttempt
+internal/v2/state/publication_read.go: Store.GetPublicationDeletionReceipt
+internal/v2/state/publication_read.go: Store.ListPublicationTargetBindingRevisions
 internal/v2/state/signing_keys.go: Store.RetainRPMSigningKeys
 internal/v2/state/state.go: Store.AddDist
 internal/v2/state/state.go: Store.FinalizeDistRemoval

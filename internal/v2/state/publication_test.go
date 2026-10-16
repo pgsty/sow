@@ -1009,6 +1009,12 @@ func TestFilesystemDeletionRequiresExactReceiptsAndProjectsLiveInventory(t *test
 		}
 		receipt = copyReceipt
 	}
+	storedReceipt, err := store.GetPublicationDeletionReceipt(ctx, receipt.ReportIdentity, receipt.Path)
+	if err != nil || storedReceipt.ReceiptIdentity != receipt.ReceiptIdentity ||
+		deletionReceiptSemanticIdentity(storedReceipt) != storedReceipt.ReceiptIdentity ||
+		!storedReceipt.StorageAbsent || !storedReceipt.PublicAbsent {
+		t.Fatalf("public deletion receipt lookup=%#v err=%v", storedReceipt, err)
+	}
 	for replay := 0; replay < 2; replay++ {
 		if err := store.MarkPublicationDeletionVerified(ctx, attempt.AttemptIdentity, report.ReportIdentity, grace.NotBefore); err != nil {
 			t.Fatalf("deletion verification replay %d: %v", replay, err)

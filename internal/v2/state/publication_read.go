@@ -33,10 +33,14 @@ type PublicationMaintenance struct {
 }
 
 func (s *Store) ListPublicationTargetBindingRevisions(ctx context.Context, targetIdentity string) ([]PublicationTargetBindingRevision, error) {
+	return listPublicationTargetBindingRevisionsOn(ctx, s.db, targetIdentity)
+}
+
+func listPublicationTargetBindingRevisionsOn(ctx context.Context, q schemaQuerier, targetIdentity string) ([]PublicationTargetBindingRevision, error) {
 	if !validSHA256Text(targetIdentity) {
 		return nil, errors.New("invalid publication target identity")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT revision, target_identity, target_storage_id, repository_id, target_name,
+	rows, err := q.QueryContext(ctx, `SELECT revision, target_identity, target_storage_id, repository_id, target_name,
 provider, endpoint, region, bucket, prefix, public_endpoint, max_cache_ttl_ns,
 authoritative_workspace, single_writer, exclusive_write_authority, config_identity,
 reason, operator_confirmed, recorded_at
@@ -77,8 +81,8 @@ FROM publication_target_binding_revisions WHERE target_identity = ? ORDER BY rev
 	return result, rows.Err()
 }
 
-func (s *Store) validatePublicationTargetBindingRevisions(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT target_identity FROM publication_target_bindings ORDER BY target_identity`)
+func validatePublicationTargetBindingRevisions(ctx context.Context, q schemaQuerier) error {
+	rows, err := q.QueryContext(ctx, `SELECT target_identity FROM publication_target_bindings ORDER BY target_identity`)
 	if err != nil {
 		return err
 	}
@@ -95,11 +99,11 @@ func (s *Store) validatePublicationTargetBindingRevisions(ctx context.Context) e
 		return err
 	}
 	for _, identity := range identities {
-		target, err := s.GetPublicationTarget(ctx, identity)
+		target, err := getPublicationTargetOn(ctx, q, identity)
 		if err != nil {
 			return err
 		}
-		revisions, err := s.ListPublicationTargetBindingRevisions(ctx, identity)
+		revisions, err := listPublicationTargetBindingRevisionsOn(ctx, q, identity)
 		if err != nil || len(revisions) == 0 || revisions[len(revisions)-1].PublicationTargetBinding != target.Binding {
 			return errors.Join(fmt.Errorf("%w: publication target differs from its append-only binding revisions", ErrConflict), err)
 		}
@@ -110,6 +114,10 @@ func (s *Store) validatePublicationTargetBindingRevisions(ctx context.Context) e
 // GetPublicationTarget returns one binding and head after recomputing every
 // persisted semantic identity. Callers must never resume from unchecked rows.
 func (s *Store) GetPublicationTarget(ctx context.Context, targetIdentity string) (PublicationTargetSnapshot, error) {
+	return getPublicationTargetOn(ctx, s.db, targetIdentity)
+}
+
+func getPublicationTargetOn(ctx context.Context, q schemaQuerier, targetIdentity string) (PublicationTargetSnapshot, error) {
 	if !validSHA256Text(targetIdentity) {
 		return PublicationTargetSnapshot{}, errors.New("invalid publication target identity")
 	}
@@ -117,7 +125,7 @@ func (s *Store) GetPublicationTarget(ctx context.Context, targetIdentity string)
 	var checkpoint, manifest sql.NullString
 	var ttl int64
 	var authoritative, singleWriter, exclusive int
-	err := s.db.QueryRowContext(ctx, `SELECT
+	err := q.QueryRowContext(ctx, `SELECT
  b.target_identity, b.target_storage_id, b.repository_id, b.target_name, b.provider,
  b.endpoint, b.region, b.bucket, b.prefix, b.public_endpoint, b.max_cache_ttl_ns,
  b.authoritative_workspace, b.single_writer, b.exclusive_write_authority, b.config_identity,
@@ -165,10 +173,21 @@ func (s *Store) GetPublicationAttempt(ctx context.Context, attemptIdentity strin
 		return PublicationAttempt{}, err
 	}
 	defer tx.Rollback()
+	out, err := getPublicationAttemptTx(ctx, tx, attemptIdentity)
+	if err != nil {
+		return PublicationAttempt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return PublicationAttempt{}, err
+	}
+	return out, nil
+}
+
+func getPublicationAttemptTx(ctx context.Context, tx *sql.Tx, attemptIdentity string) (PublicationAttempt, error) {
 	var out PublicationAttempt
 	var base sql.NullString
 	var commit int
-	err = tx.QueryRowContext(ctx, `SELECT attempt_identity, schema_version, repository_id, target_identity,
+	err := tx.QueryRowContext(ctx, `SELECT attempt_identity, schema_version, repository_id, target_identity,
  base_checkpoint, target_generation, manifest_sha256, plan_sha256, phase, commit_intent
 FROM publication_attempts WHERE attempt_identity = ?`, attemptIdentity).Scan(
 		&out.AttemptIdentity, &out.SchemaVersion, &out.RepositoryID, &out.TargetIdentity, &base,
@@ -188,9 +207,6 @@ FROM publication_attempts WHERE attempt_identity = ?`, attemptIdentity).Scan(
 	if publicationAttemptSemanticIdentity(out) != out.AttemptIdentity || validatePublicationAttempt(out) != nil {
 		return PublicationAttempt{}, fmt.Errorf("%w: publication attempt semantic identity is corrupt", ErrConflict)
 	}
-	if err := tx.Commit(); err != nil {
-		return PublicationAttempt{}, err
-	}
 	return out, nil
 }
 
@@ -198,8 +214,14 @@ func (s *Store) GetActivePublicationAttempt(ctx context.Context, targetIdentity 
 	if !validSHA256Text(targetIdentity) {
 		return PublicationAttempt{}, errors.New("invalid publication target identity")
 	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return PublicationAttempt{}, err
+	}
+	defer tx.Rollback()
+
 	var identity string
-	err := s.db.QueryRowContext(ctx, `SELECT attempt_identity FROM publication_attempts
+	err = tx.QueryRowContext(ctx, `SELECT attempt_identity FROM publication_attempts
 WHERE target_identity = ? AND phase IN (
  'planned', 'payload', 'immutable_metadata', 'pointer_prepared',
  'commit_intent', 'pointer_rollforward', 'verified', 'applied'
@@ -210,7 +232,14 @@ WHERE target_identity = ? AND phase IN (
 	if err != nil {
 		return PublicationAttempt{}, err
 	}
-	return s.GetPublicationAttempt(ctx, identity)
+	out, err := getPublicationAttemptTx(ctx, tx, identity)
+	if err != nil {
+		return PublicationAttempt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return PublicationAttempt{}, err
+	}
+	return out, nil
 }
 
 // ListPublicationAbandonedObjects returns exact, path-deduplicated orphan
@@ -319,10 +348,21 @@ func (s *Store) GetAppliedCheckpoint(ctx context.Context, checkpointIdentity str
 		return AppliedCheckpoint{}, err
 	}
 	defer tx.Rollback()
+	out, err := getAppliedCheckpointTx(ctx, tx, checkpointIdentity)
+	if err != nil {
+		return AppliedCheckpoint{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AppliedCheckpoint{}, err
+	}
+	return out, nil
+}
+
+func getAppliedCheckpointTx(ctx context.Context, tx *sql.Tx, checkpointIdentity string) (AppliedCheckpoint, error) {
 	var out AppliedCheckpoint
 	var complete int
 	var applied string
-	err = tx.QueryRowContext(ctx, `SELECT checkpoint_identity, schema_version, repository_id, target_identity,
+	err := tx.QueryRowContext(ctx, `SELECT checkpoint_identity, schema_version, repository_id, target_identity,
  attempt_identity, generation, manifest_sha256, inventory_identity, inventory_complete, applied_at
 FROM publication_checkpoints WHERE checkpoint_identity = ?`, checkpointIdentity).Scan(
 		&out.CheckpointIdentity, &out.SchemaVersion, &out.RepositoryID, &out.TargetIdentity, &out.AttemptIdentity,
@@ -349,9 +389,6 @@ FROM publication_checkpoints WHERE checkpoint_identity = ?`, checkpointIdentity)
 	if publicationInventoryIdentity(out.Inventory) != out.InventoryIdentity || appliedCheckpointSemanticIdentity(out) != out.CheckpointIdentity || validateAppliedCheckpoint(out) != nil {
 		return AppliedCheckpoint{}, fmt.Errorf("%w: publication checkpoint semantic identity is corrupt", ErrConflict)
 	}
-	if err := tx.Commit(); err != nil {
-		return AppliedCheckpoint{}, err
-	}
 	return out, nil
 }
 
@@ -371,12 +408,16 @@ func (s *Store) GetAppliedCheckpointForAttempt(ctx context.Context, attemptIdent
 }
 
 func (s *Store) GetGraceRecord(ctx context.Context, checkpointIdentity string) (GraceRecord, error) {
+	return getGraceRecordOn(ctx, s.db, checkpointIdentity)
+}
+
+func getGraceRecordOn(ctx context.Context, q schemaQuerier, checkpointIdentity string) (GraceRecord, error) {
 	if !validSHA256Text(checkpointIdentity) {
 		return GraceRecord{}, errors.New("invalid publication checkpoint identity")
 	}
 	var out GraceRecord
 	var verified, notBefore string
-	err := s.db.QueryRowContext(ctx, `SELECT grace_identity, schema_version, target_identity, checkpoint_identity,
+	err := q.QueryRowContext(ctx, `SELECT grace_identity, schema_version, target_identity, checkpoint_identity,
  verified_at, not_before, cache_policy_identity, state
 FROM publication_grace_records WHERE checkpoint_identity = ?`, checkpointIdentity).Scan(
 		&out.GraceIdentity, &out.SchemaVersion, &out.TargetIdentity, &out.CheckpointIdentity,
@@ -402,19 +443,30 @@ func (s *Store) GetPublicationCandidateReport(ctx context.Context, checkpointIde
 	if !validSHA256Text(checkpointIdentity) {
 		return PublicationCandidateReport{}, errors.New("invalid publication checkpoint identity")
 	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	defer tx.Rollback()
+	out, err := getPublicationCandidateReportTx(ctx, tx, checkpointIdentity)
+	if err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	return out, nil
+}
+
+func getPublicationCandidateReportTx(ctx context.Context, tx *sql.Tx, checkpointIdentity string) (PublicationCandidateReport, error) {
 	var identity string
-	err := s.db.QueryRowContext(ctx, `SELECT report_identity FROM publication_candidate_reports WHERE checkpoint_identity = ?`, checkpointIdentity).Scan(&identity)
+	err := tx.QueryRowContext(ctx, `SELECT report_identity FROM publication_candidate_reports WHERE checkpoint_identity = ?`, checkpointIdentity).Scan(&identity)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PublicationCandidateReport{}, fmt.Errorf("%w: publication candidate report", ErrNotFound)
 	}
 	if err != nil {
 		return PublicationCandidateReport{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return PublicationCandidateReport{}, err
-	}
-	defer tx.Rollback()
 	out := PublicationCandidateReport{Candidates: []PublicationCandidate{}}
 	var created string
 	err = tx.QueryRowContext(ctx, `SELECT report_identity, schema_version, target_identity, checkpoint_identity,
@@ -446,9 +498,6 @@ func (s *Store) GetPublicationCandidateReport(ctx context.Context, checkpointIde
 	}
 	if candidateReportSemanticIdentity(out) != out.ReportIdentity || !sortedCandidates(out.Candidates) {
 		return PublicationCandidateReport{}, fmt.Errorf("%w: candidate report semantic identity is corrupt", ErrConflict)
-	}
-	if err := tx.Commit(); err != nil {
-		return PublicationCandidateReport{}, err
 	}
 	return out, nil
 }
@@ -514,15 +563,23 @@ func (s *Store) GetPublicationDeletionReceipt(ctx context.Context, reportIdentit
 		return PublicationDeletionReceipt{}, err
 	}
 	defer tx.Rollback()
+	out, err := getPublicationDeletionReceiptTx(ctx, tx, reportIdentity, objectPath)
+	if err != nil {
+		return PublicationDeletionReceipt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return PublicationDeletionReceipt{}, err
+	}
+	return out, nil
+}
+
+func getPublicationDeletionReceiptTx(ctx context.Context, tx *sql.Tx, reportIdentity, objectPath string) (PublicationDeletionReceipt, error) {
 	receipt, found, err := publicationDeletionReceiptByPathTx(ctx, tx, reportIdentity, objectPath)
 	if err != nil {
 		return PublicationDeletionReceipt{}, err
 	}
 	if !found {
 		return PublicationDeletionReceipt{}, fmt.Errorf("%w: publication deletion receipt", ErrNotFound)
-	}
-	if err := tx.Commit(); err != nil {
-		return PublicationDeletionReceipt{}, err
 	}
 	return receipt, nil
 }
@@ -532,15 +589,18 @@ func (s *Store) GetPublicationDeletionReceipt(ctx context.Context, reportIdentit
 // deletion receipts. A pending partial report is deliberately excluded: publish
 // is blocked until that report reaches its terminal phase.
 func (s *Store) PublicationLiveInventory(ctx context.Context, checkpointIdentity string) ([]PublicationInventoryObject, error) {
-	checkpoint, err := s.GetAppliedCheckpoint(ctx, checkpointIdentity)
-	if err != nil {
-		return nil, err
+	if !validSHA256Text(checkpointIdentity) {
+		return nil, errors.New("invalid publication checkpoint identity")
 	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
+	checkpoint, err := getAppliedCheckpointTx(ctx, tx, checkpointIdentity)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT d.report_identity, d.path
 FROM publication_deletion_receipts AS d
 JOIN publication_candidate_reports AS r ON r.report_identity = d.report_identity
@@ -553,22 +613,26 @@ ORDER BY d.path, d.report_identity`, checkpoint.TargetIdentity)
 	if err != nil {
 		return nil, err
 	}
-	deleted := make(map[string]struct{})
+	type receiptKey struct{ report, path string }
+	keys := []receiptKey{}
 	for rows.Next() {
-		var reportIdentity, objectPath string
-		if err := rows.Scan(&reportIdentity, &objectPath); err != nil {
+		var key receiptKey
+		if err := rows.Scan(&key.report, &key.path); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		receipt, found, err := publicationDeletionReceiptByPathTx(ctx, tx, reportIdentity, objectPath)
-		if err != nil || !found {
-			rows.Close()
-			return nil, errors.Join(fmt.Errorf("%w: missing terminal deletion receipt", ErrConflict), err)
-		}
-		deleted[publicationObjectEvidenceKey(receipt.Path, receipt.Phase, receipt.Size, receipt.SHA256, receipt.RemoteIdentity)] = struct{}{}
+		keys = append(keys, key)
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
+	}
+	deleted := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		receipt, found, err := publicationDeletionReceiptByPathTx(ctx, tx, key.report, key.path)
+		if err != nil || !found {
+			return nil, errors.Join(fmt.Errorf("%w: missing terminal deletion receipt", ErrConflict), err)
+		}
+		deleted[publicationObjectEvidenceKey(receipt.Path, receipt.Phase, receipt.Size, receipt.SHA256, receipt.RemoteIdentity)] = struct{}{}
 	}
 	result := make([]PublicationInventoryObject, 0, len(checkpoint.Inventory))
 	for _, object := range checkpoint.Inventory {

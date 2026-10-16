@@ -771,9 +771,13 @@ func (s *Store) BootstrapLegacyGeneration(ctx context.Context, operationID strin
 }
 
 func (s *Store) GetGeneration(ctx context.Context, generation GenerationID) (GenerationInfo, error) {
+	return getGenerationOn(ctx, s.db, generation)
+}
+
+func getGenerationOn(ctx context.Context, q schemaQuerier, generation GenerationID) (GenerationInfo, error) {
 	var info GenerationInfo
 	var created string
-	err := s.db.QueryRowContext(ctx, `SELECT generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at FROM generations WHERE generation = ?`, generation).Scan(
+	err := q.QueryRowContext(ctx, `SELECT generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at FROM generations WHERE generation = ?`, generation).Scan(
 		&info.Generation, &info.PreviousGeneration, &info.OperationID, &info.ManifestSHA256, &info.RendererIdentity, &created,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -790,11 +794,15 @@ func (s *Store) GetGeneration(ctx context.Context, generation GenerationID) (Gen
 }
 
 func (s *Store) GenerationChanges(ctx context.Context, generation GenerationID) ([]FileChange, error) {
-	info, err := s.GetGeneration(ctx, generation)
+	return generationChangesOn(ctx, s.db, generation)
+}
+
+func generationChangesOn(ctx context.Context, q schemaQuerier, generation GenerationID) ([]FileChange, error) {
+	info, err := getGenerationOn(ctx, q, generation)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT action, path, phase, size, sha256 FROM operation_files WHERE operation_id = ? ORDER BY sequence`, info.OperationID)
+	rows, err := q.QueryContext(ctx, `SELECT action, path, phase, size, sha256 FROM operation_files WHERE operation_id = ? ORDER BY sequence`, info.OperationID)
 	if err != nil {
 		return nil, err
 	}
@@ -814,10 +822,14 @@ func (s *Store) GenerationChanges(ctx context.Context, generation GenerationID) 
 }
 
 func (s *Store) GenerationManifest(ctx context.Context, generation GenerationID) ([]GenerationFile, error) {
+	return generationManifestOn(ctx, s.db, generation)
+}
+
+func generationManifestOn(ctx context.Context, q schemaQuerier, generation GenerationID) ([]GenerationFile, error) {
 	if generation == 0 {
 		return []GenerationFile{}, nil
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT path, phase, size, sha256 FROM generation_files WHERE generation = ? ORDER BY path`, generation)
+	rows, err := q.QueryContext(ctx, `SELECT path, phase, size, sha256 FROM generation_files WHERE generation = ? ORDER BY path`, generation)
 	if err != nil {
 		return nil, fmt.Errorf("read generation %d manifest: %w", generation, err)
 	}
@@ -830,12 +842,12 @@ func (s *Store) GenerationManifest(ctx context.Context, generation GenerationID)
 		}
 		files = append(files, file)
 	}
-	if err := rows.Err(); err != nil {
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
 	}
 	if len(files) == 0 {
 		var exists int
-		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM generations WHERE generation = ?)`, generation).Scan(&exists); err != nil {
+		if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM generations WHERE generation = ?)`, generation).Scan(&exists); err != nil {
 			return nil, err
 		}
 		if exists == 0 {
@@ -849,11 +861,23 @@ func (s *Store) GenerationManifest(ctx context.Context, generation GenerationID)
 // public filesystem: predecessor links, manifest hashes, terminal operations,
 // and every phase-ordered physical delta must agree exactly.
 func (s *Store) ValidateGenerationLedger(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.validateGenerationLedgerOn(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) validateGenerationLedgerOn(ctx context.Context, q schemaQuerier) error {
 	identity := RepositoryIdentity{LayoutVersion: LayoutC2V1}
 	manifestLayout := LayoutC2V1
 	if s.SchemaVersion() != 6 {
 		var err error
-		identity, err = s.RepositoryIdentity(ctx)
+		identity, err = repositoryIdentityOn(ctx, q)
 		if err != nil {
 			return err
 		}
@@ -863,10 +887,10 @@ func (s *Store) ValidateGenerationLedger(ctx context.Context) error {
 		}
 	}
 	var current GenerationID
-	if err := s.db.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&current); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&current); err != nil {
 		return err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT generation, previous_generation, operation_id, manifest_sha256 FROM generations ORDER BY generation`)
+	rows, err := q.QueryContext(ctx, `SELECT generation, previous_generation, operation_id, manifest_sha256 FROM generations ORDER BY generation`)
 	if err != nil {
 		return err
 	}
@@ -909,7 +933,7 @@ func (s *Store) ValidateGenerationLedger(ctx context.Context) error {
 		}
 		seenOperations[info.OperationID] = struct{}{}
 		var operationKind, operationState string
-		if err := s.db.QueryRowContext(ctx, `SELECT kind, state FROM operations WHERE id = ?`, info.OperationID).Scan(&operationKind, &operationState); err != nil {
+		if err := q.QueryRowContext(ctx, `SELECT kind, state FROM operations WHERE id = ?`, info.OperationID).Scan(&operationKind, &operationState); err != nil {
 			return fmt.Errorf("%w: generation %d operation is unavailable", ErrConflict, info.Generation)
 		}
 		if OperationState(operationState) != OperationDone {
@@ -926,7 +950,7 @@ func (s *Store) ValidateGenerationLedger(ctx context.Context) error {
 		} else if operationKind == "layout.migrate" {
 			return fmt.Errorf("%w: unexpected or duplicate layout migration generation %d", ErrConflict, info.Generation)
 		}
-		manifest, err := s.GenerationManifest(ctx, info.Generation)
+		manifest, err := generationManifestOn(ctx, q, info.Generation)
 		if err != nil {
 			return err
 		}
@@ -935,16 +959,16 @@ func (s *Store) ValidateGenerationLedger(ctx context.Context) error {
 			return fmt.Errorf("%w: generation %d manifest hash differs", ErrConflict, info.Generation)
 		}
 		if s.SchemaVersion() >= 7 {
-			if err := validateGenerationViewSignerCoverage(ctx, s.db, info.Generation, normalized); err != nil {
+			if err := validateGenerationViewSignerCoverage(ctx, q, info.Generation, normalized); err != nil {
 				return err
 			}
 			if info.Generation == current {
-				if err := requireVerifiedGenerationSigners(ctx, s.db, info.Generation); err != nil {
+				if err := requireVerifiedGenerationSigners(ctx, q, info.Generation); err != nil {
 					return err
 				}
 			}
 		}
-		changes, err := s.GenerationChanges(ctx, info.Generation)
+		changes, err := generationChangesOn(ctx, q, info.Generation)
 		if err != nil {
 			return err
 		}

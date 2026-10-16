@@ -34,8 +34,24 @@ func (s *Store) PublicationRootRequirement(ctx context.Context) (PublicationRoot
 	if ctx == nil {
 		return PublicationRootRequirement{}, errors.New("nil publication root context")
 	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return PublicationRootRequirement{}, err
+	}
+	defer tx.Rollback()
+	out, err := publicationRootRequirementTx(ctx, tx)
+	if err != nil {
+		return PublicationRootRequirement{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return PublicationRootRequirement{}, err
+	}
+	return out, nil
+}
+
+func publicationRootRequirementTx(ctx context.Context, tx *sql.Tx) (PublicationRootRequirement, error) {
 	var evidenceCount int
-	if err := s.db.QueryRowContext(ctx, `SELECT
+	if err := tx.QueryRowContext(ctx, `SELECT
 	 (SELECT count(*) FROM publication_target_bindings) +
 		 (SELECT count(*) FROM publication_target_binding_revisions) +
 	 (SELECT count(*) FROM publication_attempts) +
@@ -67,31 +83,31 @@ func (s *Store) PublicationRootRequirement(ctx context.Context) (PublicationRoot
 		{"deletion_receipts", `SELECT receipt_identity, report_identity, path, phase, size, sha256, remote_identity, storage_absent, public_absent, observed_at FROM publication_deletion_receipts ORDER BY report_identity, path`},
 	}
 	for _, query := range queries {
-		if err := hashPublicationRows(ctx, h, query.label, s.db, query.query); err != nil {
+		if err := hashPublicationRows(ctx, h, query.label, tx, query.query); err != nil {
 			return PublicationRootRequirement{}, err
 		}
 	}
 	result.EvidenceIdentity = hex.EncodeToString(h.Sum(nil))
 
 	var bindings, heads int
-	if err := s.db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM publication_target_bindings), (SELECT count(*) FROM publication_target_heads)`).Scan(&bindings, &heads); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM publication_target_bindings), (SELECT count(*) FROM publication_target_heads)`).Scan(&bindings, &heads); err != nil {
 		return PublicationRootRequirement{}, err
 	}
 	if bindings != heads {
 		result.StateComplete = false
 	}
 	var incompleteCheckpoints int
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM publication_checkpoints WHERE inventory_complete != 1`).Scan(&incompleteCheckpoints); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM publication_checkpoints WHERE inventory_complete != 1`).Scan(&incompleteCheckpoints); err != nil {
 		return PublicationRootRequirement{}, err
 	}
 	if incompleteCheckpoints != 0 {
 		result.StateComplete = false
 	}
-	if err := s.validatePublicationEvidenceForGC(ctx); err != nil {
+	if err := validatePublicationEvidenceForGC(ctx, tx); err != nil {
 		return PublicationRootRequirement{}, err
 	}
 	roots := make(map[string]GenerationFile)
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT target_generation FROM publication_attempts WHERE phase NOT IN ('done', 'abandoned') ORDER BY target_generation`)
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT target_generation FROM publication_attempts WHERE phase NOT IN ('done', 'abandoned') ORDER BY target_generation`)
 	if err != nil {
 		return PublicationRootRequirement{}, err
 	}
@@ -108,10 +124,13 @@ func (s *Store) PublicationRootRequirement(ctx context.Context) (PublicationRoot
 		return PublicationRootRequirement{}, err
 	}
 	for _, generation := range generations {
-		manifest, err := s.GenerationManifest(ctx, generation)
-		if err != nil {
+		manifest, err := generationManifestOn(ctx, tx, generation)
+		if errors.Is(err, ErrNotFound) {
 			result.StateComplete = false
 			continue
+		}
+		if err != nil {
+			return PublicationRootRequirement{}, err
 		}
 		for _, file := range manifest {
 			if file.Phase == "payload" {
@@ -123,7 +142,7 @@ func (s *Store) PublicationRootRequirement(ctx context.Context) (PublicationRoot
 		}
 	}
 
-	checkpointRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT c.checkpoint_identity, c.inventory_complete
+	checkpointRows, err := tx.QueryContext(ctx, `SELECT DISTINCT c.checkpoint_identity, c.inventory_complete
 FROM publication_checkpoints AS c
 WHERE EXISTS (SELECT 1 FROM publication_target_heads AS h WHERE h.checkpoint_identity = c.checkpoint_identity)
    OR EXISTS (SELECT 1 FROM publication_grace_records AS g WHERE g.checkpoint_identity = c.checkpoint_identity)
@@ -159,7 +178,7 @@ ORDER BY c.checkpoint_identity`)
 	// evidence, every locally-addressable payload observed in the applied
 	// checkpoint inventory remains a GC root. An applied checkpoint is also
 	// protected during the small atomicity window before its grace row exists.
-	inventoryRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT i.path, i.size, i.sha256
+	inventoryRows, err := tx.QueryContext(ctx, `SELECT DISTINCT i.path, i.size, i.sha256
 FROM publication_inventory AS i
 JOIN publication_checkpoints AS c ON c.checkpoint_identity = i.checkpoint_identity
 JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
@@ -194,18 +213,18 @@ WHERE i.phase = 'payload'
 	return result, nil
 }
 
-func (s *Store) validatePublicationEvidenceForGC(ctx context.Context) error {
+func validatePublicationEvidenceForGC(ctx context.Context, tx *sql.Tx) error {
 	type validationSet struct {
 		query string
 		check func(string) error
 	}
 	sets := []validationSet{
 		{`SELECT target_identity FROM publication_target_bindings ORDER BY target_identity`, func(identity string) error {
-			target, err := s.GetPublicationTarget(ctx, identity)
+			target, err := getPublicationTargetOn(ctx, tx, identity)
 			if err != nil {
 				return err
 			}
-			revisions, err := s.ListPublicationTargetBindingRevisions(ctx, identity)
+			revisions, err := listPublicationTargetBindingRevisionsOn(ctx, tx, identity)
 			if err != nil || len(revisions) == 0 {
 				return errors.Join(errors.New("publication target has no binding revisions"), err)
 			}
@@ -215,24 +234,24 @@ func (s *Store) validatePublicationEvidenceForGC(ctx context.Context) error {
 			return nil
 		}},
 		{`SELECT attempt_identity FROM publication_attempts ORDER BY attempt_identity`, func(identity string) error {
-			_, err := s.GetPublicationAttempt(ctx, identity)
+			_, err := getPublicationAttemptTx(ctx, tx, identity)
 			return err
 		}},
 		{`SELECT checkpoint_identity FROM publication_checkpoints WHERE inventory_complete = 1 ORDER BY checkpoint_identity`, func(identity string) error {
-			_, err := s.GetAppliedCheckpoint(ctx, identity)
+			_, err := getAppliedCheckpointTx(ctx, tx, identity)
 			return err
 		}},
 		{`SELECT checkpoint_identity FROM publication_grace_records ORDER BY checkpoint_identity`, func(identity string) error {
-			_, err := s.GetGraceRecord(ctx, identity)
+			_, err := getGraceRecordOn(ctx, tx, identity)
 			return err
 		}},
 		{`SELECT checkpoint_identity FROM publication_candidate_reports ORDER BY checkpoint_identity`, func(identity string) error {
-			_, err := s.GetPublicationCandidateReport(ctx, identity)
+			_, err := getPublicationCandidateReportTx(ctx, tx, identity)
 			return err
 		}},
 	}
 	for _, set := range sets {
-		rows, err := s.db.QueryContext(ctx, set.query)
+		rows, err := tx.QueryContext(ctx, set.query)
 		if err != nil {
 			return err
 		}
@@ -254,7 +273,7 @@ func (s *Store) validatePublicationEvidenceForGC(ctx context.Context) error {
 			}
 		}
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT report_identity, path FROM publication_deletion_receipts ORDER BY report_identity, path`)
+	rows, err := tx.QueryContext(ctx, `SELECT report_identity, path FROM publication_deletion_receipts ORDER BY report_identity, path`)
 	if err != nil {
 		return err
 	}
@@ -272,7 +291,7 @@ func (s *Store) validatePublicationEvidenceForGC(ctx context.Context) error {
 		return err
 	}
 	for _, key := range receipts {
-		if _, err := s.GetPublicationDeletionReceipt(ctx, key.report, key.path); err != nil {
+		if _, err := getPublicationDeletionReceiptTx(ctx, tx, key.report, key.path); err != nil {
 			return fmt.Errorf("%w: publication GC deletion evidence is corrupt: %v", ErrConflict, err)
 		}
 	}
@@ -290,7 +309,7 @@ func addPublicationRoot(roots map[string]GenerationFile, file GenerationFile) er
 	return nil
 }
 
-func hashPublicationRows(ctx context.Context, h hash.Hash, label string, db *sql.DB, query string) error {
+func hashPublicationRows(ctx context.Context, h hash.Hash, label string, db schemaQuerier, query string) error {
 	writeHashField(h, []byte(label))
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {

@@ -152,7 +152,7 @@ func TestPackageMembershipProjectionBatches(t *testing.T) {
 	missing := PackageObject{SHA256: fmt.Sprintf("%064x", len(objects)+1)}
 	requested = append(requested, objects[0], missing, objects[selectedCount-1])
 	for _, table := range []string{"memberships", "built_memberships", "prior_built_memberships"} {
-		projection, err := store.packageDistsForObjects(ctx, requested, table, false)
+		projection, err := packageDistsForObjects(ctx, store.db, requested, table, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -168,12 +168,12 @@ func TestPackageMembershipProjectionBatches(t *testing.T) {
 				t.Fatalf("table=%s digest=%s dists=%v want=%v", table, object.SHA256, projection[object.SHA256], want)
 			}
 		}
-		empty, err := store.packageDistsForObjects(ctx, nil, table, false)
+		empty, err := packageDistsForObjects(ctx, store.db, nil, table, false)
 		if err != nil || len(empty) != 0 {
 			t.Fatalf("table=%s empty projection=%v err=%v", table, empty, err)
 		}
 	}
-	if _, err := store.packageDistsForObjects(ctx, requested, "package_objects", false); err == nil {
+	if _, err := packageDistsForObjects(ctx, store.db, requested, "package_objects", false); err == nil {
 		t.Fatal("accepted an invalid membership table")
 	}
 }

@@ -270,10 +270,14 @@ func (s *Store) listOperations(ctx context.Context, limit int, dist string, term
 // GetOperationSummary reads only the journal row, without loading package and
 // event history. Residue cleanup uses this bounded lookup for each actual entry.
 func (s *Store) GetOperationSummary(ctx context.Context, id string) (Operation, error) {
+	return getOperationSummaryOn(ctx, s.db, id)
+}
+
+func getOperationSummaryOn(ctx context.Context, q schemaQuerier, id string) (Operation, error) {
 	if !operationIDPattern.MatchString(id) {
 		return Operation{}, fmt.Errorf("%w: invalid operation id", ErrNotFound)
 	}
-	operation, err := scanOperation(s.db.QueryRowContext(ctx, `SELECT id, kind, state, payload_json, result_json, error_class, error_message, created_at, updated_at FROM operations WHERE id = ?`, id))
+	operation, err := scanOperation(q.QueryRowContext(ctx, `SELECT id, kind, state, payload_json, result_json, error_class, error_message, created_at, updated_at FROM operations WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Operation{}, fmt.Errorf("%w: operation %s", ErrNotFound, id)
 	}
@@ -281,7 +285,12 @@ func (s *Store) GetOperationSummary(ctx context.Context, id string) (Operation, 
 }
 
 func (s *Store) GetOperation(ctx context.Context, id string) (OperationDetail, error) {
-	operation, err := s.GetOperationSummary(ctx, id)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return OperationDetail{}, err
+	}
+	defer tx.Rollback()
+	operation, err := getOperationSummaryOn(ctx, tx, id)
 	if err != nil {
 		return OperationDetail{}, err
 	}
@@ -290,7 +299,7 @@ func (s *Store) GetOperation(ctx context.Context, id string) (OperationDetail, e
 		return OperationDetail{}, errors.New("operation audit timestamps are inconsistent")
 	}
 	detail := OperationDetail{Operation: operation, DurationMS: duration.Milliseconds(), Events: []OperationEvent{}, Packages: []OperationPackage{}, Memberships: []OperationMembership{}, Files: []OperationFile{}}
-	events, err := s.db.QueryContext(ctx, `SELECT sequence, state, detail_json, occurred_at FROM operation_events WHERE operation_id = ? ORDER BY sequence`, id)
+	events, err := tx.QueryContext(ctx, `SELECT sequence, state, detail_json, occurred_at FROM operation_events WHERE operation_id = ? ORDER BY sequence`, id)
 	if err != nil {
 		return OperationDetail{}, err
 	}
@@ -311,7 +320,7 @@ func (s *Store) GetOperation(ctx context.Context, id string) (OperationDetail, e
 	if err := errors.Join(events.Err(), events.Close()); err != nil {
 		return OperationDetail{}, err
 	}
-	packages, err := s.db.QueryContext(ctx, `SELECT sequence, input_path, package_sha256, coordinate, disposition, error_class, message FROM operation_packages WHERE operation_id = ? ORDER BY sequence`, id)
+	packages, err := tx.QueryContext(ctx, `SELECT sequence, input_path, package_sha256, coordinate, disposition, error_class, message FROM operation_packages WHERE operation_id = ? ORDER BY sequence`, id)
 	if err != nil {
 		return OperationDetail{}, err
 	}
@@ -334,7 +343,7 @@ func (s *Store) GetOperation(ctx context.Context, id string) (OperationDetail, e
 	if err := errors.Join(packages.Err(), packages.Close()); err != nil {
 		return OperationDetail{}, err
 	}
-	memberships, err := s.db.QueryContext(ctx, `SELECT sequence, dist_name, package_sha256, action FROM operation_memberships WHERE operation_id = ? ORDER BY sequence`, id)
+	memberships, err := tx.QueryContext(ctx, `SELECT sequence, dist_name, package_sha256, action FROM operation_memberships WHERE operation_id = ? ORDER BY sequence`, id)
 	if err != nil {
 		return OperationDetail{}, err
 	}
@@ -349,7 +358,7 @@ func (s *Store) GetOperation(ctx context.Context, id string) (OperationDetail, e
 	if err := errors.Join(memberships.Err(), memberships.Close()); err != nil {
 		return OperationDetail{}, err
 	}
-	files, err := s.db.QueryContext(ctx, `SELECT sequence, action, phase, path, size, sha256 FROM operation_files WHERE operation_id = ? ORDER BY sequence`, id)
+	files, err := tx.QueryContext(ctx, `SELECT sequence, action, phase, path, size, sha256 FROM operation_files WHERE operation_id = ? ORDER BY sequence`, id)
 	if err != nil {
 		return OperationDetail{}, err
 	}
@@ -369,6 +378,9 @@ func (s *Store) GetOperation(ctx context.Context, id string) (OperationDetail, e
 		detail.Files = append(detail.Files, item)
 	}
 	if err := errors.Join(files.Err(), files.Close()); err != nil {
+		return OperationDetail{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return OperationDetail{}, err
 	}
 	return detail, nil

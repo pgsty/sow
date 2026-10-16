@@ -1383,14 +1383,26 @@ func sameSchemaObjects(left, right []schemaObject) bool {
 }
 
 func (s *Store) Check(ctx context.Context) error {
-	if err := s.validateSchemaVersion(ctx, s.schemaVersion); err != nil {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
 		return err
 	}
-	if err := s.validateSemanticState(ctx); err != nil {
+	defer tx.Rollback()
+	if err := s.checkOn(ctx, tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) checkOn(ctx context.Context, q schemaQuerier) error {
+	if err := validateSchemaOn(ctx, q, s.schemaVersion); err != nil {
+		return err
+	}
+	if err := s.validateSemanticState(ctx, q); err != nil {
 		return err
 	}
 	if s.schemaVersion >= 12 {
-		if err := s.validatePublicationTargetBindingRevisions(ctx); err != nil {
+		if err := validatePublicationTargetBindingRevisions(ctx, q); err != nil {
 			return fmt.Errorf("%w: validate publication target binding revisions: %v", ErrSchema, err)
 		}
 	}
@@ -1398,11 +1410,11 @@ func (s *Store) Check(ctx context.Context) error {
 	// check. SQL constraints cannot express the source-derived pool path, and
 	// SQLite's ordinary UNIQUE collation does not model case-insensitive host
 	// filesystems.
-	if err := s.validatePackageObjectRows(ctx); err != nil {
+	if err := validatePackageObjectRows(ctx, q); err != nil {
 		return fmt.Errorf("%w: validate package objects: %v", ErrSchema, err)
 	}
 	var portableCollisions int64
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM (
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM (
 SELECT lower(pool_path) FROM package_objects GROUP BY lower(pool_path) HAVING count(*) > 1
 )`).Scan(&portableCollisions); err != nil {
 		return fmt.Errorf("%w: inspect portable package paths: %v", ErrSchema, err)
@@ -1416,9 +1428,9 @@ SELECT lower(pool_path) FROM package_objects GROUP BY lower(pool_path) HAVING co
 // validateSemanticState checks cross-table relations that SQLite foreign keys
 // and column CHECK constraints cannot express.  It is read-only and keeps
 // schema shape validation separate from repository history/filesystem checks.
-func (s *Store) validateSemanticState(ctx context.Context) error {
+func (s *Store) validateSemanticState(ctx context.Context, q schemaQuerier) error {
 	var singletonCount int64
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM repository_state WHERE singleton = 1`).Scan(&singletonCount); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM repository_state WHERE singleton = 1`).Scan(&singletonCount); err != nil {
 		return err
 	}
 	if singletonCount != 1 {
@@ -1503,7 +1515,7 @@ WHERE a.phase != 'abandoned'`,
 	issues := []error{}
 	for _, check := range checks {
 		var count int64
-		if err := s.db.QueryRowContext(ctx, check.query).Scan(&count); err != nil {
+		if err := q.QueryRowContext(ctx, check.query).Scan(&count); err != nil {
 			issues = append(issues, fmt.Errorf("%s: %w", check.label, err))
 		} else if count != 0 {
 			issues = append(issues, fmt.Errorf("%s (%d row(s))", check.label, count))
@@ -1511,12 +1523,12 @@ WHERE a.phase != 'abandoned'`,
 	}
 	var status string
 	var reason sql.NullString
-	if err := s.db.QueryRowContext(ctx, `SELECT status, dirty_reason FROM repository_state WHERE singleton = 1`).Scan(&status, &reason); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT status, dirty_reason FROM repository_state WHERE singleton = 1`).Scan(&status, &reason); err != nil {
 		issues = append(issues, err)
 	} else {
 		var projectionDirty int
 		var activeOperations int
-		if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(
+		if err := q.QueryRowContext(ctx, `SELECT EXISTS(
 SELECT 1 FROM dists AS d
 WHERE d.effective_config_sha256 != d.built_config_sha256
    OR EXISTS (SELECT package_sha256 FROM memberships WHERE dist_name = d.name
@@ -1526,7 +1538,7 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 )`).Scan(&projectionDirty); err != nil {
 			issues = append(issues, err)
 		}
-		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE state NOT IN ('done', 'done_dirty', 'rolled_back', 'failed')`).Scan(&activeOperations); err != nil {
+		if err := q.QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE state NOT IN ('done', 'done_dirty', 'rolled_back', 'failed')`).Scan(&activeOperations); err != nil {
 			issues = append(issues, err)
 		} else if status == "clean" && projectionDirty != 0 || status == "dirty" && projectionDirty == 0 && activeOperations == 0 {
 			issues = append(issues, fmt.Errorf("Repository status %s contradicts Desired/Built projection", status))
@@ -1536,16 +1548,16 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 		}
 	}
 	if s.schemaVersion != 6 {
-		identity, identityErr := s.RepositoryIdentity(ctx)
+		identity, identityErr := repositoryIdentityOn(ctx, q)
 		if identityErr != nil {
 			issues = append(issues, identityErr)
 		} else {
-			control, controlErr := s.LayoutTransitionControl(ctx)
+			control, controlErr := layoutTransitionControlOn(ctx, q)
 			if controlErr != nil {
 				issues = append(issues, controlErr)
 			} else if control != nil {
 				var head GenerationID
-				headErr := s.db.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&head)
+				headErr := q.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&head)
 				if headErr != nil || control.RepositoryID != identity.RepositoryID ||
 					identity.LayoutVersion == LayoutC2V1 || identity.LayoutVersion == LayoutC2ToSingleV1 && head != control.BaseGeneration ||
 					identity.LayoutVersion == LayoutSinglePayloadV1 && (identity.TransitionReceiptSHA256 == "" || control.CommitIntentAt == "") {
@@ -1553,7 +1565,7 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 				}
 				if identity.LayoutVersion == LayoutSinglePayloadV1 && headErr == nil {
 					var headManifest string
-					manifestErr := s.db.QueryRowContext(ctx, `SELECT manifest_sha256 FROM generations WHERE generation = ?`, head).Scan(&headManifest)
+					manifestErr := q.QueryRowContext(ctx, `SELECT manifest_sha256 FROM generations WHERE generation = ?`, head).Scan(&headManifest)
 					if manifestErr != nil || headManifest != control.TargetManifestSHA256 {
 						issues = append(issues, errors.Join(errors.New("Repository layout transition control target differs from head Generation"), manifestErr))
 					}
@@ -1565,7 +1577,7 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 				issues = append(issues, errors.New("non-terminal Repository layout has a transition receipt"))
 			}
 			var migrationCount int64
-			if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE kind = 'layout.migrate' AND state = 'done'`).Scan(&migrationCount); err != nil {
+			if err := q.QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE kind = 'layout.migrate' AND state = 'done'`).Scan(&migrationCount); err != nil {
 				issues = append(issues, err)
 			} else if migrationCount > 1 {
 				issues = append(issues, fmt.Errorf("Repository has %d completed layout migrations", migrationCount))
@@ -1575,7 +1587,7 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 				}
 			} else {
 				var operationID, payload string
-				if err := s.db.QueryRowContext(ctx, `SELECT id, payload_json FROM operations WHERE kind = 'layout.migrate' AND state = 'done'`).Scan(&operationID, &payload); err != nil {
+				if err := q.QueryRowContext(ctx, `SELECT id, payload_json FROM operations WHERE kind = 'layout.migrate' AND state = 'done'`).Scan(&operationID, &payload); err != nil {
 					issues = append(issues, err)
 				} else {
 					var wire struct {
@@ -1589,10 +1601,10 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 					var trailing any
 					trailingErr := decoder.Decode(&trailing)
 					var head GenerationID
-					headErr := s.db.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&head)
+					headErr := q.QueryRowContext(ctx, `SELECT built_generation FROM repository_state WHERE singleton = 1`).Scan(&head)
 					next, nextErr := wire.BaseGeneration.Next()
 					var generationLinkCount int64
-					linkErr := s.db.QueryRowContext(ctx, `SELECT count(*) FROM generations WHERE operation_id = ? AND generation = ? AND previous_generation = ?`, operationID, wire.TargetGeneration, wire.BaseGeneration).Scan(&generationLinkCount)
+					linkErr := q.QueryRowContext(ctx, `SELECT count(*) FROM generations WHERE operation_id = ? AND generation = ? AND previous_generation = ?`, operationID, wire.TargetGeneration, wire.BaseGeneration).Scan(&generationLinkCount)
 					if decodeErr != nil || trailingErr != io.EOF || headErr != nil ||
 						identity.LayoutVersion != LayoutSinglePayloadV1 || identity.TransitionReceiptSHA256 == "" ||
 						wire.TransitionReceiptSHA256 != identity.TransitionReceiptSHA256 || wire.TargetGeneration != head ||
@@ -1703,7 +1715,12 @@ FROM repository_state WHERE singleton = 1`).Scan(
 }
 
 func (s *Store) ListDists(ctx context.Context) ([]Dist, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `
 SELECT d.name, d.format, d.effective_config_sha256, d.built_generation,
        COALESCE(s.fingerprint, ''), COALESCE(s.public_key, X''), d.effective_signing_json
 FROM dists AS d
@@ -1721,11 +1738,11 @@ ORDER BY d.name`)
 		}
 		out = append(out, dist)
 	}
-	if err := rows.Err(); err != nil {
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, fmt.Errorf("list dists: %w", err)
 	}
 	for index := range out {
-		architectures, err := s.distArchitectures(ctx, out[index].Name)
+		architectures, err := distArchitectures(ctx, tx, out[index].Name)
 		if err != nil {
 			return nil, err
 		}
@@ -1734,12 +1751,20 @@ ORDER BY d.name`)
 	if out == nil {
 		out = []Dist{}
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
 func (s *Store) GetDist(ctx context.Context, name string) (Dist, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Dist{}, err
+	}
+	defer tx.Rollback()
 	var out Dist
-	err := s.db.QueryRowContext(ctx, `
+	err = tx.QueryRowContext(ctx, `
 SELECT d.name, d.format, d.effective_config_sha256, d.built_generation,
        COALESCE(s.fingerprint, ''), COALESCE(s.public_key, X''), d.effective_signing_json
 FROM dists AS d
@@ -1753,15 +1778,18 @@ WHERE d.name = ?`, name).Scan(
 	if err != nil {
 		return Dist{}, fmt.Errorf("read dist %q: %w", name, err)
 	}
-	out.Architectures, err = s.distArchitectures(ctx, name)
+	out.Architectures, err = distArchitectures(ctx, tx, name)
 	if err != nil {
+		return Dist{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return Dist{}, err
 	}
 	return out, nil
 }
 
-func (s *Store) distArchitectures(ctx context.Context, name string) ([]Architecture, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT family, ecosystem_arch FROM dist_architectures WHERE dist_name = ? ORDER BY CASE family WHEN 'x86_64' THEN 0 WHEN 'aarch64' THEN 1 ELSE 2 END, family`, name)
+func distArchitectures(ctx context.Context, q schemaQuerier, name string) ([]Architecture, error) {
+	rows, err := q.QueryContext(ctx, `SELECT family, ecosystem_arch FROM dist_architectures WHERE dist_name = ? ORDER BY CASE family WHEN 'x86_64' THEN 0 WHEN 'aarch64' THEN 1 ELSE 2 END, family`, name)
 	if err != nil {
 		return nil, fmt.Errorf("list architectures for dist %q: %w", name, err)
 	}

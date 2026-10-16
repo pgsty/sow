@@ -45,9 +45,13 @@ func canonicalTransitionControlTime(value string) bool {
 }
 
 func (s *Store) LayoutTransitionControl(ctx context.Context) (*LayoutTransitionControl, error) {
+	return layoutTransitionControlOn(ctx, s.db)
+}
+
+func layoutTransitionControlOn(ctx context.Context, q schemaQuerier) (*LayoutTransitionControl, error) {
 	var control LayoutTransitionControl
 	var commitIntentAt, notBefore sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT repository_id, base_generation, target_manifest_sha256, plan_identity_sha256, planned_at, commit_intent_at, not_before FROM layout_transition_control WHERE singleton = 1`).Scan(
+	err := q.QueryRowContext(ctx, `SELECT repository_id, base_generation, target_manifest_sha256, plan_identity_sha256, planned_at, commit_intent_at, not_before FROM layout_transition_control WHERE singleton = 1`).Scan(
 		&control.RepositoryID, &control.BaseGeneration, &control.TargetManifestSHA256, &control.PlanIdentitySHA256, &control.PlannedAt, &commitIntentAt, &notBefore,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -155,9 +159,13 @@ func IsCanonicalRepositoryID(value string) bool {
 }
 
 func (s *Store) RepositoryIdentity(ctx context.Context) (RepositoryIdentity, error) {
+	return repositoryIdentityOn(ctx, s.db)
+}
+
+func repositoryIdentityOn(ctx context.Context, q schemaQuerier) (RepositoryIdentity, error) {
 	var identity RepositoryIdentity
 	var receipt sql.NullString
-	if err := s.db.QueryRowContext(ctx, `SELECT repository_id, layout_version, transition_receipt_sha256 FROM repository_state WHERE singleton = 1`).Scan(&identity.RepositoryID, &identity.LayoutVersion, &receipt); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT repository_id, layout_version, transition_receipt_sha256 FROM repository_state WHERE singleton = 1`).Scan(&identity.RepositoryID, &identity.LayoutVersion, &receipt); err != nil {
 		return RepositoryIdentity{}, fmt.Errorf("read repository identity: %w", err)
 	}
 	if receipt.Valid {
@@ -177,7 +185,11 @@ func validLayoutVersion(layout string) bool {
 // mutation, publication and GC entrypoints.  The transition journal, rather
 // than a misleading steady-state manifest, owns non-terminal recovery.
 func (s *Store) RequireTerminalLayout(ctx context.Context) error {
-	identity, err := s.RepositoryIdentity(ctx)
+	return requireTerminalLayoutOn(ctx, s.db)
+}
+
+func requireTerminalLayoutOn(ctx context.Context, q schemaQuerier) error {
+	identity, err := repositoryIdentityOn(ctx, q)
 	if err != nil {
 		return err
 	}

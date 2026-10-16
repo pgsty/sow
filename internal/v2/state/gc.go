@@ -24,28 +24,33 @@ type LocalGCInventory struct {
 // SQLite has no live projection root. It is legal only for a clean terminal
 // repository with no pending operation.
 func (s *Store) LocalGCInventory(ctx context.Context) (LocalGCInventory, error) {
-	if err := s.RequireTerminalLayout(ctx); err != nil {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
 		return LocalGCInventory{}, err
 	}
-	if err := s.Check(ctx); err != nil {
+	defer tx.Rollback()
+	if err := requireTerminalLayoutOn(ctx, tx); err != nil {
+		return LocalGCInventory{}, err
+	}
+	if err := s.checkOn(ctx, tx); err != nil {
 		return LocalGCInventory{}, err
 	}
 	var inventory LocalGCInventory
 	var status string
 	var pending int64
-	if err := s.db.QueryRowContext(ctx, `SELECT repository_id, built_generation, status FROM repository_state WHERE singleton = 1`).Scan(&inventory.RepositoryID, &inventory.Generation, &status); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT repository_id, built_generation, status FROM repository_state WHERE singleton = 1`).Scan(&inventory.RepositoryID, &inventory.Generation, &status); err != nil {
 		return LocalGCInventory{}, err
 	}
 	if status != "clean" || inventory.Generation == 0 {
 		return LocalGCInventory{}, fmt.Errorf("%w: local GC requires a settled clean Built Generation", ErrConflict)
 	}
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE state NOT IN ('done', 'done_dirty', 'rolled_back', 'failed')`).Scan(&pending); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE state NOT IN ('done', 'done_dirty', 'rolled_back', 'failed')`).Scan(&pending); err != nil {
 		return LocalGCInventory{}, err
 	}
 	if pending != 0 {
 		return LocalGCInventory{}, fmt.Errorf("%w: local GC requires no pending operation", ErrConflict)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT p.sha256, p.format, p.coordinate, p.architecture, p.canonical_arch,
+	rows, err := tx.QueryContext(ctx, `SELECT p.sha256, p.format, p.coordinate, p.architecture, p.canonical_arch,
        p.pool_path, p.filename, p.size, p.name, p.source, p.version, p.epoch,
        p.release, p.kind, p.payload_sha256, p.signature_key, p.warning, p.storage,
        p.created_revision
@@ -66,7 +71,10 @@ ORDER BY p.pool_path, p.sha256`)
 		}
 		inventory.Candidates = append(inventory.Candidates, object)
 	}
-	if err := rows.Err(); err != nil {
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return LocalGCInventory{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return LocalGCInventory{}, err
 	}
 	return inventory, nil

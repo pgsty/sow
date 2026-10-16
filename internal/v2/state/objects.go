@@ -359,6 +359,11 @@ func (s *Store) listPackageObjectsByMembershipTable(ctx context.Context, distNam
 	if !validPackageMembershipTable(table) {
 		return nil, errors.New("list package objects: invalid membership table")
 	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
 	query := `SELECT DISTINCT p.sha256, p.format, p.coordinate, p.architecture, p.canonical_arch,
        p.pool_path, p.filename, p.size, p.name, p.source, p.version, p.epoch,
        p.release, p.kind, p.payload_sha256, p.signature_key, p.warning, p.storage,
@@ -377,7 +382,7 @@ FROM package_objects AS p`
 		query += `)`
 	}
 	query += ` ORDER BY p.format, p.name, p.coordinate, p.sha256`
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list package objects: %w", err)
 	}
@@ -390,20 +395,23 @@ FROM package_objects AS p`
 		}
 		objects = append(objects, object)
 	}
-	if err := rows.Err(); err != nil {
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, fmt.Errorf("list package objects: %w", err)
 	}
-	dists, err := s.packageDistsForObjects(ctx, objects, "memberships", len(distNames) == 0)
+	dists, err := packageDistsForObjects(ctx, tx, objects, "memberships", len(distNames) == 0)
 	if err != nil {
 		return nil, err
 	}
-	builtDists, err := s.packageDistsForObjects(ctx, objects, "built_memberships", len(distNames) == 0)
+	builtDists, err := packageDistsForObjects(ctx, tx, objects, "built_memberships", len(distNames) == 0)
 	if err != nil {
 		return nil, err
 	}
 	for index := range objects {
 		objects[index].Dists = dists[objects[index].SHA256]
 		objects[index].BuiltDists = builtDists[objects[index].SHA256]
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	return objects, nil
 }
@@ -437,7 +445,12 @@ func (s *Store) ListPendingPackageObjects(ctx context.Context) ([]PackageObject,
 }
 
 func (s *Store) GetPackageObject(ctx context.Context, digest string) (PackageObject, error) {
-	row := s.db.QueryRowContext(ctx, packageObjectSelect+` WHERE sha256 = ?`, digest)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return PackageObject{}, err
+	}
+	defer tx.Rollback()
+	row := tx.QueryRowContext(ctx, packageObjectSelect+` WHERE sha256 = ?`, digest)
 	object, err := scanPackageObject(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PackageObject{}, fmt.Errorf("%w: package object %s", ErrNotFound, digest)
@@ -445,16 +458,27 @@ func (s *Store) GetPackageObject(ctx context.Context, digest string) (PackageObj
 	if err != nil {
 		return PackageObject{}, err
 	}
-	object.Dists, err = s.packageDists(ctx, digest, false)
+	object.Dists, err = packageDists(ctx, tx, digest, false)
 	if err != nil {
 		return PackageObject{}, err
 	}
-	object.BuiltDists, err = s.packageDists(ctx, digest, true)
-	return object, err
+	object.BuiltDists, err = packageDists(ctx, tx, digest, true)
+	if err != nil {
+		return PackageObject{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return PackageObject{}, err
+	}
+	return object, nil
 }
 
 func (s *Store) FindPackageByCoordinate(ctx context.Context, format, coordinate string) (PackageObject, error) {
-	row := s.db.QueryRowContext(ctx, packageObjectSelect+` WHERE format = ? AND coordinate = ?`, format, coordinate)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return PackageObject{}, err
+	}
+	defer tx.Rollback()
+	row := tx.QueryRowContext(ctx, packageObjectSelect+` WHERE format = ? AND coordinate = ?`, format, coordinate)
 	object, err := scanPackageObject(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PackageObject{}, fmt.Errorf("%w: package coordinate %s:%s", ErrNotFound, format, coordinate)
@@ -462,12 +486,18 @@ func (s *Store) FindPackageByCoordinate(ctx context.Context, format, coordinate 
 	if err != nil {
 		return PackageObject{}, err
 	}
-	object.Dists, err = s.packageDists(ctx, object.SHA256, false)
+	object.Dists, err = packageDists(ctx, tx, object.SHA256, false)
 	if err != nil {
 		return PackageObject{}, err
 	}
-	object.BuiltDists, err = s.packageDists(ctx, object.SHA256, true)
-	return object, err
+	object.BuiltDists, err = packageDists(ctx, tx, object.SHA256, true)
+	if err != nil {
+		return PackageObject{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return PackageObject{}, err
+	}
+	return object, nil
 }
 
 const packageObjectSelect = `SELECT sha256, format, coordinate, architecture, canonical_arch,
@@ -475,8 +505,8 @@ const packageObjectSelect = `SELECT sha256, format, coordinate, architecture, ca
        payload_sha256, signature_key, warning, storage, created_revision
 FROM package_objects`
 
-func (s *Store) validatePackageObjectRows(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, packageObjectSelect+` ORDER BY sha256`)
+func validatePackageObjectRows(ctx context.Context, q schemaQuerier) error {
+	rows, err := q.QueryContext(ctx, packageObjectSelect+` ORDER BY sha256`)
 	if err != nil {
 		return err
 	}
@@ -573,39 +603,34 @@ func membershipDigestsTx(ctx context.Context, tx *sql.Tx, distName string, built
 }
 
 func (s *Store) MembershipDigests(ctx context.Context, distName string, built bool) ([]string, error) {
-	table := "memberships"
-	if built {
-		table = "built_memberships"
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
 	}
+	defer tx.Rollback()
 	var exists int
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM dists WHERE name = ?)`, distName).Scan(&exists); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM dists WHERE name = ?)`, distName).Scan(&exists); err != nil {
 		return nil, err
 	}
 	if exists == 0 {
 		return nil, fmt.Errorf("%w: dist %q", ErrNotFound, distName)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT package_sha256 FROM `+table+` WHERE dist_name = ? ORDER BY package_sha256`, distName)
+	result, err := membershipDigestsTx(ctx, tx, distName, built)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	result := []string{}
-	for rows.Next() {
-		var digest string
-		if err := rows.Scan(&digest); err != nil {
-			return nil, err
-		}
-		result = append(result, digest)
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
-	return result, rows.Err()
+	return result, nil
 }
 
-func (s *Store) packageDists(ctx context.Context, digest string, built bool) ([]string, error) {
+func packageDists(ctx context.Context, q schemaQuerier, digest string, built bool) ([]string, error) {
 	table := "memberships"
 	if built {
 		table = "built_memberships"
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT dist_name FROM `+table+` WHERE package_sha256 = ? ORDER BY dist_name`, digest)
+	rows, err := q.QueryContext(ctx, `SELECT dist_name FROM `+table+` WHERE package_sha256 = ? ORDER BY dist_name`, digest)
 	if err != nil {
 		return nil, err
 	}
@@ -635,7 +660,7 @@ const packageMembershipDigestBatchSize = 500
 // packageDistsForObjects uses the reverse covering indexes to expand selected
 // objects in bounded batches. Only a repository-wide object listing needs the
 // complete membership projection, which stays a single ordered table scan.
-func (s *Store) packageDistsForObjects(ctx context.Context, objects []PackageObject, table string, allObjects bool) (map[string][]string, error) {
+func packageDistsForObjects(ctx context.Context, q schemaQuerier, objects []PackageObject, table string, allObjects bool) (map[string][]string, error) {
 	if !validPackageMembershipTable(table) {
 		return nil, errors.New("list package memberships: invalid membership table")
 	}
@@ -666,7 +691,7 @@ func (s *Store) packageDistsForObjects(ctx context.Context, objects []PackageObj
 			}
 		}
 		query += ` ORDER BY package_sha256, dist_name`
-		rows, err := s.db.QueryContext(ctx, query, args...)
+		rows, err := q.QueryContext(ctx, query, args...)
 		if err != nil {
 			return nil, fmt.Errorf("list package memberships: %w", err)
 		}
