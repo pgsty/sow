@@ -35,7 +35,7 @@ help:
 		'  make install         Install sow with the release version embedded' \
 		'  make test            Run all Go packages and the patched RPM module' \
 		'  make test-core       Run the focused repository-manager tests' \
-		'  make test-perf-contract  Compile perf-tagged tests and verify their fixture' \
+		'  make test-perf-contract  Verify perf fixtures and actual Check file-read bytes' \
 		'  make test-r2-live    Run the opt-in read-only Cloudflare R2 fixture gate' \
 		'  make race            Race-test the core repository packages' \
 		'  make check           Run quality, vulnerability, provenance, and focused tests' \
@@ -137,6 +137,7 @@ test-perf-contract:
 			printf '%s\n' 'performance fixture contract test did not execute' >&2; \
 			exit 1; \
 		}
+	GO='$(GO)' python3 qa/perf/check-os-io.py
 
 test-r2-live:
 	SOW_REAL_R2_TEST=1 $(GO) test -timeout '10m' -count=1 -v ./internal/r2 -run '^TestCloudflareR2ReadOnlyCompatibility$$'
