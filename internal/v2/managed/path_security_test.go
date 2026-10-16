@@ -1015,3 +1015,132 @@ func TestDigestTreeRejectsFileReplacementAfterRead(t *testing.T) {
 		t.Fatalf("rejected tree returned digest=%q files=%d", acceptedDigest, count)
 	}
 }
+
+func TestDigestTreeAuthenticatesFileRead(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		rewrite, chmod, link bool
+		wantErr              bool
+	}{
+		{name: "unchanged"},
+		{name: "rewrite_restored_mtime", rewrite: true, wantErr: true},
+		{name: "concurrent_hardlink", link: true},
+		{name: "mode_change", chmod: true, wantErr: true},
+		{name: "mode_change_and_hardlink", chmod: true, link: true, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			root := filepath.Join(base, "root")
+			if err := os.Mkdir(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			entry := filepath.Join(root, "value")
+			body := []byte("original-data")
+			if err := os.WriteFile(entry, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			held, err := os.Open(entry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close()
+			before, err := snapshotRegularDescriptorIdentity(held)
+			if err != nil {
+				t.Fatal(err)
+			}
+			originalDigest := bytesSHA([]byte(bytesSHA(body) + "  value\n"))
+			fired := false
+			ctx := &digestFirstEOFContext{Context: context.Background()}
+			ctx.onFirstEOF = func() {
+				if tc.rewrite {
+					if err := os.WriteFile(entry, []byte("replaced-data"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tc.chmod {
+					if err := os.Chmod(entry, 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tc.link {
+					// Keep the new name outside the tree being digested.
+					if err := os.Link(entry, filepath.Join(base, "export-alias")); err != nil {
+						t.Fatal(err)
+					}
+				}
+				after := before
+				if tc.rewrite || tc.chmod || tc.link {
+					// A coarse filesystem clock can retain ctime within one tick.
+					// Establish a recorded ctime change, with the original mtime,
+					// before checking that the digest uses this evidence.
+					deadline := time.Now().Add(time.Second)
+					for {
+						mtime := time.Unix(0, before.modUnixNano)
+						if err := os.Chtimes(entry, mtime, mtime); err != nil {
+							t.Fatal(err)
+						}
+						after, err = snapshotRegularDescriptorIdentity(held)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if after.changeUnixNano != before.changeUnixNano {
+							break
+						}
+						if time.Now().After(deadline) {
+							t.Fatal("filesystem did not record a changed ctime within one second")
+						}
+						time.Sleep(time.Millisecond)
+					}
+				}
+				if !before.sameInode(after) || before.size != after.size || before.modUnixNano != after.modUnixNano {
+					t.Fatal("fixture failed to preserve inode, size and mtime")
+				}
+				wantMode, wantLinks := before.mode, before.links
+				if tc.chmod {
+					wantMode = 0o644
+				}
+				if tc.link {
+					wantLinks++
+				}
+				if after.mode != wantMode || after.links != wantLinks {
+					t.Fatalf("fixture mode=%v links=%d; want mode=%v links=%d", after.mode, after.links, wantMode, wantLinks)
+				}
+				t.Logf("same inode/size/mtime, ctime=%d->%d mode=%v->%v links=%d->%d", before.changeUnixNano, after.changeUnixNano, before.mode, after.mode, before.links, after.links)
+				fired = true
+			}
+			accepted, count, err := digestTree(ctx, root)
+			current, currentCount, currentErr := digestTree(context.Background(), root)
+			if currentErr != nil || currentCount != 1 {
+				t.Fatalf("fresh digest=%q files=%d err=%v", current, currentCount, currentErr)
+			}
+			t.Logf("hook=%t polls=%d accepted=%q original=%s current=%s files=%d err=%v", fired, ctx.calls, accepted, originalDigest, current, count, err)
+			if !fired {
+				t.Fatal("post-read hook did not execute")
+			}
+			if (current != originalDigest) != tc.rewrite {
+				t.Fatal("fixture content change did not match the requested mutation")
+			}
+			if tc.wantErr {
+				if !errors.Is(err, ErrIntegrity) || accepted != "" || count != 0 {
+					t.Fatalf("changed file returned digest=%q files=%d err=%v", accepted, count, err)
+				}
+			} else if err != nil || accepted != originalDigest || count != 1 {
+				t.Fatalf("unchanged content returned digest=%q files=%d err=%v", accepted, count, err)
+			}
+		})
+	}
+}
+
+func TestDigestTreeCancellationAfterRead(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "value"), []byte("original-data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := &digestFirstEOFContext{Context: base, onFirstEOF: cancel}
+	digest, count, err := digestTree(ctx, root)
+	if !errors.Is(err, context.Canceled) || digest != "" || count != 0 {
+		t.Fatalf("canceled digest=%q files=%d err=%v", digest, count, err)
+	}
+}
