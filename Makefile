@@ -86,7 +86,7 @@ vet:
 
 lint:
 	@command -v staticcheck >/dev/null 2>&1 || { \
-		printf '%s\n' 'staticcheck is required: go install honnef.co/go/tools/cmd/staticcheck@v0.8.1' >&2; \
+		printf '%s\n' 'staticcheck is required: go install honnef.co/go/tools/cmd/staticcheck@v0.8.2' >&2; \
 		exit 1; \
 	}
 	staticcheck ./...
