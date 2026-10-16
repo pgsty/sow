@@ -10,10 +10,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 )
 
@@ -883,6 +885,165 @@ func TestDatabaseOpenRejectsSymlink(t *testing.T) {
 	}
 	if _, err := openDatabaseMode(link, "rw", true, false); err == nil {
 		t.Fatal("low-level database open followed a symlink")
+	}
+}
+
+func TestDatabaseOpenPreservesPermissionErrorsDarwin(t *testing.T) {
+	if runtime.GOOS != "darwin" || os.Geteuid() == 0 {
+		t.Skip("Darwin permission diagnostics require a non-root user")
+	}
+	path := filepath.Join(t.TempDir(), "repo.db")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(path, 0o600)
+	for _, opener := range []struct {
+		name string
+		open func(string) (*Store, error)
+	}{{"read-only", OpenReadOnly}, {"existing", OpenExisting}, {"create-or-open", Open}} {
+		t.Run(opener.name, func(t *testing.T) {
+			store, err := opener.open(path)
+			if store != nil {
+				_ = store.Close()
+			}
+			if !errors.Is(err, os.ErrPermission) || !strings.Contains(err.Error(), "permission denied") {
+				t.Fatalf("unreadable database lost permission error: %v", err)
+			}
+		})
+	}
+}
+
+func TestDatabaseOpenPreservesSQLiteLocks(t *testing.T) {
+	const helperPath = "SOW_SQLITE_LOCK_PROBE_PATH"
+	if path := os.Getenv(helperPath); path != "" {
+		file, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		// SQLite's SHARED lock occupies these 510 bytes on the main file.
+		// Probe from another process: POSIX locks are owned by the process,
+		// so checking from another descriptor here in the parent is invalid.
+		lock := unix.Flock_t{Type: unix.F_WRLCK, Whence: 0, Start: 0x40000002, Len: 510}
+		err = unix.FcntlFlock(file.Fd(), unix.F_SETLK, &lock)
+		if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EACCES) {
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("another process acquired an exclusive lock over SQLite's shared lock")
+	}
+	for _, opener := range []struct {
+		name string
+		open func(string) (*Store, error)
+	}{{"read-only", OpenReadOnly}, {"existing", OpenExisting}, {"create-or-open", Open}} {
+		t.Run(opener.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "repo.db")
+			initial, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := initial.Close(); err != nil {
+				t.Fatal(err)
+			}
+			first, err := opener.open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer first.Close()
+			assertLocked := func() {
+				t.Helper()
+				cmd := exec.Command(os.Args[0], "-test.run=^TestDatabaseOpenPreservesSQLiteLocks$")
+				cmd.Env = append(os.Environ(), helperPath+"="+path)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("SQLite lock was released: %v\n%s", err, output)
+				}
+			}
+			assertLocked()
+			second, err := OpenReadOnly(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertLocked()
+			if err := second.Close(); err != nil {
+				t.Fatal(err)
+			}
+			assertLocked()
+		})
+	}
+}
+
+func TestDatabaseBindingPinsLinuxInode(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux O_PATH inode binding")
+	}
+	path := filepath.Join(t.TempDir(), "repo.db")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	probe, original, existed, err := bindDatabaseFile(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe == nil || !existed {
+		t.Fatal("existing database inode is not pinned")
+	}
+	defer probe.Close()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := probe.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(original, pinned) || os.SameFile(original, replacement) {
+		t.Fatal("unlinked database inode was not retained independently of its replacement")
+	}
+}
+
+func TestDatabaseOpenRejectsMultiplyLinkedFiles(t *testing.T) {
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		for _, opener := range []struct {
+			name string
+			open func(string) (*Store, error)
+		}{{"read-only", OpenReadOnly}, {"existing", OpenExisting}, {"initializing", OpenInitializing}, {"create-or-open", Open}} {
+			t.Run(suffix+"/"+opener.name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "repo.db")
+				store, err := Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := store.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if suffix == "-journal" {
+					if err := os.WriteFile(path+suffix, nil, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.Link(path+suffix, path+suffix+".alias"); err != nil {
+					t.Fatal(err)
+				}
+				opened, err := opener.open(path)
+				if opened != nil {
+					_ = opened.Close()
+				}
+				if err == nil || !strings.Contains(err.Error(), "multiply linked") {
+					t.Fatalf("multiply linked file accepted: %v", err)
+				}
+			})
+		}
 	}
 }
 

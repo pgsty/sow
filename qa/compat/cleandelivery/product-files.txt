@@ -164,6 +164,8 @@ internal/v2/plain/timestamp_test.go
 internal/v2/plain/types.go
 internal/v2/state/audit.go
 internal/v2/state/audit_maintenance_test.go
+internal/v2/state/database_file_darwin.go
+internal/v2/state/database_file_linux.go
 internal/v2/state/doc.go
 internal/v2/state/facts.go
 internal/v2/state/facts_test.go
