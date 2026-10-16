@@ -3,12 +3,16 @@ package managed
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1014,5 +1018,310 @@ func TestRemoveRecoveryConverges(t *testing.T) {
 				t.Fatalf("pending=%#v members=%#v summary=%#v", pending, members, summary)
 			}
 		})
+	}
+}
+
+func TestRemovePolicyAuditNormal(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		name := "pool"
+		if pending {
+			name = "pending-skip"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			opts, digests := newRemovePolicyAuditFixture(t, root, pending)
+			ctx := context.Background()
+			var preview RemoveResult
+			if !pending {
+				var err error
+				previewOpts := opts
+				previewOpts.Check = true
+				preview, err = Remove(ctx, previewOpts)
+				if err != nil || len(preview.Removed) != 2 || preview.Operation != "" {
+					t.Fatalf("policy preview=%+v err=%v", preview, err)
+				}
+			}
+			var staged mutationManifest
+			opts.Fault = func(point string) error {
+				if point != "rm.staged" {
+					return nil
+				}
+				_, staged = readRemovePolicyJournal(t, root)
+				return nil
+			}
+			result, err := Remove(ctx, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Removed) != 2 || result.Dirty != pending {
+				t.Fatalf("explicit removals=%+v dirty=%v", result.Removed, result.Dirty)
+			}
+			if !pending && (!reflect.DeepEqual(preview.Removed, result.Removed) || preview.Generation != result.Generation) {
+				t.Fatalf("preview=%+v actual=%+v", preview, result)
+			}
+			assertRemovePolicyJournal(t, staged, digests)
+			assertRemovePolicyAudit(t, root, result.Operation, digests, pending)
+		})
+	}
+}
+
+func TestRemovePolicyAuditRecovery(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		name := "pool"
+		points := []string{"rm.staged", "rm.applied", "build.pointer.jammy"}
+		if pending {
+			name = "pending-skip"
+			points = points[:2]
+		}
+		for _, point := range points {
+			t.Run(name+"/"+point, func(t *testing.T) {
+				root := t.TempDir()
+				_, digests := newRemovePolicyAuditFixture(t, root, pending)
+				command := exec.Command(os.Args[0], "-test.run=^TestRemovePolicyAuditCrashHelper$")
+				command.Env = append(os.Environ(), "SOW_REMOVE_POLICY_ROOT="+root, "SOW_REMOVE_POLICY_POINT="+point)
+				if pending {
+					command.Env = append(command.Env, "SOW_REMOVE_POLICY_SKIP=1")
+				}
+				output, err := command.CombinedOutput()
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) {
+					t.Fatalf("crash helper did not exit by signal: %v: %s", err, output)
+				}
+				status, ok := exit.Sys().(syscall.WaitStatus)
+				if !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
+					t.Fatalf("crash helper was not killed: %v: %s", err, output)
+				}
+				operation, manifest := readRemovePolicyJournal(t, root)
+				assertRemovePolicyJournal(t, manifest, digests)
+				ctx := context.Background()
+				store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer store.Close()
+				var first state.OperationDetail
+				for attempt := 0; attempt < 2; attempt++ {
+					if err := recoverDistOperations(ctx, root, "repo", store); err != nil {
+						t.Fatalf("recovery %d: %v", attempt, err)
+					}
+					detail, err := store.GetOperation(ctx, operation.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if attempt == 0 {
+						first = detail
+					} else if !reflect.DeepEqual(first, detail) {
+						t.Fatalf("repeated recovery changed completed audit: first=%+v next=%+v", first, detail)
+					}
+				}
+				active, activeErr := store.PendingOperations(ctx)
+				if err := errors.Join(activeErr, store.Close()); err != nil || len(active) != 0 {
+					t.Fatalf("pending=%+v err=%v", active, err)
+				}
+				assertRemovePolicyAudit(t, root, operation.ID, digests, pending)
+			})
+		}
+	}
+}
+
+func TestRemovePolicyAuditCrashHelper(t *testing.T) {
+	root := os.Getenv("SOW_REMOVE_POLICY_ROOT")
+	if root == "" {
+		return
+	}
+	_, err := Remove(context.Background(), RemoveOptions{
+		WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo",
+		Dists: []string{"noble", "jammy"}, Packages: []string{"remove-me"}, Jobs: 1,
+		Skip: os.Getenv("SOW_REMOVE_POLICY_SKIP") == "1",
+		Fault: func(point string) error {
+			if point != os.Getenv("SOW_REMOVE_POLICY_POINT") {
+				return nil
+			}
+			process, err := os.FindProcess(os.Getpid())
+			if err != nil {
+				return err
+			}
+			if err := process.Kill(); err != nil {
+				return err
+			}
+			select {}
+		},
+	})
+	t.Fatalf("remove crash point was not reached: %v", err)
+}
+
+func newRemovePolicyAuditFixture(t *testing.T, root string, pending bool) (RemoveOptions, map[string]string) {
+	t.Helper()
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{
+		"focal": {Format: "deb"}, "jammy": {Format: "deb"}, "noble": {Format: "deb"},
+	}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := []string{}
+	digests := map[string]string{}
+	for _, item := range []struct{ label, name, version string }{
+		{"explicit", "remove-me", "1.0-1"}, {"old", "policy-me", "1.0-1"},
+		{"new", "policy-me", "2.0-1"}, {"keep", "keep-me", "1.0-1"},
+	} {
+		body, err := managedBenchmarkDEBBytes(item.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// These equal-length versions preserve the uncompressed tar entry size.
+		body = bytes.Replace(body, []byte("Version: 1.0-1\n"), []byte("Version: "+item.version+"\n"), 1)
+		input := filepath.Join(root, item.label+".deb")
+		if err := os.WriteFile(input, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		inputs = append(inputs, input)
+		digests[item.label] = bytesSHA(body)
+	}
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	dists := []string{"noble", "jammy", "focal"}
+	if pending {
+		// Fully dropped pending objects lose package_objects rows. Audit reasons
+		// must remain bound to the operation's durable remove evidence.
+		dists = dists[:2]
+	}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: dists, Paths: inputs, Skip: pending, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	repository := cfg.Repositories["repo"]
+	repository.Dists["jammy"] = config.DistConfig{Format: "deb", Limit: 1, Exclude: []config.ExcludeRule{{Name: []string{"remove-me"}}}}
+	repository.Dists["noble"] = config.DistConfig{Format: "deb", Limit: 1, Exclude: []config.ExcludeRule{{Name: []string{"policy-me", "remove-me"}}}}
+	cfg.Repositories["repo"] = repository
+	writeManagedConfig(t, root, cfg)
+	return RemoveOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"noble", "jammy"}, Packages: []string{"remove-me"}, Skip: pending, Jobs: 1}, digests
+}
+
+func readRemovePolicyJournal(t *testing.T, root string) (state.Operation, mutationManifest) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	active, err := store.PendingOperations(ctx)
+	if err != nil || len(active) != 1 || active[0].Kind != "rm" {
+		t.Fatalf("pending remove=%+v err=%v", active, err)
+	}
+	operation, _, manifest, err := loadMutationJournal(ctx, store, root, "repo", active[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return operation, manifest
+}
+
+func removePolicyAuditMemberships(digests map[string]string) []state.OperationMembership {
+	members := []state.OperationMembership{}
+	for _, dist := range []string{"jammy", "noble"} {
+		removed := []string{digests["explicit"], digests["old"]}
+		if dist == "noble" {
+			removed = append(removed, digests["new"])
+		}
+		sort.Strings(removed)
+		for _, digest := range removed {
+			members = append(members, state.OperationMembership{DistName: dist, PackageSHA256: digest, Action: "remove"})
+		}
+	}
+	members = append(members, state.OperationMembership{DistName: "jammy", PackageSHA256: digests["old"], Action: "limit"})
+	excluded := []string{digests["old"], digests["new"]}
+	sort.Strings(excluded)
+	for _, digest := range excluded {
+		members = append(members, state.OperationMembership{DistName: "noble", PackageSHA256: digest, Action: "exclude"})
+	}
+	for index := range members {
+		members[index].Sequence = index
+	}
+	return members
+}
+
+func assertRemovePolicyJournal(t *testing.T, manifest mutationManifest, digests map[string]string) {
+	t.Helper()
+	want := removePolicyAuditMemberships(digests)[5:]
+	got := append([]state.OperationMembership(nil), manifest.Outcomes...)
+	sort.Slice(got, func(i, j int) bool {
+		if got[i].DistName != got[j].DistName {
+			return got[i].DistName < got[j].DistName
+		}
+		return got[i].PackageSHA256 < got[j].PackageSHA256
+	})
+	for index := range want {
+		want[index].Sequence = 0
+	}
+	if !reflect.DeepEqual(got, want) || manifest.Result["removed"] != 2 {
+		t.Errorf("staged policy outcomes=%+v want=%+v result=%v", got, want, manifest.Result)
+	}
+}
+
+func assertRemovePolicyAudit(t *testing.T, root, operation string, digests map[string]string, pending bool) {
+	t.Helper()
+	ctx := context.Background()
+	opts := LogOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Operation: operation}
+	logged, err := Log(ctx, opts)
+	if err != nil || logged.Detail == nil {
+		t.Fatalf("remove log=%+v err=%v", logged, err)
+	}
+	want := removePolicyAuditMemberships(digests)
+	if !reflect.DeepEqual(logged.Detail.Memberships, want) {
+		t.Errorf("remove audit=%+v want=%+v", logged.Detail.Memberships, want)
+	}
+	terminal := state.OperationDone
+	if pending {
+		terminal = state.OperationDoneDirty
+	}
+	if logged.Detail.Operation.State != terminal || len(logged.Detail.Packages) != 2 {
+		t.Fatalf("operation=%+v explicit packages=%+v", logged.Detail.Operation, logged.Detail.Packages)
+	}
+	for index, item := range logged.Detail.Packages {
+		if item.Sequence != index || item.PackageSHA256 != digests["explicit"] || item.Disposition != "removed" || item.InputPath != "remove-me" {
+			t.Errorf("explicit package evidence=%+v", item)
+		}
+	}
+	var exported bytes.Buffer
+	if _, err := ExportLog(ctx, opts, &exported); err != nil {
+		t.Fatal(err)
+	}
+	found := 0
+	for _, line := range bytes.Split(bytes.TrimSpace(exported.Bytes()), []byte("\n")) {
+		var detail state.OperationDetail
+		if err := json.Unmarshal(line, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if detail.Operation.ID == operation {
+			found++
+			if !reflect.DeepEqual(detail.Memberships, logged.Detail.Memberships) || !reflect.DeepEqual(detail.Packages, logged.Detail.Packages) {
+				t.Errorf("export differs from log: %+v", detail)
+			}
+		}
+	}
+	if found != 1 {
+		t.Errorf("remove operation exported %d times", found)
+	}
+	store, err := state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	wanted := map[string][]string{"jammy": {digests["new"], digests["keep"]}, "noble": {digests["keep"]}, "focal": {}}
+	if !pending {
+		wanted["focal"] = []string{digests["explicit"], digests["old"], digests["new"], digests["keep"]}
+	}
+	for dist, digests := range wanted {
+		actual, err := store.MembershipDigests(ctx, dist, false)
+		if err != nil || !sameStringSet(actual, digests) {
+			t.Errorf("desired %s=%v want=%v err=%v", dist, actual, digests, err)
+		}
+	}
+	if pending {
+		objects, err := store.ListPackageObjects(ctx, nil, false)
+		if err != nil || len(objects) != 2 {
+			t.Fatalf("dropped pending objects remain: objects=%+v err=%v", objects, err)
+		}
 	}
 }

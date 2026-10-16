@@ -76,7 +76,7 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	if err != nil {
 		return result, err
 	}
-	desired, removed, err := desiredAfterRemoval(ctx, store, distNames, effectiveDists, objects)
+	desired, removed, outcomes, err := desiredAfterRemoval(ctx, store, distNames, effectiveDists, objects)
 	if err != nil {
 		return result, err
 	}
@@ -94,7 +94,7 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 			return result, err
 		}
 	}
-	manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"removed": len(removed)}}
+	manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"removed": len(removed)}, Outcomes: outcomes}
 	var preflight *mutationBuildPreflight
 	if !opts.Skip && len(buildDists) != 0 {
 		preflight, err = prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, nil, currentSnapshot, opts.Jobs)
@@ -165,6 +165,10 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	}
 	if !sameStringSet(mutation.ChangedDists, desiredChangedDists) {
 		return result, fmt.Errorf("%w: applied remove Dist changes differ from its staged Desired change set", ErrIntegrity)
+	}
+	if err := store.RecordOperationMembershipOutcomes(ctx, id, manifest.Outcomes); err != nil {
+		retainCommittedProjection(ctx, ws.Root, repoName, cfg, store, &result.Generation, &result.Dirty)
+		return result, err
 	}
 	for _, object := range mutation.DroppedPending {
 		if err := removePendingObject(ws.Root, repoName, object); err != nil {
@@ -268,7 +272,7 @@ func previewRemove(ctx context.Context, opts RemoveOptions) (result RemoveResult
 	if err != nil {
 		return result, err
 	}
-	desired, removed, err := desiredAfterRemoval(ctx, store, distNames, effectiveDists, objects)
+	desired, removed, outcomes, err := desiredAfterRemoval(ctx, store, distNames, effectiveDists, objects)
 	result.Removed, result.Dists = removed, distNames
 	if err != nil {
 		return result, err
@@ -294,7 +298,7 @@ func previewRemove(ctx context.Context, opts RemoveOptions) (result RemoveResult
 			return result, fmt.Errorf("%w: %v", ErrRejected, nextErr)
 		}
 		predictedGeneration = nextGeneration
-		manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"removed": len(removed)}}
+		manifest := mutationManifest{Version: mutationOperationVersion, Objects: []state.PackageObject{}, Desired: desired, Result: map[string]int{"removed": len(removed)}, Outcomes: outcomes}
 		preflight, preflightErr := prepareMutationBuildPreflight(ctx, ws.Root, repoName, cfg, buildDists, manifest, store, nil, currentSnapshot, opts.Jobs)
 		if preflightErr != nil {
 			return result, preflightErr
@@ -566,16 +570,17 @@ func scanPreviewFiles(ctx context.Context, root, prefix string) ([]state.Generat
 	return files, nil
 }
 
-func desiredAfterRemoval(ctx context.Context, store *state.Store, distNames []string, effective map[string]config.EffectiveDist, removedObjects []state.PackageObject) (map[string][]string, []RemovedMembership, error) {
+func desiredAfterRemoval(ctx context.Context, store *state.Store, distNames []string, effective map[string]config.EffectiveDist, removedObjects []state.PackageObject) (map[string][]string, []RemovedMembership, []state.OperationMembership, error) {
 	remove := map[string]state.PackageObject{}
 	for _, object := range removedObjects {
 		remove[object.SHA256] = object
 	}
 	desired := make(map[string][]string, len(distNames))
 	removed := []RemovedMembership{}
+	outcomes := []state.OperationMembership{}
 	currentObjects, err := store.ListPackageObjects(ctx, distNames, false)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	currentByDist := packageObjectsByDist(currentObjects, distNames, false)
 	for _, distName := range distNames {
@@ -591,14 +596,20 @@ func desiredAfterRemoval(ctx context.Context, store *state.Store, distNames []st
 		}
 		policy, err := ApplyPolicy(remaining, effective[distName])
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		for _, object := range policy.Kept {
 			desired[distName] = append(desired[distName], object.SHA256)
 		}
+		for _, object := range policy.Excluded {
+			outcomes = append(outcomes, state.OperationMembership{DistName: distName, PackageSHA256: object.SHA256, Action: "exclude"})
+		}
+		for _, object := range policy.Limited {
+			outcomes = append(outcomes, state.OperationMembership{DistName: distName, PackageSHA256: object.SHA256, Action: "limit"})
+		}
 	}
 	if len(removed) == 0 {
-		return nil, nil, fmt.Errorf("%w: package references match no Membership in the selected Dists", ErrRejected)
+		return nil, nil, nil, fmt.Errorf("%w: package references match no Membership in the selected Dists", ErrRejected)
 	}
 	sort.Slice(removed, func(i, j int) bool {
 		if removed[i].Dist != removed[j].Dist {
@@ -606,7 +617,7 @@ func desiredAfterRemoval(ctx context.Context, store *state.Store, distNames []st
 		}
 		return removed[i].Coordinate < removed[j].Coordinate
 	})
-	return desired, removed, nil
+	return desired, removed, outcomes, nil
 }
 
 func publicTreeSnapshot(root, repoName string) (map[string]string, error) {
