@@ -410,11 +410,8 @@ func (r *uploadProgressReadSeekAt) ReadAt(buffer []byte, offset int64) (int, err
 }
 
 func (r *uploadProgressReadSeekAt) Seek(offset int64, whence int) (int64, error) {
-	position, err := r.source.Seek(offset, whence)
-	if err == nil {
-		r.observed(1)
-	}
-	return position, err
+	// A retry rewind does not read bytes or reset the idle deadline.
+	return r.source.Seek(offset, whence)
 }
 
 func monitorUploadProgress(ctx context.Context, source ReadSeekReaderAt, timeout time.Duration) (context.Context, ReadSeekReaderAt, func() error) {

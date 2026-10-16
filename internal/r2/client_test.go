@@ -6,12 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -288,6 +290,209 @@ func TestUploadProgressMonitorCancelsAnIdleBody(t *testing.T) {
 	}
 	if err := finish(); !errors.Is(err, errUploadNoProgress) {
 		t.Fatalf("idle upload finish error=%v", err)
+	}
+}
+
+func TestUploadProgressSeekOnlyRepositions(t *testing.T) {
+	progress := make(chan struct{}, 8)
+	reader := &uploadProgressReadSeekAt{source: bytes.NewReader([]byte("body")), progress: progress}
+	for _, test := range []struct {
+		offset   int64
+		whence   int
+		position int64
+		wantErr  bool
+	}{
+		{0, io.SeekCurrent, 0, false},
+		{-1, io.SeekEnd, 3, false},
+		{1, io.SeekStart, 1, false},
+		{0, io.SeekStart, 0, false},
+		{-1, io.SeekStart, 0, true},
+		{0, 99, 0, true},
+	} {
+		position, err := reader.Seek(test.offset, test.whence)
+		if position != test.position || (err != nil) != test.wantErr {
+			t.Fatalf("Seek(%d, %d)=(%d, %v), want position=%d error=%t", test.offset, test.whence, position, err, test.position, test.wantErr)
+		}
+	}
+	if events := len(progress); events != 0 {
+		t.Fatalf("6 seeks (4 successful) produced %d progress events without reading bytes", events)
+	}
+	t.Log("seek_calls=6 successful_seeks=4 progress_events=0 bytes=0")
+}
+
+func TestUploadProgressMonitorIgnoresActivityWithoutBytes(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		body     string
+		activity func(ReadSeekReaderAt) (int, error)
+		wantErr  error
+	}{
+		{"seek", "body", func(r ReadSeekReaderAt) (int, error) { _, err := r.Seek(0, io.SeekStart); return 0, err }, nil},
+		{"empty Read", "body", func(r ReadSeekReaderAt) (int, error) { return r.Read(nil) }, nil},
+		{"empty ReadAt", "body", func(r ReadSeekReaderAt) (int, error) { return r.ReadAt(nil, 0) }, nil},
+		{"Read EOF", "", func(r ReadSeekReaderAt) (int, error) { return r.Read(make([]byte, 1)) }, io.EOF},
+		{"ReadAt EOF", "", func(r ReadSeekReaderAt) (int, error) { return r.ReadAt(make([]byte, 1), 0) }, io.EOF},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const timeout = 10 * time.Second
+				started := time.Now()
+				ctx, reader, finish := monitorUploadProgress(context.Background(), strings.NewReader(test.body), timeout)
+				defer finish()
+				synctest.Wait()
+				for range 4 {
+					time.Sleep(2 * time.Second)
+					count, err := test.activity(reader)
+					if count != 0 || !errors.Is(err, test.wantErr) {
+						t.Fatalf("activity=(%d, %v), want zero bytes and %v", count, err, test.wantErr)
+					}
+					synctest.Wait()
+					if ctx.Err() != nil {
+						t.Fatalf("canceled early at %s: %v", time.Since(started), ctx.Err())
+					}
+				}
+				time.Sleep(2 * time.Second)
+				synctest.Wait()
+				t.Logf("activity_calls=4 bytes=0 elapsed=%s context_error=%v", time.Since(started), ctx.Err())
+				if !errors.Is(ctx.Err(), context.Canceled) {
+					t.Error("activity without bytes extended the idle deadline")
+				}
+				for range 2 {
+					if err := finish(); !errors.Is(err, errUploadNoProgress) {
+						t.Errorf("finish error=%v, want idle timeout", err)
+					}
+				}
+			})
+		})
+	}
+}
+
+type uploadProgressErrorReader struct {
+	*bytes.Reader
+	readErr error
+}
+
+func (r *uploadProgressErrorReader) Read(buffer []byte) (int, error) {
+	count, err := r.Reader.Read(buffer)
+	if count > 0 {
+		err = r.readErr
+	}
+	return count, err
+}
+
+func (r *uploadProgressErrorReader) ReadAt(buffer []byte, offset int64) (int, error) {
+	count, err := r.Reader.ReadAt(buffer, offset)
+	if count > 0 {
+		err = r.readErr
+	}
+	return count, err
+}
+
+func TestUploadProgressMonitorResetsOnBytes(t *testing.T) {
+	for _, method := range []string{"Read", "ReadAt"} {
+		for _, readErr := range []error{nil, io.EOF, errors.New("source read failed")} {
+			t.Run(method+"/"+fmt.Sprint(readErr), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					started := time.Now()
+					source := &uploadProgressErrorReader{Reader: bytes.NewReader([]byte("body")), readErr: readErr}
+					ctx, reader, finish := monitorUploadProgress(context.Background(), source, 10*time.Second)
+					defer finish()
+					synctest.Wait()
+					time.Sleep(8 * time.Second)
+					buffer := make([]byte, 4)
+					if readErr != nil {
+						buffer = make([]byte, 8)
+					}
+					var count int
+					var err error
+					if method == "Read" {
+						count, err = reader.Read(buffer)
+					} else {
+						count, err = reader.ReadAt(buffer, 0)
+					}
+					if count != 4 || !errors.Is(err, readErr) || string(buffer[:count]) != "body" {
+						t.Fatalf("read=(%d, %v), want 4 bytes and %v", count, err, readErr)
+					}
+					synctest.Wait()
+					time.Sleep(9 * time.Second)
+					synctest.Wait()
+					if ctx.Err() != nil {
+						t.Fatalf("real bytes did not reset the idle deadline: %v", ctx.Err())
+					}
+					time.Sleep(time.Second)
+					synctest.Wait()
+					t.Logf("read_calls=1 bytes=%d read_at=8s elapsed=%s context_error=%v", count, time.Since(started), ctx.Err())
+					if !errors.Is(ctx.Err(), context.Canceled) || !errors.Is(finish(), errUploadNoProgress) {
+						t.Fatal("upload did not time out exactly 10s after real bytes")
+					}
+				})
+			})
+		}
+	}
+}
+
+func TestUploadProgressMonitorRetryRewind(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, reader, finish := monitorUploadProgress(context.Background(), strings.NewReader("body"), 10*time.Second)
+		defer finish()
+		synctest.Wait()
+		for attempt := range 2 {
+			time.Sleep(8 * time.Second)
+			if attempt > 0 {
+				if position, err := reader.Seek(0, io.SeekStart); position != 0 || err != nil {
+					t.Fatalf("retry rewind=(%d, %v)", position, err)
+				}
+			}
+			buffer := make([]byte, 4)
+			if count, err := reader.Read(buffer); count != 4 || err != nil || string(buffer) != "body" {
+				t.Fatalf("attempt %d read=(%d, %v) body=%q", attempt+1, count, err, buffer)
+			}
+			synctest.Wait()
+		}
+		time.Sleep(9 * time.Second)
+		synctest.Wait()
+		if ctx.Err() != nil || finish() != nil {
+			t.Fatal("retry body bytes did not extend the idle deadline")
+		}
+		synctest.Wait()
+		time.Sleep(20 * time.Second)
+		if err := finish(); err != nil {
+			t.Fatalf("finished retry later reported idle timeout: %v", err)
+		}
+		t.Log("read_calls=2 bytes=8 rewind_calls=1 completed_at=25s no_late_timeout_at=45s")
+	})
+}
+
+func TestUploadProgressMonitorStopsOnCancelAndFinish(t *testing.T) {
+	for _, cancelParent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel_parent=%t", cancelParent), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				parent, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				ctx, _, finish := monitorUploadProgress(parent, strings.NewReader("body"), 10*time.Second)
+				defer finish()
+				synctest.Wait()
+				time.Sleep(5 * time.Second)
+				for range 2 {
+					if cancelParent {
+						cancel()
+					} else if err := finish(); err != nil {
+						t.Fatalf("finish error=%v", err)
+					}
+				}
+				synctest.Wait()
+				if !errors.Is(ctx.Err(), context.Canceled) {
+					t.Fatalf("request context not canceled: %v", ctx.Err())
+				}
+				time.Sleep(20 * time.Second)
+				for range 2 {
+					if err := finish(); err != nil {
+						t.Fatalf("stopped monitor later reported idle timeout: %v", err)
+					}
+				}
+				t.Log("stopped_at=5s repeated_finish_at=25s no_late_timeout=true")
+			})
+		})
 	}
 }
 
