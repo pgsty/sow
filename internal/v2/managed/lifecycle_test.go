@@ -2980,6 +2980,105 @@ func TestReadSurfacesRejectMissingRepositoryLayout(t *testing.T) {
 	}
 }
 
+func assertDistReadsMaintenanceState(t *testing.T, options WorkspaceOptions, kind string, wantState state.OperationState) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := state.OpenReadOnly(filepath.Join(options.Workdir, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, pendingErr := store.PendingOperations(ctx)
+	if err := errors.Join(pendingErr, store.Close()); err != nil {
+		t.Fatal(err)
+	}
+	wantStatus, reason := "clean", ""
+	if wantState != state.OperationDone {
+		if len(pending) != 1 || pending[0].Kind != kind || pending[0].State != wantState {
+			t.Fatalf("pending maintenance=%#v, want %s in %s", pending, kind, wantState)
+		}
+		wantStatus = "recovering"
+		reason = fmt.Sprintf("operation %s is %s", pending[0].ID, wantState)
+	} else if len(pending) != 0 {
+		t.Fatalf("terminal maintenance is still pending: %#v", pending)
+	}
+	before := persistentWorkspaceSnapshot(t, options.Workdir)
+	dists, err := ListDists(ctx, DistListOptions{WorkspaceOptions: options, Repository: "repo"})
+	if err != nil || len(dists) != 2 {
+		t.Fatalf("dist ls with %s in %s: dists=%#v err=%v", kind, wantState, dists, err)
+	}
+	for _, dist := range dists {
+		if dist.Status != wantStatus || dist.Dirty != (wantStatus == "recovering") || reason != "" && !strings.Contains(strings.Join(dist.DirtyReasons, "\n"), reason) {
+			t.Fatalf("dist ls maintenance state=%#v, want %s with reason %q", dist, wantStatus, reason)
+		}
+		shown, err := ShowDist(ctx, DistShowOptions{WorkspaceOptions: options, Repository: "repo", Name: dist.Name})
+		if err != nil || !reflect.DeepEqual(shown, dist) {
+			t.Fatalf("dist show with %s in %s: shown=%#v listed=%#v err=%v", kind, wantState, shown, dist, err)
+		}
+	}
+	if !reflect.DeepEqual(before, persistentWorkspaceSnapshot(t, options.Workdir)) {
+		t.Fatal("dist reads changed persistent maintenance state")
+	}
+}
+
+func TestDistReadsRejectInvalidPendingMaintenance(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		kind    string
+		payload string
+		state   string
+	}{
+		{name: "unknown kind", kind: "local.unknown", payload: `{}`},
+		{name: "gc malformed payload", kind: "local.gc", payload: `{}`},
+		{name: "gc foreign repository", kind: "local.gc", payload: `{"schema":"sow/local-gc/v1","repository":"other","repository_id":"12345678-1234-4123-8123-123456789abc","operation_id":"999","base_generation":"00000000000000000001","generation":"00000000000000000002","plan_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`},
+		{name: "gc wrong operation", kind: "local.gc", payload: `{"schema":"sow/local-gc/v1","repository":"repo","repository_id":"12345678-1234-4123-8123-123456789abc","operation_id":"998","base_generation":"00000000000000000001","generation":"00000000000000000002","plan_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`},
+		{name: "gc unknown state", kind: "local.gc", payload: `{"schema":"sow/local-gc/v1","repository":"repo","repository_id":"12345678-1234-4123-8123-123456789abc","operation_id":"999","base_generation":"00000000000000000001","generation":"00000000000000000002","plan_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`, state: "unknown"},
+		{name: "prune malformed payload", kind: "log.prune", payload: `{}`},
+		{name: "prune foreign repository", kind: "log.prune", payload: `{"version":1,"repository":"other","before":"2026-01-01T00:00:00Z"}`},
+		{name: "prune invalid cutoff", kind: "log.prune", payload: `{"version":1,"repository":"repo","before":"invalid"}`},
+		{name: "prune unknown state", kind: "log.prune", payload: `{"version":1,"repository":"repo","before":"2026-01-01T00:00:00Z"}`, state: "unknown"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			cfg := config.Default()
+			cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}
+			writeManagedConfig(t, root, cfg)
+			if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+				t.Fatal(err)
+			}
+			store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.BeginOperation(ctx, state.Operation{ID: "999", Kind: test.kind, State: state.OperationPlanned, PayloadJSON: test.payload}); err != nil {
+				t.Fatal(err)
+			}
+			if test.state != "" {
+				if _, err := store.DB().Exec(`PRAGMA ignore_check_constraints=ON`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.DB().Exec(`UPDATE operations SET state=? WHERE id='999'`, test.state); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			options := WorkspaceOptions{Workdir: root, CWD: root}
+			before := persistentWorkspaceSnapshot(t, root)
+			if _, err := ListDists(ctx, DistListOptions{WorkspaceOptions: options, Repository: "repo"}); !errors.Is(err, ErrIntegrity) {
+				t.Fatalf("dist ls accepted invalid pending operation: %v", err)
+			}
+			if _, err := ShowDist(ctx, DistShowOptions{WorkspaceOptions: options, Repository: "repo", Name: "el9"}); !errors.Is(err, ErrIntegrity) {
+				t.Fatalf("dist show accepted invalid pending operation: %v", err)
+			}
+			if !reflect.DeepEqual(before, persistentWorkspaceSnapshot(t, root)) {
+				t.Fatal("dist reads changed invalid pending operation")
+			}
+		})
+	}
+}
+
 func TestReadSurfacesClassifyCorruptDistRowsAsIntegrity(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

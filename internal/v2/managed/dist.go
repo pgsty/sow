@@ -221,6 +221,11 @@ func makeDistInfo(ctx context.Context, store *state.Store, root, repoName string
 		return DistInfo{}, fmt.Errorf("read pending operations: %w", err)
 	}
 	for _, operation := range pending {
+		switch operation.State {
+		case state.OperationPlanned, state.OperationStaged, state.OperationApplied, state.OperationBuilt, state.OperationRecovering:
+		default:
+			return DistInfo{}, fmt.Errorf("%w: unsupported pending operation state %q", ErrIntegrity, operation.State)
+		}
 		touches := false
 		switch operation.Kind {
 		case "dist.new", "dist.init", "dist.rm":
@@ -240,6 +245,18 @@ func makeDistInfo(ctx context.Context, store *state.Store, root, repoName string
 					break
 				}
 			}
+		case "local.gc":
+			payload, err := decodeLocalGCOperationPayload(operation.PayloadJSON)
+			if err != nil || payload.Repository != repoName || payload.OperationID != operation.ID {
+				return DistInfo{}, errors.Join(fmt.Errorf("%w: invalid pending local GC payload", ErrIntegrity), err)
+			}
+			// Maintenance has no Dist selection and affects the whole Repository.
+			touches = true
+		case "log.prune":
+			if _, _, err := decodeLogPrunePayload(operation.PayloadJSON, repoName); err != nil {
+				return DistInfo{}, err
+			}
+			touches = true
 		default:
 			return DistInfo{}, fmt.Errorf("%w: unsupported pending operation %q", ErrIntegrity, operation.Kind)
 		}

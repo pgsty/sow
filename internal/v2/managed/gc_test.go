@@ -400,13 +400,16 @@ LIMIT 1`, fixture.object.PoolPath).Scan(&sourceGeneration); err != nil {
 }
 
 func TestLocalGCCrashReplayBeforeAndAfterSQLiteCommit(t *testing.T) {
-	for _, point := range []string{"gc.applied", "gc.committed", "gc.plan_unlinked"} {
+	for _, point := range []string{"gc.planned", "gc.detached", "gc.applied", "gc.recovering", "gc.committed", "gc.plan_unlinked"} {
 		t.Run(point, func(t *testing.T) {
 			ctx := context.Background()
 			fixture := newLocalGCFixture(t, false)
+			if _, err := NewDist(ctx, DistNewOptions{WorkspaceOptions: fixture.options, Repository: "repo", Name: "el10", Format: "rpm"}); err != nil {
+				t.Fatal(err)
+			}
 			injected := errors.New("injected local GC crash")
 			_, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo", Fault: func(got string) error {
-				if got == point {
+				if got == point || point == "gc.detached" && strings.HasPrefix(got, "gc.detached.") || point == "gc.recovering" && got == "gc.applied" {
 					return injected
 				}
 				return nil
@@ -414,6 +417,29 @@ func TestLocalGCCrashReplayBeforeAndAfterSQLiteCommit(t *testing.T) {
 			if !errors.Is(err, injected) {
 				t.Fatalf("fault=%v", err)
 			}
+			wantState := state.OperationDone
+			switch point {
+			case "gc.planned":
+				wantState = state.OperationPlanned
+			case "gc.detached":
+				wantState = state.OperationStaged
+			case "gc.applied":
+				wantState = state.OperationApplied
+			case "gc.recovering":
+				store, err := state.OpenExisting(filepath.Join(fixture.root, ".sow", "repo.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				pending, err := store.PendingOperations(ctx)
+				if err != nil || len(pending) != 1 {
+					t.Fatalf("pending=%#v err=%v", pending, err)
+				}
+				if err := errors.Join(store.SetOperationState(ctx, pending[0].ID, state.OperationRecovering, ""), store.Close()); err != nil {
+					t.Fatal(err)
+				}
+				wantState = state.OperationRecovering
+			}
+			assertDistReadsMaintenanceState(t, fixture.options, "local.gc", wantState)
 			result, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"})
 			if err != nil || !result.Noop {
 				t.Fatalf("replay=%#v err=%v", result, err)

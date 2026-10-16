@@ -319,6 +319,7 @@ func TestLogPruneCrashPhasesRecoverWithoutLosingGenerationOrChanges(t *testing.T
 		"log.prune.planned",
 		"log.prune.staged",
 		"log.prune.applied",
+		"log.prune.recovering",
 		"log.prune.done",
 	} {
 		t.Run(strings.TrimPrefix(point, "log.prune."), func(t *testing.T) {
@@ -326,7 +327,7 @@ func TestLogPruneCrashPhasesRecoverWithoutLosingGenerationOrChanges(t *testing.T
 			root := t.TempDir()
 			options := WorkspaceOptions{Workdir: root, CWD: root}
 			cfg := config.Default()
-			cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}
+			cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}, "el10": {Format: "rpm"}}}
 			writeManagedConfig(t, root, cfg)
 			if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
 				t.Fatal(err)
@@ -356,7 +357,7 @@ func TestLogPruneCrashPhasesRecoverWithoutLosingGenerationOrChanges(t *testing.T
 				Repository:       "repo",
 				Before:           time.Now().Add(time.Hour),
 				Fault: func(observed string) error {
-					if observed == point {
+					if observed == point || point == "log.prune.recovering" && observed == "log.prune.staged" {
 						return injected
 					}
 					return nil
@@ -365,6 +366,17 @@ func TestLogPruneCrashPhasesRecoverWithoutLosingGenerationOrChanges(t *testing.T
 			if !errors.Is(err, injected) || pruned.Operation == "" {
 				t.Fatalf("faulted prune=%#v err=%v", pruned, err)
 			}
+			wantState := state.OperationState(strings.TrimPrefix(point, "log.prune."))
+			if wantState == state.OperationRecovering {
+				store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := errors.Join(store.SetOperationState(ctx, pruned.Operation, wantState, ""), store.Close()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			assertDistReadsMaintenanceState(t, options, "log.prune", wantState)
 
 			// The next ordinary writer must recover planned/staged/applied prune
 			// state before doing its own no-op build. At the done fault point the
