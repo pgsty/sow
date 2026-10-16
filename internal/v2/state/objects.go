@@ -393,11 +393,11 @@ FROM package_objects AS p`
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("list package objects: %w", err)
 	}
-	dists, err := s.packageDistsForObjects(ctx, objects, "memberships")
+	dists, err := s.packageDistsForObjects(ctx, objects, "memberships", len(distNames) == 0)
 	if err != nil {
 		return nil, err
 	}
-	builtDists, err := s.packageDistsForObjects(ctx, objects, "built_memberships")
+	builtDists, err := s.packageDistsForObjects(ctx, objects, "built_memberships", len(distNames) == 0)
 	if err != nil {
 		return nil, err
 	}
@@ -630,37 +630,63 @@ func validPackageMembershipTable(table string) bool {
 	}
 }
 
-// packageDistsForObjects expands one membership projection with one ordered
-// table scan. The membership primary key is (dist_name, package_sha256), so the
-// former per-object WHERE package_sha256 = ? query could not use its leading
-// key and became quadratic for large repositories.
-func (s *Store) packageDistsForObjects(ctx context.Context, objects []PackageObject, table string) (map[string][]string, error) {
+const packageMembershipDigestBatchSize = 500
+
+// packageDistsForObjects uses the reverse covering indexes to expand selected
+// objects in bounded batches. Only a repository-wide object listing needs the
+// complete membership projection, which stays a single ordered table scan.
+func (s *Store) packageDistsForObjects(ctx context.Context, objects []PackageObject, table string, allObjects bool) (map[string][]string, error) {
 	if !validPackageMembershipTable(table) {
 		return nil, errors.New("list package memberships: invalid membership table")
 	}
 	result := make(map[string][]string, len(objects))
+	digests := make([]string, 0, len(objects))
 	for _, object := range objects {
-		result[object.SHA256] = []string{}
+		if _, exists := result[object.SHA256]; !exists {
+			result[object.SHA256] = []string{}
+			digests = append(digests, object.SHA256)
+		}
 	}
 	if len(result) == 0 {
 		return result, nil
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT package_sha256, dist_name FROM `+table+` ORDER BY package_sha256, dist_name`)
-	if err != nil {
-		return nil, fmt.Errorf("list package memberships: %w", err)
+	batchSize := packageMembershipDigestBatchSize
+	if allObjects {
+		batchSize = len(digests)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var digest, distName string
-		if err := rows.Scan(&digest, &distName); err != nil {
-			return nil, err
+	for start := 0; start < len(digests); start += batchSize {
+		query := `SELECT package_sha256, dist_name FROM ` + table
+		var args []any
+		if !allObjects {
+			end := min(start+batchSize, len(digests))
+			query += ` WHERE package_sha256 IN (` + strings.TrimSuffix(strings.Repeat("?,", end-start), ",") + `)`
+			args = make([]any, 0, end-start)
+			for _, digest := range digests[start:end] {
+				args = append(args, digest)
+			}
 		}
-		if dists, selected := result[digest]; selected {
-			result[digest] = append(dists, distName)
+		query += ` ORDER BY package_sha256, dist_name`
+		rows, err := s.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("list package memberships: %w", err)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list package memberships: %w", err)
+		for rows.Next() {
+			var digest, distName string
+			if err := rows.Scan(&digest, &distName); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if dists, selected := result[digest]; selected {
+				result[digest] = append(dists, distName)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("list package memberships: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("list package memberships: %w", err)
+		}
 	}
 	return result, nil
 }

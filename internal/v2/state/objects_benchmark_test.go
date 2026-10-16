@@ -20,6 +20,29 @@ func BenchmarkListPackageObjectsDistinct50K(b *testing.B) {
 	benchmarkListPackageObjectsDistinct(b, 50_000)
 }
 
+func BenchmarkListPackageObjectsSparse(b *testing.B) {
+	for _, objectCount := range []int{5_000, 50_000} {
+		for _, selectedCount := range []int{1, 1_101} {
+			b.Run(fmt.Sprintf("history_%d/selected_%d", objectCount, selectedCount), func(b *testing.B) {
+				store, _ := newSparseMembershipFixture(b, objectCount, selectedCount)
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					objects, err := store.ListPackageObjects(context.Background(), []string{"selected"}, false)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if len(objects) != selectedCount {
+						b.Fatalf("objects=%d want=%d", len(objects), selectedCount)
+					}
+				}
+				b.ReportMetric(float64(objectCount), "history_objects")
+				b.ReportMetric(float64(selectedCount), "selected_objects/op")
+			})
+		}
+	}
+}
+
 func benchmarkListPackageObjectsDistinct(b *testing.B, objectCount int) {
 	ctx := context.Background()
 	store, err := Open(filepath.Join(b.TempDir(), "repo.db"))
