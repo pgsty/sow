@@ -449,9 +449,10 @@ func AddRetainedGeneration(ctx context.Context, opts RetainAddOptions) (result R
 	if err := durableMkdir(metadataRoot, 0o700); err != nil {
 		return result, err
 	}
+	evidence := newPayloadEvidenceRegistry()
 	for _, file := range manifest {
 		if file.Phase == "payload" {
-			if err := verifyRetainedSource(ctx, filepath.Join(ws.Root, repoName), file); err != nil {
+			if err := evidence.verifyRetainedReference(ctx, filepath.Join(ws.Root, repoName), file); err != nil {
 				return result, err
 			}
 			continue
@@ -487,7 +488,7 @@ func AddRetainedGeneration(ctx context.Context, opts RetainAddOptions) (result R
 	if err := callFault(opts.Fault, "retain.committed"); err != nil {
 		return result, err
 	}
-	return verifyRetainedGenerationLocked(ctx, ws.Root, repoName, opts.Generation, identity.RepositoryID)
+	return verifyRetainedGenerationLockedWithEvidence(ctx, ws.Root, repoName, opts.Generation, identity.RepositoryID, evidence)
 }
 
 // The repository lock excludes a live retain writer. An abandoned add stage

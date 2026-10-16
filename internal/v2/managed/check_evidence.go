@@ -90,6 +90,35 @@ func payloadEvidenceForMutationSnapshot(snapshot *publicGenerationSnapshot) (*pa
 	return registry, nil
 }
 
+// GC requires a fresh content authentication even when ordinary current-tree
+// validation accepted a persisted fingerprint. Import only full reads from
+// this operation, under the identity recorded for that read. Every later use
+// rebinds the opened descriptor; changed identities are never refreshed here.
+func payloadEvidenceForAuthenticatedSnapshot(snapshot *publicGenerationSnapshot) (*payloadEvidenceRegistry, error) {
+	if snapshot == nil {
+		return nil, fmt.Errorf("%w: authenticated public snapshot is unavailable", ErrIntegrity)
+	}
+	registry := newPayloadEvidenceRegistry()
+	for _, file := range snapshot.Manifest {
+		if file.Phase != "payload" {
+			continue
+		}
+		identity, authenticated := snapshot.AuthenticatedPayloads[file.Path]
+		if !authenticated {
+			continue
+		}
+		if identity != snapshot.Identities[file.Path] || !identity.valid(file.Size) || !lowercaseSHA256.MatchString(file.SHA256) {
+			return nil, fmt.Errorf("%w: authenticated payload identity differs for %s", ErrIntegrity, file.Path)
+		}
+		key := physicalPayloadIdentityFrom(identity)
+		if previous := registry.slots[key]; previous != nil && (previous.evidence.File.Size != file.Size || previous.evidence.File.SHA256 != file.SHA256) {
+			return nil, fmt.Errorf("%w: authenticated payload identities conflict at %s", ErrIntegrity, file.Path)
+		}
+		registry.slots[key] = &payloadEvidenceSlot{done: closedEvidenceChannel(), evidence: &checkPayloadEvidence{Identity: identity, File: file}}
+	}
+	return registry, nil
+}
+
 type checkVerificationSnapshot struct {
 	Public   *publicGenerationSnapshot
 	Evidence *payloadEvidenceRegistry
@@ -309,43 +338,62 @@ func (registry *payloadEvidenceRegistry) verifyPayloadReference(ctx context.Cont
 	if err != nil {
 		return fmt.Errorf("%w: payload source %q is missing or unsafe: %v", ErrIntegrity, file.Path, err)
 	}
-	identity, err := snapshotRootedRegularIdentity(opened)
+	_, authErr := registry.authenticateDescriptor(ctx, opened.file, file.Size, file.SHA256)
+	if err := errors.Join(authErr, opened.CloseVerified()); err != nil {
+		return fmt.Errorf("%w: payload source %q differs from reference: %w", ErrIntegrity, file.Path, err)
+	}
+	return nil
+}
+
+// authenticateDescriptor leaves namespace verification to its rooted caller.
+// Nil evidence retains the independent full-authentication contract of general
+// namespace helpers. GC supplies only its fresh, operation-local registry.
+func (registry *payloadEvidenceRegistry) authenticateDescriptor(ctx context.Context, opened *os.File, size int64, expectedSHA string) (rootedRegularIdentity, error) {
+	if registry == nil {
+		return authenticateRegularDescriptor(ctx, opened, size, expectedSHA)
+	}
+	identity, err := snapshotRegularDescriptorIdentity(opened)
 	if err != nil {
-		return errors.Join(err, opened.CloseVerified())
+		return rootedRegularIdentity{}, err
+	}
+	if !identity.valid(size) || !lowercaseSHA256.MatchString(expectedSHA) {
+		return rootedRegularIdentity{}, fmt.Errorf("%w: payload source differs from reference", ErrIntegrity)
 	}
 	key := physicalPayloadIdentityFrom(identity)
 	slot, owner := registry.claim(key)
 	if !owner {
 		select {
 		case <-ctx.Done():
-			return errors.Join(ctx.Err(), opened.CloseVerified())
+			return rootedRegularIdentity{}, ctx.Err()
 		case <-slot.done:
 		}
-		after, identityErr := snapshotRootedRegularIdentity(opened)
-		if slot.err != nil || identityErr != nil || slot.evidence == nil || slot.evidence.File.Size != file.Size || slot.evidence.File.SHA256 != file.SHA256 {
-			return errors.Join(fmt.Errorf("%w: payload evidence differs for %q", ErrIntegrity, file.Path), slot.err, identityErr, opened.CloseVerified())
+		if err := ctx.Err(); err != nil {
+			return rootedRegularIdentity{}, err
+		}
+		after, identityErr := snapshotRegularDescriptorIdentity(opened)
+		if slot.err != nil || identityErr != nil || slot.evidence == nil || slot.evidence.File.Size != size || slot.evidence.File.SHA256 != expectedSHA {
+			return rootedRegularIdentity{}, errors.Join(fmt.Errorf("%w: payload evidence differs from reference", ErrIntegrity), slot.err, identityErr)
 		}
 		if identity == after && slot.evidence.Identity == after {
-			return opened.CloseVerified()
+			return after, nil
 		}
 		// A cache hit is valid only for the current descriptor identity.
 		// Reauthenticate below if it changed while waiting for the owner.
 		identity = after
 	}
-	digest, after, err := digestPayloadDescriptor(ctx, opened.file, identity)
-	closeErr := opened.CloseVerified()
-	if err != nil || closeErr != nil || after.size != file.Size || digest != file.SHA256 {
-		err = errors.Join(fmt.Errorf("%w: payload source %q differs from reference", ErrIntegrity, file.Path), err, closeErr)
+	digest, after, err := digestPayloadDescriptor(ctx, opened, identity)
+	if err != nil || after.size != size || digest != expectedSHA {
+		err = errors.Join(fmt.Errorf("%w: payload source differs from reference", ErrIntegrity), err)
 		if owner {
 			registry.complete(key, slot, nil, err)
 		}
-		return err
+		return rootedRegularIdentity{}, err
 	}
 	if owner {
-		evidence := &checkPayloadEvidence{Identity: after, File: file, SignatureResults: make(map[string]yumrepo.RPMSignatureTrustRingResult)}
+		evidence := &checkPayloadEvidence{Identity: after, File: state.GenerationFile{Phase: "payload", Size: size, SHA256: digest}}
 		registry.complete(key, slot, evidence, nil)
 	}
-	return nil
+	return after, nil
 }
 
 func (registry *payloadEvidenceRegistry) walkedPayload(ctx context.Context, file *os.File, info os.FileInfo, relative string) (state.GenerationFile, error) {

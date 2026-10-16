@@ -124,7 +124,12 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
 		return result, err
 	}
-	if err := validateCurrentPublicGeneration(ctx, ws.Root, repoName, store); err != nil {
+	snapshot, err := validateCurrentPublicGenerationSnapshot(ctx, ws.Root, repoName, store)
+	if err != nil {
+		return result, err
+	}
+	evidence, err := payloadEvidenceForAuthenticatedSnapshot(snapshot)
+	if err != nil {
 		return result, err
 	}
 	if err := cleanupRetainedAddStagesLocked(ctx, ws.Root, repoName, store); err != nil {
@@ -150,7 +155,7 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 		}
 		objectByPath[object.PoolPath] = object
 	}
-	protected, err := verifiedRetainedPayloadRootsLocked(ctx, ws.Root, repoName, inventory.RepositoryID, objectByPath)
+	protected, err := verifiedRetainedPayloadRootsLocked(ctx, ws.Root, repoName, inventory.RepositoryID, objectByPath, evidence)
 	if err != nil {
 		return result, err
 	}
@@ -218,7 +223,7 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 	}
 	for _, entry := range plan.Entries {
 		public := filepath.Join(repoName, filepath.FromSlash(entry.Path))
-		ok, err := exactLocalGCFile(ctx, ws.Root, public, entry.Size, entry.SHA256)
+		ok, err := exactLocalGCFile(ctx, ws.Root, public, entry.Size, entry.SHA256, evidence)
 		if err != nil {
 			return result, err
 		}
@@ -250,7 +255,7 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 	if err := store.SetOperationState(ctx, plan.OperationID, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
 		return result, errors.Join(err, ctx.Err())
 	}
-	committed, err := applyLocalGCPlan(ctx, ws.Root, repoName, store, plan, opts.Fault)
+	committed, err := applyLocalGCPlan(ctx, ws.Root, repoName, store, plan, opts.Fault, evidence)
 	if committed {
 		result = localGCResult(plan)
 	}
@@ -363,28 +368,28 @@ func validateLocalGCPlan(plan localGCPlan) error {
 	return nil
 }
 
-func applyLocalGCPlan(ctx context.Context, root, repoName string, store *state.Store, plan localGCPlan, fault func(string) error) (terminalCommitted bool, resultErr error) {
-	if err := validateLocalGCRecoveryInventory(ctx, root, repoName, plan); err != nil {
+func applyLocalGCPlan(ctx context.Context, root, repoName string, store *state.Store, plan localGCPlan, fault func(string) error, evidence *payloadEvidenceRegistry) (terminalCommitted bool, resultErr error) {
+	if err := validateLocalGCRecoveryInventory(ctx, root, repoName, plan, evidence); err != nil {
 		return false, err
 	}
 	for _, entry := range plan.Entries {
 		public := filepath.Join(repoName, filepath.FromSlash(entry.Path))
 		tombstone := filepath.Join(".sow", repoName, "recovery", plan.OperationID, localGCPayloadDir, filepath.FromSlash(entry.Path))
-		publicOK, err := exactLocalGCFile(ctx, root, public, entry.Size, entry.SHA256)
+		publicOK, err := exactLocalGCFile(ctx, root, public, entry.Size, entry.SHA256, evidence)
 		if err != nil {
 			return false, err
 		}
-		tombstoneOK, err := exactLocalGCFile(ctx, root, tombstone, entry.Size, entry.SHA256)
+		tombstoneOK, err := exactLocalGCFile(ctx, root, tombstone, entry.Size, entry.SHA256, evidence)
 		if err != nil {
 			return false, err
 		}
 		switch {
 		case publicOK && !tombstoneOK:
-			if err := renameRootedRegular(ctx, root, public, tombstone, entry.Size, entry.SHA256, 0o600, 0o700); err != nil {
+			if err := renameRootedRegularWithEvidence(ctx, root, public, tombstone, entry.Size, entry.SHA256, 0o600, 0o700, evidence); err != nil {
 				return false, err
 			}
 		case publicOK && tombstoneOK:
-			if err := removeRootedRegularExact(ctx, root, public, entry.Size, entry.SHA256); err != nil {
+			if err := removeRootedRegularExactWithEvidence(ctx, root, public, entry.Size, entry.SHA256, evidence); err != nil {
 				return false, err
 			}
 		case !publicOK && tombstoneOK:
@@ -420,7 +425,7 @@ func applyLocalGCPlan(ctx context.Context, root, repoName string, store *state.S
 	}
 	completionCtx, cancel := operationCompletionContext(ctx)
 	defer cancel()
-	return true, errors.Join(finalizeErr, cleanupLocalGCPlan(completionCtx, root, repoName, plan, fault))
+	return true, errors.Join(finalizeErr, cleanupLocalGCPlan(completionCtx, root, repoName, plan, fault, evidence))
 }
 
 func recoverLocalGCOperation(ctx context.Context, root, repoName string, store *state.Store, operation state.Operation) error {
@@ -468,7 +473,7 @@ func recoverLocalGCOperation(ctx context.Context, root, repoName string, store *
 			return errors.Join(err, ctx.Err())
 		}
 	}
-	_, err = applyLocalGCPlan(ctx, root, repoName, store, plan, nil)
+	_, err = applyLocalGCPlan(ctx, root, repoName, store, plan, nil, newPayloadEvidenceRegistry())
 	return err
 }
 
@@ -501,18 +506,18 @@ func recoverDoneLocalGCCleanup(ctx context.Context, root, repoName string, opera
 	if err != nil || bytesSHA(data) != payload.PlanSHA256 {
 		return errors.Join(fmt.Errorf("%w: completed local GC plan differs from journal", ErrIntegrity), err)
 	}
-	return cleanupLocalGCPlan(ctx, root, repoName, plan, nil)
+	return cleanupLocalGCPlan(ctx, root, repoName, plan, nil, newPayloadEvidenceRegistry())
 }
 
-func cleanupLocalGCPlan(ctx context.Context, root, repoName string, plan localGCPlan, fault func(string) error) error {
+func cleanupLocalGCPlan(ctx context.Context, root, repoName string, plan localGCPlan, fault func(string) error, evidence *payloadEvidenceRegistry) error {
 	recoveryRoot := localGCRecoveryRoot(root, repoName, plan.OperationID)
-	if err := validateLocalGCRecoveryInventory(ctx, root, repoName, plan); err != nil {
+	if err := validateLocalGCRecoveryInventory(ctx, root, repoName, plan, evidence); err != nil {
 		return err
 	}
 	directories := map[string]struct{}{localGCPayloadDir: {}}
 	for _, entry := range plan.Entries {
 		relative := filepath.Join(localGCPayloadDir, filepath.FromSlash(entry.Path))
-		if err := removeRootedRegularExact(ctx, recoveryRoot, relative, entry.Size, entry.SHA256); err != nil {
+		if err := removeRootedRegularExactWithEvidence(ctx, recoveryRoot, relative, entry.Size, entry.SHA256, evidence); err != nil {
 			return err
 		}
 		for parent := filepath.Dir(relative); parent != "."; parent = filepath.Dir(parent) {
@@ -551,7 +556,7 @@ func cleanupLocalGCPlan(ctx context.Context, root, repoName string, plan localGC
 	return removeRootedEmptyDirectory(filepath.Join(root, ".sow", repoName, "recovery"), plan.OperationID)
 }
 
-func validateLocalGCRecoveryInventory(ctx context.Context, root, repoName string, plan localGCPlan) error {
+func validateLocalGCRecoveryInventory(ctx context.Context, root, repoName string, plan localGCPlan, evidence *payloadEvidenceRegistry) error {
 	recoveryRoot := localGCRecoveryRoot(root, repoName, plan.OperationID)
 	expectedFiles := map[string]localGCEntry{}
 	planData, err := readRootedPrivateRegular(recoveryRoot, localGCPlanName, maxLocalGCPlanBytes, false)
@@ -573,9 +578,16 @@ func validateLocalGCRecoveryInventory(ctx context.Context, root, repoName string
 		if !exists || info.Size() != expected.Size {
 			return fmt.Errorf("%w: unknown or changed local GC recovery file %q", ErrIntegrity, path)
 		}
-		digest, err := hashRegularDescriptor(ctx, file)
-		if err != nil || digest != expected.SHA256 {
-			return errors.Join(fmt.Errorf("%w: changed local GC recovery file %q", ErrIntegrity, path), err)
+		// Every entry is still walked. Namespace mutations invalidate the
+		// old ctime/link-count proof, so tombstones get a fresh stable read.
+		var authErr error
+		if path == localGCPlanName {
+			_, authErr = authenticateRegularDescriptor(ctx, file, expected.Size, expected.SHA256)
+		} else {
+			_, authErr = evidence.authenticateDescriptor(ctx, file, expected.Size, expected.SHA256)
+		}
+		if authErr != nil {
+			return errors.Join(fmt.Errorf("%w: changed local GC recovery file %q", ErrIntegrity, path), authErr)
 		}
 		return nil
 	}, func(relative string, _ *os.File, _ os.FileInfo) error {
@@ -591,7 +603,7 @@ func validateLocalGCRecoveryInventory(ctx context.Context, root, repoName string
 	return err
 }
 
-func verifiedRetainedPayloadRootsLocked(ctx context.Context, root, repoName, repositoryID string, objects map[string]state.PackageObject) (map[string]state.GenerationFile, error) {
+func verifiedRetainedPayloadRootsLocked(ctx context.Context, root, repoName, repositoryID string, objects map[string]state.PackageObject, evidence *payloadEvidenceRegistry) (map[string]state.GenerationFile, error) {
 	protected := map[string]state.GenerationFile{}
 	entries, err := listRootedDirectory(filepath.Join(root, ".sow", repoName, "retained"))
 	if err != nil {
@@ -602,7 +614,7 @@ func verifiedRetainedPayloadRootsLocked(ctx context.Context, root, repoName, rep
 		if err != nil || generation == 0 || uint32(entry.Stat.Mode)&unix.S_IFMT != unix.S_IFDIR {
 			return nil, fmt.Errorf("%w: non-canonical retained entry %q", ErrIntegrity, entry.Name)
 		}
-		if _, err := verifyRetainedGenerationLocked(ctx, root, repoName, generation, repositoryID); err != nil {
+		if _, err := verifyRetainedGenerationLockedWithEvidence(ctx, root, repoName, generation, repositoryID, evidence); err != nil {
 			return nil, err
 		}
 		data, err := readRootedPrivateRegular(filepath.Join(root, ".sow", repoName, "retained", generation.String()), "manifest.tsv", maxRetainedManifestBytes, true)
@@ -687,7 +699,7 @@ func decodeLocalGCOperationPayload(data string) (localGCOperationPayload, error)
 	return payload, nil
 }
 
-func exactLocalGCFile(ctx context.Context, root, relative string, size int64, digest string) (bool, error) {
+func exactLocalGCFile(ctx context.Context, root, relative string, size int64, digest string, evidence *payloadEvidenceRegistry) (bool, error) {
 	opened, err := openRootedRegular(root, relative)
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOENT) || strings.Contains(errString(err), "no such file or directory") {
 		return false, nil
@@ -695,9 +707,9 @@ func exactLocalGCFile(ctx context.Context, root, relative string, size int64, di
 	if err != nil {
 		return false, fmt.Errorf("%w: inspect local GC path %q: %v", ErrIntegrity, relative, err)
 	}
-	actual, hashErr := hashRegularDescriptor(ctx, opened.file)
+	_, hashErr := evidence.authenticateDescriptor(ctx, opened.file, size, digest)
 	closeErr := opened.CloseVerified()
-	if hashErr != nil || closeErr != nil || opened.before.Size() != size || actual != digest {
+	if hashErr != nil || closeErr != nil || opened.before.Size() != size {
 		return false, errors.Join(fmt.Errorf("%w: local GC path %q differs from its plan", ErrIntegrity, relative), hashErr, closeErr)
 	}
 	return true, nil

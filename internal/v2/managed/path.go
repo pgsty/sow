@@ -629,6 +629,10 @@ func (chain *rootedDirectoryChain) verify() error {
 // the source link removed. A crash between those two actions leaves two exact
 // links, which the operation journal can safely collapse on replay.
 func renameRootedRegular(ctx context.Context, root, sourceRelative, targetRelative string, expectedSize int64, expectedSHA string, fileMode, directoryMode os.FileMode) error {
+	return renameRootedRegularWithEvidence(ctx, root, sourceRelative, targetRelative, expectedSize, expectedSHA, fileMode, directoryMode, nil)
+}
+
+func renameRootedRegularWithEvidence(ctx context.Context, root, sourceRelative, targetRelative string, expectedSize int64, expectedSHA string, fileMode, directoryMode os.FileMode, evidence *payloadEvidenceRegistry) error {
 	if ctx == nil {
 		return errors.New("managed: nil rooted rename context")
 	}
@@ -679,15 +683,20 @@ func renameRootedRegular(ctx context.Context, root, sourceRelative, targetRelati
 	if entryErr != nil || sourceEntry.Dev != before.Dev || sourceEntry.Ino != before.Ino || sourceEntry.Size != before.Size || uint32(sourceEntry.Mode)&unix.S_IFMT != unix.S_IFREG {
 		return closeFile(errors.Join(errors.New("managed: rooted rename source entry changed while opening"), entryErr))
 	}
-	authenticated, err := authenticateRegularDescriptor(ctx, file, expectedSize, expectedSHA)
+	authenticated, err := evidence.authenticateDescriptor(ctx, file, expectedSize, expectedSHA)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return closeFile(ctxErr) // a cancelled read is not a digest mismatch
 		}
 		return closeFile(errors.Join(errors.New("managed: rooted rename source digest differs"), err))
 	}
-	if err := errors.Join(sourceParent.verify(), targetParent.verify()); err != nil {
+	if err := errors.Join(ctx.Err(), sourceParent.verify(), targetParent.verify()); err != nil {
 		return closeFile(err)
+	}
+	current, identityErr := snapshotRegularDescriptorIdentity(file)
+	entryErr = unix.Fstatat(int(sourceParent.directory().Fd()), sourceName, &sourceEntry, unix.AT_SYMLINK_NOFOLLOW)
+	if identityErr != nil || entryErr != nil || current != authenticated || !authenticated.matchesStat(sourceEntry) {
+		return closeFile(errors.Join(errors.New("managed: rooted rename source changed after authentication"), identityErr, entryErr))
 	}
 	linkErr := unix.Linkat(int(sourceParent.directory().Fd()), sourceName, int(targetParent.directory().Fd()), targetName, 0)
 	if linkErr != nil && !errors.Is(linkErr, unix.EEXIST) {
@@ -1208,6 +1217,10 @@ func removeRootedRegular(root, relative string, expectedSize int64) error {
 // checking its complete content identity. A missing entry (or missing parent
 // left by an earlier successful replay step) is already complete.
 func removeRootedRegularExact(ctx context.Context, root, relative string, expectedSize int64, expectedSHA string) error {
+	return removeRootedRegularExactWithEvidence(ctx, root, relative, expectedSize, expectedSHA, nil)
+}
+
+func removeRootedRegularExactWithEvidence(ctx context.Context, root, relative string, expectedSize int64, expectedSHA string, evidence *payloadEvidenceRegistry) error {
 	if ctx == nil || expectedSize < 0 || !lowercaseSHA256.MatchString(expectedSHA) {
 		return errors.New("managed: invalid exact rooted removal identity")
 	}
@@ -1238,8 +1251,8 @@ func removeRootedRegularExact(ctx context.Context, root, relative string, expect
 	if statErr != nil || uint32(before.Mode)&unix.S_IFMT != unix.S_IFREG || before.Size != expectedSize {
 		return closeFile(errors.Join(errors.New("managed: exact rooted removal target differs in size or kind"), statErr))
 	}
-	digest, hashErr := hashRegularDescriptor(ctx, file)
-	if hashErr != nil || digest != expectedSHA {
+	authenticated, hashErr := evidence.authenticateDescriptor(ctx, file, expectedSize, expectedSHA)
+	if hashErr != nil {
 		return closeFile(errors.Join(errors.New("managed: exact rooted removal target differs in digest"), hashErr))
 	}
 	var entry, afterHash unix.Stat_t
@@ -1250,8 +1263,13 @@ func removeRootedRegularExact(ctx context.Context, root, relative string, expect
 		uint32(entry.Mode)&unix.S_IFMT != unix.S_IFREG || uint32(afterHash.Mode)&unix.S_IFMT != unix.S_IFREG {
 		return closeFile(errors.Join(errors.New("managed: exact rooted removal entry changed while hashing"), entryErr, afterErr))
 	}
-	if err := parent.verify(); err != nil {
+	if err := errors.Join(ctx.Err(), parent.verify()); err != nil {
 		return closeFile(err)
+	}
+	current, identityErr := snapshotRegularDescriptorIdentity(file)
+	entryErr = unix.Fstatat(int(parent.directory().Fd()), name, &entry, unix.AT_SYMLINK_NOFOLLOW)
+	if identityErr != nil || entryErr != nil || current != authenticated || !authenticated.matchesStat(entry) {
+		return closeFile(errors.Join(errors.New("managed: exact rooted removal identity changed after authentication"), identityErr, entryErr))
 	}
 	if err := unix.Unlinkat(int(parent.directory().Fd()), name, 0); err != nil {
 		return closeFile(err)
