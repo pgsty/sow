@@ -45,7 +45,7 @@ func TestVerifyGnuPGClearSignatureFinalNewline(t *testing.T) {
 	}
 	at := time.Now().UTC().Add(time.Minute).Truncate(time.Second)
 	message := []byte("Origin: SOW\nSuite: stable\n")
-	inRelease := run(message, "--armor", "--digest-algo", "SHA256", "--faked-system-time", strconv.FormatInt(at.Unix(), 10), "--clearsign")
+	inRelease := run(message, "--armor", "--digest-algo", "SHA256", "--faked-system-time", strconv.FormatInt(at.Unix(), 10)+"!", "--clearsign")
 	var detached bytes.Buffer
 	if err := signer.DetachedSign(&detached, bytes.NewReader(message), at); err != nil {
 		t.Fatal(err)
