@@ -85,6 +85,30 @@ func TestOpenPGPArmoredIOAndSingleKeyPolicy(t *testing.T) {
 	if _, err := NewOpenPGPSigner(bytes.NewReader(keyring.Bytes()), nil, time.Unix(1_700_000_000, 0)); err == nil {
 		t.Fatal("multiple OpenPGP entities unexpectedly accepted")
 	}
+
+	for _, test := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "multiple armor blocks", data: bytes.Repeat(armored.Bytes(), 2)},
+		{name: "trailing garbage", data: append(append([]byte(nil), armored.Bytes()...), []byte("private-tail-marker")...)},
+		{name: "unterminated armor", data: bytes.Replace(armored.Bytes(), []byte("-----END PGP PRIVATE KEY BLOCK-----"), nil, 1)},
+		{name: "unterminated second armor", data: append(append([]byte(nil), armored.Bytes()...), []byte("\n-----BEGIN PGP PRIVATE KEY BLOCK-----\n\n")...)},
+		{name: "multiple binary entities", data: keyring.Bytes()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NewOpenPGPSigner(bytes.NewReader(test.data), nil, time.Unix(1_700_000_000, 0)); err == nil || strings.Contains(err.Error(), "private-tail-marker") {
+				t.Fatalf("invalid signer input was accepted or exposed: %v", err)
+			}
+			if _, err := NewOpenPGPVerifier(bytes.NewReader(test.data), time.Unix(1_700_000_000, 0)); err == nil || strings.Contains(err.Error(), "private-tail-marker") {
+				t.Fatalf("invalid verifier input was accepted or exposed: %v", err)
+			}
+		})
+	}
+	whitespace := append(append([]byte("\r\n \t"), bytes.ReplaceAll(armored.Bytes(), []byte("\n"), []byte("\r\n"))...), []byte("\r\n \t")...)
+	if _, err := NewOpenPGPSigner(bytes.NewReader(whitespace), nil, time.Unix(1_700_000_000, 0)); err != nil {
+		t.Fatalf("valid CRLF armor with surrounding whitespace: %v", err)
+	}
 }
 
 func TestOpenPGPVerifierSelectsExactAggregateCertificate(t *testing.T) {

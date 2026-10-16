@@ -100,6 +100,54 @@ func TestSignerRequiresExactlyOnePrivateEntity(t *testing.T) {
 	}
 }
 
+func TestSingleKeyReadersConsumeCompleteInput(t *testing.T) {
+	created := time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)
+	first := newTestEntity(t, "complete-input-first", created)
+	second := newTestEntity(t, "complete-input-second", created)
+	private := serializePrivateEntities(t, []*openpgp.Entity{first}, true, created)
+	other := serializePrivateEntities(t, []*openpgp.Entity{second}, true, created)
+	var binary bytes.Buffer
+	if err := first.SerializePrivateWithoutSigning(&binary, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "separate entities", data: bytes.Join([][]byte{private, other}, []byte("\n"))},
+		{name: "repeated block", data: bytes.Join([][]byte{private, private}, []byte("\n"))},
+		{name: "trailing garbage", data: append(append([]byte(nil), private...), []byte("private-tail-marker")...)},
+		{name: "unterminated", data: bytes.Replace(private, []byte("-----END PGP PRIVATE KEY BLOCK-----"), nil, 1)},
+		{name: "unterminated second block", data: append(append([]byte(nil), private...), []byte("\n-----BEGIN PGP PRIVATE KEY BLOCK-----\n\n")...)},
+		{name: "binary trailing garbage", data: append(append([]byte(nil), binary.Bytes()...), []byte("private-tail-marker")...)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NewSignerBytes(test.data, nil); !errors.Is(err, ErrInvalidSigningKey) {
+				t.Fatalf("signer accepted incomplete single-key input: %v", err)
+			}
+			if _, err := NewVerifierBytes(test.data); !errors.Is(err, ErrInvalidSigningKey) {
+				t.Fatalf("verifier accepted incomplete single-key input: %v", err)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name string
+		data []byte
+	}{
+		{name: "binary", data: binary.Bytes()},
+		{name: "armor whitespace", data: append(append([]byte("\r\n \t"), bytes.ReplaceAll(private, []byte("\n"), []byte("\r\n"))...), []byte("\r\n \t")...)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := NewSignerBytes(test.data, nil); err != nil {
+				t.Fatalf("valid signer input: %v", err)
+			}
+			if _, err := NewVerifierBytes(test.data); err != nil {
+				t.Fatalf("valid verifier input: %v", err)
+			}
+		})
+	}
+}
+
 func TestSignerRejectsMultipleUsableSigningKeys(t *testing.T) {
 	created := time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)
 	entity := newTestEntity(t, "multiple-signers", created)

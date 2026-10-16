@@ -19,6 +19,7 @@ import (
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/pgsty/sow/internal/openpgpkey"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
 	"github.com/pgsty/sow/internal/yumrepo"
@@ -670,16 +671,7 @@ func resolvePublicKeyReference(ctx context.Context, root, reference string) ([]b
 }
 
 func publicOpenPGPKeyMaterial(data []byte) ([]byte, error) {
-	trimmed := bytes.TrimSpace(data)
-	var (
-		entities openpgp.EntityList
-		err      error
-	)
-	if bytes.HasPrefix(trimmed, []byte("-----BEGIN PGP")) {
-		entities, err = openpgp.ReadArmoredKeyRing(bytes.NewReader(trimmed))
-	} else {
-		entities, err = openpgp.ReadKeyRing(bytes.NewReader(data))
-	}
+	entities, err := openpgpkey.Read(data)
 	if err != nil || len(entities) == 0 {
 		return nil, errors.New("key reference has no parseable OpenPGP key")
 	}

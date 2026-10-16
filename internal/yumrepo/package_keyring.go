@@ -11,6 +11,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	openpgpv2 "github.com/ProtonMail/go-crypto/openpgp/v2"
+	"github.com/pgsty/sow/internal/openpgpkey"
 )
 
 // ParseRPMPackageKeyring parses a public-only package trust bundle while
@@ -209,48 +210,9 @@ func parseHistoricalKeyring(data []byte) (openpgpv2.EntityList, error) {
 }
 
 func splitPublicKeyArmorBlocks(data []byte) ([][]byte, error) {
-	const (
-		begin = "-----BEGIN PGP PUBLIC KEY BLOCK-----"
-		end   = "-----END PGP PUBLIC KEY BLOCK-----"
-	)
-	remaining := bytes.TrimSpace(data)
-	var blocks [][]byte
-	for len(remaining) > 0 {
-		firstEnd := bytes.IndexByte(remaining, '\n')
-		if firstEnd < 0 {
-			firstEnd = len(remaining)
-		}
-		if string(bytes.TrimSpace(remaining[:firstEnd])) != begin {
-			return nil, errors.New("yumrepo: armored RPM package keyring must contain public-key blocks only")
-		}
-		offset := 0
-		found := false
-		for offset < len(remaining) {
-			lineEnd := bytes.IndexByte(remaining[offset:], '\n')
-			blockEnd := len(remaining)
-			lineLimit := len(remaining)
-			if lineEnd >= 0 {
-				lineLimit = offset + lineEnd
-				blockEnd = lineLimit + 1
-			}
-			if string(bytes.TrimSpace(remaining[offset:lineLimit])) == end {
-				block := append([]byte(nil), remaining[:blockEnd]...)
-				blocks = append(blocks, block)
-				remaining = bytes.TrimSpace(remaining[blockEnd:])
-				found = true
-				break
-			}
-			if lineEnd < 0 {
-				break
-			}
-			offset = blockEnd
-		}
-		if !found {
-			return nil, errors.New("yumrepo: unterminated armored RPM package public key block")
-		}
-	}
-	if len(blocks) == 0 {
-		return nil, errors.New("yumrepo: armored RPM package keyring is empty")
+	blocks, err := openpgpkey.SplitArmor(data, openpgp.PublicKeyType)
+	if err != nil {
+		return nil, fmt.Errorf("yumrepo: armored RPM package keyring must contain complete public-key blocks only: %w", err)
 	}
 	return blocks, nil
 }

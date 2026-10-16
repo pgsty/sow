@@ -13,6 +13,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
+	"github.com/pgsty/sow/internal/openpgpkey"
 )
 
 const maxOpenPGPKeyBytes = 16 << 20
@@ -201,13 +202,8 @@ func readSingleKey(reader io.Reader) (openpgp.EntityList, error) {
 	if len(data) > maxOpenPGPKeyBytes {
 		return nil, fmt.Errorf("yumrepo: OpenPGP key exceeds %d bytes", maxOpenPGPKeyBytes)
 	}
-	var entities openpgp.EntityList
-	trimmed := bytes.TrimSpace(data)
-	if bytes.HasPrefix(trimmed, []byte("-----BEGIN PGP")) {
-		entities, err = openpgp.ReadArmoredKeyRing(bytes.NewReader(trimmed))
-	} else {
-		entities, err = openpgp.ReadKeyRing(bytes.NewReader(data))
-	}
+	defer clear(data)
+	entities, err := openpgpkey.ReadSingle(data)
 	if err != nil {
 		return nil, fmt.Errorf("yumrepo: parse OpenPGP key: %w", err)
 	}

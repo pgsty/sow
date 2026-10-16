@@ -12,6 +12,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
+	"github.com/pgsty/sow/internal/openpgpkey"
 )
 
 const maxSigningKeyBytes = 16 << 20
@@ -47,12 +48,7 @@ func NewSigner(key io.Reader, passphrase []byte) (*Signer, error) {
 	}
 	defer clear(data)
 
-	var entities openpgp.EntityList
-	if bytes.HasPrefix(bytes.TrimSpace(data), []byte("-----BEGIN PGP")) {
-		entities, err = openpgp.ReadArmoredKeyRing(bytes.NewReader(data))
-	} else {
-		entities, err = openpgp.ReadKeyRing(bytes.NewReader(data))
-	}
+	entities, err := openpgpkey.ReadSingle(data)
 	if err != nil || len(entities) != 1 || entities[0] == nil {
 		return nil, ErrInvalidSigningKey
 	}
@@ -119,12 +115,7 @@ func NewVerifier(key io.Reader) (*Verifier, error) {
 		return nil, ErrInvalidSigningKey
 	}
 	defer clear(data)
-	var entities openpgp.EntityList
-	if bytes.HasPrefix(bytes.TrimSpace(data), []byte("-----BEGIN PGP")) {
-		entities, err = openpgp.ReadArmoredKeyRing(bytes.NewReader(data))
-	} else {
-		entities, err = openpgp.ReadKeyRing(bytes.NewReader(data))
-	}
+	entities, err := openpgpkey.ReadSingle(data)
 	if err != nil || len(entities) != 1 || entities[0] == nil || entities[0].PrimaryKey == nil {
 		return nil, ErrInvalidSigningKey
 	}

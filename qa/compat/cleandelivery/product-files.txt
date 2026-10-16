@@ -23,6 +23,8 @@ internal/aptrepo/sign.go
 internal/aptrepo/sign_gpg_test.go
 internal/aptrepo/sign_test.go
 internal/aptrepo/testdata/libpqtypes0_1.5.1-9.pgdg22.04+1_arm64.deb.b64
+internal/openpgpkey/keyring.go
+internal/openpgpkey/keyring_test.go
 internal/r2/client.go
 internal/r2/client_test.go
 internal/r2/cloudflare_integration_test.go
