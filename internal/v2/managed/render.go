@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -147,22 +146,11 @@ func digestTree(ctx context.Context, root string) (string, int, error) {
 	type item struct{ relative, digest string }
 	var items []item
 	err := walkRootedTree(ctx, root, func(relative string, file *os.File, _ os.FileInfo) error {
-		before, err := snapshotRegularDescriptorIdentity(file)
+		digest, err := hashRegularDescriptor(ctx, file)
 		if err != nil {
-			return err
+			return fmt.Errorf("digest regular content %q: %w", relative, err)
 		}
-		hash := sha256.New()
-		if _, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file}); err != nil {
-			return err
-		}
-		after, err := snapshotRegularDescriptorIdentity(file)
-		if err != nil {
-			return err
-		}
-		if !before.unchangedWhileOpen(after) || before.mode != after.mode {
-			return fmt.Errorf("%w: regular content changed while digesting %q", ErrIntegrity, relative)
-		}
-		items = append(items, item{relative: relative, digest: hex.EncodeToString(hash.Sum(nil))})
+		items = append(items, item{relative: relative, digest: digest})
 		return nil
 	}, nil)
 	if err != nil {

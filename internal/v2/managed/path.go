@@ -89,29 +89,29 @@ func (identity rootedRegularIdentity) sameContentStat(other rootedRegularIdentit
 		identity.changeUnixNano == other.changeUnixNano
 }
 
-// unchangedWhileOpen compares snapshots of one open file taken around a content
-// read, or reused within one command. Read-locked commands may hardlink the same
-// immutable inode concurrently (export --hardlink), which changes ctime together
-// with the link count. Inode, size and mtime must still match, and a ctime change
-// without a link-count change is still treated as a rewrite.
-func (identity rootedRegularIdentity) unchangedWhileOpen(other rootedRegularIdentity) bool {
-	if !identity.sameInode(other) || identity.size != other.size || identity.modUnixNano != other.modUnixNano {
-		return false
-	}
-	return identity.changeUnixNano == other.changeUnixNano || identity.links != other.links
+// sameReadTarget permits only ctime/link-count drift to trigger a new read.
+// Those fields cannot distinguish a harmless link from a concurrent rewrite.
+func (identity rootedRegularIdentity) sameReadTarget(other rootedRegularIdentity) bool {
+	return identity.sameInode(other) && identity.size == other.size &&
+		identity.modUnixNano == other.modUnixNano && identity.mode == other.mode
 }
 
 func snapshotRegularDescriptorIdentity(file *os.File) (rootedRegularIdentity, error) {
 	if file == nil {
 		return rootedRegularIdentity{}, errors.New("managed: invalid regular identity source")
 	}
-	info, infoErr := file.Stat()
+	// One Fstat supplies all fields: combining File.Stat's mtime with a
+	// later Fstat's ctime could describe two different file versions.
 	var raw unix.Stat_t
-	statErr := unix.Fstat(int(file.Fd()), &raw)
-	if infoErr != nil || statErr != nil || info == nil || !info.Mode().IsRegular() || uint32(raw.Mode)&unix.S_IFMT != unix.S_IFREG {
-		return rootedRegularIdentity{}, errors.Join(errors.New("managed: regular identity source is not regular"), infoErr, statErr)
+	if err := unix.Fstat(int(file.Fd()), &raw); err != nil || uint32(raw.Mode)&unix.S_IFMT != unix.S_IFREG {
+		return rootedRegularIdentity{}, errors.Join(errors.New("managed: regular identity source is not regular"), err)
 	}
-	return newRootedRegularIdentity(info, raw), nil
+	return rootedRegularIdentity{
+		device: uint64(raw.Dev), inode: uint64(raw.Ino), size: raw.Size,
+		modUnixNano:    raw.Mtim.Sec*1_000_000_000 + raw.Mtim.Nsec,
+		changeUnixNano: statChangeTimeNano(raw), mode: os.FileMode(raw.Mode).Perm(),
+		links: uint64(raw.Nlink),
+	}, nil
 }
 
 func snapshotRootedRegularIdentity(opened *rootedRegularFile) (rootedRegularIdentity, error) {
@@ -742,22 +742,53 @@ func renameRootedRegular(ctx context.Context, root, sourceRelative, targetRelati
 }
 
 func hashRegularDescriptor(ctx context.Context, file *os.File) (string, error) {
-	if file == nil {
-		return "", errors.New("managed: nil regular descriptor")
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
+	before, err := snapshotRegularDescriptorIdentity(file)
+	if err != nil {
 		return "", err
 	}
-	hash := sha256.New()
-	if _, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file}); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hash.Sum(nil)), nil
+	digest, _, err := digestRegularDescriptor(ctx, file, before, nil)
+	return digest, err
 }
 
-// authenticateRegularDescriptor binds one content read to a stable inode.
-// ctime is checked across hashing, before our own link/chmod operations can
-// change it. This detects rewrites reflected in ctime, including restored mtime.
+// digestRegularDescriptor accepts only a content pass whose complete identity
+// stays stable. A ctime/link-count change gets one retry, and the new, stable
+// pass must also match the first digest. This tolerates concurrent hardlinks
+// without treating their ctime changes as proof that bytes stayed immutable.
+func digestRegularDescriptor(ctx context.Context, file *os.File, before rootedRegularIdentity, recordRead func(int64)) (string, rootedRegularIdentity, error) {
+	var previous string
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return "", rootedRegularIdentity{}, err
+		}
+		hash := sha256.New()
+		read, readErr := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
+		if recordRead != nil {
+			recordRead(read)
+		}
+		if readErr != nil {
+			return "", rootedRegularIdentity{}, readErr
+		}
+		digest := hex.EncodeToString(hash.Sum(nil))
+		after, err := snapshotRegularDescriptorIdentity(file)
+		if err != nil {
+			return "", rootedRegularIdentity{}, err
+		}
+		if before == after && (attempt == 0 || digest == previous) {
+			if err := ctx.Err(); err != nil {
+				return "", rootedRegularIdentity{}, err
+			}
+			return digest, after, nil
+		}
+		if attempt != 0 || !before.sameReadTarget(after) {
+			return "", rootedRegularIdentity{}, fmt.Errorf("%w: regular content changed while reading", ErrIntegrity)
+		}
+		before, previous = after, digest
+	}
+	return "", rootedRegularIdentity{}, fmt.Errorf("%w: unstable regular content", ErrIntegrity)
+}
+
+// authenticateRegularDescriptor binds the expected digest to the last stable
+// content pass. Namespace operations after this point retain their own checks.
 func authenticateRegularDescriptor(ctx context.Context, file *os.File, expectedSize int64, expectedSHA string) (rootedRegularIdentity, error) {
 	before, err := snapshotRegularDescriptorIdentity(file)
 	if err != nil {
@@ -766,18 +797,14 @@ func authenticateRegularDescriptor(ctx context.Context, file *os.File, expectedS
 	if !before.valid(expectedSize) {
 		return rootedRegularIdentity{}, fmt.Errorf("%w: content source is not the expected regular file", ErrIntegrity)
 	}
-	digest, err := hashRegularDescriptor(ctx, file)
+	digest, after, err := digestRegularDescriptor(ctx, file, before, nil)
 	if err != nil {
 		return rootedRegularIdentity{}, err
 	}
-	after, err := snapshotRegularDescriptorIdentity(file)
-	if err != nil {
-		return rootedRegularIdentity{}, err
+	if digest != expectedSHA {
+		return rootedRegularIdentity{}, fmt.Errorf("%w: regular content differs while authenticating", ErrIntegrity)
 	}
-	if digest != expectedSHA || !before.unchangedWhileOpen(after) || before.mode != after.mode {
-		return rootedRegularIdentity{}, fmt.Errorf("%w: regular content differs or changed while authenticating", ErrIntegrity)
-	}
-	return after, ctx.Err()
+	return after, nil
 }
 
 // linkRootedRegularDeferredTargetSync creates and authenticates one hardlink

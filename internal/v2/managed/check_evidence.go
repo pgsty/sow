@@ -145,25 +145,55 @@ func (registry *payloadEvidenceRegistry) auditObject(ctx context.Context, source
 	key := physicalPayloadIdentityFrom(before)
 	slot, owner := registry.claim(key)
 	if !owner {
-		<-slot.done
-		closeErr := opened.CloseVerified()
-		if slot.err != nil || closeErr != nil {
-			return nil, errors.Join(slot.err, closeErr)
+		select {
+		case <-ctx.Done():
+			return nil, errors.Join(ctx.Err(), opened.CloseVerified())
+		case <-slot.done:
 		}
-		if slot.evidence == nil || !slot.evidence.Identity.unchangedWhileOpen(before) || slot.evidence.File.Size != object.Size || slot.evidence.File.SHA256 != object.SHA256 {
-			return nil, fmt.Errorf("%w: physical payload evidence conflicts with package object %s", ErrIntegrity, object.SHA256)
+		after, identityErr := snapshotRootedRegularIdentity(opened)
+		if slot.err != nil || identityErr != nil {
+			return nil, errors.Join(slot.err, identityErr, opened.CloseVerified())
 		}
-		return slot.evidence, nil
+		if slot.evidence == nil || slot.evidence.File.Size != object.Size || slot.evidence.File.SHA256 != object.SHA256 {
+			return nil, errors.Join(fmt.Errorf("%w: physical payload evidence conflicts with package object %s", ErrIntegrity, object.SHA256), opened.CloseVerified())
+		}
+		if before == after && slot.evidence.Identity == after {
+			return slot.evidence, opened.CloseVerified()
+		}
+		// The owner may have retried while this descriptor waited. Rebuild
+		// the evidence from a stable read instead of rebinding its old facts.
+		return auditOpenedPackageEvidence(ctx, opened, after, source, object, stored, trust, observedAt)
 	}
+
 	evidence, auditErr := auditOpenedPackageEvidence(ctx, opened, before, source, object, stored, trust, observedAt)
 	registry.complete(key, slot, evidence, auditErr)
 	return evidence, auditErr
 }
 
 func auditOpenedPackageEvidence(ctx context.Context, opened *rootedRegularFile, before rootedRegularIdentity, source ManagedPackageSource, object state.PackageObject, stored *state.PackageFact, trust checkRPMTrustPlan, observedAt time.Time) (*checkPayloadEvidence, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		evidence, err := readOpenedPackageEvidence(ctx, opened, before, source, object, stored, trust, observedAt)
+		if err != nil {
+			return nil, errors.Join(err, opened.CloseVerified())
+		}
+		after, identityErr := snapshotRootedRegularIdentity(opened)
+		if identityErr == nil && before == after {
+			return evidence, opened.CloseVerified()
+		}
+		if identityErr != nil || attempt != 0 || !before.sameReadTarget(after) {
+			return nil, errors.Join(fmt.Errorf("%w: package descriptor identity changed during audit", ErrIntegrity), identityErr, opened.CloseVerified())
+		}
+		// Discard all first-pass facts and signature results. The complete
+		// authentication and parsing pass must run under one stable identity.
+		before = after
+	}
+	return nil, fmt.Errorf("%w: unstable package audit", ErrIntegrity)
+}
+
+func readOpenedPackageEvidence(ctx context.Context, opened *rootedRegularFile, before rootedRegularIdentity, source ManagedPackageSource, object state.PackageObject, stored *state.PackageFact, trust checkRPMTrustPlan, observedAt time.Time) (*checkPayloadEvidence, error) {
 	digest, neutral, err := authenticatePackageDescriptor(ctx, opened.file, object)
 	if err != nil || digest != object.SHA256 || object.Format == "rpm" && neutral != object.PayloadSHA256 {
-		return nil, errors.Join(fmt.Errorf("%w: package %s checksum or RPM-neutral identity differs", ErrIntegrity, object.SHA256), err, opened.CloseVerified())
+		return nil, errors.Join(fmt.Errorf("%w: package %s checksum or RPM-neutral identity differs", ErrIntegrity, object.SHA256), err)
 	}
 	evidence := &checkPayloadEvidence{
 		Identity: before, File: state.GenerationFile{Path: object.PoolPath, Phase: "payload", Size: object.Size, SHA256: digest},
@@ -177,7 +207,7 @@ func auditOpenedPackageEvidence(ctx context.Context, opened *rootedRegularFile, 
 		decoded, err = inspectKnownPackageFacts(ctx, opened.file, source)
 	}
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("%w: package %s facts differ from SQLite/bytes", ErrIntegrity, object.SHA256), err, opened.CloseVerified())
+		return nil, errors.Join(fmt.Errorf("%w: package %s facts differ from SQLite/bytes", ErrIntegrity, object.SHA256), err)
 	}
 	evidence.RPMFacts, evidence.DEBFacts = decoded.RPMFacts, decoded.DEBFacts
 	if object.Format == "rpm" {
@@ -192,11 +222,6 @@ func auditOpenedPackageEvidence(ctx context.Context, opened *rootedRegularFile, 
 		if err != nil {
 			evidence.SignatureAuditErr = err
 		}
-	}
-	after, identityErr := snapshotRootedRegularIdentity(opened)
-	closeErr := opened.CloseVerified()
-	if identityErr != nil || closeErr != nil || !before.unchangedWhileOpen(after) {
-		return nil, errors.Join(fmt.Errorf("%w: package descriptor identity changed during audit", ErrIntegrity), identityErr, closeErr)
 	}
 	return evidence, nil
 }
@@ -291,30 +316,35 @@ func (registry *payloadEvidenceRegistry) verifyPayloadReference(ctx context.Cont
 	key := physicalPayloadIdentityFrom(identity)
 	slot, owner := registry.claim(key)
 	if !owner {
-		<-slot.done
-		after, identityErr := snapshotRootedRegularIdentity(opened)
-		closeErr := opened.CloseVerified()
-		if slot.err != nil || identityErr != nil || closeErr != nil || !identity.unchangedWhileOpen(after) || slot.evidence == nil || !slot.evidence.Identity.unchangedWhileOpen(identity) || slot.evidence.File.Size != file.Size || slot.evidence.File.SHA256 != file.SHA256 {
-			return errors.Join(fmt.Errorf("%w: payload evidence differs for %q", ErrIntegrity, file.Path), slot.err, identityErr, closeErr)
+		select {
+		case <-ctx.Done():
+			return errors.Join(ctx.Err(), opened.CloseVerified())
+		case <-slot.done:
 		}
-		return nil
+		after, identityErr := snapshotRootedRegularIdentity(opened)
+		if slot.err != nil || identityErr != nil || slot.evidence == nil || slot.evidence.File.Size != file.Size || slot.evidence.File.SHA256 != file.SHA256 {
+			return errors.Join(fmt.Errorf("%w: payload evidence differs for %q", ErrIntegrity, file.Path), slot.err, identityErr, opened.CloseVerified())
+		}
+		if identity == after && slot.evidence.Identity == after {
+			return opened.CloseVerified()
+		}
+		// A cache hit is valid only for the current descriptor identity.
+		// Reauthenticate below if it changed while waiting for the owner.
+		identity = after
 	}
-	if _, err := opened.file.Seek(0, io.SeekStart); err != nil {
-		registry.complete(key, slot, nil, errors.Join(err, opened.CloseVerified()))
-		return slot.err
-	}
-	hash := sha256.New()
-	read, copyErr := io.Copy(hash, &retainedContextReader{ctx: ctx, reader: opened.file})
-	workmetrics.RecordFullPackageRead(ctx, read)
-	after, identityErr := snapshotRootedRegularIdentity(opened)
+	digest, after, err := digestPayloadDescriptor(ctx, opened.file, identity)
 	closeErr := opened.CloseVerified()
-	if copyErr != nil || identityErr != nil || closeErr != nil || !identity.unchangedWhileOpen(after) || read != file.Size || hex.EncodeToString(hash.Sum(nil)) != file.SHA256 {
-		err = errors.Join(fmt.Errorf("%w: payload source %q differs from reference", ErrIntegrity, file.Path), copyErr, identityErr, closeErr)
-		registry.complete(key, slot, nil, err)
+	if err != nil || closeErr != nil || after.size != file.Size || digest != file.SHA256 {
+		err = errors.Join(fmt.Errorf("%w: payload source %q differs from reference", ErrIntegrity, file.Path), err, closeErr)
+		if owner {
+			registry.complete(key, slot, nil, err)
+		}
 		return err
 	}
-	evidence := &checkPayloadEvidence{Identity: identity, File: file, SignatureResults: make(map[string]yumrepo.RPMSignatureTrustRingResult)}
-	registry.complete(key, slot, evidence, nil)
+	if owner {
+		evidence := &checkPayloadEvidence{Identity: after, File: file, SignatureResults: make(map[string]yumrepo.RPMSignatureTrustRingResult)}
+		registry.complete(key, slot, evidence, nil)
+	}
 	return nil
 }
 
@@ -328,24 +358,40 @@ func (registry *payloadEvidenceRegistry) walkedPayload(ctx context.Context, file
 	slot := registry.slots[key]
 	registry.mu.Unlock()
 	if slot != nil {
-		<-slot.done
-		if slot.err != nil || slot.evidence == nil || !slot.evidence.Identity.unchangedWhileOpen(identity) {
-			return state.GenerationFile{}, errors.Join(fmt.Errorf("%w: public payload evidence is invalid for %s", ErrIntegrity, relative), slot.err)
+		select {
+		case <-ctx.Done():
+			return state.GenerationFile{}, ctx.Err()
+		case <-slot.done:
 		}
-		return state.GenerationFile{Path: relative, Phase: "payload", Size: slot.evidence.File.Size, SHA256: slot.evidence.File.SHA256}, nil
+		after, identityErr := snapshotRegularDescriptorIdentity(file)
+		if slot.err != nil || slot.evidence == nil || identityErr != nil {
+			return state.GenerationFile{}, errors.Join(fmt.Errorf("%w: public payload evidence is invalid for %s", ErrIntegrity, relative), slot.err, identityErr)
+		}
+		if identity == after && slot.evidence.Identity == after {
+			return state.GenerationFile{Path: relative, Phase: "payload", Size: slot.evidence.File.Size, SHA256: slot.evidence.File.SHA256}, nil
+		}
+		identity = after
 	}
-	hash := sha256.New()
-	read, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
-	workmetrics.RecordFullPackageRead(workmetrics.WithPhase(ctx, "public_payload_reaudit"), read)
-	after, identityErr := snapshotRegularDescriptorIdentity(file)
-	if err != nil || identityErr != nil || !identity.unchangedWhileOpen(after) || read != info.Size() {
-		return state.GenerationFile{}, errors.Join(fmt.Errorf("%w: public payload changed while re-auditing %s", ErrIntegrity, relative), err, identityErr)
+	digest, after, err := digestPayloadDescriptor(workmetrics.WithPhase(ctx, "public_payload_reaudit"), file, identity)
+	if err != nil || after.size != info.Size() {
+		return state.GenerationFile{}, errors.Join(fmt.Errorf("%w: public payload changed while re-auditing %s", ErrIntegrity, relative), err)
 	}
-	result := state.GenerationFile{Path: relative, Phase: "payload", Size: read, SHA256: hex.EncodeToString(hash.Sum(nil))}
+	result := state.GenerationFile{Path: relative, Phase: "payload", Size: after.size, SHA256: digest}
 	registry.mu.Lock()
-	registry.slots[key] = &payloadEvidenceSlot{done: closedEvidenceChannel(), evidence: &checkPayloadEvidence{Identity: identity, File: result, SignatureResults: make(map[string]yumrepo.RPMSignatureTrustRingResult)}}
+	key = physicalPayloadIdentityFrom(after)
+	if registry.slots[key] == nil {
+		registry.slots[key] = &payloadEvidenceSlot{done: closedEvidenceChannel(), evidence: &checkPayloadEvidence{Identity: after, File: result, SignatureResults: make(map[string]yumrepo.RPMSignatureTrustRingResult)}}
+	}
 	registry.mu.Unlock()
 	return result, nil
+}
+
+// digestPayloadDescriptor uses the same stable-content boundary as other
+// descriptor hashing and records every physical package pass, including retry.
+func digestPayloadDescriptor(ctx context.Context, file *os.File, before rootedRegularIdentity) (string, rootedRegularIdentity, error) {
+	return digestRegularDescriptor(ctx, file, before, func(read int64) {
+		workmetrics.RecordFullPackageRead(ctx, read)
+	})
 }
 
 func closedEvidenceChannel() chan struct{} {

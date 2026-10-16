@@ -7,11 +7,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/pgsty/sow/internal/aptrepo"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 )
 
 type descriptorEOFContext struct {
@@ -1142,5 +1145,519 @@ func TestDigestTreeCancellationAfterRead(t *testing.T) {
 	digest, count, err := digestTree(ctx, root)
 	if !errors.Is(err, context.Canceled) || digest != "" || count != 0 {
 		t.Fatalf("canceled digest=%q files=%d err=%v", digest, count, err)
+	}
+}
+
+// contentBoundaryContext mutates real files between a read's last data chunk
+// and EOF. These fixtures are smaller than the read buffer, so each full pass
+// has exactly two polls; digestTree also polls once before visiting the file.
+type contentBoundaryContext struct {
+	context.Context
+	calls int
+	at    map[int]func()
+}
+
+func (ctx *contentBoundaryContext) Err() error {
+	ctx.calls++
+	if f := ctx.at[ctx.calls]; f != nil {
+		f()
+	}
+	return ctx.Context.Err()
+}
+
+func restoreContentFixtureMTime(t *testing.T, path string, held *os.File, before rootedRegularIdentity) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		mtime := time.Unix(0, before.modUnixNano)
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+		after, err := snapshotRegularDescriptorIdentity(held)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.changeUnixNano != before.changeUnixNano {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("filesystem did not advance ctime")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestContentAuthenticationLinkChanges(t *testing.T) {
+	for _, caller := range []string{"tree", "descriptor", "hash", "export", "reference", "walked"} {
+		for _, change := range []string{"stable", "link", "unlink", "ctime_only", "rewrite_link", "rewrite_unlink", "mode_link", "repeated_link", "cancel_retry"} {
+			t.Run(caller+"/"+change, func(t *testing.T) {
+				base := t.TempDir()
+				root := filepath.Join(base, "root")
+				if err := os.Mkdir(root, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				path, alias := filepath.Join(root, "payload"), filepath.Join(base, "alias")
+				body := []byte("aaaaaaaa")
+				if err := os.WriteFile(path, body, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				if change == "unlink" || change == "rewrite_unlink" {
+					if err := os.Link(path, alias); err != nil {
+						t.Fatal(err)
+					}
+				}
+				held, err := os.Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer held.Close()
+				before, err := snapshotRegularDescriptorIdentity(held)
+				if err != nil {
+					t.Fatal(err)
+				}
+				baseCtx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				poll := 2
+				if caller == "tree" {
+					poll++
+				}
+				ctx := &contentBoundaryContext{Context: baseCtx, at: make(map[int]func())}
+				fired := false
+				ctx.at[poll] = func() {
+					fired = true
+					if change == "stable" {
+						return
+					}
+					if change == "rewrite_link" || change == "rewrite_unlink" {
+						if err := os.WriteFile(path, []byte("bbbbbbbb"), 0o644); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if change == "mode_link" {
+						if err := os.Chmod(path, 0o600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if change == "unlink" || change == "rewrite_unlink" {
+						if err := os.Remove(alias); err != nil {
+							t.Fatal(err)
+						}
+					} else if change != "ctime_only" {
+						if err := os.Link(path, alias); err != nil {
+							t.Fatal(err)
+						}
+					}
+					restoreContentFixtureMTime(t, path, held, before)
+				}
+				if change == "repeated_link" {
+					ctx.at[poll+2] = func() {
+						current, err := snapshotRegularDescriptorIdentity(held)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := os.Link(path, alias+"-again"); err != nil {
+							t.Fatal(err)
+						}
+						restoreContentFixtureMTime(t, path, held, current)
+					}
+				}
+				if change == "cancel_retry" {
+					ctx.at[poll+1] = cancel
+				}
+				var got string
+				var count int
+				ref := state.GenerationFile{Path: "payload", Phase: "payload", Size: int64(len(body)), SHA256: bytesSHA(body)}
+				switch caller {
+				case "tree":
+					got, count, err = digestTree(ctx, root)
+				case "descriptor":
+					_, err = authenticateRegularDescriptor(ctx, held, ref.Size, ref.SHA256)
+				case "hash":
+					got, err = hashRegularDescriptor(ctx, held)
+				case "export":
+					target := filepath.Join(base, "target")
+					if mkErr := os.Mkdir(target, 0o755); mkErr != nil {
+						t.Fatal(mkErr)
+					}
+					err = exportRPMLeafObject(ctx, root, target, state.PackageObject{Storage: "pool", PoolPath: "payload", Size: ref.Size, SHA256: ref.SHA256}, true)
+					if err != nil {
+						if _, statErr := os.Lstat(filepath.Join(target, "payload")); !errors.Is(statErr, os.ErrNotExist) {
+							t.Fatalf("failed authentication published target: %v", statErr)
+						}
+					}
+				case "reference":
+					err = newPayloadEvidenceRegistry().verifyPayloadReference(ctx, root, ref)
+				case "walked":
+					info, statErr := held.Stat()
+					if statErr != nil {
+						t.Fatal(statErr)
+					}
+					var result state.GenerationFile
+					result, err = newPayloadEvidenceRegistry().walkedPayload(ctx, held, info, "payload")
+					got = result.SHA256
+				}
+				if !fired {
+					t.Fatalf("mutation boundary not reached: polls=%d err=%v", ctx.calls, err)
+				}
+				wantErr := change == "rewrite_link" || change == "rewrite_unlink" || change == "mode_link" || change == "repeated_link" || change == "cancel_retry"
+				if wantErr {
+					cause := ErrIntegrity
+					if change == "cancel_retry" {
+						cause = context.Canceled
+					}
+					if !errors.Is(err, cause) || got != "" || count != 0 {
+						t.Fatalf("unsafe result: digest=%q count=%d polls=%d err=%v", got, count, ctx.calls, err)
+					}
+				} else {
+					if err != nil {
+						t.Fatal(err)
+					}
+					if caller == "tree" && (got != bytesSHA([]byte(ref.SHA256+"  payload\n")) || count != 1) {
+						t.Fatalf("tree=%s count=%d", got, count)
+					}
+					if (caller == "hash" || caller == "walked") && got != ref.SHA256 {
+						t.Fatalf("digest=%s", got)
+					}
+				}
+				if ctx.calls > poll+4 {
+					t.Fatalf("unbounded authentication: %d polls", ctx.calls)
+				}
+			})
+		}
+	}
+}
+
+func TestContentAuthenticationCancellationBeforeSuccess(t *testing.T) {
+	for _, caller := range []string{"tree", "descriptor", "hash", "export", "reference", "walked"} {
+		t.Run(caller, func(t *testing.T) {
+			base := t.TempDir()
+			root, target := filepath.Join(base, "root"), filepath.Join(base, "target")
+			for _, dir := range []string{root, target} {
+				if err := os.Mkdir(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			body := []byte("aaaaaaaa")
+			path := filepath.Join(root, "payload")
+			if err := os.WriteFile(path, body, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			held, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close()
+			baseCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			// Two read polls precede the success boundary. The tree walker
+			// also polls before visiting this file.
+			poll := 3
+			if caller == "tree" {
+				poll++
+			}
+			fired := false
+			ctx := &contentBoundaryContext{Context: baseCtx, at: map[int]func(){poll: func() {
+				fired = true
+				cancel()
+			}}}
+			ref := state.GenerationFile{Path: "payload", Phase: "payload", Size: int64(len(body)), SHA256: bytesSHA(body)}
+			var digest string
+			var count int
+			switch caller {
+			case "tree":
+				digest, count, err = digestTree(ctx, root)
+			case "descriptor":
+				_, err = authenticateRegularDescriptor(ctx, held, ref.Size, ref.SHA256)
+			case "hash":
+				digest, err = hashRegularDescriptor(ctx, held)
+			case "export":
+				err = exportRPMLeafObject(ctx, root, target, state.PackageObject{Storage: "pool", PoolPath: "payload", Size: ref.Size, SHA256: ref.SHA256}, true)
+			case "reference":
+				err = newPayloadEvidenceRegistry().verifyPayloadReference(ctx, root, ref)
+			case "walked":
+				info, statErr := held.Stat()
+				if statErr != nil {
+					t.Fatal(statErr)
+				}
+				var result state.GenerationFile
+				result, err = newPayloadEvidenceRegistry().walkedPayload(ctx, held, info, ref.Path)
+				digest = result.SHA256
+			}
+			if !fired || !errors.Is(err, context.Canceled) || digest != "" || count != 0 {
+				t.Fatalf("success boundary cancellation: fired=%t digest=%q count=%d polls=%d err=%v", fired, digest, count, ctx.calls, err)
+			}
+			if caller == "export" {
+				if _, err := os.Lstat(filepath.Join(target, ref.Path)); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("canceled authentication published target: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func contentPackageFixture(t *testing.T) (ManagedPackageSource, []byte, *os.File, rootedRegularIdentity) {
+	t.Helper()
+	body, err := managedBenchmarkDEBBytesForArchitecture("sow-auth", "all", 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "sow-auth_1.0-1_all.deb")
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	parsed, err := aptrepo.InspectPackageReaderKnown(context.Background(), held, "main", filepath.Base(path), bytesSHA(body), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := debObjectFromInfo(parsed, filepath.Base(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := snapshotRegularDescriptorIdentity(held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ManagedPackageSource{Object: object, Path: path}, body, held, before
+}
+
+func TestPackageFactsContentIdentity(t *testing.T) {
+	for _, caller := range []string{"audit", "facts", "authenticated_facts", "authentication"} {
+		for _, change := range []string{"stable", "link", "unlink", "ctime_only", "rewrite_link", "rewrite_unlink", "mode_link", "repeated_link", "cancel_retry"} {
+			t.Run(caller+"/"+change, func(t *testing.T) {
+				source, body, held, before := contentPackageFixture(t)
+				alias := filepath.Join(t.TempDir(), "alias")
+				if change == "unlink" || change == "rewrite_unlink" {
+					if err := os.Link(source.Path, alias); err != nil {
+						t.Fatal(err)
+					}
+					var err error
+					before, err = snapshotRegularDescriptorIdentity(held)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				poll := 2
+				var authenticated *rootedRegularIdentity
+				if caller == "authenticated_facts" {
+					poll = 1
+					authenticated = &before
+				}
+				baseCtx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				ctx := &contentBoundaryContext{Context: baseCtx, at: make(map[int]func())}
+				fired := false
+				ctx.at[poll] = func() {
+					fired = true
+					if change == "stable" {
+						return
+					}
+					if change == "rewrite_link" || change == "rewrite_unlink" {
+						changed := append([]byte(nil), body...)
+						changed[len(changed)-1] ^= 1
+						if err := os.WriteFile(source.Path, changed, 0o644); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if change == "mode_link" {
+						if err := os.Chmod(source.Path, 0o600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if change == "unlink" || change == "rewrite_unlink" {
+						if err := os.Remove(alias); err != nil {
+							t.Fatal(err)
+						}
+					} else if change != "ctime_only" {
+						if err := os.Link(source.Path, alias); err != nil {
+							t.Fatal(err)
+						}
+					}
+					restoreContentFixtureMTime(t, source.Path, held, before)
+				}
+				if change == "repeated_link" || change == "cancel_retry" {
+					firstPassPolls := 0
+					if caller != "authentication" {
+						probe := &contentBoundaryContext{Context: context.Background()}
+						if _, err := inspectKnownPackageFacts(probe, held, source); err != nil {
+							t.Fatal(err)
+						}
+						firstPassPolls = probe.calls
+					}
+					// Change the retry's final-read boundary again, or cancel it.
+					// Fact callers also parse before deciding to retry.
+					if caller != "authenticated_facts" {
+						firstPassPolls += 2
+					}
+					if change == "cancel_retry" {
+						ctx.at[firstPassPolls+1] = cancel
+					} else {
+						ctx.at[firstPassPolls+2] = func() {
+							current, err := snapshotRegularDescriptorIdentity(held)
+							if err != nil {
+								t.Fatal(err)
+							}
+							if err := os.Link(source.Path, alias+"-again"); err != nil {
+								t.Fatal(err)
+							}
+							restoreContentFixtureMTime(t, source.Path, held, current)
+						}
+					}
+				}
+				measured, collector := workmetrics.Ensure(ctx)
+				var err error
+				if caller == "audit" {
+					_, err = newPayloadEvidenceRegistry().auditObject(measured, source, source.Object, nil, checkRPMTrustPlan{}, time.Time{})
+				} else if caller == "authentication" {
+					opened, openErr := source.open()
+					if openErr != nil {
+						t.Fatal(openErr)
+					}
+					err = errors.Join(authenticatePackageFactSource(measured, opened, source.Object), opened.CloseVerified())
+				} else {
+					_, _, err = rebuildManagedPackageFact(measured, source, authenticated)
+				}
+				if !fired {
+					t.Fatalf("boundary not reached: calls=%d err=%v", ctx.calls, err)
+				}
+				wantErr := change == "rewrite_link" || change == "rewrite_unlink" || change == "mode_link" || change == "repeated_link" || change == "cancel_retry"
+				if (err != nil) != wantErr {
+					t.Fatalf("facts returned err=%v wantError=%t", err, wantErr)
+				}
+				if change == "cancel_retry" && !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancellation cause lost: %v", err)
+				}
+				metrics := collector.Snapshot()
+				if metrics.FullPackageReads > 2 {
+					t.Fatalf("unbounded facts authentication: %#v", metrics)
+				}
+				if !wantErr {
+					wantReads := int64(1)
+					if change != "stable" {
+						wantReads++
+					}
+					if caller == "authenticated_facts" {
+						wantReads--
+					}
+					if metrics.FullPackageReads != wantReads || metrics.PayloadBytesRead != wantReads*int64(len(body)) {
+						t.Fatalf("physical authentication budget=%#v wantReads=%d", metrics, wantReads)
+					}
+				}
+				t.Logf("package_size=%d authenticated_reads=%d authenticated_bytes=%d parser_polls=%d", len(body), metrics.FullPackageReads, metrics.PayloadBytesRead, ctx.calls)
+			})
+		}
+	}
+}
+
+// Done is evaluated after the opened identity has selected a cache slot. It
+// gives a deterministic real-file mutation during the wait, before that slot's
+// old evidence is returned; no production hook or timing sleep is needed.
+type evidenceWaitContext struct {
+	context.Context
+	onWait func()
+	fired  bool
+}
+
+func (ctx *evidenceWaitContext) Done() <-chan struct{} {
+	if !ctx.fired {
+		ctx.fired = true
+		ctx.onWait()
+	}
+	return ctx.Context.Done()
+}
+
+func TestContentEvidenceWaitReauthenticates(t *testing.T) {
+	for _, caller := range []string{"audit", "reference", "walked"} {
+		for _, rewrite := range []bool{false, true} {
+			t.Run(caller+"/rewrite_"+strconv.FormatBool(rewrite), func(t *testing.T) {
+				source, body, held, before := contentPackageFixture(t)
+				root, relative := filepath.Dir(source.Path), filepath.Base(source.Path)
+				ref := state.GenerationFile{Path: relative, Phase: "payload", Size: int64(len(body)), SHA256: bytesSHA(body)}
+				registry := newPayloadEvidenceRegistry()
+				if _, err := registry.auditObject(context.Background(), source, source.Object, nil, checkRPMTrustPlan{}, time.Time{}); err != nil {
+					t.Fatal(err)
+				}
+				ctx := &evidenceWaitContext{Context: context.Background()}
+				ctx.onWait = func() {
+					if rewrite {
+						changed := append([]byte(nil), body...)
+						changed[len(changed)-1] ^= 1
+						if err := os.WriteFile(source.Path, changed, 0o644); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := os.Link(source.Path, filepath.Join(t.TempDir(), "alias")); err != nil {
+						t.Fatal(err)
+					}
+					restoreContentFixtureMTime(t, source.Path, held, before)
+				}
+				measured, collector := workmetrics.Ensure(ctx)
+				var err error
+				var got string
+				switch caller {
+				case "audit":
+					_, err = registry.auditObject(measured, source, source.Object, nil, checkRPMTrustPlan{}, time.Time{})
+				case "reference":
+					err = registry.verifyPayloadReference(measured, root, ref)
+				case "walked":
+					info, statErr := held.Stat()
+					if statErr != nil {
+						t.Fatal(statErr)
+					}
+					var result state.GenerationFile
+					result, err = registry.walkedPayload(measured, held, info, relative)
+					got = result.SHA256
+				}
+				if !ctx.fired {
+					t.Fatal("cache wait boundary was not reached")
+				}
+				if rewrite && caller == "walked" {
+					changed, readErr := os.ReadFile(source.Path)
+					if readErr != nil {
+						t.Fatal(readErr)
+					}
+					if err != nil || got != bytesSHA(changed) || got == ref.SHA256 {
+						t.Fatalf("stale walked digest=%s err=%v", got, err)
+					}
+				} else if (err != nil) != rewrite {
+					t.Fatalf("cache reuse err=%v rewrite=%t", err, rewrite)
+				}
+				if metrics := collector.Snapshot(); metrics.FullPackageReads != 1 || metrics.PayloadBytesRead != int64(len(body)) {
+					t.Fatalf("cache drift did not authenticate once: %#v", metrics)
+				}
+			})
+		}
+	}
+}
+
+func TestContentEvidenceWaitCancellation(t *testing.T) {
+	for _, caller := range []string{"audit", "reference", "walked"} {
+		t.Run(caller, func(t *testing.T) {
+			source, body, held, before := contentPackageFixture(t)
+			registry := newPayloadEvidenceRegistry()
+			registry.claim(physicalPayloadIdentityFrom(before))
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			var err error
+			switch caller {
+			case "audit":
+				_, err = registry.auditObject(ctx, source, source.Object, nil, checkRPMTrustPlan{}, time.Time{})
+			case "reference":
+				err = registry.verifyPayloadReference(ctx, filepath.Dir(source.Path), state.GenerationFile{Path: filepath.Base(source.Path), Size: int64(len(body)), SHA256: bytesSHA(body)})
+			case "walked":
+				info, statErr := held.Stat()
+				if statErr != nil {
+					t.Fatal(statErr)
+				}
+				_, err = registry.walkedPayload(ctx, held, info, filepath.Base(source.Path))
+			}
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled evidence wait: %v", err)
+			}
+		})
 	}
 }

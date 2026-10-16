@@ -157,65 +157,61 @@ func rebuildManagedPackageFact(ctx context.Context, source ManagedPackageSource,
 	if err != nil {
 		return ManagedPackageSource{}, fact, errors.Join(err, opened.CloseVerified())
 	}
-	reuseAuthenticated := false
-	if authenticated != nil {
-		reuseAuthenticated = authenticated.sameContentStat(openedIdentity) && authenticated.valid(source.Object.Size)
-	}
-	if !reuseAuthenticated {
-		if err := authenticatePackageFactSource(ctx, opened, source.Object); err != nil {
+	var decoded ManagedPackageSource
+	for attempt := 0; attempt < 2; attempt++ {
+		reuseAuthenticated := attempt == 0 && authenticated != nil && *authenticated == openedIdentity && authenticated.valid(source.Object.Size)
+		if !reuseAuthenticated {
+			if err := readPackageFactSource(ctx, opened, source.Object); err != nil {
+				return ManagedPackageSource{}, fact, errors.Join(err, opened.CloseVerified())
+			}
+		}
+		decoded, err = inspectKnownPackageFacts(ctx, opened.file, source)
+		if err != nil {
 			return ManagedPackageSource{}, fact, errors.Join(err, opened.CloseVerified())
 		}
+		after, identityErr := snapshotRootedRegularIdentity(opened)
+		if identityErr == nil && openedIdentity == after {
+			if err := opened.CloseVerified(); err != nil {
+				return ManagedPackageSource{}, fact, err
+			}
+			switch source.Object.Format {
+			case "rpm":
+				blob, err := decoded.RPMFacts.MarshalBinary()
+				return decoded, state.PackageFact{PackageSHA256: source.Object.SHA256, FactSchema: yumrepo.PackageFactsSchema, Facts: blob}, err
+			case "deb":
+				blob, err := aptrepo.MarshalPackageFacts(*decoded.DEBFacts)
+				return decoded, state.PackageFact{PackageSHA256: source.Object.SHA256, FactSchema: aptrepo.PackageFactsSchema, Facts: blob}, err
+			}
+		}
+		if identityErr != nil || attempt != 0 || !openedIdentity.sameReadTarget(after) {
+			return ManagedPackageSource{}, fact, errors.Join(fmt.Errorf("%w: package fact source identity changed during inspection", ErrIntegrity), identityErr, opened.CloseVerified())
+		}
+		// Discard the parsed facts and authenticate again; old facts do not
+		// become evidence for the new ctime even when nlink changed too.
+		openedIdentity = after
 	}
-	switch source.Object.Format {
-	case "rpm":
-		parsed, info, inspectErr := yumrepo.InspectManagedPackageFactsReaderKnown(ctx, opened.file, source.Object.Filename, source.Object.SHA256, source.Object.Size)
-		closeErr := closePackageFactSource(opened, openedIdentity)
-		if err := errors.Join(inspectErr, closeErr); err != nil {
-			return ManagedPackageSource{}, fact, err
-		}
-		actual, err := rpmObjectFromInfo(info, source.Object.Filename, source.Object.PayloadSHA256)
-		if err != nil || !sameManagedPackageFacts(source.Object, actual) {
-			return ManagedPackageSource{}, fact, errors.Join(errors.New("rebuilt RPM package facts differ from object"), err)
-		}
-		blob, err := parsed.MarshalBinary()
-		if err != nil {
-			return ManagedPackageSource{}, fact, err
-		}
-		source.RPMFacts = parsed
-		fact = state.PackageFact{PackageSHA256: source.Object.SHA256, FactSchema: yumrepo.PackageFactsSchema, Facts: blob}
-		return source, fact, nil
-	case "deb":
-		parsed, inspectErr := aptrepo.InspectPackageReaderKnown(ctx, opened.file, "main", source.Object.Filename, source.Object.SHA256, source.Object.Size)
-		parsed.SourcePath = source.Path
-		closeErr := closePackageFactSource(opened, openedIdentity)
-		if err := errors.Join(inspectErr, closeErr); err != nil {
-			return ManagedPackageSource{}, fact, err
-		}
-		actual, err := debObjectFromInfo(parsed, source.Object.Filename)
-		if err != nil || !sameManagedPackageFacts(source.Object, actual) {
-			return ManagedPackageSource{}, fact, errors.Join(errors.New("rebuilt DEB package facts differ from object"), err)
-		}
-		blob, err := aptrepo.MarshalPackageFacts(parsed)
-		if err != nil {
-			return ManagedPackageSource{}, fact, err
-		}
-		source.DEBFacts = &parsed
-		fact = state.PackageFact{PackageSHA256: source.Object.SHA256, FactSchema: aptrepo.PackageFactsSchema, Facts: blob}
-		return source, fact, nil
-	}
-	return ManagedPackageSource{}, fact, errors.New("unsupported package object format")
-}
-
-func closePackageFactSource(opened *rootedRegularFile, before rootedRegularIdentity) error {
-	after, identityErr := snapshotRootedRegularIdentity(opened)
-	closeErr := opened.CloseVerified()
-	if identityErr != nil || !before.unchangedWhileOpen(after) {
-		return errors.Join(errors.New("package fact source identity changed during inspection"), identityErr, closeErr)
-	}
-	return closeErr
+	return ManagedPackageSource{}, fact, errors.Join(fmt.Errorf("%w: unstable package facts", ErrIntegrity), opened.CloseVerified())
 }
 
 func authenticatePackageFactSource(ctx context.Context, opened *rootedRegularFile, object state.PackageObject) error {
+	before, err := snapshotRootedRegularIdentity(opened)
+	if err != nil {
+		return err
+	}
+	digest, after, err := digestPayloadDescriptor(ctx, opened.file, before)
+	if err != nil {
+		return err
+	}
+	if after.size != object.Size || digest != object.SHA256 {
+		return errors.New("package bytes differ from immutable object")
+	}
+	return nil
+}
+
+// readPackageFactSource makes one pass within rebuildManagedPackageFact's
+// bounded read-and-parse loop. Its caller must verify the complete identity
+// across both steps; this bare read is not standalone content authentication.
+func readPackageFactSource(ctx context.Context, opened *rootedRegularFile, object state.PackageObject) error {
 	if _, err := opened.file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
