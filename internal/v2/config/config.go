@@ -262,7 +262,9 @@ func openConfigParent(parent string) (*configDirectoryBinding, error) {
 			return nil, errors.New("config parent has an unsafe path component")
 		}
 	}
-	rootFD, err := unix.Open(string(filepath.Separator), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+	// These descriptors only bind the lookup chain; reading sow.yml does not
+	// require permission to enumerate any parent directory.
+	rootFD, err := unix.Open(string(filepath.Separator), directorySearchAccess|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +279,7 @@ func openConfigParent(parent string) (*configDirectoryBinding, error) {
 	binding.stats = append(binding.stats, rootStat)
 	for index, component := range components {
 		parentHandle := binding.directories[len(binding.directories)-1]
-		fd, openErr := unix.Openat(int(parentHandle.Fd()), component, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+		fd, openErr := unix.Openat(int(parentHandle.Fd()), component, directorySearchAccess|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
 		if openErr != nil {
 			return closeError(openErr)
 		}

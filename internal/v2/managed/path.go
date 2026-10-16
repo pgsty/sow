@@ -128,6 +128,12 @@ type rootedDirectoryBinding struct {
 }
 
 func openBoundRootDirectory(root string) (*os.File, rootedDirectoryBinding, error) {
+	return openBoundRootDirectoryWithAccess(root, unix.O_RDONLY)
+}
+
+// Only the owner needs the requested access (ReadDir/Sync for ordinary callers).
+// Its ancestors are held for lookup and identity checks, not enumeration.
+func openBoundRootDirectoryWithAccess(root string, access int) (*os.File, rootedDirectoryBinding, error) {
 	absolute, err := filepath.Abs(root)
 	if err != nil {
 		return nil, rootedDirectoryBinding{}, fmt.Errorf("managed: resolve rooted owner: %w", err)
@@ -143,7 +149,11 @@ func openBoundRootDirectory(root string) (*os.File, rootedDirectoryBinding, erro
 	if err != nil || !before.IsDir() || before.Mode()&os.ModeSymlink != 0 {
 		return nil, rootedDirectoryBinding{}, errors.New("managed: rooted owner is missing or unsafe")
 	}
-	fd, err := unix.Open(string(filepath.Separator), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+	rootAccess := directorySearchAccess
+	if absolute == string(filepath.Separator) {
+		rootAccess = access
+	}
+	fd, err := unix.Open(string(filepath.Separator), rootAccess|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
 	if err != nil {
 		return nil, rootedDirectoryBinding{}, fmt.Errorf("managed: open rooted owner: %w", err)
 	}
@@ -152,12 +162,16 @@ func openBoundRootDirectory(root string) (*os.File, rootedDirectoryBinding, erro
 		components = nil
 	}
 	currentPath := string(filepath.Separator)
-	for _, component := range components {
+	for index, component := range components {
 		if component == "" || component == "." || component == ".." || filepath.Base(component) != component {
 			_ = unix.Close(fd)
 			return nil, rootedDirectoryBinding{}, errors.New("managed: rooted owner has an unsafe component")
 		}
-		next, openErr := unix.Openat(fd, component, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+		componentAccess := directorySearchAccess
+		if index == len(components)-1 {
+			componentAccess = access
+		}
+		next, openErr := unix.Openat(fd, component, componentAccess|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
 		_ = unix.Close(fd)
 		if openErr != nil {
 			return nil, rootedDirectoryBinding{}, fmt.Errorf("managed: open rooted owner component: %w", openErr)
@@ -1597,44 +1611,22 @@ func prospectiveRealDirectory(path string) (physical string, exists bool, err er
 }
 
 func canonicalDirectoryEntrySpelling(path string) (string, error) {
-	abs, err := filepath.Abs(path)
+	handle, binding, err := openBoundRootDirectoryWithAccess(path, directorySearchAccess)
 	if err != nil {
 		return "", err
 	}
-	volume := filepath.VolumeName(abs)
-	root := volume + string(filepath.Separator)
-	relative, err := filepath.Rel(root, abs)
-	if err != nil {
+	physical, pathErr := physicalDirectoryPath(handle, binding.path)
+	var identityErr error
+	if pathErr == nil {
+		info, err := os.Lstat(physical)
+		if err != nil || !filepath.IsAbs(physical) || !info.IsDir() || !os.SameFile(binding.before, info) {
+			identityErr = errors.Join(errors.New("managed: canonical directory pathname changed during lookup"), err)
+		}
+	}
+	if err := errors.Join(pathErr, identityErr, verifyBoundRootDirectory(handle, binding), handle.Close()); err != nil {
 		return "", err
 	}
-	if relative == "." {
-		return root, nil
-	}
-	current := root
-	for _, component := range strings.Split(relative, string(filepath.Separator)) {
-		requested := filepath.Join(current, component)
-		requestedInfo, err := os.Stat(requested)
-		if err != nil || !requestedInfo.IsDir() {
-			return "", errors.Join(fmt.Errorf("%w: inspect directory component %q", ErrRejected, requested), err)
-		}
-		entries, err := os.ReadDir(current)
-		if err != nil {
-			return "", err
-		}
-		matched := ""
-		for _, entry := range entries {
-			entryInfo, infoErr := entry.Info()
-			if infoErr == nil && entryInfo.IsDir() && os.SameFile(requestedInfo, entryInfo) {
-				matched = entry.Name()
-				break
-			}
-		}
-		if matched == "" {
-			return "", fmt.Errorf("%w: cannot bind directory spelling for %q", ErrRejected, requested)
-		}
-		current = filepath.Join(current, matched)
-	}
-	return current, nil
+	return filepath.Clean(physical), nil
 }
 
 func ownedPath(root string, parts ...string) (string, error) {

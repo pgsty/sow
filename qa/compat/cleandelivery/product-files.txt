@@ -34,8 +34,11 @@ internal/testdata/PGDG-RPM-GPG-KEY-RHEL-nonfree.asc
 internal/testdata/pgdg-redhat-nonfree-repo.rpm.b64
 internal/v2/config/config.go
 internal/v2/config/config_test.go
+internal/v2/config/directory_access_darwin.go
+internal/v2/config/directory_access_linux.go
 internal/v2/config/discovery.go
 internal/v2/config/discovery_test.go
+internal/v2/config/permissions_test.go
 internal/v2/config/selection_test.go
 internal/v2/config/targets.go
 internal/v2/config/targets_test.go
@@ -87,6 +90,7 @@ internal/v2/managed/package_facts.go
 internal/v2/managed/package_refs.go
 internal/v2/managed/package_refs_test.go
 internal/v2/managed/path.go
+internal/v2/managed/path_permissions_test.go
 internal/v2/managed/path_security_test.go
 internal/v2/managed/physical_path_darwin.go
 internal/v2/managed/physical_path_linux.go
