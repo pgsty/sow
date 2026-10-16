@@ -540,20 +540,20 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 		} else {
 			spec.APTSigner = metadataSnapshot.APTSigner
 		}
-		rendered, err := RenderManagedDist(ctx, buildRoot, spec)
+		distRoot, err := renderManagedDistTree(ctx, buildRoot, spec)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 		if distState.Format == "rpm" {
-			if err := retainPriorRPMMetadata(ctx, filepath.Join(root, repoName, "dists", distName), rendered.Path, distState.Architectures); err != nil {
+			if err := retainPriorRPMMetadata(ctx, filepath.Join(root, repoName, "dists", distName), distRoot, distState.Architectures); err != nil {
 				return nil, nil, nil, err
 			}
-		} else if err := retainPriorAPTByHash(ctx, filepath.Join(root, repoName, "dists", distName), rendered.Path, distState.Architectures); err != nil {
+		} else if err := retainPriorAPTByHash(ctx, filepath.Join(root, repoName, "dists", distName), distRoot, distState.Architectures); err != nil {
 			return nil, nil, nil, err
 		}
 		// Retained protocol objects are part of the staged Dist identity and
 		// therefore must be bound into the crash-recovery journal digest.
-		rendered.TreeSHA256, _, err = digestTree(ctx, rendered.Path)
+		treeSHA256, _, err := digestTree(ctx, distRoot)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -562,7 +562,7 @@ func stageMutationBuild(ctx context.Context, root, repoName string, cfg config.C
 			identity = metadataSnapshot.DEB
 		}
 		buildDists = append(buildDists, mutationBuildDist{
-			Name: distName, TreeSHA256: rendered.TreeSHA256, EffectiveConfigSHA256: effectiveSHA, Architectures: architectures,
+			Name: distName, TreeSHA256: treeSHA256, EffectiveConfigSHA256: effectiveSHA, Architectures: architectures,
 			MetadataSignerFingerprint: identity.Fingerprint, MetadataSignerPublicKey: identity.PublicKey,
 			EffectiveSigning: frozenSigning,
 		})

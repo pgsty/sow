@@ -161,14 +161,28 @@ func (guard *pendingSourceGuard) Close() error {
 // repository stage. RPM views contain metadata-only parent-relative hrefs;
 // DEB views use raw root Pool Filenames plus by-hash index hardlinks.
 func RenderManagedDist(ctx context.Context, repositoryStage string, spec ManagedDistSpec) (RenderedDist, error) {
+	distRoot, err := renderManagedDistTree(ctx, repositoryStage, spec)
+	if err != nil {
+		return RenderedDist{}, err
+	}
+	digest, files, err := digestTree(workmetrics.WithPhase(ctx, "render_"+spec.Format), distRoot)
+	if err != nil {
+		return RenderedDist{}, err
+	}
+	return RenderedDist{Path: distRoot, TreeSHA256: digest, Files: files}, nil
+}
+
+// renderManagedDistTree renders, validates and syncs the private Dist. Callers
+// that retain prior indexes must compute its identity after retention completes.
+func renderManagedDistTree(ctx context.Context, repositoryStage string, spec ManagedDistSpec) (string, error) {
 	if ctx == nil {
-		return RenderedDist{}, errors.New("managed: nil context")
+		return "", errors.New("managed: nil context")
 	}
 	if spec.Name == "" || strings.ContainsAny(spec.Name, "/\\") || spec.Generation < 1 {
-		return RenderedDist{}, errors.New("managed: invalid managed Dist spec")
+		return "", errors.New("managed: invalid managed Dist spec")
 	}
 	if spec.Format != "rpm" && spec.Format != "deb" {
-		return RenderedDist{}, fmt.Errorf("managed: unsupported Dist format %q", spec.Format)
+		return "", fmt.Errorf("managed: unsupported Dist format %q", spec.Format)
 	}
 	ctx = workmetrics.WithPhase(ctx, "render_"+spec.Format)
 	if spec.Jobs < 1 {
@@ -176,40 +190,40 @@ func RenderManagedDist(ctx context.Context, repositoryStage string, spec Managed
 	}
 	if spec.PublishedAt.IsZero() {
 		if spec.RPMSigner != nil || spec.APTSigner != nil {
-			return RenderedDist{}, errors.New("managed: signed Dist publication time is required")
+			return "", errors.New("managed: signed Dist publication time is required")
 		}
 		spec.PublishedAt = time.Unix(0, 0).UTC()
 	} else {
 		spec.PublishedAt = spec.PublishedAt.UTC()
 	}
 	if _, err := validateFamilies(familiesOf(spec.Architectures)); err != nil {
-		return RenderedDist{}, err
+		return "", err
 	}
 	root, err := filepath.Abs(repositoryStage)
 	if err != nil {
-		return RenderedDist{}, err
+		return "", err
 	}
 	if info, err := os.Lstat(root); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return RenderedDist{}, fmt.Errorf("managed: repository stage is not a real directory: %w", err)
+		return "", fmt.Errorf("managed: repository stage is not a real directory: %w", err)
 	}
 	dists := filepath.Join(root, "dists")
 	if _, err := durableEnsureDir(dists, 0o755); err != nil {
-		return RenderedDist{}, err
+		return "", err
 	}
 	distRoot := filepath.Join(dists, spec.Name)
 	if err := durableMkdir(distRoot, 0o755); err != nil {
-		return RenderedDist{}, err
+		return "", err
 	}
 	for _, source := range spec.Packages {
 		if source.Object.Format != spec.Format || source.Path == "" {
-			return RenderedDist{}, errors.New("managed: package source does not match Dist format")
+			return "", errors.New("managed: package source does not match Dist format")
 		}
 		opened, err := source.open()
 		if err != nil {
-			return RenderedDist{}, fmt.Errorf("managed: package source %s is missing or unsafe: %w", source.Object.SHA256, err)
+			return "", fmt.Errorf("managed: package source %s is missing or unsafe: %w", source.Object.SHA256, err)
 		}
 		if err := opened.CloseVerified(); err != nil {
-			return RenderedDist{}, err
+			return "", err
 		}
 	}
 	if spec.Format == "rpm" {
@@ -218,19 +232,15 @@ func RenderManagedDist(ctx context.Context, repositoryStage string, spec Managed
 		err = renderManagedDEBDist(ctx, distRoot, spec)
 	}
 	if err != nil {
-		return RenderedDist{}, err
+		return "", err
 	}
 	if err := syncTree(distRoot); err != nil {
-		return RenderedDist{}, err
+		return "", err
 	}
 	if err := errors.Join(syncDir(dists), syncDir(root)); err != nil {
-		return RenderedDist{}, err
+		return "", err
 	}
-	digest, files, err := digestTree(ctx, distRoot)
-	if err != nil {
-		return RenderedDist{}, err
-	}
-	return RenderedDist{Path: distRoot, TreeSHA256: digest, Files: files}, nil
+	return distRoot, nil
 }
 
 func renderManagedRPMDist(ctx context.Context, repositoryRoot, distRoot string, spec ManagedDistSpec) error {
