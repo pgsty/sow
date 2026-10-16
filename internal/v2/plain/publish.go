@@ -15,15 +15,20 @@ const legacyPlainJournal = ".sow-plain-operation.json"
 // identity is already captured by the one content pass; publication never
 // reopens a retained package merely to prove a durable transaction journal.
 type publicationPlan struct {
-	changed   bool
-	staleRPM  []string
-	removeRPM []string
-	removeDEB []string
+	changed          bool
+	staleRPM         []string
+	removeRPM        []string
+	removeDEB        []string
+	rpmHistory       bool
+	removeRPMHistory bool
 }
 
 func preparePublication(ctx context.Context, root string, staged stagedBuild, scan scanResult, opts Options) (publicationPlan, error) {
 	plan := publicationPlan{}
 	if err := prepareRPMPublication(ctx, root, staged, &plan); err != nil {
+		return publicationPlan{}, err
+	}
+	if err := prepareRPMRetention(ctx, root, staged, &plan); err != nil {
 		return publicationPlan{}, err
 	}
 	if err := prepareDEBPublication(ctx, root, staged, &plan); err != nil {
@@ -112,7 +117,6 @@ func prepareRPMPublication(ctx context.Context, root string, staged stagedBuild,
 		}
 		if _, keep := stagedNames[name]; !keep {
 			plan.staleRPM = append(plan.staleRPM, name)
-			plan.changed = true
 		}
 	}
 	return nil
@@ -245,8 +249,19 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 			}
 		}
 		sort.Strings(names)
-		for _, name := range names {
+		for sequence, name := range names {
+			if err := inject(opts.Fault, FaultBeforeRPMIndex, name, sequence); err != nil {
+				return err
+			}
 			if err := installStagedFile(filepath.Join(staged.dir, "repodata", name), filepath.Join(liveDir, name)); err != nil {
+				return err
+			}
+			if err := inject(opts.Fault, FaultAfterRPMIndex, name, sequence); err != nil {
+				return err
+			}
+		}
+		if plan.rpmHistory {
+			if err := installStagedFile(filepath.Join(staged.dir, rpmHistoryName), filepath.Join(root, rpmHistoryName)); err != nil {
 				return err
 			}
 		}
@@ -289,6 +304,14 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 			if err := syncDir(root); err != nil {
 				return &Error{Kind: KindRuntime, Op: "sync rpm index removal", Path: root, Err: err}
 			}
+		}
+	}
+	if plan.removeRPMHistory {
+		if err := removeRegularFile(filepath.Join(root, rpmHistoryName), false); err != nil {
+			return err
+		}
+		if err := syncDir(root); err != nil {
+			return &Error{Kind: KindRuntime, Op: "sync rpm retention removal", Path: root, Err: err}
 		}
 	}
 

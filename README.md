@@ -93,7 +93,24 @@ complete option contract. Continue with the [Quick Start](https://sow.pgsty.com/
 ## Managed workspaces
 
 Plain `sow create` treats repository metadata as a deterministic result of the directory:
-change the inputs and run it again. A managed workspace is for repositories that SOW should
+change the inputs and run it again. RPM publication installs and syncs new hash-named
+indexes before replacing `repomd.xml`. It retains indexes referenced by the current and
+immediately previous distinct `repomd.xml`; unchanged runs preserve that window. After a
+successful pointer switch, or a rerun that completes interrupted cleanup, it removes
+older SOW hash-named indexes. Other files, including an external `repomd.xml.asc`, stay
+untouched and external signatures must be refreshed separately.
+
+The bounded `.sow-plain-rpm-history.json` file records at most three reference sets so a
+rerun can identify the predecessor on either side of an interrupted pointer switch.
+It is a retention list, not a publication journal. Missing or corrupt history resets the
+window: a changed pointer retains its readable predecessor; an unchanged pointer can
+only retain its current indexes. Malformed old `repomd.xml` and corrupt historical indexes
+do not prevent rebuilding, but their old reader closure cannot be restored. Symlinks at
+SOW-owned metadata paths are rejected. Rebuilding with only DEB inputs, or an empty
+`--pigsty` result, removes SOW RPM metadata and the retention list. Package removal
+rules, including `--pigsty`, are unchanged.
+
+A managed workspace is for repositories that SOW should
 own over time, with explicit membership, policy, signed metadata, immutable snapshots,
 audit history, and publication targets:
 

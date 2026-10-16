@@ -193,10 +193,11 @@ func ValidateDirectory(ctx context.Context, dir string, compression Compression,
 }
 
 // ValidateFlatUnsignedDirectory validates the unsigned flat rpm-md shape used
-// by sow create. Package hrefs must be single RPM basenames and no detached
-// repomd signature is accepted or required.
+// by sow create, including checksum-named indexes retained for old readers.
+// Package hrefs must be single RPM basenames and no detached repomd signature
+// is accepted or required.
 func ValidateFlatUnsignedDirectory(ctx context.Context, dir string, compression Compression) (*Generation, error) {
-	return validateDirectoryMode(ctx, dir, compression, nil, true, false, false)
+	return validateDirectoryModeRetained(ctx, dir, compression, nil, true, false, false, false, true, nil)
 }
 
 // ValidateManagedUnsignedDirectory validates unsigned managed rpm-md. Package
@@ -286,11 +287,7 @@ func ValidateLegacyC2RPMViewDirectory(ctx context.Context, dir string, compressi
 }
 
 func validateDirectory(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, flatCompatibility bool) (*Generation, error) {
-	return validateDirectoryMode(ctx, dir, compression, verifier, flatCompatibility, true, false)
-}
-
-func validateDirectoryMode(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, flatCompatibility, signed, requireEmpty bool) (*Generation, error) {
-	return validateDirectoryModeRetained(ctx, dir, compression, verifier, flatCompatibility, false, signed, requireEmpty, false, nil)
+	return validateDirectoryModeRetained(ctx, dir, compression, verifier, flatCompatibility, false, true, false, false, nil)
 }
 
 func validateDirectoryModeRetained(ctx context.Context, dir string, compression Compression, verifier DetachedVerifier, flatCompatibility, managed, signed, requireEmpty, retained bool, viewValidation rpmViewValidation) (*Generation, error) {

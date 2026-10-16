@@ -615,13 +615,9 @@ func inspectTestRPMSignatures(path string) ([]yumrepo.EmbeddedRPMSignature, erro
 
 func readPrimaryXML(t *testing.T, repodata string) []byte {
 	t.Helper()
-	entries, err := os.ReadDir(repodata)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		if strings.HasSuffix(entry.Name(), "-primary.xml.gz") {
-			return gunzip(t, mustRead(t, filepath.Join(repodata, entry.Name())))
+	for href := range readRPMReaderView(t, filepath.Dir(repodata)).files {
+		if strings.HasSuffix(href, "-primary.xml.gz") {
+			return gunzip(t, mustRead(t, filepath.Join(filepath.Dir(repodata), filepath.FromSlash(href))))
 		}
 	}
 	t.Fatal("primary metadata not found")

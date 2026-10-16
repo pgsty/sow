@@ -68,6 +68,8 @@ const (
 	FaultAfterMarkerWithdrawn FaultPoint = "after-marker-withdrawn"
 	FaultBeforeRPMPackage     FaultPoint = "before-rpm-package-replace"
 	FaultAfterRPMPackage      FaultPoint = "after-rpm-package-replace"
+	FaultBeforeRPMIndex       FaultPoint = "before-rpm-index"
+	FaultAfterRPMIndex        FaultPoint = "after-rpm-index"
 	FaultBeforeRPMPointer     FaultPoint = "before-rpm-pointer"
 	FaultAfterRPMPointer      FaultPoint = "after-rpm-pointer"
 	FaultBeforeDEBPackages    FaultPoint = "before-deb-packages"

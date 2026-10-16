@@ -152,6 +152,8 @@ internal/v2/plain/pigsty_test.go
 internal/v2/plain/publish.go
 internal/v2/plain/rebuild_test.go
 internal/v2/plain/render.go
+internal/v2/plain/retention.go
+internal/v2/plain/retention_test.go
 internal/v2/plain/scan.go
 internal/v2/plain/sign.go
 internal/v2/plain/timestamp_test.go
