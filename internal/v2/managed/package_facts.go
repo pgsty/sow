@@ -16,10 +16,10 @@ import (
 	"github.com/pgsty/sow/internal/yumrepo"
 )
 
-// loadManagedPackageFacts performs one repository-wide SQLite read, matches
-// selected objects in memory, and parallel-backfills only missing or invalid
-// cache rows. Cache failures never become repository truth: source bytes remain
-// authoritative and every rebuilt fact is checked against PackageObject.
+// loadManagedPackageFacts reads cached facts for selected digests in bounded
+// batches and parallel-backfills missing or invalid cache rows. Cache failures
+// never become repository truth: source bytes remain authoritative and every
+// rebuilt fact is checked against PackageObject.
 func loadManagedPackageFacts(ctx context.Context, sources map[string]ManagedPackageSource, store *state.Store, jobs int, authenticated *publicGenerationSnapshot) error {
 	digests := make([]string, 0, len(sources))
 	for digest := range sources {

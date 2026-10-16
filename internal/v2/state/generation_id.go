@@ -91,8 +91,8 @@ func (generation GenerationID) Value() (driver.Value, error) {
 }
 
 // Scan accepts the canonical v7+ TEXT domain and the non-negative SQLite
-// INTEGER domain of the frozen v0.2 (schema v6) read-only compatibility
-// surface. All current writes still use Value's fixed-width TEXT spelling.
+// INTEGER domain of the frozen schema v6 C2 read-only compatibility contract.
+// All current writes still use Value's fixed-width TEXT spelling.
 func (generation *GenerationID) Scan(source any) error {
 	if generation == nil {
 		return errors.New("nil GenerationID receiver")

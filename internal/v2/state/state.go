@@ -485,9 +485,6 @@ func ReadOnlyRequiresLifecycleFence(path string) (bool, error) {
 
 func (s *Store) DB() *sql.DB { return s.db }
 
-// SchemaVersion reports the byte-for-byte schema contract validated when the
-// Store was opened. Version 6 is the frozen v0.2 C2 read-only compatibility
-// surface; writable Stores are always current.
 // OpenedSchemaVersion reports the schema found before an explicit Repository
 // migration advanced the database. It equals SchemaVersion otherwise.
 func (s *Store) OpenedSchemaVersion() int {
@@ -497,6 +494,9 @@ func (s *Store) OpenedSchemaVersion() int {
 	return s.openedSchema
 }
 
+// SchemaVersion reports the byte-for-byte schema contract validated when the
+// Store was opened. Version 6 is the frozen C2 read-only compatibility
+// contract; writable Stores are always current.
 func (s *Store) SchemaVersion() int { return s.schemaVersion }
 
 // ReadOnly reports whether the Store was opened through OpenReadOnly. Cache

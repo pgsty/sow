@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 )
 
-// GenerateFlatUnsigned builds the unsigned flat rpm-md repository used by
-// `sow create`. It deliberately has no EL policy, modulemd, signature, or
+// GenerateFlatUnsigned builds an unsigned flat rpm-md repository from a package
+// iterator. It deliberately has no EL policy, modulemd, signature, or
 // Packages/<bucket> placement: every package location is its safe basename.
 // The destination is installed only after a complete structural validation.
 func GenerateFlatUnsigned(ctx context.Context, dest string, revision uint64, packages PackageIterator) (*Generation, error) {

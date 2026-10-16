@@ -95,9 +95,8 @@ ON CONFLICT(package_sha256) DO UPDATE SET fact_schema = excluded.fact_schema, fa
 	return tx.Commit()
 }
 
-// ListPackageFacts is the one bulk read used by a repository build. Keeping
-// this API repository-wide avoids one SQLite lookup per selected package and
-// lets callers match facts to their already-loaded PackageObjects in memory.
+// ListPackageFacts returns all cached package facts ordered by package digest.
+// Builds use ListPackageFactsForDigests to read only their selected objects.
 func (s *Store) ListPackageFacts(ctx context.Context) ([]PackageFact, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT package_sha256, fact_schema, facts, facts_sha256, device, inode, size, mtime_ns, ctime_ns
 FROM package_facts ORDER BY package_sha256`)

@@ -226,10 +226,7 @@ func repositoryInfo(ctx context.Context, root, name string, cfg config.Config) (
 	if err != nil {
 		return RepositoryInfo{}, fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
-	var recent *OperationInfo
-	if last != nil {
-		recent = &OperationInfo{ID: last.ID, Kind: last.Kind, State: last.State, ErrorClass: last.ErrorClass, CreatedAt: last.CreatedAt, UpdatedAt: last.UpdatedAt}
-	}
+	recent := publicOperationInfo(last)
 	sort.Strings(dirtyReasons)
 	return RepositoryInfo{
 		Name: name, Path: path, Protected: repo.Protected, Dists: int64(len(repo.Dists)),

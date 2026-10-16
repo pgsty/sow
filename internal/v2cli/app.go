@@ -17,15 +17,15 @@ import (
 	"github.com/pgsty/sow/internal/v2/state"
 )
 
-// Main is the active SOW V2 command entry point. It intentionally dispatches
-// only the closed P0-P3 command tree accepted by Parse.
+// Main runs the command tree accepted by Parse with a background context.
+// Use MainContext when the caller owns cancellation.
 func Main(args []string, stdout, stderr io.Writer) int {
 	return MainContext(context.Background(), args, stdout, stderr)
 }
 
-// MainContext is Main with a caller-owned cancellation context for tests and
-// embedders. Command diagnostics always go to stderr; --json data always goes
-// to stdout, including failure envelopes.
+// MainContext runs the command tree accepted by Parse with the caller's
+// cancellation context. Command diagnostics always go to stderr; --json data
+// always goes to stdout, including failure envelopes.
 func MainContext(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if ctx == nil {
 		ctx = context.Background()

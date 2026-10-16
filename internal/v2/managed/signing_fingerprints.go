@@ -33,8 +33,7 @@ func effectiveConfigView(ctx context.Context, root string, cfg config.Config, op
 }
 
 // EffectiveConfigView returns the secret-safe effective workspace view with
-// all configured public-key fingerprints resolved. It is shared by the CLI's
-// scoped config-show projection and renderer identity calculation.
+// all configured public-key fingerprints resolved.
 func EffectiveConfigView(ctx context.Context, root string, cfg config.Config, opts config.ViewOptions) (config.EffectiveConfig, error) {
 	return effectiveConfigView(ctx, root, cfg, opts)
 }

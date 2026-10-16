@@ -173,9 +173,9 @@ func Load(filename string) (Config, error) {
 	return cfg, err
 }
 
-// LoadWithSHA parses and hashes the exact same bounded, descriptor-bound
-// config bytes. Mutation journals use the returned digest so a concurrent
-// pathname replacement cannot bind a different config from the one applied.
+// LoadWithSHA returns the parsed configuration and digest from LoadDocument,
+// discarding the source bytes. Both values come from the same bounded,
+// descriptor-bound read.
 func LoadWithSHA(filename string) (Config, string, error) {
 	cfg, _, digest, err := LoadDocument(filename)
 	return cfg, digest, err

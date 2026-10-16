@@ -6,7 +6,7 @@ import (
 	"github.com/pgsty/sow/internal/v2/state"
 )
 
-// repositoryReadLayout classifies both the byte-for-byte frozen v0.2 schema
+// repositoryReadLayout classifies both the frozen schema 6 C2 contract
 // and a current-schema Repository that was safely returned to C2 before
 // commit_intent.  The latter is intentionally readable but remains unwritable
 // until the operator runs the explicit migration again.
