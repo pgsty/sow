@@ -328,3 +328,43 @@ func TestInspectCheckedInExternallyBuiltDeb(t *testing.T) {
 		t.Fatalf("checked-in external fixture digest = %s", pkg.SHA256)
 	}
 }
+
+type coordinateProbeReader struct {
+	*bytes.Reader
+	read int64
+}
+
+func (r *coordinateProbeReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.read += int64(n)
+	return n, err
+}
+func (r *coordinateProbeReader) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.Reader.ReadAt(p, off)
+	r.read += int64(n)
+	return n, err
+}
+
+func TestUnverifiedCoordinateProbeUsesBoundedControlReads(t *testing.T) {
+	filename := writeDebWithDataMember(t, t.TempDir(), "libfoo.deb", fixtureControl, "data.tar.zst", make([]byte, 1<<20))
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &coordinateProbeReader{Reader: bytes.NewReader(data)}
+	hint, err := ProbePackageCoordinateReader(context.Background(), reader, "main", "renamed.deb", int64(len(data)))
+	if err != nil || hint.Name != "libfoo-bin" || hint.Source != "libfoo" || hint.Version != "1:1.2.3-1" || hint.Architecture != "amd64" {
+		t.Fatalf("hint=%+v err=%v", hint, err)
+	}
+	if reader.read <= 0 || reader.read >= 64<<10 {
+		t.Fatalf("metadata probe read %d bytes of a %d byte package", reader.read, len(data))
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := ProbePackageCoordinateReader(cancelled, reader, "main", "renamed.deb", int64(len(data))); err == nil {
+		t.Fatal("cancelled probe accepted")
+	}
+	if _, err := InspectPackageReaderKnown(context.Background(), reader, "main", "renamed.deb", "", int64(len(data))); err == nil {
+		t.Fatal("unverified coordinate satisfied Known digest contract")
+	}
+}

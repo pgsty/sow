@@ -62,40 +62,73 @@ func InspectManagedPackageFacts(ctx context.Context, input PackageInput) (*Packa
 // the caller has already copied and authenticated the complete descriptor.
 // It trusts only the supplied SHA/size identity and performs no payload pass.
 func InspectManagedPackageFactsReaderKnown(ctx context.Context, input io.ReadSeeker, originalBasename, digest string, size int64) (*PackageFacts, PackageInfo, error) {
-	if ctx == nil {
-		return nil, PackageInfo{}, errors.New("yumrepo: nil context")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, PackageInfo{}, err
-	}
-	if input == nil || !factsSHA256Pattern.MatchString(digest) || size < 0 || originalBasename == "" ||
-		path.Base(originalBasename) != originalBasename || filepath.Base(originalBasename) != originalBasename || !safeManagedRPMBasename(originalBasename) {
+	if !factsSHA256Pattern.MatchString(digest) {
 		return nil, PackageInfo{}, fmt.Errorf("%w: invalid known RPM identity", ErrInvalidPackage)
 	}
-	if _, err := input.Seek(0, io.SeekStart); err != nil {
-		return nil, PackageInfo{}, fmt.Errorf("%w: rewind RPM facts reader: %v", ErrInvalidPackage, err)
-	}
-	reader := rpmReaderPool.Get().(*bufio.Reader)
-	reader.Reset(input)
-	pkg, err := crpm.Read(reader)
-	reader.Reset(strings.NewReader(""))
-	rpmReaderPool.Put(reader)
-	if err != nil {
-		return nil, PackageInfo{}, fmt.Errorf("%w: parse RPM facts reader: %v", ErrInvalidPackage, err)
-	}
-	if err := validatePackageSizeTags(pkg); err != nil {
-		return nil, PackageInfo{}, fmt.Errorf("%w: parse RPM facts reader: %v", ErrInvalidPackage, err)
-	}
-	metadata, err := packageMetadataFromParsedRPM(pkg, PackageInput{Path: "authenticated-rpm", Basename: originalBasename, FileTime: unixEpoch}, originalBasename, digest, size, 0, true)
+	metadata, err := readManagedPackageMetadata(ctx, input, originalBasename, digest, size)
 	if err != nil {
 		return nil, PackageInfo{}, err
 	}
-	metadata.Location = ""
-	metadata.FileTime = 0
 	if err := validatePackageFactsMetadata(metadata); err != nil {
 		return nil, PackageInfo{}, err
 	}
 	return &PackageFacts{metadata: metadata}, packageInfo(metadata), nil
+}
+
+// UnverifiedPackageCoordinate contains only routing hints from bounded RPM
+// headers. No payload digest or signature authorization is implied.
+type UnverifiedPackageCoordinate struct {
+	Name, Source, SourceRPM, Version, Release, Arch string
+	Epoch                                           int64
+}
+
+// ProbePackageCoordinateReader does not authenticate payload bytes. A caller
+// accepting a package must bind the same descriptor's complete identity from
+// before this probe through its full content read and final facts inspection.
+func ProbePackageCoordinateReader(ctx context.Context, input io.ReadSeeker, originalBasename string, size int64) (UnverifiedPackageCoordinate, error) {
+	metadata, err := readManagedPackageMetadata(ctx, input, originalBasename, "", size)
+	if err != nil {
+		return UnverifiedPackageCoordinate{}, err
+	}
+	if err := validateUnverifiedPackageMetadata(metadata); err != nil {
+		return UnverifiedPackageCoordinate{}, err
+	}
+	info := packageInfo(metadata)
+	return UnverifiedPackageCoordinate{Name: info.Name, Source: info.Source, SourceRPM: info.SourceRPM, Version: info.Version, Release: info.Release, Arch: info.Arch, Epoch: info.Epoch}, nil
+}
+
+func readManagedPackageMetadata(ctx context.Context, input io.ReadSeeker, originalBasename, digest string, size int64) (*packageMetadata, error) {
+	if ctx == nil {
+		return nil, errors.New("yumrepo: nil context")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if input == nil || size < 0 || originalBasename == "" ||
+		path.Base(originalBasename) != originalBasename || filepath.Base(originalBasename) != originalBasename || !safeManagedRPMBasename(originalBasename) {
+		return nil, fmt.Errorf("%w: invalid RPM metadata input", ErrInvalidPackage)
+	}
+	if _, err := input.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("%w: rewind RPM facts reader: %v", ErrInvalidPackage, err)
+	}
+	reader := rpmReaderPool.Get().(*bufio.Reader)
+	reader.Reset(&contextReader{ctx: ctx, r: input})
+	pkg, err := crpm.Read(reader)
+	reader.Reset(strings.NewReader(""))
+	rpmReaderPool.Put(reader)
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse RPM facts reader: %v", ErrInvalidPackage, err)
+	}
+	if err := validatePackageSizeTags(pkg); err != nil {
+		return nil, fmt.Errorf("%w: parse RPM facts reader: %v", ErrInvalidPackage, err)
+	}
+	metadata, err := packageMetadataFromParsedRPM(pkg, PackageInput{Path: "authenticated-rpm", Basename: originalBasename, FileTime: unixEpoch}, originalBasename, digest, size, 0, true)
+	if err != nil {
+		return nil, err
+	}
+	metadata.Location = ""
+	metadata.FileTime = 0
+	return metadata, nil
 }
 
 func (facts *PackageFacts) MarshalBinary() ([]byte, error) {
@@ -175,11 +208,18 @@ func ProjectManagedPackageFacts(facts *PackageFacts, input PackageInput) (*Parse
 }
 
 func validatePackageFactsMetadata(metadata *packageMetadata) error {
+	if metadata == nil || !factsSHA256Pattern.MatchString(metadata.Checksum) {
+		return fmt.Errorf("%w: RPM package facts have invalid digest", ErrInvalidPackage)
+	}
+	return validateUnverifiedPackageMetadata(metadata)
+}
+
+func validateUnverifiedPackageMetadata(metadata *packageMetadata) error {
 	if metadata == nil || metadata.Name == "" || metadata.Version == "" || metadata.Release == "" || metadata.Arch == "" ||
 		!validXMLString(metadata.Name) || !validXMLString(metadata.Version) || !validXMLString(metadata.Release) || !validXMLString(metadata.Arch) {
 		return fmt.Errorf("%w: RPM package facts lack required NEVRA fields", ErrInvalidPackage)
 	}
-	if !factsSHA256Pattern.MatchString(metadata.Checksum) || metadata.PackageSize < 0 || metadata.Epoch < 0 || metadata.FileTime != 0 || metadata.BuildTime < 0 || metadata.Location != "" || metadata.HeaderStart < 0 || metadata.HeaderEnd < metadata.HeaderStart {
+	if metadata.PackageSize < 0 || metadata.Epoch < 0 || metadata.FileTime != 0 || metadata.BuildTime < 0 || metadata.Location != "" || metadata.HeaderStart < 0 || metadata.HeaderEnd < metadata.HeaderStart {
 		return fmt.Errorf("%w: RPM package facts have invalid identity or sizes", ErrInvalidPackage)
 	}
 	stringsToCheck := []string{

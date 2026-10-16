@@ -161,6 +161,27 @@ type PackageReader interface {
 	io.Seeker
 }
 
+// UnverifiedPackageCoordinate is a routing hint read from bounded ar/control
+// metadata. It proves neither the identity nor the contents of the package.
+// In particular it must never be persisted as authenticated package facts.
+type UnverifiedPackageCoordinate struct {
+	Name, Source, Version, Architecture string
+}
+
+// ProbePackageCoordinateReader reads no package payload hash. The caller must
+// keep the same descriptor, bind its complete identity before this call, and
+// authenticate all bytes before using any metadata to accept the package.
+func ProbePackageCoordinateReader(ctx context.Context, reader PackageReader, component, originalBasename string, size int64) (UnverifiedPackageCoordinate, error) {
+	if size < 0 {
+		return UnverifiedPackageCoordinate{}, errors.New("aptrepo: invalid provisional deb size")
+	}
+	pkg, err := parsePackageReaderAs(ctx, reader, component, originalBasename, "", size)
+	if err != nil {
+		return UnverifiedPackageCoordinate{}, err
+	}
+	return UnverifiedPackageCoordinate{Name: pkg.Name, Source: pkg.Source, Version: pkg.Version, Architecture: pkg.Architecture}, nil
+}
+
 // InspectPackageReaderAs parses and hashes one Debian package through a
 // caller-owned seekable descriptor. The caller is responsible for binding the
 // descriptor to the intended path/inode and for closing it. The reader is

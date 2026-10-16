@@ -519,3 +519,40 @@ func TestManagedExplicitPublicationTimestamp(t *testing.T) {
 		}
 	}
 }
+
+type rpmCoordinateProbeReader struct {
+	*bytes.Reader
+	read int64
+}
+
+func (r *rpmCoordinateProbeReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.read += int64(n)
+	return n, err
+}
+
+func TestUnverifiedCoordinateProbeUsesBoundedRPMHeaders(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "fixture-1.2.3-4.x86_64.rpm")
+	writeRPMFixture(t, filename, "fixture")
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, make([]byte, 1<<20)...)
+	reader := &rpmCoordinateProbeReader{Reader: bytes.NewReader(data)}
+	hint, err := ProbePackageCoordinateReader(context.Background(), reader, "renamed.rpm", int64(len(data)))
+	if err != nil || hint.Name != "fixture" || hint.Version != "1.2.3" || hint.Release != "4" || hint.Arch != "x86_64" {
+		t.Fatalf("hint=%+v err=%v", hint, err)
+	}
+	if reader.read <= 0 || reader.read > 128<<10 {
+		t.Fatalf("header probe read %d bytes of a %d byte package", reader.read, len(data))
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := ProbePackageCoordinateReader(cancelled, reader, "renamed.rpm", int64(len(data))); err == nil {
+		t.Fatal("cancelled probe accepted")
+	}
+	if _, _, err := InspectManagedPackageFactsReaderKnown(context.Background(), reader, "renamed.rpm", "", int64(len(data))); err == nil {
+		t.Fatal("unverified coordinate satisfied Known digest contract")
+	}
+}

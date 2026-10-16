@@ -243,8 +243,8 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	newObjectStage := make(map[string]string)
 	byCoordinate := make(map[string]batchCoordinate)
 	itemObjects := make(map[int]state.PackageObject)
-	inspected := inspectInputs(ctx, inputsRoot, files, opts.Jobs)
-	lookups, candidatePaths := lookupInputCoordinates(ctx, store, inspected)
+	inspected, lookups := inspectInputs(ctx, inputsRoot, files, opts.Jobs, store)
+	candidatePaths := newInputPoolPaths(inspected, lookups)
 	pathOwners, err := store.PackagePoolPathOwners(ctx, candidatePaths)
 	if err != nil {
 		return result, err
@@ -267,11 +267,20 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 			return result, err
 		}
 	}
+	backingEvidence, err := payloadEvidenceForMutationSnapshot(currentSnapshot)
+	if err != nil {
+		return result, err
+	}
 	for sequence, input := range files {
 		item := MutationItem{Input: input.Display, Status: "failed", Dists: map[string]string{}}
 		reused := false
 		snapshot := filepath.Join(inputsRoot, fmt.Sprintf("%08d-%s", sequence, input.Base))
 		inspection := inspected[sequence]
+		if inspection.Deferred && inspection.Err == nil {
+			_, acceptedEarlier := byCoordinate[inputCoordinateKey(inspection.Object)]
+			copyPayload := !acceptedEarlier && errors.Is(lookups[sequence].err, state.ErrNotFound)
+			inspection = inspectDeferredInput(ctx, input, inspection, snapshot, copyPayload)
+		}
 		if inspection.Err != nil {
 			item.Error = inspection.Err.Error()
 			result.Failed++
@@ -300,6 +309,22 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 				result.Items = append(result.Items, item)
 				continue
 			}
+			var source ManagedPackageSource
+			var sourceErr error
+			if prior.new {
+				source = ManagedPackageSource{Object: prior.object, Owner: objectsRoot, Relative: prior.object.SHA256, Path: newObjectStage[prior.object.SHA256]}
+			} else {
+				source, sourceErr = availableManagedPackageSource(ws.Root, repoName, prior.object)
+			}
+			if sourceErr == nil {
+				reusable, sourceErr = verifyIngestReuse(ctx, source, backingEvidence, rpmPolicy, object.Format == "rpm" && prior.object.SHA256 != inputSHA)
+			}
+			if sourceErr != nil || !reusable {
+				item.Error = errors.Join(errors.New("managed: prior input backing package cannot be reused"), sourceErr).Error()
+				result.Failed++
+				result.Items = append(result.Items, item)
+				continue
+			}
 			object = prior.object
 			reused = true
 			_ = removeOwnedRegularPath(ws.Root, snapshot, -1)
@@ -307,18 +332,13 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 			existing, lookupErr := lookups[sequence].object, lookups[sequence].err
 			switch {
 			case lookupErr == nil:
-				reusable := existing.SHA256 == object.SHA256
-				if !reusable && object.Format == "rpm" && existing.PayloadSHA256 == object.PayloadSHA256 && rpmPolicy.mode != "never" {
+				exact := existing.SHA256 == object.SHA256
+				neutral := !exact && object.Format == "rpm" && existing.PayloadSHA256 == object.PayloadSHA256 && rpmPolicy.mode != "never"
+				reusable := exact || neutral
+				if reusable {
 					source, sourceErr := availableManagedPackageSource(ws.Root, repoName, existing)
 					if sourceErr == nil {
-						opened, openErr := source.open()
-						if openErr == nil {
-							reusable = rpmPolicy.permitsNeutralReuseReader(ctx, opened.file)
-							openErr = opened.CloseVerified()
-						}
-						if openErr != nil {
-							sourceErr = openErr
-						}
+						reusable, sourceErr = verifyIngestReuse(ctx, source, backingEvidence, rpmPolicy, neutral)
 					}
 					if sourceErr != nil {
 						item.Error = sourceErr.Error()
@@ -713,24 +733,18 @@ type coordinateLookup struct {
 	err    error
 }
 
-// lookupInputCoordinates resolves each inspected input's logical coordinate
-// once. Only a new coordinate can create a Package Object, so only its pool
-// path enters the path-owner query; re-added packages never read the
-// per-checkpoint publication history of their paths.
-func lookupInputCoordinates(ctx context.Context, store *state.Store, inspected []inspectedInput) ([]coordinateLookup, []string) {
-	lookups := make([]coordinateLookup, len(inspected))
+// Only a new coordinate can create a Package Object. Keep the path-owner
+// query batched and exclude existing coordinates and their publication history.
+// Deferred hints may nominate paths for this read-only query, but cannot prove
+// ownership or authorize acceptance before their complete input inspection.
+func newInputPoolPaths(inspected []inspectedInput, lookups []coordinateLookup) []string {
 	candidatePaths := make([]string, 0, len(inspected))
 	for index, input := range inspected {
-		if input.Err != nil {
-			continue
-		}
-		existing, err := store.FindPackageByCoordinate(ctx, input.Object.Format, input.Object.Coordinate)
-		lookups[index] = coordinateLookup{object: existing, err: err}
-		if errors.Is(err, state.ErrNotFound) {
+		if input.Err == nil && errors.Is(lookups[index].err, state.ErrNotFound) {
 			candidatePaths = append(candidatePaths, input.Object.PoolPath)
 		}
 	}
-	return lookups, candidatePaths
+	return candidatePaths
 }
 
 // stateTransactionCommitted is valid only for the error returned directly by
