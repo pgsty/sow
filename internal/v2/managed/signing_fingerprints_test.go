@@ -183,7 +183,7 @@ func TestRPMPackageSigningPreflightUsesRPMMacroChannelInsteadOfDirectGPGProbe(t 
 	}
 	t.Setenv("PATH", tools+string(os.PathListSeparator)+os.Getenv("PATH"))
 	signing := config.SigningConfig{RPM: config.RPMSigningConfig{Packages: config.RPMPackageSigningConfig{Mode: "fill", Key: "env://SOW_TEST_RPM_MACRO_KEY"}}}
-	if err := validateSigningApplicability(ctx, root, signing); err != nil {
+	if err := validateSigningApplicabilityForFormats(ctx, root, signing, true, true); err != nil {
 		t.Fatalf("RPM macro-capable signing environment was rejected: %v", err)
 	}
 }
@@ -210,7 +210,7 @@ func TestEffectiveRPMPackageSigningFingerprintParity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	buildSide, err := frozenEffectiveSigning(signing, policy, metadataSignerSnapshot{})
+	buildSide, err := frozenEffectiveSigningForFormats(signing, policy, metadataSignerSnapshot{}, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestEffectiveRPMPackageSigningFingerprintParity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dormant package keys were resolved: %v", err)
 	}
-	dormantBuild, err := frozenEffectiveSigning(dormant, rpmSigningPolicy{mode: "never"}, metadataSignerSnapshot{})
+	dormantBuild, err := frozenEffectiveSigningForFormats(dormant, rpmSigningPolicy{mode: "never"}, metadataSignerSnapshot{}, true, true)
 	if err != nil || !reflect.DeepEqual(dormantRead.RPM.Packages, dormantBuild.RPM.Packages) {
 		t.Fatalf("dormant read/build parity: read=%#v build=%#v err=%v", dormantRead.RPM.Packages, dormantBuild.RPM.Packages, err)
 	}

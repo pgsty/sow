@@ -17,7 +17,10 @@ import (
 
 func TestRenderEmptyRPMDistViews(t *testing.T) {
 	root := t.TempDir()
-	result, err := RenderEmptyDist(context.Background(), root, EmptyDistSpec{Name: "el9", Format: "rpm", Architectures: []string{"x86_64", "aarch64"}, Generation: 1})
+	result, err := RenderManagedDist(context.Background(), root, ManagedDistSpec{
+		Name: "el9", Format: "rpm", Generation: 1, Jobs: 1,
+		Architectures: []state.Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}, {Family: "aarch64", EcosystemArch: "aarch64"}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +29,7 @@ func TestRenderEmptyRPMDistViews(t *testing.T) {
 	}
 	for _, family := range []string{"x86_64", "aarch64"} {
 		view := filepath.Join(root, "dists", "el9", family, "repodata")
-		validated, err := yumrepo.ValidateFlatUnsignedDirectory(context.Background(), view, yumrepo.CompressionGzip)
+		validated, err := yumrepo.ValidateManagedUnsignedDirectory(context.Background(), view, yumrepo.CompressionGzip)
 		if err != nil {
 			t.Fatalf("validate %s: %v", family, err)
 		}
@@ -38,7 +41,10 @@ func TestRenderEmptyRPMDistViews(t *testing.T) {
 
 func TestRenderEmptyDEBDistViews(t *testing.T) {
 	root := t.TempDir()
-	result, err := RenderEmptyDist(context.Background(), root, EmptyDistSpec{Name: "noble", Format: "deb", Architectures: []string{"x86_64", "aarch64"}, Generation: 1})
+	result, err := RenderManagedDist(context.Background(), root, ManagedDistSpec{
+		Name: "noble", Format: "deb", Generation: 1, Jobs: 1,
+		Architectures: []state.Architecture{{Family: "x86_64", EcosystemArch: "amd64"}, {Family: "aarch64", EcosystemArch: "arm64"}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,9 +71,14 @@ func TestRenderEmptyDEBDistViews(t *testing.T) {
 	}
 }
 
-func TestRenderEmptyDistRejectsUnknownNeutralAndDuplicateFamilies(t *testing.T) {
-	for _, architectures := range [][]string{{"all"}, {"noarch"}, {"riscv64"}, {"x86_64", "x86_64"}} {
-		if _, err := RenderEmptyDist(context.Background(), t.TempDir(), EmptyDistSpec{Name: "test", Format: "rpm", Architectures: architectures, Generation: 1}); err == nil {
+func TestRenderManagedDistRejectsUnknownNeutralAndDuplicateFamilies(t *testing.T) {
+	for _, architectures := range [][]state.Architecture{
+		{{Family: "all"}},
+		{{Family: "noarch"}},
+		{{Family: "riscv64"}},
+		{{Family: "x86_64", EcosystemArch: "x86_64"}, {Family: "x86_64", EcosystemArch: "x86_64"}},
+	} {
+		if _, err := RenderManagedDist(context.Background(), t.TempDir(), ManagedDistSpec{Name: "test", Format: "rpm", Architectures: architectures, Generation: 1, Jobs: 1}); err == nil {
 			t.Fatalf("architectures %v succeeded", architectures)
 		}
 	}

@@ -64,6 +64,7 @@ internal/v2/managed/exchange_at_darwin.go
 internal/v2/managed/exchange_at_linux.go
 internal/v2/managed/external_input_path_test.go
 internal/v2/managed/gc.go
+internal/v2/managed/gc_evidence_test.go
 internal/v2/managed/gc_test.go
 internal/v2/managed/generation_signer_projection_test.go
 internal/v2/managed/ingest.go
@@ -96,6 +97,7 @@ internal/v2/managed/physical_path_darwin.go
 internal/v2/managed/physical_path_linux.go
 internal/v2/managed/policy.go
 internal/v2/managed/policy_test.go
+internal/v2/managed/postcommit_test.go
 internal/v2/managed/process_concurrent_init_test.go
 internal/v2/managed/process_crash_multidist_test.go
 internal/v2/managed/process_crash_test.go
@@ -109,6 +111,7 @@ internal/v2/managed/publication_payload_reuse_test.go
 internal/v2/managed/publication_r2.go
 internal/v2/managed/publication_r2_test.go
 internal/v2/managed/publication_test.go
+internal/v2/managed/publication_time_test.go
 internal/v2/managed/query.go
 internal/v2/managed/query_status_test.go
 internal/v2/managed/read_layout.go
@@ -180,12 +183,14 @@ internal/v2/state/objects_bulk_test.go
 internal/v2/state/operation_progress_test.go
 internal/v2/state/pool_paths.go
 internal/v2/state/pool_paths_test.go
+internal/v2/state/postcommit_test.go
 internal/v2/state/publication.go
 internal/v2/state/publication_gc.go
 internal/v2/state/publication_plan.go
 internal/v2/state/publication_plan_test.go
 internal/v2/state/publication_read.go
 internal/v2/state/publication_test.go
+internal/v2/state/read_snapshot_test.go
 internal/v2/state/repository.go
 internal/v2/state/schema_v1.sql
 internal/v2/state/schema_v10.sql
@@ -221,12 +226,12 @@ internal/v2cli/output.go
 internal/v2cli/output_test.go
 internal/v2cli/parse.go
 internal/v2cli/parse_test.go
+internal/v2cli/postcommit_test.go
 internal/v2cli/prune_maintenance_test.go
 internal/v2cli/testdata/root-help.golden
 internal/v2cli/timestamp_test.go
 internal/workmetrics/metrics.go
 internal/workmetrics/metrics_test.go
-internal/yumrepo/catalog.go
 internal/yumrepo/exchange.go
 internal/yumrepo/exchange_darwin.go
 internal/yumrepo/exchange_guard_test.go

@@ -1182,6 +1182,18 @@ func TestRemovePolicyAuditCrashHelper(t *testing.T) {
 	t.Fatalf("remove crash point was not reached: %v", err)
 }
 
+func publicTreeSnapshot(root, repoName string) (map[string]string, error) {
+	manifest, err := scanPublicManifest(context.Background(), filepath.Join(root, repoName))
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]string, len(manifest))
+	for _, file := range manifest {
+		result[file.Path] = file.SHA256
+	}
+	return result, nil
+}
+
 func newRemovePolicyAuditFixture(t *testing.T, root string, pending bool) (RemoveOptions, map[string]string) {
 	t.Helper()
 	ctx := context.Background()

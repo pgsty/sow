@@ -199,13 +199,9 @@ func resolveReferenceFingerprints(ctx context.Context, root, reference string) (
 	return stableUniqueStrings(fingerprints), nil
 }
 
-// validateSigningApplicability is the config-check preflight. It proves that
+// validateSigningApplicabilityForFormats is the config-check preflight. It proves that
 // configured signing keys can actually sign at the current time without
 // mutating repository state. Agent keys use one small non-interactive probe.
-func validateSigningApplicability(ctx context.Context, root string, signing config.SigningConfig) error {
-	return validateSigningApplicabilityForFormats(ctx, root, signing, true, true)
-}
-
 func validateSigningApplicabilityForFormats(ctx context.Context, root string, signing config.SigningConfig, wantRPM, wantDEB bool) error {
 	if _, err := resolveEffectiveSigningFingerprintsForFormats(ctx, root, signing, config.EffectiveSigningConfig{}, wantRPM, wantDEB); err != nil {
 		return err

@@ -589,10 +589,6 @@ func validateOpenXML(ctx context.Context, source io.Reader, kind string, compres
 	return hex.EncodeToString(h.Sum(nil)), counter.n, count, identities, nil
 }
 
-func validateMetadataXML(reader io.Reader, kind string) (int64, error) {
-	return validateMetadataXMLMode(reader, kind, false, false, nil, nil)
-}
-
 func validateMetadataXMLMode(reader io.Reader, kind string, flatCompatibility, managed bool, identities *metadataIdentitySpool, viewValidation rpmViewValidation) (int64, error) {
 	wantedLocal, wantedNS := "metadata", commonNS
 	switch kind {
@@ -753,14 +749,6 @@ func validateMetadataXMLMode(reader io.Reader, kind string, flatCompatibility, m
 		return 0, fmt.Errorf("%w: %s declares %d packages but contains %d", ErrInvalidRepodata, kind, declared, actual)
 	}
 	return actual, nil
-}
-
-func validatePackageHref(name, href string) error {
-	return validatePackageHrefForMode(name, href, false)
-}
-
-func validatePackageHrefForMode(name, href string, flatCompatibility bool) error {
-	return validatePackageHrefForModes(name, href, flatCompatibility, false)
 }
 
 func validatePackageHrefForModes(name, href string, flatCompatibility, managed bool) error {

@@ -335,14 +335,14 @@ func TestGenerateRejectsEL7OutsideFrozenGzipPolicy(t *testing.T) {
 
 func TestValidatePackageHref(t *testing.T) {
 	t.Parallel()
-	if err := validatePackageHref("PostgreSQL", "Packages/p/postgresql-1.rpm"); err != nil {
+	if err := validatePackageHrefForModes("PostgreSQL", "Packages/p/postgresql-1.rpm", false, false); err != nil {
 		t.Fatalf("valid href: %v", err)
 	}
 	for _, href := range []string{
 		"/Packages/p/x.rpm", "Packages/p/../x.rpm", "Packages/q/postgresql.rpm",
 		"Packages/p/x%2frpm.rpm", "Packages/p/x?.rpm", "other/p/x.rpm",
 	} {
-		if err := validatePackageHref("PostgreSQL", href); err == nil {
+		if err := validatePackageHrefForModes("PostgreSQL", href, false, false); err == nil {
 			t.Errorf("unsafe href accepted: %q", href)
 		}
 	}
@@ -617,7 +617,7 @@ func TestMalformedXMLAndSymlinkGenerationAreRejected(t *testing.T) {
 		`<!DOCTYPE metadata [<!ENTITY x "boom">]><metadata xmlns="` + commonNS + `" packages="0"></metadata>`,
 		`<metadata xmlns="` + commonNS + `" packages="1"><package><name>x</name><location href="Packages/x/../x.rpm"/></package></metadata>`,
 	} {
-		if _, err := validateMetadataXML(strings.NewReader(malformed), "primary"); err == nil {
+		if _, err := validateMetadataXMLMode(strings.NewReader(malformed), "primary", false, false, nil, nil); err == nil {
 			t.Fatalf("malformed XML unexpectedly accepted: %s", malformed)
 		}
 	}

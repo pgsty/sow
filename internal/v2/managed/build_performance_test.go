@@ -133,7 +133,7 @@ func TestPromotePendingObjectsGroupCommitSharedParent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := promotePendingObjects(ctx, root, "repo", objects, nil); err != nil {
+	if _, err := promotePendingObjectsWithIdentities(ctx, root, "repo", objects, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, object := range objects {
@@ -169,7 +169,7 @@ func TestPromotePendingObjectsRejectsDigestBeforePublicLink(t *testing.T) {
 	if err := os.WriteFile(pending, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := promotePendingObjects(ctx, root, "repo", []state.PackageObject{object}, nil); err == nil {
+	if _, err := promotePendingObjectsWithIdentities(ctx, root, "repo", []state.PackageObject{object}, nil); err == nil {
 		t.Fatal("promotion unexpectedly accepted a bad pending digest")
 	}
 	if _, err := os.Lstat(filepath.Join(root, "repo", filepath.FromSlash(object.PoolPath))); !errors.Is(err, os.ErrNotExist) {
@@ -250,7 +250,7 @@ func TestPromotePendingObjectsFaultLeavesRecoverableBatchState(t *testing.T) {
 		}
 	}
 	injected := errors.New("injected payload boundary")
-	err := promotePendingObjects(ctx, root, "repo", objects, func(point string) error {
+	_, err := promotePendingObjectsWithIdentities(ctx, root, "repo", objects, func(point string) error {
 		if point == "build.payload."+objects[1].SHA256 {
 			return injected
 		}
@@ -269,7 +269,7 @@ func TestPromotePendingObjectsFaultLeavesRecoverableBatchState(t *testing.T) {
 			t.Fatalf("prepared suffix is not dual-linked: public=%v pending=%v", publicErr, pendingErr)
 		}
 	}
-	if err := promotePendingObjects(ctx, root, "repo", objects, nil); err != nil {
+	if _, err := promotePendingObjectsWithIdentities(ctx, root, "repo", objects, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, object := range objects {
@@ -299,7 +299,7 @@ func TestPromotePendingObjectsTargetBarrierLeavesExactDualLinks(t *testing.T) {
 		}
 	}
 	injected := errors.New("target barrier reached")
-	err := promotePendingObjects(ctx, root, "repo", objects, func(point string) error {
+	_, err := promotePendingObjectsWithIdentities(ctx, root, "repo", objects, func(point string) error {
 		if point == "build.payload-targets" {
 			return injected
 		}
@@ -322,7 +322,7 @@ func TestPromotePendingObjectsTargetBarrierLeavesExactDualLinks(t *testing.T) {
 			t.Fatalf("object %s is not one exact dual-linked inode: pending=%#v target=%#v", object.SHA256, pendingRaw, targetRaw)
 		}
 	}
-	if err := promotePendingObjects(ctx, root, "repo", objects, nil); err != nil {
+	if _, err := promotePendingObjectsWithIdentities(ctx, root, "repo", objects, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -350,7 +350,7 @@ func TestPromotePendingObjectsRejectsNameReplacementBeforeCleanup(t *testing.T) 
 			if err := os.WriteFile(pending, body, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			err := promotePendingObjects(context.Background(), root, "repo", []state.PackageObject{object}, func(point string) error {
+			_, err := promotePendingObjectsWithIdentities(context.Background(), root, "repo", []state.PackageObject{object}, func(point string) error {
 				if point != "build.payload-targets" {
 					return nil
 				}
@@ -405,7 +405,7 @@ func TestPromotePendingObjectsCancellationLeavesBoundedRecoverableState(t *testi
 			t.Fatal(err)
 		}
 	}
-	err := promotePendingObjects(ctx, root, "repo", objects, func(point string) error {
+	_, err := promotePendingObjectsWithIdentities(ctx, root, "repo", objects, func(point string) error {
 		if point == "build.payload-linked."+objects[0].SHA256 {
 			cancel()
 		}
@@ -424,7 +424,7 @@ func TestPromotePendingObjectsCancellationLeavesBoundedRecoverableState(t *testi
 			t.Fatalf("unprepared object changed: public=%v pending=%v", publicErr, pendingErr)
 		}
 	}
-	if err := promotePendingObjects(context.Background(), root, "repo", objects, nil); err != nil {
+	if _, err := promotePendingObjectsWithIdentities(context.Background(), root, "repo", objects, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -804,7 +804,7 @@ func TestAuthenticatedPayloadSnapshotRejectsRestoredMTimeRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := normalizeManagedPublicTreeWithPayloads(ctx, repositoryRoot, nil, "", authenticated); !errors.Is(err, ErrIntegrity) {
+	if _, _, err := normalizeManagedPublicTreeSnapshotWithPayloads(ctx, repositoryRoot, nil, "", authenticated); !errors.Is(err, ErrIntegrity) {
 		t.Fatalf("restored-mtime rewrite passed authenticated snapshot: %v", err)
 	}
 }

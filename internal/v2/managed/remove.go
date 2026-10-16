@@ -622,15 +622,3 @@ func desiredAfterRemoval(ctx context.Context, store *state.Store, distNames []st
 	})
 	return desired, removed, outcomes, nil
 }
-
-func publicTreeSnapshot(root, repoName string) (map[string]string, error) {
-	manifest, err := scanPublicManifest(context.Background(), filepath.Join(root, repoName))
-	if err != nil {
-		return nil, err
-	}
-	result := make(map[string]string, len(manifest))
-	for _, file := range manifest {
-		result[file.Path] = file.SHA256
-	}
-	return result, nil
-}

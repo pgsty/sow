@@ -3,6 +3,7 @@ package yumrepo
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -272,18 +273,29 @@ func TestLegacyMissingOKRequirementProjectsAsRecommend(t *testing.T) {
 	if recommendsStart < 0 || recommendsEnd < recommendsStart || !strings.Contains(primary[recommendsStart:recommendsEnd], `name="legacy-optional" epoch="0" ver="2.0" rel="1"`) {
 		t.Fatalf("legacy weak dependency missing from recommends:\n%s", primary)
 	}
-	catalogPackage, err := InspectCatalogPackage(context.Background(), PackageInput{Path: rpmPath})
+	body, err := os.ReadFile(rpmPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(body)
+	facts, _, err := InspectManagedPackageFactsReaderKnown(context.Background(), bytes.NewReader(body), filepath.Base(rpmPath), fmt.Sprintf("%x", digest), int64(len(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := facts.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := ParsePackageFacts(encoded)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var catalogRequires []string
-	for _, relation := range catalogPackage.Relations {
-		if relation.Kind == "requires" {
-			catalogRequires = append(catalogRequires, relation.Name)
-		}
+	for _, relation := range decoded.metadata.CatalogRequires {
+		catalogRequires = append(catalogRequires, relation.Name)
 	}
 	if want := []string{"legacy-optional", "bash"}; !reflect.DeepEqual(catalogRequires, want) {
-		t.Fatalf("catalog requires = %v, want raw header requires %v", catalogRequires, want)
+		t.Fatalf("raw facts requires = %v, want raw header requires %v", catalogRequires, want)
 	}
 }
 

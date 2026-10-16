@@ -1051,17 +1051,12 @@ func pendingObjectsForBuildPlan(ctx context.Context, store *state.Store, digests
 	return result, nil
 }
 
-// promotePendingObjects is intentionally a single-writer group commit. Pending
+// promotePendingObjectsWithIdentities is intentionally a single-writer group commit. Pending
 // bytes and names are durable before this phase begins. Each bounded batch first
 // creates every Pool link, persists each distinct target parent, then removes
 // the pending names and persists their one shared directory. A crash therefore
 // leaves pending-only, exact dual-link, or Pool-only state, all bound to the
 // operation journal; it can never durably lose both names.
-func promotePendingObjects(ctx context.Context, root, repoName string, objects []state.PackageObject, fault func(string) error) error {
-	_, err := promotePendingObjectsWithIdentities(ctx, root, repoName, objects, fault)
-	return err
-}
-
 func promotePendingObjectsWithIdentities(ctx context.Context, root, repoName string, objects []state.PackageObject, fault func(string) error) (map[string]rootedRegularIdentity, error) {
 	if ctx == nil {
 		return nil, errors.New("managed: nil payload promotion context")
@@ -1262,20 +1257,12 @@ func buildAuthenticatedPayloads(base *publicGenerationSnapshot, promoted []state
 	return result, nil
 }
 
-// normalizeManagedPublicTree authenticates the complete public byte tree while
+// normalizeManagedPublicTreeSnapshotWithPayloads authenticates the complete public byte tree while
 // converging its delivery modes. Mode changes are not Generation changes, so
 // this step is journal-replayed before an operation can be finalized. Every
 // entry remains descriptor-bound. Ordinary in-process builds may reuse a
 // payload checksum only when its post-authentication descriptor identity still
 // matches; recovery and callers without such evidence retain the full hash.
-func normalizeManagedPublicTreeWithPayloads(ctx context.Context, repositoryRoot string, fault func(string) error, modeFaultPoint string, authenticated map[string]authenticatedPayload) ([]state.GenerationFile, int, error) {
-	snapshot, normalized, err := normalizeManagedPublicTreeSnapshotWithPayloads(ctx, repositoryRoot, fault, modeFaultPoint, authenticated)
-	if err != nil {
-		return nil, normalized, err
-	}
-	return snapshot.Manifest, normalized, nil
-}
-
 func normalizeManagedPublicTreeSnapshotWithPayloads(ctx context.Context, repositoryRoot string, fault func(string) error, modeFaultPoint string, authenticated map[string]authenticatedPayload) (*publicGenerationSnapshot, int, error) {
 	ctx = workmetrics.WithPhase(ctx, "public_normalization")
 	files := []state.GenerationFile{}

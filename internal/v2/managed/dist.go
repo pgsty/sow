@@ -394,10 +394,6 @@ func hashEffectiveDistWithContract(effectiveRepo config.EffectiveRepository, dis
 	return bytesSHA(data), effective, nil
 }
 
-func frozenEffectiveSigning(raw config.SigningConfig, rpmPolicy rpmSigningPolicy, metadata metadataSignerSnapshot) (config.EffectiveSigningConfig, error) {
-	return frozenEffectiveSigningForFormats(raw, rpmPolicy, metadata, true, true)
-}
-
 func frozenEffectiveSigningForFormats(raw config.SigningConfig, rpmPolicy rpmSigningPolicy, metadata metadataSignerSnapshot, wantRPM, wantDEB bool) (config.EffectiveSigningConfig, error) {
 	effective := config.EffectiveSigningConfig{}
 	if wantRPM {
