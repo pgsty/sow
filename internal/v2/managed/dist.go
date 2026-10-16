@@ -871,7 +871,7 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 	}
 	dist := state.Dist{Name: distName, Format: distCfg.Format, EffectiveConfigSHA256: payload.EffectiveConfigSHA256, BuiltGeneration: generation, Architectures: payload.Architectures, MetadataSignerFingerprint: identity.Fingerprint, MetadataSignerPublicKey: identity.PublicKey, EffectiveSigningJSON: string(effectiveSigningJSON)}
 	result = DistInfo{Name: dist.Name, Format: dist.Format, Architectures: append([]state.Architecture(nil), dist.Architectures...), Generation: dist.BuiltGeneration, EffectiveConfigSHA: dist.EffectiveConfigSHA256, Status: "clean"}
-	manifest, changes, err := distLifecycleGeneration(ctx, root, repoName, generation, store)
+	manifest, changes, err := distLifecycleGeneration(ctx, root, repoName, distName, generation, store, publicSnapshot)
 	if err != nil {
 		return DistInfo{}, err
 	}
@@ -987,7 +987,7 @@ func executeDistRemove(ctx context.Context, root, repoName, distName string, old
 	if err := callFault(fault, "dist.rm.built"); err != nil {
 		return err
 	}
-	manifest, changes, err := distLifecycleGeneration(ctx, root, repoName, payload.Generation, store)
+	manifest, changes, err := distLifecycleGeneration(ctx, root, repoName, distName, payload.Generation, store, publicSnapshot)
 	if err != nil {
 		return err
 	}
@@ -1061,7 +1061,7 @@ func finalizePreApplyDistOperation(parent context.Context, root, repoName, id st
 	return returned
 }
 
-func distLifecycleGeneration(ctx context.Context, root, repoName string, generation state.GenerationID, store *state.Store) ([]state.GenerationFile, []state.FileChange, error) {
+func distLifecycleGeneration(ctx context.Context, root, repoName, distName string, generation state.GenerationID, store *state.Store, snapshot *publicGenerationSnapshot) ([]state.GenerationFile, []state.FileChange, error) {
 	if generation < 1 {
 		return nil, nil, fmt.Errorf("%w: invalid Dist lifecycle generation", ErrIntegrity)
 	}
@@ -1073,9 +1073,19 @@ func distLifecycleGeneration(ctx context.Context, root, repoName string, generat
 			return nil, nil, fmt.Errorf("%w: previous Dist lifecycle generation is unavailable", ErrIntegrity)
 		}
 	}
-	target, err := scanPublicManifest(ctx, filepath.Join(root, repoName))
+	// The normalized snapshot belongs to this locked operation. Rebind every
+	// path and complete descriptor identity before reusing its manifest; a
+	// recovery caller must first obtain a fresh content-authenticated snapshot.
+	target, err := validatedPublicSnapshotManifest(ctx, filepath.Join(root, repoName), snapshot)
 	if err != nil {
 		return nil, nil, err
+	}
+	// Dist creation and withdrawal cannot alter the pool or another Dist.
+	// In particular, recovery must compare its freshly authenticated bytes
+	// with the retained Generation instead of adopting whatever it scanned.
+	prefix := "dists/" + distName + "/"
+	if !sameGenerationManifest(filterGenerationManifestPrefix(base, prefix), filterGenerationManifestPrefix(target, prefix)) {
+		return nil, nil, fmt.Errorf("%w: Dist lifecycle changed public paths outside %s", ErrIntegrity, prefix)
 	}
 	changes := state.DiffManifests(base, target)
 	if len(changes) == 0 {
@@ -1155,7 +1165,7 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 			}
 			operation.State = state.OperationApplied
 		}
-		if operation.State == state.OperationApplied {
+		if operation.State == state.OperationApplied || operation.State == state.OperationBuilt {
 			if currentSHA != payload.NewConfigSHA256 {
 				return fmt.Errorf("%w: applied operation config evidence conflicts", ErrIntegrity)
 			}
@@ -1167,10 +1177,12 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 			if err != nil {
 				return err
 			}
-			if err := store.SetOperationState(ctx, operation.ID, state.OperationBuilt, ""); err != nil {
-				return err
+			if operation.State == state.OperationApplied {
+				if err := store.SetOperationState(ctx, operation.ID, state.OperationBuilt, ""); err != nil {
+					return err
+				}
+				operation.State = state.OperationBuilt
 			}
-			operation.State = state.OperationBuilt
 		}
 		if operation.State == state.OperationBuilt {
 			publicSnapshot, normalizedModes, err := normalizeManagedPublicTreeSnapshotWithPayloads(ctx, filepath.Join(root, repoName), nil, "", nil)
@@ -1184,7 +1196,7 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 				return err
 			}
 			if operation.Kind == "dist.rm" {
-				manifest, changes, err := distLifecycleGeneration(ctx, root, repoName, payload.Generation, store)
+				manifest, changes, err := distLifecycleGeneration(ctx, root, repoName, payload.Name, payload.Generation, store, publicSnapshot)
 				if err != nil {
 					return err
 				}
@@ -1208,7 +1220,7 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 					return err
 				}
 				dist := state.Dist{Name: payload.Name, Format: payload.Format, EffectiveConfigSHA256: payload.EffectiveConfigSHA256, BuiltGeneration: payload.Generation, Architectures: payload.Architectures, MetadataSignerFingerprint: identity.Fingerprint, MetadataSignerPublicKey: identity.PublicKey, EffectiveSigningJSON: string(effectiveSigningJSON)}
-				manifest, changes, err := distLifecycleGeneration(ctx, root, repoName, payload.Generation, store)
+				manifest, changes, err := distLifecycleGeneration(ctx, root, repoName, payload.Name, payload.Generation, store, publicSnapshot)
 				if err != nil {
 					return err
 				}

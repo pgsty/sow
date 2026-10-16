@@ -1292,29 +1292,21 @@ func normalizeManagedPublicTreeSnapshotWithPayloads(ctx context.Context, reposit
 		if phase == "" {
 			return fmt.Errorf("%w: dists contains package payload %s", ErrIntegrity, relative)
 		}
+		identity, err := snapshotRegularDescriptorIdentity(file)
+		if err != nil {
+			return err
+		}
+		expected, reuse := remaining[relative]
 		if phase == "payload" && authenticated != nil {
-			expected, exists := remaining[relative]
-			if !exists || expected.File.Path != relative || expected.File.Phase != "payload" || expected.File.Size != info.Size() {
+			if !reuse || expected.File.Path != relative || expected.File.Phase != "payload" || expected.File.Size != info.Size() {
 				return fmt.Errorf("%w: public payload set changed during build at %s", ErrIntegrity, relative)
 			}
-			identity, err := snapshotRegularDescriptorIdentity(file)
-			if err != nil || !expected.Identity.sameContentStat(identity) {
-				return errors.Join(fmt.Errorf("%w: public payload identity changed during build at %s", ErrIntegrity, relative), err)
+			if !expected.Identity.sameContentStat(identity) {
+				return fmt.Errorf("%w: public payload identity changed during build at %s", ErrIntegrity, relative)
 			}
-			files = append(files, expected.File)
-			delete(remaining, relative)
-		} else {
-			hash := sha256.New()
-			read, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
-			if err != nil {
-				return err
-			}
-			if phase == "payload" {
-				workmetrics.RecordFullPackageRead(ctx, read)
-			}
-			files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
 		}
-		if info.Mode().Perm() != 0o644 {
+		modeChanged := info.Mode().Perm() != 0o644
+		if modeChanged {
 			if err := errors.Join(file.Chmod(0o644), file.Sync()); err != nil {
 				return err
 			}
@@ -1322,11 +1314,34 @@ func normalizeManagedPublicTreeSnapshotWithPayloads(ctx context.Context, reposit
 			if err := callFault(fault, modeFaultPoint); err != nil {
 				return err
 			}
+			identity, err = snapshotRegularDescriptorIdentity(file)
+			if err != nil {
+				return err
+			}
 		}
-		identity, err := snapshotRegularDescriptorIdentity(file)
-		if err != nil {
-			return err
+		entry := expected.File
+		if !reuse || modeChanged {
+			// Chmod changes ctime, so the previous identity no longer proves
+			// unchanged bytes. Authenticate once under the normalized identity
+			// instead of rebinding an earlier digest to the new ctime.
+			digest, after, err := digestRegularDescriptor(ctx, file, identity, func(read int64) {
+				if phase == "payload" {
+					workmetrics.RecordFullPackageRead(ctx, read)
+				} else {
+					workmetrics.RecordMetadataRead(ctx, read)
+				}
+			})
+			if err != nil {
+				return err
+			}
+			if reuse && (digest != expected.File.SHA256 || after.size != expected.File.Size) {
+				return fmt.Errorf("%w: public payload changed while normalizing modes at %s", ErrIntegrity, relative)
+			}
+			entry = state.GenerationFile{Path: relative, Phase: phase, Size: after.size, SHA256: digest}
+			identity = after
 		}
+		files = append(files, entry)
+		delete(remaining, relative)
 		identities[relative] = identity
 		return nil
 	}, func(relative string, directory *os.File, info os.FileInfo) error {
@@ -1355,6 +1370,51 @@ func normalizeManagedPublicTreeSnapshotWithPayloads(ctx context.Context, reposit
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	return &publicGenerationSnapshot{Manifest: files, Identities: identities}, normalized, nil
+}
+
+// validatedPublicSnapshotManifest reuses only a snapshot produced in the same
+// locked operation. Its final namespace walk binds every retained digest to
+// the current descriptor, including ctime, modes and link count. Persisted
+// fingerprints or a previous process's journal cannot stand in for snapshot.
+func validatedPublicSnapshotManifest(ctx context.Context, repositoryRoot string, snapshot *publicGenerationSnapshot) ([]state.GenerationFile, error) {
+	if snapshot == nil {
+		return nil, fmt.Errorf("%w: validated public snapshot is unavailable", ErrIntegrity)
+	}
+	remaining := make(map[string]state.GenerationFile, len(snapshot.Manifest))
+	for _, file := range snapshot.Manifest {
+		identity, exists := snapshot.Identities[file.Path]
+		if !exists || !identity.valid(file.Size) || !lowercaseSHA256.MatchString(file.SHA256) {
+			return nil, fmt.Errorf("%w: validated public identity is unavailable for %s", ErrIntegrity, file.Path)
+		}
+		if _, duplicate := remaining[file.Path]; duplicate {
+			return nil, fmt.Errorf("%w: validated public snapshot repeats %s", ErrIntegrity, file.Path)
+		}
+		remaining[file.Path] = file
+	}
+	err := walkRootedTree(ctx, repositoryRoot, func(relative string, file *os.File, info os.FileInfo) error {
+		expected, exists := remaining[relative]
+		if !exists || publicFilePhase(relative) != expected.Phase || info.Size() != expected.Size {
+			return fmt.Errorf("public snapshot path changed at %s", relative)
+		}
+		identity, err := snapshotRegularDescriptorIdentity(file)
+		if err != nil || identity != snapshot.Identities[relative] || identity.mode != 0o644 {
+			return errors.Join(fmt.Errorf("public snapshot identity changed at %s", relative), err)
+		}
+		delete(remaining, relative)
+		return nil
+	}, func(relative string, _ *os.File, info os.FileInfo) error {
+		if info.Mode().Perm() != 0o755 || relative != "" && !strings.HasPrefix(relative+"/", "pool/") && !strings.HasPrefix(relative+"/", "dists/") {
+			return errors.New("public snapshot contains an unsafe directory")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("%w: public tree changed after validation", ErrIntegrity), err)
+	}
+	if len(remaining) != 0 {
+		return nil, fmt.Errorf("%w: validated public paths are missing", ErrIntegrity)
+	}
+	return append([]state.GenerationFile(nil), snapshot.Manifest...), nil
 }
 
 func normalizeCurrentPublicTree(ctx context.Context, root, repoName, operationID string, store *state.Store, fault func(string) error) (int, error) {
@@ -1481,21 +1541,21 @@ func scanPublicGenerationSnapshotForLayout(ctx context.Context, repositoryRoot, 
 		if phase == "" {
 			return fmt.Errorf("%w: dists contains package payload %s", ErrIntegrity, relative)
 		}
-		hash := sha256.New()
-		read, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
-		if err != nil {
-			return err
-		}
-		if phase == "payload" {
-			workmetrics.RecordFullPackageRead(ctx, read)
-		} else {
-			workmetrics.RecordMetadataRead(ctx, read)
-		}
 		identity, err := snapshotRegularDescriptorIdentity(file)
 		if err != nil {
 			return err
 		}
-		files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
+		digest, identity, err := digestRegularDescriptor(ctx, file, identity, func(read int64) {
+			if phase == "payload" {
+				workmetrics.RecordFullPackageRead(ctx, read)
+			} else {
+				workmetrics.RecordMetadataRead(ctx, read)
+			}
+		})
+		if err != nil {
+			return err
+		}
+		files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: digest})
 		identities[relative] = identity
 		if phase == "payload" {
 			authenticated[relative] = identity
