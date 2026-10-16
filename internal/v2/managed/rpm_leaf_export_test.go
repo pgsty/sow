@@ -13,6 +13,7 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 )
 
 func prepareRPMLeafExportFixture(t *testing.T, signed bool) (string, WorkspaceOptions, state.PackageObject, map[string][]byte) {
@@ -172,7 +173,7 @@ func TestRPMLeafVerifierRejectsForeignMissingAndUnknownMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	marker.ManifestSHA256 = strings.Repeat("0", 64)
-	if _, err := verifyRPMLeafExport(context.Background(), target, trust, false, marker); err == nil {
+	if _, err := verifyRPMLeafExportWithEvidence(context.Background(), target, trust, newPayloadEvidenceRegistry(), false, marker); err == nil {
 		t.Fatal("pre-marker verifier accepted a mismatched manifest digest")
 	}
 }
@@ -295,5 +296,137 @@ func TestExportRPMLeafRejectsNonemptyAndCanonicalRoots(t *testing.T) {
 		if _, err := ExportRPMLeaf(context.Background(), RPMLeafExportOptions{WorkspaceOptions: opts, Repository: "repo", Dist: "el9", Arch: "x86_64", Directory: target}); !errors.Is(err, ErrRejected) {
 			t.Fatalf("target %s error=%v", target, err)
 		}
+	}
+}
+
+func TestRPMLeafVerificationAuthenticatesEveryInvocation(t *testing.T) {
+	root, opts, object, trust := prepareRPMLeafExportFixture(t, false)
+	target := filepath.Join(root, "export")
+	if _, err := ExportRPMLeaf(context.Background(), RPMLeafExportOptions{WorkspaceOptions: opts, Repository: "repo", Dist: "el9", Arch: "x86_64", Directory: target}); err != nil {
+		t.Fatal(err)
+	}
+	for _, sourceBound := range []bool{false, true, false, true} {
+		ctx, collector := workmetrics.Ensure(context.Background())
+		var err error
+		if sourceBound {
+			_, err = VerifyRPMLeafExportSourceBound(ctx, RPMLeafVerifySourceOptions{WorkspaceOptions: opts, Repository: "repo", Directory: target})
+		} else {
+			_, err = VerifyRPMLeafExportStandalone(ctx, target, trust)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if metrics := collector.Snapshot(); metrics.FullPackageReads != 1 || metrics.PayloadBytesRead != object.Size {
+			t.Fatalf("independent verification must authenticate the payload once: %#v", metrics)
+		}
+	}
+	path := filepath.Join(target, filepath.FromSlash(object.PoolPath))
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body[len(body)-1] ^= 1
+	if err := os.WriteFile(path, body, info.Mode()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyRPMLeafExportStandalone(context.Background(), target, trust); err == nil {
+		t.Fatal("independent verification accepted changed bytes with the original manifest and mtime")
+	}
+	if _, err := VerifyRPMLeafExportSourceBound(context.Background(), RPMLeafVerifySourceOptions{WorkspaceOptions: opts, Repository: "repo", Directory: target}); err == nil {
+		t.Fatal("source-bound verification accepted changed bytes")
+	}
+}
+
+func TestRPMLeafOutputEvidenceRebindsDescriptors(t *testing.T) {
+	root, opts, object, trust := prepareRPMLeafExportFixture(t, false)
+	for _, change := range []string{"stable", "replace_before_open", "link_during_wait", "rewrite_during_wait", "replace_during_wait", "foreign_directory", "cancel"} {
+		t.Run(change, func(t *testing.T) {
+			target := filepath.Join(root, change)
+			if _, err := ExportRPMLeaf(context.Background(), RPMLeafExportOptions{WorkspaceOptions: opts, Repository: "repo", Dist: "el9", Arch: "x86_64", Directory: target}); err != nil {
+				t.Fatal(err)
+			}
+			evidence := newPayloadEvidenceRegistry()
+			if _, _, _, err := buildRPMLeafManifest(context.Background(), target, evidence); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(target, filepath.FromSlash(object.PoolPath))
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			held, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer held.Close()
+			before, err := snapshotRegularDescriptorIdentity(held)
+			if err != nil {
+				t.Fatal(err)
+			}
+			alias := filepath.Join(root, change+"-old")
+			replace := func() {
+				if err := os.Rename(path, alias); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, body, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				restoreContentFixtureMTime(t, path, held, before)
+			}
+			base, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctx := &evidenceWaitContext{Context: base}
+			ctx.onWait = func() {
+				switch change {
+				case "link_during_wait", "rewrite_during_wait":
+					if change == "rewrite_during_wait" {
+						body[len(body)-1] ^= 1
+						if err := os.WriteFile(path, body, 0o644); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := os.Link(path, alias); err != nil {
+						t.Fatal(err)
+					}
+					restoreContentFixtureMTime(t, path, held, before)
+				case "replace_during_wait":
+					replace()
+				case "foreign_directory":
+					if err := os.Mkdir(filepath.Join(target, "pool", "foreign"), 0o755); err != nil {
+						t.Fatal(err)
+					}
+				case "cancel":
+					cancel()
+				}
+			}
+			if change == "replace_before_open" {
+				replace()
+			}
+			measured, collector := workmetrics.Ensure(ctx)
+			_, err = verifyRPMLeafExportWithEvidence(measured, target, trust, evidence, true)
+			wantErr := change == "rewrite_during_wait" || change == "replace_during_wait" || change == "foreign_directory" || change == "cancel"
+			if (err != nil) != wantErr {
+				t.Fatalf("changed output verification: err=%v wantErr=%t", err, wantErr)
+			}
+			if change != "replace_before_open" && !ctx.fired {
+				t.Fatal("did not exercise the cached descriptor boundary")
+			}
+			if !wantErr {
+				wantReads := int64(1)
+				if change == "stable" {
+					wantReads = 0
+				}
+				if metrics := collector.Snapshot(); metrics.FullPackageReads != wantReads || metrics.PayloadBytesRead != wantReads*object.Size {
+					t.Fatalf("changed identity must authenticate again: %#v wantReads=%d", metrics, wantReads)
+				}
+			}
+		})
 	}
 }

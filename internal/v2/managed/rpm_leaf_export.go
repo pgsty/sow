@@ -252,7 +252,11 @@ func ExportRPMLeaf(ctx context.Context, opts RPMLeafExportOptions) (result RPMLe
 	if _, err := yumrepo.GenerateRPMLeaf(ctx, filepath.Join(target, "repodata"), uint64(summary.BuiltGeneration), &yumrepo.SliceIterator{Inputs: inputs}, signer); err != nil {
 		return result, err
 	}
-	entries, manifest, manifestSHA, err := buildRPMLeafManifest(ctx, target)
+	// Authenticate output payloads after generation, then reuse only those
+	// stable descriptor identities through this export's remaining checks.
+	// Source-copy evidence and persisted manifests cannot seed this registry.
+	evidence := newPayloadEvidenceRegistry()
+	entries, manifest, manifestSHA, err := buildRPMLeafManifest(ctx, target, evidence)
 	if err != nil {
 		return result, err
 	}
@@ -271,13 +275,13 @@ func ExportRPMLeaf(ctx context.Context, opts RPMLeafExportOptions) (result RPMLe
 	if marker.Signed {
 		trust[marker.SignerIdentity] = signing.TrustedPublicKey
 	}
-	if _, err := verifyRPMLeafExport(ctx, target, trust, false, marker); err != nil {
+	if _, err := verifyRPMLeafExportWithEvidence(ctx, target, trust, evidence, false, marker); err != nil {
 		return result, fmt.Errorf("%w: RPM leaf pre-marker verification failed: %v", ErrIntegrity, err)
 	}
 	if err := writeRPMLeafControl(filepath.Join(target, ".sow-export.json"), markerBytes, 0o644); err != nil {
 		return result, err
 	}
-	verified, err := verifyRPMLeafExport(ctx, target, trust, true)
+	verified, err := verifyRPMLeafExportWithEvidence(ctx, target, trust, evidence, true)
 	if err != nil || verified != marker {
 		return result, fmt.Errorf("%w: completed RPM leaf failed source-bound verification: %v", ErrIntegrity, err)
 	}
@@ -401,11 +405,19 @@ func exportRPMLeafObject(ctx context.Context, repositoryRoot, target string, obj
 	return nil
 }
 
-func buildRPMLeafManifest(ctx context.Context, root string) ([]rpmLeafManifestEntry, []byte, string, error) {
+func buildRPMLeafManifest(ctx context.Context, root string, evidence *payloadEvidenceRegistry) ([]rpmLeafManifestEntry, []byte, string, error) {
 	entries := []rpmLeafManifestEntry{}
 	for _, top := range []string{"pool", "repodata"} {
 		path := filepath.Join(root, top)
 		err := walkRootedTree(ctx, path, func(relative string, file *os.File, info os.FileInfo) error {
+			if top == "pool" {
+				payload, err := evidence.walkedPayload(ctx, file, info, filepath.ToSlash(filepath.Join(top, relative)))
+				if err != nil {
+					return err
+				}
+				entries = append(entries, rpmLeafManifestEntry{SHA256: payload.SHA256, Size: payload.Size, Path: payload.Path})
+				return nil
+			}
 			hash := sha256.New()
 			if _, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file}); err != nil {
 				return err
@@ -438,7 +450,8 @@ func writeRPMLeafControl(filename string, data []byte, mode os.FileMode) error {
 // VerifyRPMLeafExportStandalone validates a completed export using only an
 // externally supplied signer-identity to public-key trust map.
 func VerifyRPMLeafExportStandalone(ctx context.Context, root string, trust map[string][]byte) (RPMLeafExportMarker, error) {
-	return verifyRPMLeafExport(ctx, root, trust, true)
+	// Each independent verification starts with fresh payload authentication.
+	return verifyRPMLeafExportWithEvidence(ctx, root, trust, newPayloadEvidenceRegistry(), true)
 }
 
 // VerifyRPMLeafExportSourceBound additionally proves that the marker's
@@ -486,14 +499,14 @@ func VerifyRPMLeafExportSourceBound(ctx context.Context, opts RPMLeafVerifySourc
 	if marker.Signed {
 		trust[marker.SignerIdentity] = signing.TrustedPublicKey
 	}
-	verified, err := verifyRPMLeafExport(ctx, opts.Directory, trust, true)
+	verified, err := verifyRPMLeafExportWithEvidence(ctx, opts.Directory, trust, newPayloadEvidenceRegistry(), true)
 	if err != nil || verified != marker {
 		return marker, fmt.Errorf("%w: source-bound RPM leaf verification failed: %v", ErrIntegrity, err)
 	}
 	return marker, nil
 }
 
-func verifyRPMLeafExport(ctx context.Context, root string, trust map[string][]byte, requireMarker bool, expected ...RPMLeafExportMarker) (RPMLeafExportMarker, error) {
+func verifyRPMLeafExportWithEvidence(ctx context.Context, root string, trust map[string][]byte, evidence *payloadEvidenceRegistry, requireMarker bool, expected ...RPMLeafExportMarker) (RPMLeafExportMarker, error) {
 	if ctx == nil || root == "" {
 		return RPMLeafExportMarker{}, fmt.Errorf("%w: invalid RPM leaf verification input", ErrRejected)
 	}
@@ -541,7 +554,14 @@ func verifyRPMLeafExport(ctx context.Context, root string, trust map[string][]by
 			}
 			return marker, errors.New("managed: RPM leaf manifest entry is missing or differs")
 		}
-		digest, hashErr := hashRegularDescriptor(ctx, opened.file)
+		var digest string
+		var hashErr error
+		if strings.HasPrefix(entry.Path, "pool/") {
+			payload, err := evidence.walkedPayload(ctx, opened.file, opened.before, entry.Path)
+			digest, hashErr = payload.SHA256, err
+		} else {
+			digest, hashErr = hashRegularDescriptor(ctx, opened.file)
+		}
 		closeErr := opened.CloseVerified()
 		if hashErr != nil || closeErr != nil || digest != entry.SHA256 {
 			return marker, errors.New("managed: RPM leaf manifest entry digest differs")
@@ -554,7 +574,7 @@ func verifyRPMLeafExport(ctx context.Context, root string, trust map[string][]by
 			expectedRPM = append(expectedRPM, yumrepo.ManagedRPMPackageExpectation{SHA256: entry.SHA256, Size: entry.Size, PoolPath: pool})
 		}
 	}
-	actual, _, _, err := buildRPMLeafManifest(ctx, root)
+	actual, _, _, err := buildRPMLeafManifest(ctx, root, evidence)
 	if err != nil || len(actual) != len(entries) {
 		return marker, errors.New("managed: RPM leaf contains foreign or missing data files")
 	}
