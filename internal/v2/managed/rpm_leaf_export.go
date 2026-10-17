@@ -411,7 +411,7 @@ func buildRPMLeafManifest(ctx context.Context, root string, evidence *payloadEvi
 		path := filepath.Join(root, top)
 		err := walkRootedTree(ctx, path, func(relative string, file *os.File, info os.FileInfo) error {
 			if top == "pool" {
-				payload, err := evidence.walkedPayload(ctx, file, info, filepath.ToSlash(filepath.Join(top, relative)))
+				payload, _, err := evidence.walkedPayload(ctx, file, info, filepath.ToSlash(filepath.Join(top, relative)))
 				if err != nil {
 					return err
 				}
@@ -557,7 +557,7 @@ func verifyRPMLeafExportWithEvidence(ctx context.Context, root string, trust map
 		var digest string
 		var hashErr error
 		if strings.HasPrefix(entry.Path, "pool/") {
-			payload, err := evidence.walkedPayload(ctx, opened.file, opened.before, entry.Path)
+			payload, _, err := evidence.walkedPayload(ctx, opened.file, opened.before, entry.Path)
 			digest, hashErr = payload.SHA256, err
 		} else {
 			digest, hashErr = hashRegularDescriptor(ctx, opened.file)

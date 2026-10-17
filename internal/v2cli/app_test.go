@@ -72,6 +72,68 @@ func TestMainManagedLifecycleAndJSONEnvelope(t *testing.T) {
 	assertCLISuccess(t, []string{"repo", "rm", "pgsql", "-C", root, "--json"}, `"noop":true`)
 }
 
+func TestMigrationAbortFailureReportsSelectedRepository(t *testing.T) {
+	root := t.TempDir()
+	assertCLISuccess(t, []string{"init", root}, "initialized")
+	assertCLISuccess(t, []string{"repo", "new", "repo", "-C", root}, "repo")
+	stdout, stderr, code := runCLI([]string{"repo", "migrate", "repo", "--abort", "-C", root, "--json"})
+	var envelope struct {
+		OK         bool            `json:"ok"`
+		Repository *string         `json:"repository"`
+		Result     json.RawMessage `json:"result"`
+		Errors     []CLIError      `json:"errors"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if code != ExitRejected || envelope.OK || envelope.Repository == nil || *envelope.Repository != "repo" || string(envelope.Result) != "null" || len(envelope.Errors) != 1 {
+		t.Fatalf("abort failure lost repository context: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestMigrationAbortWarningsKeepSuccessExit(t *testing.T) {
+	for _, jsonOutput := range []bool{false, true} {
+		t.Run(strconv.FormatBool(jsonOutput), func(t *testing.T) {
+			root := t.TempDir()
+			assertCLISuccess(t, []string{"init", root}, "initialized")
+			assertCLISuccess(t, []string{"repo", "new", "repo", "-C", root}, "repo")
+			store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = store.DB().Exec(`UPDATE repository_state SET layout_version = ?`, state.LayoutC2ToSingleV1)
+			if err := errors.Join(err, store.Close()); err != nil {
+				t.Fatal(err)
+			}
+			stage := filepath.Join(root, ".sow", "repo", "stage", "c2-to-single-v1")
+			if err := os.Mkdir(stage, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(stage, "unknown"), []byte("keep me"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"repo", "migrate", "repo", "--abort", "-C", root}
+			if jsonOutput {
+				args = append(args, "--json")
+			}
+			stdout, stderr, code := runCLI(args)
+			if code != ExitOK || !strings.Contains(stderr, "warning: migration stage retained at ") || !strings.Contains(stdout, "abandoned") {
+				t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+			}
+			if jsonOutput {
+				var envelope struct {
+					OK     bool
+					Result managed.RepositoryMigrationResult
+					Errors []CLIError
+				}
+				if err := json.Unmarshal([]byte(stdout), &envelope); err != nil || !envelope.OK || len(envelope.Errors) != 0 || len(envelope.Result.Warnings) != 1 {
+					t.Fatalf("warning corrupted JSON success: %s %v", stdout, err)
+				}
+			}
+		})
+	}
+}
+
 func TestCLISummaryCheckAndChangesPreserveMaxUint64Generation(t *testing.T) {
 	root := t.TempDir()
 	assertCLISuccess(t, []string{"init", root, "--json"}, `"command":"init"`)

@@ -589,38 +589,6 @@ func validateDistPublicationTime(distRoot, format string, architectures []state.
 	return nil
 }
 
-// frozenPublicationTree selects the exact journaled tree before any promotion
-// or pointer exchange. Legacy plans retain their original hash-only contract.
-func frozenPublicationTree(ctx context.Context, live, staged, expected string) (string, error) {
-	for _, candidate := range []string{live, staged} {
-		sha, _, err := digestTree(ctx, candidate)
-		if err == nil && sha == expected {
-			return candidate, nil
-		}
-	}
-	return "", fmt.Errorf("%w: neither live nor staged tree matches the publication journal", ErrIntegrity)
-}
-
-func validateMutationPublicationTime(ctx context.Context, root, repoName, operationID string, store *state.Store, publication publicationIdentity, manifest mutationManifest) error {
-	if !publication.Current || manifest.Build == nil {
-		return nil
-	}
-	for _, build := range manifest.Build.Dists {
-		dist, err := store.GetDist(ctx, build.Name)
-		if err != nil {
-			return err
-		}
-		tree, err := frozenPublicationTree(ctx, filepath.Join(root, repoName, "dists", build.Name), filepath.Join(mutationStageRoot(root, repoName, operationID), "build", "dists", build.Name), build.TreeSHA256)
-		if err != nil {
-			return err
-		}
-		if err := validateDistPublicationTime(tree, dist.Format, build.Architectures, build.MetadataSignerFingerprint != "", publication); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // nextMutationPublicationTime preserves the deterministic chooser for journals
 // without publication_time. Never use the current wall clock on this path.
 func nextMutationPublicationTime(ctx context.Context, root string, repository config.RepositoryConfig, store *state.Store, generation state.GenerationID, wantRPM, wantDEB bool) (time.Time, error) {

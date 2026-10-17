@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +25,122 @@ type descriptorEOFContext struct {
 	size  int64
 	onEOF func()
 	fired bool
+}
+
+// Ignore SQL and traversal cancellation polls so the mutation happens after
+// the small fixture's data read and immediately before that reader reaches EOF.
+type treeReadEOFContext struct {
+	context.Context
+	reads int
+	onEOF func()
+}
+
+func (ctx *treeReadEOFContext) Err() error {
+	if pc, _, _, ok := runtime.Caller(1); ok {
+		if caller := runtime.FuncForPC(pc); caller != nil && strings.HasSuffix(caller.Name(), "(*managedContextReader).Read") {
+			ctx.reads++
+			if ctx.reads == 2 {
+				ctx.onEOF()
+			}
+		}
+	}
+	return ctx.Context.Err()
+}
+
+func TestPublicSnapshotsAuthenticateFileReads(t *testing.T) {
+	for _, relative := range []string{"dists/noble/Release", "pool/p/pkg/pkg-1-1.x86_64.rpm"} {
+		for _, scanner := range []string{"full", "fast", "evidence"} {
+			for _, change := range []string{"stable", "rewrite", "hardlink"} {
+				t.Run(publicFilePhase(relative)+"/"+scanner+"/"+change, func(t *testing.T) {
+					base := t.TempDir()
+					root := filepath.Join(base, "repo")
+					path := filepath.Join(root, filepath.FromSlash(relative))
+					if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+						t.Fatal(err)
+					}
+					body := []byte("original-data")
+					if err := os.WriteFile(path, body, 0o644); err != nil {
+						t.Fatal(err)
+					}
+					held, err := os.Open(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer held.Close()
+					before, err := snapshotRegularDescriptorIdentity(held)
+					if err != nil {
+						t.Fatal(err)
+					}
+					store, err := state.Open(filepath.Join(base, "state.db"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer store.Close()
+					if publicFilePhase(relative) == "payload" {
+						plain := context.Background()
+						if err := store.AddDist(plain, state.Dist{Name: "el9", Format: "rpm", EffectiveConfigSHA256: "cfg", Architectures: []state.Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}}}); err != nil {
+							t.Fatal(err)
+						}
+						operationID := strings.Repeat("8", 64)
+						if err := store.BeginOperation(plain, state.Operation{ID: operationID, Kind: "add", State: state.OperationPlanned, PayloadJSON: `{}`}); err != nil {
+							t.Fatal(err)
+						}
+						if err := store.SetOperationState(plain, operationID, state.OperationStaged, ""); err != nil {
+							t.Fatal(err)
+						}
+						object := state.PackageObject{SHA256: bytesSHA(body), Format: "rpm", Coordinate: "pkg-0:1-1.x86_64", Architecture: "x86_64", CanonicalArch: "x86_64", PoolPath: relative, Filename: filepath.Base(relative), Size: int64(len(body)), Name: "pkg", Source: "pkg", Version: "1", Release: "1", Kind: "main", Storage: "pending"}
+						if _, err := store.ApplyDesiredMutation(plain, operationID, []state.PackageObject{object}, map[string][]string{"el9": {object.SHA256}}, `{}`); err != nil {
+							t.Fatal(err)
+						}
+					}
+					fired := false
+					ctx := &treeReadEOFContext{Context: context.Background(), onEOF: func() {
+						fired = true
+						switch change {
+						case "rewrite":
+							if err := os.WriteFile(path, []byte("replaced-data"), 0o644); err != nil {
+								t.Fatal(err)
+							}
+						case "hardlink":
+							if err := os.Link(path, filepath.Join(base, "export-alias")); err != nil {
+								t.Fatal(err)
+							}
+						}
+						if change != "stable" {
+							restoreContentFixtureMTime(t, path, held, before)
+						}
+					}}
+					want := state.GenerationFile{Path: relative, Phase: publicFilePhase(relative), Size: int64(len(body)), SHA256: bytesSHA(body)}
+					var snapshot *publicGenerationSnapshot
+					switch scanner {
+					case "full":
+						snapshot, err = scanPublicGenerationSnapshot(ctx, root)
+					case "fast":
+						snapshot, _, err = scanCurrentPublicGenerationFast(ctx, root, []state.GenerationFile{want}, store)
+					case "evidence":
+						snapshot, err = scanPublicGenerationSnapshotForLayoutWithEvidence(ctx, root, state.LayoutSinglePayloadV1, newPayloadEvidenceRegistry())
+					}
+					if !fired {
+						t.Fatalf("EOF boundary was not reached: reads=%d err=%v", ctx.reads, err)
+					}
+					if change == "rewrite" {
+						if !errors.Is(err, ErrIntegrity) || snapshot != nil {
+							t.Fatalf("post-read rewrite accepted: snapshot=%+v err=%v", snapshot, err)
+						}
+						return
+					}
+					current, identityErr := snapshotRegularDescriptorIdentity(held)
+					if err != nil || identityErr != nil || snapshot == nil || len(snapshot.Manifest) != 1 || snapshot.Manifest[0] != want || snapshot.Identities[relative] != current {
+						t.Fatalf("stable file identity mismatch: snapshot=%+v current=%+v err=%v", snapshot, current, errors.Join(err, identityErr))
+					}
+					if want.Phase == "payload" && snapshot.AuthenticatedPayloads[relative] != current {
+						t.Fatalf("payload evidence identity is stale: got=%+v want=%+v", snapshot.AuthenticatedPayloads[relative], current)
+					}
+				})
+			}
+		}
+	}
+
 }
 
 func (ctx *descriptorEOFContext) Err() error {
@@ -1293,7 +1411,7 @@ func TestContentAuthenticationLinkChanges(t *testing.T) {
 						t.Fatal(statErr)
 					}
 					var result state.GenerationFile
-					result, err = newPayloadEvidenceRegistry().walkedPayload(ctx, held, info, "payload")
+					result, _, err = newPayloadEvidenceRegistry().walkedPayload(ctx, held, info, "payload")
 					got = result.SHA256
 				}
 				if !fired {
@@ -1380,7 +1498,7 @@ func TestContentAuthenticationCancellationBeforeSuccess(t *testing.T) {
 					t.Fatal(statErr)
 				}
 				var result state.GenerationFile
-				result, err = newPayloadEvidenceRegistry().walkedPayload(ctx, held, info, ref.Path)
+				result, _, err = newPayloadEvidenceRegistry().walkedPayload(ctx, held, info, ref.Path)
 				digest = result.SHA256
 			}
 			if !fired || !errors.Is(err, context.Canceled) || digest != "" || count != 0 {
@@ -1609,7 +1727,7 @@ func TestContentEvidenceWaitReauthenticates(t *testing.T) {
 						t.Fatal(statErr)
 					}
 					var result state.GenerationFile
-					result, err = registry.walkedPayload(measured, held, info, relative)
+					result, _, err = registry.walkedPayload(measured, held, info, relative)
 					got = result.SHA256
 				}
 				if !ctx.fired {
@@ -1653,7 +1771,7 @@ func TestContentEvidenceWaitCancellation(t *testing.T) {
 				if statErr != nil {
 					t.Fatal(statErr)
 				}
-				_, err = registry.walkedPayload(ctx, held, info, filepath.Base(source.Path))
+				_, _, err = registry.walkedPayload(ctx, held, info, filepath.Base(source.Path))
 			}
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("canceled evidence wait: %v", err)

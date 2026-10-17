@@ -5,6 +5,7 @@ readonly module='github.com/cavaliergopher/rpm'
 readonly version='v1.3.0'
 readonly expected_sum='h1:UHX46sasX8MesUXXQ+UbkFLUX4eUWTlEcX8jcnRBIgI='
 readonly local_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+go_root=$(GOWORK=off go env GOROOT)
 readonly upstream_cache="$(mktemp -d "${TMPDIR:-/tmp}/sow-rpm-upstream.XXXXXX")"
 
 cleanup() {
@@ -18,7 +19,9 @@ trap cleanup EXIT
 # a second, unauthenticated source of truth. Disable the network checksum
 # service so a local read-only module proxy can reproduce the comparison; the
 # downloaded zip must still match the fixed h1 before bytewise verification.
-if ! metadata="$(GOWORK=off GOSUMDB=off GOMODCACHE="$upstream_cache" go mod download -json "${module}@${version}" 2>&1)"; then
+# Resolve the active toolchain before replacing GOMODCACHE. Otherwise an auto-
+# selected toolchain would be downloaded again with checksum verification off.
+if ! metadata="$(GOWORK=off GOTOOLCHAIN=local GOSUMDB=off GOMODCACHE="$upstream_cache" "$go_root/bin/go" mod download -json "${module}@${version}" 2>&1)"; then
   echo 'unable to download pinned upstream RPM module:' >&2
   printf '%s\n' "$metadata" >&2
   exit 1

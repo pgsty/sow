@@ -3,6 +3,7 @@ package v2cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -20,6 +21,7 @@ import (
 func TestCancellationClassificationPreservesLockTimeout(t *testing.T) {
 	for _, err := range []error{
 		context.Canceled,
+		sql.ErrTxDone,
 		fmt.Errorf("%w: %w", managed.ErrRejected, context.Canceled),
 		fmt.Errorf("%w: %w", managed.ErrLockUnavailable, context.Canceled),
 	} {

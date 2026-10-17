@@ -276,11 +276,6 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 		reused := false
 		snapshot := filepath.Join(inputsRoot, fmt.Sprintf("%08d-%s", sequence, input.Base))
 		inspection := inspected[sequence]
-		if inspection.Deferred && inspection.Err == nil {
-			_, acceptedEarlier := byCoordinate[inputCoordinateKey(inspection.Object)]
-			copyPayload := !acceptedEarlier && errors.Is(lookups[sequence].err, state.ErrNotFound)
-			inspection = inspectDeferredInput(ctx, input, inspection, snapshot, copyPayload)
-		}
 		if inspection.Err != nil {
 			item.Error = inspection.Err.Error()
 			result.Failed++

@@ -244,27 +244,75 @@ func TestPublicationTimeInvalidJournalRejectsBeforePublicMutation(t *testing.T) 
 			if err := store.UpdateOperationPayload(ctx, operation.ID, operation.PayloadJSON); err != nil {
 				t.Fatal(err)
 			}
-			if point == "build.staged" {
-				publication, err := retainedPublicationIdentity(operation)
-				if err != nil {
-					t.Fatal(err)
-				}
-				fields["publication_time"] = json.RawMessage(`"` + publication.Time.Add(time.Second).Format(time.RFC3339) + `"`)
-				data, _ := json.Marshal(fields)
-				if err := store.UpdateOperationPayload(ctx, operation.ID, string(data)); err != nil {
-					t.Fatal(err)
-				}
-				if _, _, _, err := loadMutationJournal(ctx, store, root, "repo", operation.ID); !errors.Is(err, ErrIntegrity) {
-					t.Fatalf("plan/time mismatch accepted: %v", err)
-				}
-				if err := store.UpdateOperationPayload(ctx, operation.ID, operation.PayloadJSON); err != nil {
-					t.Fatal(err)
-				}
-			}
 			if err := recoverDistOperations(ctx, root, "repo", store); err != nil {
 				t.Fatal(err)
 			}
 			_ = store.Close()
+			assertPublicationMetadata(t, ctx, root)
+		})
+	}
+}
+
+func TestPublicationTimeDriftRejectsFurtherDistPublication(t *testing.T) {
+	for _, point := range []string{"build.staged", "build.pointer.el9", "build.pointer.jammy"} {
+		t.Run(point, func(t *testing.T) {
+			ctx, root, opts, paths := publicationFixture(t)
+			stopped := errors.New("stop publication")
+			result, err := Add(ctx, AddOptions{WorkspaceOptions: opts, Repository: "repo", Dists: []string{"el9", "jammy"}, Paths: paths, Jobs: 1, Fault: func(at string) error {
+				if at == point {
+					return stopped
+				}
+				return nil
+			}})
+			if !errors.Is(err, stopped) {
+				t.Fatal(err)
+			}
+			store := publicationStore(t, root)
+			operation, _, _, err := loadMutationJournal(ctx, store, root, "repo", result.Operation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			distsRoot := filepath.Join(root, "repo", "dists")
+			before, _, err := digestTree(ctx, distsRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publication, err := retainedPublicationIdentity(operation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(operation.PayloadJSON), &fields); err != nil {
+				t.Fatal(err)
+			}
+			fields["publication_time"] = json.RawMessage(`"` + publication.Time.Add(time.Second).Format(time.RFC3339) + `"`)
+			data, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.UpdateOperationPayload(ctx, operation.ID, string(data)); err != nil {
+				t.Fatal(err)
+			}
+			// Payload promotion is allowed after apply, but a time mismatch in
+			// either the staged or already-live Dist must stop further publication.
+			for attempt := range 2 {
+				if err := recoverDistOperations(ctx, root, "repo", store); !errors.Is(err, ErrIntegrity) {
+					t.Fatalf("recovery %d accepted publication time drift: %v", attempt, err)
+				}
+				after, _, err := digestTree(ctx, distsRoot)
+				if err != nil || after != before {
+					t.Fatalf("recovery %d changed published Dists: %v", attempt, err)
+				}
+			}
+			if err := store.UpdateOperationPayload(ctx, operation.ID, operation.PayloadJSON); err != nil {
+				t.Fatal(err)
+			}
+			if err := recoverDistOperations(ctx, root, "repo", store); err != nil {
+				t.Fatalf("recover after restoring publication time: %v", err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
 			assertPublicationMetadata(t, ctx, root)
 		})
 	}

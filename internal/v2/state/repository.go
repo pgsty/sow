@@ -201,7 +201,7 @@ func requireTerminalLayoutOn(ctx context.Context, q schemaQuerier) error {
 
 // AbandonLayoutTransition discards an uncommitted plan, retaining the existing
 // transition layout so a later explicit migration can safely plan again. The
-// managed layer verifies the old public tree and cleans the owned stage first.
+// managed layer checks the plan binding and preserves leftover stage files.
 func (s *Store) AbandonLayoutTransition(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

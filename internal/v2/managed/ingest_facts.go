@@ -33,10 +33,6 @@ type inspectedInput struct {
 	FactSchema string
 	Facts      []byte
 	Err        error
-	// Deferred carries only a routing hint. It is never accepted without
-	// reopening, rebinding and fully inspecting the source in input order.
-	Deferred bool
-	identity rootedRegularIdentity
 }
 
 type probedInput struct {
@@ -49,10 +45,9 @@ func inputCoordinateKey(object state.PackageObject) string {
 	return object.Format + "\x00" + object.Coordinate
 }
 
-// inspectInputs bounds held source descriptors and parallel content passes by
-// workers. New coordinates are staged once, in input order. Later inputs for
-// that coordinate wait for Add's acceptance decision: if the first input is
-// rejected, the next can still stage its own bytes and public basename.
+// inspectInputs skips temporary copies only for coordinates already in the
+// repository. New inputs are staged independently; Add resolves batch conflicts
+// in input order after inspection, without reopening the external inputs.
 func inspectInputs(ctx context.Context, inputsRoot string, files []inputFile, workers int, store *state.Store) ([]inspectedInput, []coordinateLookup) {
 	ctx = workmetrics.WithPhase(ctx, "ingest")
 	results := make([]inspectedInput, len(files))
@@ -60,53 +55,32 @@ func inspectInputs(ctx context.Context, inputsRoot string, files []inputFile, wo
 	if workers < 1 {
 		workers = 1
 	}
-	seen := make(map[string]bool)
-	coordinates := make(map[string]coordinateLookup)
-	for start := 0; start < len(files); start += workers {
-		end := min(start+workers, len(files))
-		probes := make([]*probedInput, end-start)
-		var group sync.WaitGroup
-		for index := start; index < end; index++ {
-			group.Go(func() {
+	queue := make(chan int)
+	var group sync.WaitGroup
+	for range min(workers, len(files)) {
+		group.Go(func() {
+			for index := range queue {
 				probe, err := openInputProbe(ctx, files[index])
-				probes[index-start], results[index].Err = probe, err
-			})
-		}
-		group.Wait()
-		for index := start; index < end; index++ {
-			probe := probes[index-start]
-			if probe == nil {
-				continue
-			}
-			key := inputCoordinateKey(probe.object)
-			lookup, known := coordinates[key]
-			if !known {
-				existing, err := store.FindPackageByCoordinate(ctx, probe.object.Format, probe.object.Coordinate)
-				lookup = coordinateLookup{object: existing, err: err}
-				coordinates[key] = lookup
-			}
-			lookups[index] = lookup
-			if lookup.err != nil && !errors.Is(lookup.err, state.ErrNotFound) {
-				results[index].Err = errors.Join(lookup.err, probe.opened.CloseVerified())
-				continue
-			}
-			copyPayload := errors.Is(lookup.err, state.ErrNotFound)
-			if copyPayload && seen[key] {
-				after, err := snapshotRootedRegularIdentity(probe.opened)
-				if err == nil && after != probe.before {
-					err = errors.New("managed: package input changed during coordinate probe")
+				if err != nil {
+					results[index].Err = err
+					continue
 				}
-				results[index] = inspectedInput{Object: probe.object, Deferred: true, identity: probe.before, Err: errors.Join(err, probe.opened.CloseVerified())}
-				continue
-			}
-			seen[key] = true
-			group.Go(func() {
+				existing, err := store.FindPackageByCoordinate(ctx, probe.object.Format, probe.object.Coordinate)
+				lookups[index] = coordinateLookup{object: existing, err: err}
+				if err != nil && !errors.Is(err, state.ErrNotFound) {
+					results[index].Err = errors.Join(err, probe.opened.CloseVerified())
+					continue
+				}
 				snapshot := filepath.Join(inputsRoot, fmt.Sprintf("%08d-%s", index, files[index].Base))
-				results[index] = inspectProbedInput(ctx, probe, snapshot, files[index].Base, copyPayload)
-			})
-		}
-		group.Wait()
+				results[index] = inspectProbedInput(ctx, probe, snapshot, files[index].Base, errors.Is(err, state.ErrNotFound))
+			}
+		})
 	}
+	for index := range files {
+		queue <- index
+	}
+	close(queue)
+	group.Wait()
 	return results, lookups
 }
 
@@ -139,17 +113,6 @@ func probeInputCoordinate(ctx context.Context, file *os.File, basename string, s
 		return state.PackageObject{}, err
 	}
 	return debObjectFromInfo(aptrepo.Package{Name: hint.Name, Source: hint.Source, Version: hint.Version, Architecture: hint.Architecture, Size: size}, basename)
-}
-
-func inspectDeferredInput(ctx context.Context, input inputFile, previous inspectedInput, snapshot string, copyPayload bool) inspectedInput {
-	probe, err := openInputProbe(ctx, input)
-	if err != nil {
-		return inspectedInput{Err: err}
-	}
-	if probe.before != previous.identity || inputCoordinateKey(probe.object) != inputCoordinateKey(previous.Object) || probe.object.PoolPath != previous.Object.PoolPath {
-		return inspectedInput{Err: errors.Join(errors.New("managed: deferred package input changed during inspection"), probe.opened.CloseVerified())}
-	}
-	return inspectProbedInput(workmetrics.WithPhase(ctx, "ingest"), probe, snapshot, input.Base, copyPayload)
 }
 
 // inspectProbedInput owns one held source descriptor. A retry discards all

@@ -6,7 +6,7 @@ import (
 )
 
 // Version is a link-time replaceable binary version.
-var Version = "0.5.0"
+var Version = "0.6.0"
 
 func VersionString() string {
 	return "sow " + Version + " " + runtime.GOOS + "/" + runtime.GOARCH + " " + runtime.Version()
@@ -206,6 +206,10 @@ Options:
 `,
 	"repo migrate": `Usage:
   sow repo migrate [NAME] [--abort] [-j N] [-C DIR] [-r NAME] [-T DUR | -N] [--json]
+
+Aborting preserves non-empty temporary stages under .sow/NAME/abandoned/.
+Cleanup problems produce warnings and do not prevent abandoning an uncommitted
+plan. Warning paths are printed to stderr and included in JSON results.
 
 Options:
   -j, --jobs N          Parallel workers; defaults to logical CPU count

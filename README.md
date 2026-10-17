@@ -132,12 +132,13 @@ authoritative CLI reference shipped with the binary; machine consumers can rely 
 closed `--json` envelopes and the documented exit-code contract.
 
 Upgrading a workspace created by SOW v0.3 or v0.4? Stop writers, back up the workspace,
-and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Version 0.5 uses
+and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Versions 0.5 and 0.6 use
 schema v13 to index pool-path ownership without scanning unrelated publication history;
 configuration and public layout stay unchanged. Then run `sow build` and `sow check`:
 the updated RPM authentication and APT metadata contracts require one rebuild of affected
 Dists. Later unchanged RPMs reuse matching Built evidence instead of repeated payload
 verification. Do not reopen the migrated database with an older binary.
+Upgrading from v0.5 to v0.6 requires no schema migration or public-layout change.
 Publication ordering, recovery, target rebinding, the one-copy boundary,
 and RPM leaf export are specified in [Commands](https://sow.pgsty.com/docs/command/) and
 [Design Records](https://sow.pgsty.com/blog/design/).

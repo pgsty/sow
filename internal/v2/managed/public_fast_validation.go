@@ -2,11 +2,8 @@ package managed
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"sort"
 	"strings"
@@ -94,7 +91,6 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 			if identityErr != nil {
 				return identityErr
 			}
-			identities[relative] = identity
 			needsHash := false
 			if fingerprint := expectation.fingerprint; fingerprint != nil {
 				contentMatch := identity.device == fingerprint.Device && identity.inode == fingerprint.Inode &&
@@ -113,35 +109,35 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 				needsHash = true
 			}
 			if needsHash {
-				hash := sha256.New()
-				read, hashErr := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
+				digest, after, hashErr := digestPayloadDescriptor(ctx, file, identity)
 				if hashErr != nil {
 					return hashErr
 				}
-				workmetrics.RecordFullPackageRead(ctx, read)
-				if hex.EncodeToString(hash.Sum(nil)) != want.SHA256 {
+				if digest != want.SHA256 {
 					return fmt.Errorf("%w: public payload checksum changed at %s", ErrIntegrity, relative)
 				}
+				identity = after
 				authenticated[relative] = identity
 				if expectation.factExists {
 					backfill = append(backfill, state.PackageFact{PackageSHA256: expectation.object.SHA256, Fingerprint: packageFingerprint(identity)})
 				}
 			}
+			identities[relative] = identity
 			files = append(files, want)
 			return nil
-		}
-		hash := sha256.New()
-		read, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
-		if err != nil {
-			return err
-		}
-		workmetrics.RecordMetadataRead(ctx, read)
-		if hex.EncodeToString(hash.Sum(nil)) != want.SHA256 {
-			return fmt.Errorf("%w: public metadata checksum changed at %s", ErrIntegrity, relative)
 		}
 		identity, err := snapshotRegularDescriptorIdentity(file)
 		if err != nil {
 			return err
+		}
+		digest, identity, err := digestRegularDescriptor(ctx, file, identity, func(read int64) {
+			workmetrics.RecordMetadataRead(ctx, read)
+		})
+		if err != nil {
+			return err
+		}
+		if digest != want.SHA256 {
+			return fmt.Errorf("%w: public metadata checksum changed at %s", ErrIntegrity, relative)
 		}
 		identities[relative] = identity
 		files = append(files, want)

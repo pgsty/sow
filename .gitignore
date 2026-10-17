@@ -19,6 +19,7 @@ _bmad-output/
 coverage.out
 bin/
 dist/
+/outputs/
 
 # Runtime state
 .sow/

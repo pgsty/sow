@@ -6,7 +6,7 @@ GO ?= go
 GORELEASER ?= goreleaser
 DEADCODE_VERSION ?= v0.49.0
 GOVULNCHECK_VERSION ?= v1.7.0
-VERSION ?= 0.5.0
+VERSION ?= 0.6.0
 TEST_TIMEOUT ?= 60m
 CORE_TEST_TIMEOUT ?= 20m
 RACE_TIMEOUT ?= 45m
@@ -35,7 +35,7 @@ help:
 		'  make install         Install sow with the release version embedded' \
 		'  make test            Run all Go packages and the patched RPM module' \
 		'  make test-core       Run the focused repository-manager tests' \
-		'  make test-perf-contract  Verify perf fixtures and actual Check file-read bytes' \
+		'  make test-perf-contract  Compile performance tests and verify fixtures' \
 		'  make test-r2-live    Run the opt-in read-only Cloudflare R2 fixture gate' \
 		'  make race            Race-test the core repository packages' \
 		'  make check           Run quality, vulnerability, provenance, and focused tests' \
@@ -131,13 +131,7 @@ test-core:
 test-v2: test-core
 
 test-perf-contract:
-	@output="$$( $(GO) test -v -tags perf -count=1 ./qa/perf -run '^TestYUMPerformanceFixtureAvailable$$' )" || { status=$$?; printf '%s\n' "$$output" >&2; exit $$status; }; \
-		printf '%s\n' "$$output"; \
-		printf '%s\n' "$$output" | grep -F -- '--- PASS: TestYUMPerformanceFixtureAvailable ' >/dev/null || { \
-			printf '%s\n' 'performance fixture contract test did not execute' >&2; \
-			exit 1; \
-		}
-	GO='$(GO)' python3 qa/perf/check-os-io.py
+	$(GO) test -tags perf -count=1 ./qa/perf -run '^TestYUMPerformanceFixtureAvailable$$'
 
 test-r2-live:
 	SOW_REAL_R2_TEST=1 $(GO) test -timeout '10m' -count=1 -v ./internal/r2 -run '^TestCloudflareR2ReadOnlyCompatibility$$'

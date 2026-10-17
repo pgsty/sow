@@ -324,6 +324,9 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 		staged := filepath.Join(buildRoot, "dists", dist.Name)
 		liveDigest, _, liveErr := digestTree(ctx, live)
 		if liveErr == nil && liveDigest == dist.TreeSHA256 {
+			if err := validateDistPublicationTime(live, cfg.Repositories[repoName].Dists[dist.Name].Format, dist.Architectures, dist.MetadataSignerFingerprint != "", payload.PublicationTime.identity()); err != nil {
+				return 0, err
+			}
 			if err := recordBuildProgress(ctx, store, operationID, "publishing_dists", distIndex+1, len(buildDists), jobs); err != nil {
 				return 0, err
 			}
@@ -332,6 +335,9 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 		stagedDigest, _, stagedErr := digestTree(ctx, staged)
 		if stagedErr != nil || stagedDigest != dist.TreeSHA256 {
 			return 0, fmt.Errorf("%w: neither live nor staged Dist %q matches the journal build", ErrIntegrity, dist.Name)
+		}
+		if err := validateDistPublicationTime(staged, cfg.Repositories[repoName].Dists[dist.Name].Format, dist.Architectures, dist.MetadataSignerFingerprint != "", payload.PublicationTime.identity()); err != nil {
+			return 0, err
 		}
 		if err := requireSameDevice(live, staged); err != nil {
 			return 0, err
@@ -909,9 +915,6 @@ func loadMutationJournal(ctx context.Context, store *state.Store, root, repoName
 		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, err
 	}
 	if err := normalizeLegacyMutationDesired(ctx, store, *operation, payload, &manifest); err != nil {
-		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, err
-	}
-	if err := validateMutationPublicationTime(ctx, root, repoName, operationID, store, payload.PublicationTime.identity(), manifest); err != nil {
 		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, err
 	}
 	return *operation, payload, manifest, nil
@@ -1578,20 +1581,22 @@ func scanPublicGenerationSnapshotForLayoutWithEvidence(ctx context.Context, repo
 			return err
 		}
 		if phase == "payload" {
-			entry, err := evidence.walkedPayload(ctx, file, info, relative)
+			var entry state.GenerationFile
+			entry, identity, err = evidence.walkedPayload(ctx, file, info, relative)
 			if err != nil {
 				return err
 			}
 			files = append(files, entry)
 			authenticated[relative] = identity
 		} else {
-			hash := sha256.New()
-			read, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
+			var digest string
+			digest, identity, err = digestRegularDescriptor(ctx, file, identity, func(read int64) {
+				workmetrics.RecordMetadataRead(ctx, read)
+			})
 			if err != nil {
 				return err
 			}
-			workmetrics.RecordMetadataRead(ctx, read)
-			files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: hex.EncodeToString(hash.Sum(nil))})
+			files = append(files, state.GenerationFile{Path: relative, Phase: phase, Size: info.Size(), SHA256: digest})
 		}
 		identities[relative] = identity
 		return nil

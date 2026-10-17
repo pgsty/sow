@@ -44,7 +44,7 @@ var (
 		".agents", ".bmad-loop", ".claude", ".codex", ".git", ".idea", ".pool", ".sow", ".tmp",
 		"_bmad", "_bmad-output", "bin", "dist", "tmp",
 	}
-	ignoredRootFileNames    = map[string]struct{}{".DS_Store": {}, "coverage.out": {}, "sow": {}}
+	ignoredRootFileNames    = map[string]struct{}{".DS_Store": {}, "AGENTS.md": {}, "coverage.out": {}, "sow": {}}
 	ignoredRootFileSuffixes = []string{".iml", ".test"}
 	markdownInlineLink      = regexp.MustCompile(`!?\[[^\]]*\]\(([^)]+)\)`)
 	markdownReference       = regexp.MustCompile(`(?m)^\s*\[[^\]]+\]:\s*(\S+)`)
@@ -366,8 +366,8 @@ func build(root, out string) (buildResult, error) {
 }
 
 // auditRepositoryRootEntries closes the gap around the strict managed-directory
-// allowlists. Every root file must be shipped, and every root directory must be
-// either audited by auditSource or an explicitly named developer/build output.
+// allowlists. Root files must be shipped or explicitly excluded local metadata
+// or build outputs. Root directories must be audited or explicitly excluded.
 func auditRepositoryRootEntries(root string, managedRoots, allowed []string) error {
 	if _, err := validateRepositoryRoot(root); err != nil {
 		return err

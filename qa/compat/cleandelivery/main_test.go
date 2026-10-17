@@ -121,7 +121,7 @@ func TestAuditRepositoryRootEntriesRejectsUnlistedAndUnsafeEntries(t *testing.T)
 		t.Fatal(err)
 	}
 	for name, mode := range map[string]os.FileMode{
-		".DS_Store": 0o644, "coverage.out": 0o644, "sow": 0o755, "project.iml": 0o644, "package.test": 0o755,
+		".DS_Store": 0o644, "AGENTS.md": 0o644, "coverage.out": 0o644, "sow": 0o755, "project.iml": 0o644, "package.test": 0o755,
 	} {
 		writeFixture(t, root, name, "ignored developer output\n", mode)
 	}

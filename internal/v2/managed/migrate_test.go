@@ -1487,19 +1487,6 @@ func migrationAbortFixture(t *testing.T, stop string) (string, RepositoryMigrati
 	return root, opts
 }
 
-func migrationAbortAuthority(t *testing.T, root string) [2]string {
-	t.Helper()
-	var result [2]string
-	for i, name := range []string{filepath.Join(root, ".sow", "repo.db"), transitionJournalPath(root, "repo")} {
-		data, err := os.ReadFile(name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		result[i] = string(data)
-	}
-	return result
-}
-
 func TestMigrationAbortAllowsExplicitRestart(t *testing.T) {
 	for _, stop := range []string{"migrate.planned", "migrate.staged"} {
 		t.Run(stop, func(t *testing.T) {
@@ -1536,10 +1523,107 @@ func TestMigrationAbortAllowsExplicitRestart(t *testing.T) {
 	}
 }
 
+func TestMigrationAbortWithoutJournalBeforeManifestBootstrap(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	prepareStartedC2MigrationFixture(t, root, false)
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An already-started legacy migration may have a Built generation whose
+	// physical manifest has not yet been bootstrapped by planC2Transition.
+	_, err = store.DB().ExecContext(ctx, `UPDATE repository_state SET built_generation = ? WHERE singleton = 1`, state.GenerationID(1))
+	if err := errors.Join(err, store.Close()); err != nil {
+		t.Fatal(err)
+	}
+	rewriteConfigAsLegacyV2(t, root)
+	stopped := errors.New("stop before manifest bootstrap")
+	opts := RepositoryMigrationOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Jobs: 1, Fault: func(point string) error {
+		if point == "migrate.config" {
+			return stopped
+		}
+		return nil
+	}}
+	if _, err := MigrateRepositoryLayout(ctx, opts); !errors.Is(err, stopped) {
+		t.Fatalf("migration before bootstrap: %v", err)
+	}
+	if journal, _, err := loadTransitionJournal(root, "repo"); err != nil || journal != nil {
+		t.Fatalf("unexpected journal: %+v %v", journal, err)
+	}
+	stage := migrationStageRoot(root, "repo")
+	if err := os.Mkdir(stage, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "unknown"), []byte("retain before bootstrap"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts.Fault = nil
+	for attempt := range 2 {
+		result, err := AbandonRepositoryMigration(ctx, opts)
+		if err != nil || result.Phase != "abandoned" || result.Repository != "repo" || result.Generation != 1 {
+			t.Fatalf("abort %d before bootstrap: %+v %v", attempt, result, err)
+		}
+		if len(result.Warnings) != 1-attempt {
+			t.Fatalf("abort %d warnings=%v", attempt, result.Warnings)
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(retainedMigrationStage(t, root), "unknown")); err != nil || string(data) != "retain before bootstrap" {
+		t.Fatalf("retained stage: %q %v", data, err)
+	}
+	store, err = state.OpenReadOnly(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.GenerationManifest(ctx, 1); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("abort must not create a manifest baseline: %v", err)
+	}
+}
+
+func TestMigrationAbortManifestErrorsPreserveCause(t *testing.T) {
+	root, _ := migrationAbortFixture(t, "migrate.planned")
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	identity, err := store.RepositoryIdentity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, _, err := loadTransitionJournal(root, "repo")
+	if err != nil || journal == nil {
+		t.Fatalf("journal: %+v %v", journal, err)
+	}
+	journal.BaseGeneration = 1
+	err = validateMigrationAbandon(context.Background(), store, identity, 1, journal, nil)
+	if !errors.Is(err, ErrIntegrity) || !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("missing journal base must retain its integrity classification and cause: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = validateMigrationAbandon(ctx, store, identity, 1, journal, nil)
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrIntegrity) {
+		t.Fatalf("canceled manifest read must not become an integrity error: %v", err)
+	}
+}
+
 func TestMigrationAbortRecoversCleanupBoundaries(t *testing.T) {
 	for _, stop := range []string{"missing-stage", "migrate.abort_stage", "migrate.abort_state", "cancel-after-reset", "journal-unlink-permission"} {
 		t.Run(stop, func(t *testing.T) {
 			root, opts := migrationAbortFixture(t, "migrate.planned")
+			if stop == "migrate.abort_stage" {
+				if err := os.WriteFile(filepath.Join(migrationStageRoot(root, "repo"), "unknown"), []byte("preserve across interruption"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			injected := errors.New("abort cleanup stop")
@@ -1605,6 +1689,11 @@ func TestMigrationAbortRecoversCleanupBoundaries(t *testing.T) {
 			if result, err := MigrateRepositoryLayout(context.Background(), opts); err != nil || !result.Complete {
 				t.Fatalf("replan: %+v %v", result, err)
 			}
+			if stop == "migrate.abort_stage" {
+				if data, err := os.ReadFile(filepath.Join(retainedMigrationStage(t, root), "unknown")); err != nil || string(data) != "preserve across interruption" {
+					t.Fatal("retry or replan changed the retained stage")
+				}
+			}
 		})
 	}
 }
@@ -1652,57 +1741,65 @@ func TestMigrationAbortPreservesUnprovenStage(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			// Snapshot without traversing the symlink. Exact state bytes and the
-			// directory/file entry must survive a rejected cleanup.
-			dbBefore, err := os.ReadFile(filepath.Join(root, ".sow", "repo.db"))
-			if err != nil {
-				t.Fatal(err)
+			before := migrationAbortNoFollowSnapshot(t, stage)
+			result, err := AbandonRepositoryMigration(context.Background(), opts)
+			if err != nil || result.Phase != "abandoned" {
+				t.Fatalf("abort: %+v %v", result, err)
 			}
-			journalBefore, _, err := loadTransitionJournal(root, "repo")
-			if err != nil {
-				t.Fatal(err)
-			}
-			stageBefore, err := os.Lstat(stage)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := AbandonRepositoryMigration(context.Background(), opts); !errors.Is(err, ErrIntegrity) {
-				t.Fatalf("unsafe stage %s: %v", change, err)
-			}
-			dbAfter, err := os.ReadFile(filepath.Join(root, ".sow", "repo.db"))
-			if err != nil || !bytes.Equal(dbBefore, dbAfter) {
-				t.Fatal("rejected abort changed database")
-			}
-			journalAfter, _, err := loadTransitionJournal(root, "repo")
-			if err != nil || !reflect.DeepEqual(journalBefore, journalAfter) {
-				t.Fatal("rejected abort changed journal")
-			}
-			stageAfter, err := os.Lstat(stage)
-			if err != nil || !os.SameFile(stageBefore, stageAfter) {
-				t.Fatal("rejected abort replaced stage")
+			if change != "no-control" && change != "no-journal" {
+				retained := stage
+				if change != "symlink" {
+					retained = retainedMigrationStage(t, root)
+				}
+				if after := migrationAbortNoFollowSnapshot(t, retained); !reflect.DeepEqual(before, after) {
+					t.Fatal("abort changed retained bytes or entries")
+				}
+				if len(result.Warnings) == 0 {
+					t.Fatal("retained stage was not reported")
+				}
 			}
 			if data, err := os.ReadFile(sentinel); err != nil || string(data) != "retain external bytes" {
-				t.Fatal("rejected abort changed external sentinel")
+				t.Fatal("abort touched external bytes")
 			}
-			if strings.HasPrefix(change, "unknown-") {
-				if _, err := os.Lstat(filepath.Join(stage, "unknown")); err != nil {
-					t.Fatal("rejected abort removed unknown content")
+			if journal, _, err := loadTransitionJournal(root, "repo"); err != nil || journal != nil {
+				t.Fatalf("journal remains: %v %v", journal, err)
+			}
+			if change == "symlink" {
+				if err := os.Remove(stage); err != nil {
+					t.Fatal(err)
 				}
+			}
+			if result, err := MigrateRepositoryLayout(context.Background(), opts); err != nil || !result.Complete {
+				t.Fatalf("replan: %+v %v", result, err)
+			}
+			if _, err := LocalGC(context.Background(), LocalGCOptions{WorkspaceOptions: opts.WorkspaceOptions, Repository: "repo"}); err != nil {
+				t.Fatalf("discarded migration output blocked GC: %v", err)
 			}
 		})
 	}
 }
 
-func TestMigrationAbortPropagatesStageLookupErrors(t *testing.T) {
+func retainedMigrationStage(t *testing.T, root string) string {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(root, ".sow", "repo", "abandoned", "c2-*"))
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("retained stages=%v err=%v", paths, err)
+	}
+	return paths[0]
+}
+
+func TestMigrationAbortWarnsOnStageLookupErrors(t *testing.T) {
 	for _, failure := range []string{"permission", "not-directory"} {
 		t.Run(failure, func(t *testing.T) {
 			root, opts := migrationAbortFixture(t, "migrate.planned")
 			stage := migrationStageRoot(root, "repo")
 			parent := filepath.Dir(stage)
-			before := migrationAbortAuthority(t, root)
+			if err := os.WriteFile(filepath.Join(stage, "unknown"), []byte("retain unknown"), 0o600); err != nil {
+				t.Fatal(err)
+			}
 			if failure == "permission" {
 				if os.Geteuid() == 0 {
-					t.Skip("Lstat permission regression requires an unprivileged user")
+					t.Skip("requires unprivileged filesystem permissions")
 				}
 				if err := os.Chmod(parent, 0); err != nil {
 					t.Fatal(err)
@@ -1716,25 +1813,39 @@ func TestMigrationAbortPropagatesStageLookupErrors(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			_, wantErr := os.Lstat(stage)
-			if wantErr == nil || errors.Is(wantErr, os.ErrNotExist) {
-				t.Fatalf("fixture did not produce a distinct lookup error: %v", wantErr)
+			result, err := AbandonRepositoryMigration(context.Background(), opts)
+			if err != nil || result.Phase != "abandoned" || len(result.Warnings) != 1 {
+				t.Fatalf("cleanup failure blocked abort: %+v %v", result, err)
 			}
-			_, err := AbandonRepositoryMigration(context.Background(), opts)
-			var want *os.PathError
-			if !errors.As(wantErr, &want) || !errors.Is(err, want.Err) {
-				t.Fatalf("lost Lstat diagnostic: got=%v want=%v", err, wantErr)
+			if failure == "permission" {
+				if err := os.Chmod(parent, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if data, err := os.ReadFile(parent); err != nil || string(data) != "retain not-directory" {
+					t.Fatal("abort changed parent replacement")
+				}
+				if err := os.Remove(parent); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(parent+"-saved", parent); err != nil {
+					t.Fatal(err)
+				}
 			}
-			if after := migrationAbortAuthority(t, root); after != before {
-				t.Fatal("lookup failure discarded recovery authority")
+			// A later migration must preserve leftovers that abort could not move.
+			result, err = MigrateRepositoryLayout(context.Background(), opts)
+			if err != nil || !result.Complete || len(result.Warnings) != 1 {
+				t.Fatalf("replan: %+v %v", result, err)
 			}
-			t.Logf("uid=%d failure=%s error=%v", os.Geteuid(), failure, err)
+			if data, err := os.ReadFile(filepath.Join(retainedMigrationStage(t, root), "unknown")); err != nil || string(data) != "retain unknown" {
+				t.Fatal("replan discarded leftover stage")
+			}
 		})
 	}
 }
 
 func TestMigrationAbortRejectsMismatchedAuthorityBeforeCleanup(t *testing.T) {
-	for _, field := range []string{"repository", "generation", "base-manifest", "target-manifest", "control-repository", "control-generation", "control-plan", "public-tree"} {
+	for _, field := range []string{"repository", "generation", "base-manifest", "target-manifest", "control-repository", "control-generation", "control-plan", "control-repository-no-journal", "control-generation-no-journal"} {
 		t.Run(field, func(t *testing.T) {
 			root, opts := migrationAbortFixture(t, "migrate.planned")
 			journal, _, err := loadTransitionJournal(root, "repo")
@@ -1750,10 +1861,6 @@ func TestMigrationAbortRejectsMismatchedAuthorityBeforeCleanup(t *testing.T) {
 				journal.BaseManifestSHA256 = strings.Repeat("a", 64)
 			case "target-manifest":
 				journal.TargetManifestSHA256 = strings.Repeat("a", 64)
-			case "public-tree":
-				if err := os.WriteFile(filepath.Join(root, "repo", "foreign"), []byte("preserve public bytes"), 0o644); err != nil {
-					t.Fatal(err)
-				}
 			default:
 				store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
 				if err != nil {
@@ -1764,12 +1871,17 @@ func TestMigrationAbortRejectsMismatchedAuthorityBeforeCleanup(t *testing.T) {
 					"control-generation": `UPDATE layout_transition_control SET base_generation = '00000000000000000001'`,
 					"control-plan":       `UPDATE layout_transition_control SET plan_identity_sha256 = '` + strings.Repeat("a", 64) + `'`,
 				}
-				_, err = store.DB().Exec(queries[field])
+				_, err = store.DB().Exec(queries[strings.TrimSuffix(field, "-no-journal")])
 				if err := errors.Join(err, store.Checkpoint(context.Background()), store.Close()); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if err := persistTransitionJournal(root, "repo", *journal); err != nil {
+			if strings.HasSuffix(field, "-no-journal") {
+				err = clearTransitionJournal(root, "repo")
+			} else {
+				err = persistTransitionJournal(root, "repo", *journal)
+			}
+			if err != nil {
 				t.Fatal(err)
 			}
 			before := persistentWorkspaceSnapshot(t, root)
@@ -1817,10 +1929,9 @@ func TestMigrationAbortRejectsCommitIntentFromEitherAuthority(t *testing.T) {
 	}
 }
 
-func TestMigrationAbortMissingStageRejectsSymlinkAncestor(t *testing.T) {
+func TestMigrationAbortWarnsOnSymlinkStageAncestor(t *testing.T) {
 	root, opts := migrationAbortFixture(t, "migrate.planned")
-	stage := migrationStageRoot(root, "repo")
-	owner := filepath.Dir(stage)
+	owner := filepath.Dir(migrationStageRoot(root, "repo"))
 	external := t.TempDir()
 	sentinel := filepath.Join(external, "sentinel")
 	if err := os.WriteFile(sentinel, []byte("retain external tree"), 0o600); err != nil {
@@ -1832,43 +1943,53 @@ func TestMigrationAbortMissingStageRejectsSymlinkAncestor(t *testing.T) {
 	if err := os.Symlink(external, owner); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Lstat(stage); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("fixture stage is not missing: %v", err)
-	}
-	before := migrationAbortAuthority(t, root)
-	if _, err := AbandonRepositoryMigration(context.Background(), opts); !errors.Is(err, ErrIntegrity) {
-		t.Fatalf("missing stage under symlink owner: %v", err)
-	}
-	if after := migrationAbortAuthority(t, root); before != after {
-		t.Fatal("unsafe missing stage cleared authority")
+	result, err := AbandonRepositoryMigration(context.Background(), opts)
+	if err != nil || result.Phase != "abandoned" || len(result.Warnings) != 1 {
+		t.Fatalf("abort: %+v %v", result, err)
 	}
 	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "retain external tree" {
-		t.Fatal("unsafe missing stage changed external bytes")
+		t.Fatal("abort changed external bytes")
 	}
 	if info, err := os.Lstat(owner); err != nil || info.Mode()&os.ModeSymlink == 0 {
-		t.Fatal("unsafe stage owner was removed")
+		t.Fatal("abort removed stage owner")
+	}
+	if _, err := MigrateRepositoryLayout(context.Background(), opts); err == nil {
+		t.Fatal("new migration followed unsafe stage owner")
 	}
 }
 
 func TestMigrationAbortPreservesDirectoryAddedAfterValidation(t *testing.T) {
 	root, opts := migrationAbortFixture(t, "migrate.planned")
-	stage := migrationStageRoot(root, "repo")
-	unknown := filepath.Join(stage, "unknown-empty-directory")
-	before := migrationAbortAuthority(t, root)
+	unknown := filepath.Join(migrationStageRoot(root, "repo"), "unknown-empty-directory")
 	opts.Fault = func(point string) error {
 		if point == "migrate.abort_validated" {
 			return os.Mkdir(unknown, 0o700)
 		}
 		return nil
 	}
-	if _, err := AbandonRepositoryMigration(context.Background(), opts); !errors.Is(err, ErrIntegrity) {
-		t.Fatalf("unknown directory at cleanup: %v", err)
+	result, err := AbandonRepositoryMigration(context.Background(), opts)
+	if err != nil || result.Phase != "abandoned" || len(result.Warnings) != 1 {
+		t.Fatalf("abort: %+v %v", result, err)
 	}
-	if info, err := os.Lstat(unknown); err != nil || !info.IsDir() {
-		t.Fatal("abort recursively removed an unproven directory")
+	if info, err := os.Lstat(filepath.Join(retainedMigrationStage(t, root), "unknown-empty-directory")); err != nil || !info.IsDir() {
+		t.Fatal("abort removed unknown directory")
 	}
-	if after := migrationAbortAuthority(t, root); before != after {
-		t.Fatal("incomplete cleanup discarded authority")
+}
+
+func TestMigrationAbortDoesNotRequireAHealthyPublicTree(t *testing.T) {
+	root, opts := migrationAbortFixture(t, "migrate.planned")
+	foreign := filepath.Join(root, "repo", "foreign")
+	if err := os.WriteFile(foreign, []byte("preserve public bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := AbandonRepositoryMigration(context.Background(), opts); err != nil || result.Phase != "abandoned" {
+		t.Fatalf("abort: %+v %v", result, err)
+	}
+	if data, err := os.ReadFile(foreign); err != nil || string(data) != "preserve public bytes" {
+		t.Fatal("abort touched public data")
+	}
+	if _, err := MigrateRepositoryLayout(context.Background(), opts); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("replan must still validate public data: %v", err)
 	}
 }
 
@@ -1909,105 +2030,6 @@ func migrationAbortTwoViewFixture(t *testing.T) (string, RepositoryMigrationOpti
 	return root, opts
 }
 
-func TestMigrationAbortRetriesItsPartialCleanup(t *testing.T) {
-	for _, stop := range []string{"file-permission", "directory-permission", "file-cancel", "second-view-file", "first-pointer"} {
-		t.Run(stop, func(t *testing.T) {
-			if os.Geteuid() == 0 && strings.HasSuffix(stop, "permission") {
-				t.Skip("requires real unprivileged filesystem permissions")
-			}
-			root, opts := migrationAbortTwoViewFixture(t)
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			stage := migrationStageRoot(root, "repo")
-			files, err := scanPublicManifest(ctx, stage)
-			if err != nil || len(files) != 8 {
-				t.Fatalf("two view fixture files=%d err=%v", len(files), err)
-			}
-			authority := migrationAbortAuthority(t, root)
-			public, err := scanPublicManifestForLayout(ctx, filepath.Join(root, "repo"), state.LayoutC2V1)
-			if err != nil {
-				t.Fatal(err)
-			}
-			blockedParent := filepath.Join(stage, "dists")
-			if stop == "directory-permission" {
-				if err := os.Chmod(blockedParent, 0o500); err != nil {
-					t.Fatal(err)
-				}
-			}
-			t.Cleanup(func() { _ = os.Chmod(blockedParent, 0o700) })
-			injected := errors.New("partial abort stop")
-			removed := 0
-			opts.Fault = func(point string) error {
-				if !strings.HasPrefix(point, "migrate.abort_file.") {
-					return nil
-				}
-				removed++
-				relative := strings.TrimPrefix(point, "migrate.abort_file.")
-				switch stop {
-				case "file-permission":
-					if removed == 1 {
-						blockedParent = filepath.Dir(filepath.Join(stage, relative))
-						return os.Chmod(blockedParent, 0o500)
-					}
-				case "file-cancel":
-					cancel()
-				case "second-view-file":
-					if strings.Contains(relative, "/x86_64/") {
-						return injected
-					}
-				case "first-pointer":
-					if strings.HasSuffix(relative, "/repomd.xml") {
-						return injected
-					}
-				}
-				return nil
-			}
-			result, err := AbandonRepositoryMigration(ctx, opts)
-			if err == nil || result.Phase == "abandoned" || removed == 0 {
-				t.Fatalf("no interrupted cleanup: removed=%d result=%+v err=%v", removed, result, err)
-			}
-			if strings.HasSuffix(stop, "permission") && !errors.Is(err, os.ErrPermission) || stop == "file-cancel" && !errors.Is(err, context.Canceled) {
-				t.Fatalf("cleanup swallowed %s diagnostic: %v", stop, err)
-			}
-			firstErr := err
-			remaining, err := scanPublicManifest(context.Background(), stage)
-			if err != nil || len(remaining) != len(files)-removed {
-				t.Fatalf("partial files=%d removed=%d err=%v", len(remaining), removed, err)
-			}
-			if stop == "directory-permission" && len(remaining) != 0 || stop != "directory-permission" && len(remaining) == 0 {
-				t.Fatalf("wrong cleanup boundary: stop=%s remaining=%d", stop, len(remaining))
-			}
-			if after := migrationAbortAuthority(t, root); after != authority {
-				t.Fatal("partial cleanup discarded its plan authority")
-			}
-			if err := os.Chmod(blockedParent, 0o700); err != nil && !errors.Is(err, os.ErrNotExist) {
-				t.Fatal(err)
-			}
-			opts.Fault = nil
-			if result, err := MigrateRepositoryLayout(context.Background(), opts); err == nil || result.Complete {
-				t.Fatalf("ordinary resume accepted an incomplete stage: %+v %v", result, err)
-			}
-			if result, err := AbandonRepositoryMigration(context.Background(), opts); err != nil || result.Phase != "abandoned" {
-				t.Fatalf("repeat abort after %s: %+v %v", stop, result, err)
-			}
-			after, err := scanPublicManifestForLayout(context.Background(), filepath.Join(root, "repo"), state.LayoutC2V1)
-			if err != nil || !sameGenerationManifest(public, after) {
-				t.Fatal("partial cleanup changed old public bytes")
-			}
-			if result, err := MigrateRepositoryLayout(context.Background(), opts); !errors.Is(err, ErrNotReady) || result.Phase != "grace" {
-				t.Fatalf("explicit replan did not reach alias grace: %+v %v", result, err)
-			}
-			at := opts.now().Add(31 * 24 * time.Hour)
-			opts.now = func() time.Time { return at }
-			if result, err := MigrateRepositoryLayout(context.Background(), opts); err != nil || !result.Complete {
-				t.Fatalf("replanned migration did not complete: %+v %v", result, err)
-			}
-			t.Logf("uid=%d stop=%s removed=%d remaining=%d first_error=%v repeated_abort_and_migrate=pass", os.Geteuid(), stop, removed, len(remaining), firstErr)
-		})
-	}
-}
-
-// Include symlink entries without following them, for rejected cleanup cases.
 func migrationAbortNoFollowSnapshot(t *testing.T, root string) map[string]string {
 	t.Helper()
 	result := map[string]string{}
@@ -2045,21 +2067,15 @@ func TestMigrationAbortPartialStagePreservesUnprovenEntries(t *testing.T) {
 		t.Run(mutation, func(t *testing.T) {
 			root, opts := migrationAbortTwoViewFixture(t)
 			stage := migrationStageRoot(root, "repo")
-			injected := errors.New("stop after one artifact")
-			opts.Fault = func(point string) error {
-				if strings.HasPrefix(point, "migrate.abort_file.") {
-					return injected
-				}
-				return nil
+			files, err := scanPublicManifest(context.Background(), stage)
+			if err != nil || len(files) != 8 {
+				t.Fatalf("stage files=%d err=%v", len(files), err)
 			}
-			if _, err := AbandonRepositoryMigration(context.Background(), opts); !errors.Is(err, injected) {
+			// Also accept a partial cleanup left by older SOW versions.
+			if err := os.Remove(filepath.Join(stage, files[0].Path)); err != nil {
 				t.Fatal(err)
 			}
-			opts.Fault = nil
-			files, err := scanPublicManifest(context.Background(), stage)
-			if err != nil || len(files) != 7 {
-				t.Fatalf("partial stage files=%d err=%v", len(files), err)
-			}
+			files = files[1:]
 			artifact := filepath.Join(stage, files[0].Path)
 			repomd := filepath.Join(filepath.Dir(artifact), "repomd.xml")
 			external := filepath.Join(t.TempDir(), "sentinel")
@@ -2125,12 +2141,30 @@ func TestMigrationAbortPartialStagePreservesUnprovenEntries(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			before := migrationAbortNoFollowSnapshot(t, root)
-			if result, err := AbandonRepositoryMigration(context.Background(), opts); err == nil || result.Phase == "abandoned" {
-				t.Fatalf("accepted unproven partial stage %s: %+v %v", mutation, result, err)
+			before := migrationAbortNoFollowSnapshot(t, stage)
+			result, err := AbandonRepositoryMigration(context.Background(), opts)
+			if mutation == "journal-tamper" {
+				if !errors.Is(err, ErrIntegrity) {
+					t.Fatalf("mismatched authority accepted: %v", err)
+				}
+				if after := migrationAbortNoFollowSnapshot(t, stage); !reflect.DeepEqual(before, after) {
+					t.Fatal("rejected abort changed stage")
+				}
+				return
 			}
-			if after := migrationAbortNoFollowSnapshot(t, root); !reflect.DeepEqual(before, after) {
-				t.Fatal("rejected partial stage cleanup changed bytes or entries")
+			if err != nil || result.Phase != "abandoned" || len(result.Warnings) != 1 {
+				t.Fatalf("abort: %+v %v", result, err)
+			}
+			retained := retainedMigrationStage(t, root)
+			if after := migrationAbortNoFollowSnapshot(t, retained); !reflect.DeepEqual(before, after) {
+				t.Fatal("abort changed retained bytes or entries")
+			}
+			result, err = MigrateRepositoryLayout(context.Background(), opts)
+			if !errors.Is(err, ErrNotReady) || result.Phase != "grace" {
+				t.Fatalf("replan: %+v %v", result, err)
+			}
+			if after := migrationAbortNoFollowSnapshot(t, retained); !reflect.DeepEqual(before, after) {
+				t.Fatal("replan touched retained stage")
 			}
 			if data, err := os.ReadFile(external); err != nil || string(data) != "retain external bytes" {
 				t.Fatal("rejected partial stage cleanup changed external sentinel")

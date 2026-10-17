@@ -1015,6 +1015,10 @@ func TestReAddedCoordinatesSkipPoolPathOwnerHistory(t *testing.T) {
 	if lookups[0].err != nil || lookups[0].object.SHA256 != existing.SHA256 || !errors.Is(lookups[1].err, state.ErrNotFound) {
 		t.Fatalf("coordinate lookups=%#v", lookups)
 	}
+	staged, err := os.ReadDir(stage)
+	if err != nil || len(staged) != 1 || staged[0].Name() != "00000001-"+filepath.Base(freshPath) {
+		t.Fatalf("only the new input should have a temporary copy: %v %v", staged, err)
+	}
 }
 
 func TestSourceDirectorySpellingsRejectOnlyCaseAliases(t *testing.T) {

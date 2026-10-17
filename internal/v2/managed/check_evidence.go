@@ -396,10 +396,10 @@ func (registry *payloadEvidenceRegistry) authenticateDescriptor(ctx context.Cont
 	return after, nil
 }
 
-func (registry *payloadEvidenceRegistry) walkedPayload(ctx context.Context, file *os.File, info os.FileInfo, relative string) (state.GenerationFile, error) {
+func (registry *payloadEvidenceRegistry) walkedPayload(ctx context.Context, file *os.File, info os.FileInfo, relative string) (state.GenerationFile, rootedRegularIdentity, error) {
 	identity, err := snapshotRegularDescriptorIdentity(file)
 	if err != nil {
-		return state.GenerationFile{}, err
+		return state.GenerationFile{}, rootedRegularIdentity{}, err
 	}
 	key := physicalPayloadIdentityFrom(identity)
 	registry.mu.Lock()
@@ -408,21 +408,21 @@ func (registry *payloadEvidenceRegistry) walkedPayload(ctx context.Context, file
 	if slot != nil {
 		select {
 		case <-ctx.Done():
-			return state.GenerationFile{}, ctx.Err()
+			return state.GenerationFile{}, rootedRegularIdentity{}, ctx.Err()
 		case <-slot.done:
 		}
 		after, identityErr := snapshotRegularDescriptorIdentity(file)
 		if slot.err != nil || slot.evidence == nil || identityErr != nil {
-			return state.GenerationFile{}, errors.Join(fmt.Errorf("%w: public payload evidence is invalid for %s", ErrIntegrity, relative), slot.err, identityErr)
+			return state.GenerationFile{}, rootedRegularIdentity{}, errors.Join(fmt.Errorf("%w: public payload evidence is invalid for %s", ErrIntegrity, relative), slot.err, identityErr)
 		}
 		if identity == after && slot.evidence.Identity == after {
-			return state.GenerationFile{Path: relative, Phase: "payload", Size: slot.evidence.File.Size, SHA256: slot.evidence.File.SHA256}, nil
+			return state.GenerationFile{Path: relative, Phase: "payload", Size: slot.evidence.File.Size, SHA256: slot.evidence.File.SHA256}, after, nil
 		}
 		identity = after
 	}
 	digest, after, err := digestPayloadDescriptor(workmetrics.WithPhase(ctx, "public_payload_reaudit"), file, identity)
 	if err != nil || after.size != info.Size() {
-		return state.GenerationFile{}, errors.Join(fmt.Errorf("%w: public payload changed while re-auditing %s", ErrIntegrity, relative), err)
+		return state.GenerationFile{}, rootedRegularIdentity{}, errors.Join(fmt.Errorf("%w: public payload changed while re-auditing %s", ErrIntegrity, relative), err)
 	}
 	result := state.GenerationFile{Path: relative, Phase: "payload", Size: after.size, SHA256: digest}
 	registry.mu.Lock()
@@ -431,7 +431,7 @@ func (registry *payloadEvidenceRegistry) walkedPayload(ctx context.Context, file
 		registry.slots[key] = &payloadEvidenceSlot{done: closedEvidenceChannel(), evidence: &checkPayloadEvidence{Identity: after, File: result, SignatureResults: make(map[string]yumrepo.RPMSignatureTrustRingResult)}}
 	}
 	registry.mu.Unlock()
-	return result, nil
+	return result, after, nil
 }
 
 // digestPayloadDescriptor uses the same stable-content boundary as other

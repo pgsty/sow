@@ -55,6 +55,9 @@ func MainContext(ctx context.Context, args []string, stdout, stderr io.Writer) i
 
 	output, err := executeManaged(ctx, inv)
 	command := invocationCommand(inv)
+	for _, warning := range output.warnings {
+		fmt.Fprintln(stderr, "warning: "+warning)
+	}
 	if err != nil {
 		err = markCommandInterrupted(ctx, err)
 		classified := classifyManagedError(command, err)
@@ -97,6 +100,7 @@ type managedOutput struct {
 	operation  any
 	result     any
 	human      string
+	warnings   []string
 	// preserveFailureResult is set only after a command has produced a
 	// committed, partial, or diagnostic result that remains meaningful despite
 	// its returned error. All pre-result failures serialize result:null.
@@ -198,12 +202,12 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		}
 		if inv.Abort {
 			result, err := managed.AbandonRepositoryMigration(ctx, migrationOptions)
-			return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: result.Phase != "", human: fmt.Sprintf(
+			return managedOutput{repository: nullableString(result.Repository), result: result, warnings: result.Warnings, preserveFailureResult: result.Phase != "", human: fmt.Sprintf(
 				"abandoned repository migration %s: phase=%s complete=%t\n", result.Repository, result.Phase, result.Complete,
 			)}, err
 		}
 		result, err := managed.MigrateRepository(ctx, migrationOptions)
-		return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: result.Phase != "", human: fmt.Sprintf(
+		return managedOutput{repository: nullableString(result.Repository), result: result, warnings: result.Warnings, preserveFailureResult: result.Phase != "", human: fmt.Sprintf(
 			"migrated repository %s: %s -> %s schema=%d->%d generation=%s phase=%s complete=%t\n",
 			result.Repository, result.FromLayout, result.ToLayout, result.SchemaFrom, result.SchemaTo, result.Generation, result.Phase, result.Complete,
 		)}, err

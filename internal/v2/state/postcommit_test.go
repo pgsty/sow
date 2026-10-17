@@ -221,7 +221,9 @@ func TestPostcommitBeginCommitBoundary(t *testing.T) {
 				if !errors.Is(err, syscall.EIO) {
 					t.Fatalf("expected EIO, got %v", err)
 				}
-			} else if mode == "before" && !errors.Is(err, context.Canceled) || mode == "after" && err != nil {
+			} else if mode == "before" {
+				assertPrecommitCancellation(t, ctx, err)
+			} else if mode == "after" && err != nil {
 				t.Fatalf("mode=%s err=%v", mode, err)
 			}
 			assertPostcommitError(t, err, mode == "io")
@@ -238,6 +240,9 @@ func TestPostcommitBeginCommitBoundary(t *testing.T) {
 			commits, checkpoints := h.commits, h.checkpoints
 			h.mode = ""
 			h.Unlock()
+			if mode == "before" && (commits != 0 || checkpoints != 0) {
+				t.Fatalf("cancelled transaction committed=%d checkpoints=%d", commits, checkpoints)
+			}
 			retryErr := s.BeginOperation(context.Background(), op)
 			if mode == "before" {
 				if retryErr != nil {
@@ -271,7 +276,9 @@ func TestPostcommitDesiredCommitBoundaryAndReplay(t *testing.T) {
 				if !errors.Is(err, syscall.EIO) {
 					t.Fatalf("expected EIO: %v", err)
 				}
-			} else if mode == "before" && !errors.Is(err, context.Canceled) || mode == "after" && err != nil {
+			} else if mode == "before" {
+				assertPrecommitCancellation(t, ctx, err)
+			} else if mode == "after" && err != nil {
 				t.Fatalf("mode=%s err=%v", mode, err)
 			}
 			assertPostcommitError(t, err, mode == "io")
@@ -289,9 +296,12 @@ func TestPostcommitDesiredCommitBoundaryAndReplay(t *testing.T) {
 				t.Fatalf("out=%+v summary=%+v memberships=%d audit=%d", out, summary, members, audit)
 			}
 			h.Lock()
-			commits := h.commits
+			commits, checkpoints := h.commits, h.checkpoints
 			h.mode = ""
 			h.Unlock()
+			if mode == "before" && (commits != 0 || checkpoints != 0) {
+				t.Fatalf("cancelled mutation committed=%d checkpoints=%d", commits, checkpoints)
+			}
 			retry, errRetry := apply(context.Background())
 			if mode == "before" {
 				if errRetry != nil || !retry.Changed {
@@ -380,6 +390,16 @@ func TestPostcommitTerminalCommitResults(t *testing.T) {
 			}
 			t.Logf("kind=%s err=%v canceled_summary=%v durable_generation=%d last_operation_state=%s audit_events_before=%d after_retry=%d", kind, err, sameContextErr, summary.BuiltGeneration, operation.State, eventsBefore, eventsAfter)
 		})
+	}
+}
+
+// database/sql may finish its asynchronous cancellation rollback before Commit
+// observes the context. Both errors are valid; callers still verify that no
+// business rows, audit events, driver commits, or checkpoints escaped rollback.
+func assertPrecommitCancellation(t *testing.T, ctx context.Context, err error) {
+	t.Helper()
+	if !errors.Is(ctx.Err(), context.Canceled) || (!errors.Is(err, context.Canceled) && !errors.Is(err, sql.ErrTxDone)) {
+		t.Fatalf("pre-commit cancellation: context=%v err=%v", ctx.Err(), err)
 	}
 }
 

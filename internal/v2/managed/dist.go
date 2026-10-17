@@ -844,7 +844,7 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 	if err := callFault(fault, kind+".applied"); err != nil {
 		return DistInfo{}, err
 	}
-	if err := installStagedDist(ctx, root, repoName, distName, id, payload.TreeSHA256); err != nil {
+	if err := installStagedDist(ctx, root, repoName, id, payload); err != nil {
 		return DistInfo{}, err
 	}
 	authenticatedPayloads, err := buildAuthenticatedPayloads(currentSnapshot, nil, nil)
@@ -1170,20 +1170,7 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 			if operation.Kind == "dist.rm" {
 				err = moveDistToRecovery(ctx, root, repoName, payload.Name, operation.ID, payload.TreeSHA256)
 			} else {
-				if publication := payload.PublicationTime.identity(); publication.Current {
-					tree, treeErr := frozenPublicationTree(ctx, filepath.Join(root, repoName, "dists", payload.Name), filepath.Join(distStageRoot(root, repoName, operation.ID), "dists", payload.Name), payload.TreeSHA256)
-					if treeErr != nil {
-						return treeErr
-					}
-					identity, err := loadDistMetadataSignerSnapshot(root, repoName, operation.ID, payload.MetadataSignerSnapshotSHA256)
-					if err != nil {
-						return err
-					}
-					if err := validateDistPublicationTime(tree, payload.Format, payload.Architectures, identity.Fingerprint != "", publication); err != nil {
-						return err
-					}
-				}
-				err = installStagedDist(ctx, root, repoName, payload.Name, operation.ID, payload.TreeSHA256)
+				err = installStagedDist(ctx, root, repoName, operation.ID, payload)
 			}
 			if err != nil {
 				return err
@@ -1864,9 +1851,10 @@ func distRecoveryPath(root, repoName, id string) string {
 	return filepath.Join(root, ".sow", repoName, "recovery", id)
 }
 
-func installStagedDist(ctx context.Context, root, repoName, distName, id, expectedSHA string) error {
-	source := filepath.Join(distStageRoot(root, repoName, id), "dists", distName)
-	target := filepath.Join(root, repoName, "dists", distName)
+func installStagedDist(ctx context.Context, root, repoName, id string, payload distOperationPayload) error {
+	source := filepath.Join(distStageRoot(root, repoName, id), "dists", payload.Name)
+	target := filepath.Join(root, repoName, "dists", payload.Name)
+	tree := source
 	if info, err := os.Lstat(target); err == nil {
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("%w: unsafe live Dist path", ErrIntegrity)
@@ -1876,21 +1864,29 @@ func installStagedDist(ctx context.Context, root, repoName, distName, id, expect
 		} else if !errors.Is(sourceErr, os.ErrNotExist) {
 			return sourceErr
 		}
-		actual, _, digestErr := digestTree(ctx, target)
-		if digestErr != nil || actual != expectedSHA {
-			return fmt.Errorf("%w: live Dist tree digest mismatch", ErrIntegrity)
-		}
-		return nil
+		tree = target
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	info, err := os.Lstat(source)
+	info, err := os.Lstat(tree)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%w: staged Dist is missing or unsafe", ErrIntegrity)
+		return fmt.Errorf("%w: Dist is missing or unsafe", ErrIntegrity)
 	}
-	actual, _, err := digestTree(ctx, source)
-	if err != nil || actual != expectedSHA {
-		return fmt.Errorf("%w: staged Dist tree digest mismatch", ErrIntegrity)
+	actual, _, err := digestTree(ctx, tree)
+	if err != nil || actual != payload.TreeSHA256 {
+		return fmt.Errorf("%w: Dist tree digest mismatch", ErrIntegrity)
+	}
+	if publication := payload.PublicationTime.identity(); publication.Current {
+		identity, err := loadDistMetadataSignerSnapshot(root, repoName, id, payload.MetadataSignerSnapshotSHA256)
+		if err != nil {
+			return err
+		}
+		if err := validateDistPublicationTime(tree, payload.Format, payload.Architectures, identity.Fingerprint != "", publication); err != nil {
+			return err
+		}
+	}
+	if tree == target {
+		return nil
 	}
 	if err := requireSameDevice(filepath.Dir(source), filepath.Dir(target)); err != nil {
 		return err

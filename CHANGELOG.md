@@ -4,6 +4,41 @@ All notable changes to SOW are recorded here.
 
 ## Unreleased
 
+## 0.6.0 - 2026-10-17
+
+- Bind metadata and payload authentication to stable file-descriptor identity,
+  including fast validation and reused evidence. Reject in-place rewrites with
+  restored mtime, and retain the authenticated identity after concurrent hard links.
+  Keep no-follow traversal checks while allowing execute-only ancestor directories.
+- Read complete OpenPGP key bundles instead of silently ignoring later keys.
+- Retain current and previous Plain RPM indexes so clients can finish using a
+  previously fetched `repomd.xml`; unchanged runs do not advance retention.
+- Persist one metadata publication time per new Managed build and reuse it across
+  recovery. Migration and older journals retain their previous timestamp behavior.
+  Reject timestamp drift before publishing further Dist pointers.
+- Keep SQLite identity checks from releasing existing POSIX locks. Read composite
+  repository state within one SQLite snapshot and validate eligible WAL databases
+  once per open.
+- Preserve committed command results when checkpoint or other post-commit
+  maintenance fails, and show pending repository maintenance in Dist status.
+- Keep C2 migration abort restartable before the first journal or manifest exists.
+  Retain abandoned stage files, reject contradictory control authority, and report
+  the selected Repository in JSON failures. Preserve removal-policy audit outcomes.
+- Reuse authenticated payload and Dist publication evidence within each operation,
+  avoid duplicate ingest stage writes and unused tree hashing, and scope membership
+  reads to selected packages. Keep input staging workers independent and bounded.
+- Bound parallel R2 inventory HEAD requests and prevent retry seeks from resetting
+  the upload idle timeout.
+- Update the build toolchain to Go 1.27.2 and staticcheck to 0.8.2. Verify the patched
+  RPM module against its pinned upstream source using the already selected Go
+  toolchain, including installations that use automatic toolchain downloads.
+- Expand recovery, identity, client compatibility, and performance regression
+  coverage. Keep deterministic source delivery and remove brittle Go runtime I/O
+  instrumentation from the performance gates.
+
+This release keeps schema v13 and the existing public repository layout. Workspaces
+already on v0.5.0 do not require a schema migration.
+
 ## 0.5.0 - 2026-09-29
 
 - Fixed historical Dist-removal cleanup deleting packages re-added to another
