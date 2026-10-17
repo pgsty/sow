@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -70,9 +71,32 @@ func TestMetadataKeyFingerprintRotationMarksDirtyAndRebuilds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tamperedSignature := append([]byte(nil), originalSignature...)
-	tamperedSignature[len(tamperedSignature)/2] ^= 1
-	if err := os.WriteFile(repomdSignature, tamperedSignature, 0o644); err != nil {
+	// Keep the armor and publication time valid so only cryptographic
+	// verification fails. Flipping an armored byte can corrupt base64 syntax.
+	block, err := armor.Decode(bytes.NewReader(originalSignature))
+	if err != nil {
+		t.Fatal(err)
+	}
+	signaturePacket, err := io.ReadAll(block.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(signaturePacket) == 0 {
+		t.Fatal("empty signature packet")
+	}
+	signaturePacket[len(signaturePacket)-1] ^= 1
+	var tamperedSignature bytes.Buffer
+	armored, err := armor.Encode(&tamperedSignature, block.Type, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := armored.Write(signaturePacket); err != nil {
+		t.Fatal(err)
+	}
+	if err := armored.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(repomdSignature, tamperedSignature.Bytes(), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	tampered, err := Check(ctx, CheckOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Dists: []string{"el9"}, Jobs: 1})
