@@ -142,8 +142,11 @@ func generateManagedMetadata(ctx context.Context, dest string, revision uint64, 
 		return nil, fmt.Errorf("yumrepo: create managed generation parent: %w", err)
 	}
 	parentInfo, err := os.Lstat(parent)
-	if err != nil || !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
+	if err != nil {
 		return nil, fmt.Errorf("yumrepo: managed generation parent is not a real directory: %w", err)
+	}
+	if !parentInfo.IsDir() || parentInfo.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("yumrepo: managed generation parent is not a real directory: %s", parent)
 	}
 	if _, err := os.Lstat(dest); err == nil {
 		return nil, fmt.Errorf("%w: %s", ErrGenerationExists, dest)

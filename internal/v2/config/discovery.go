@@ -127,8 +127,11 @@ func Discover(opts DiscoverOptions) (Workspace, error) {
 			return Workspace{}, fmt.Errorf("resolve workspace discovery start %q: %w", start, err)
 		}
 		var rootStat unix.Stat_t
-		if err := unix.Lstat(realRoot, &rootStat); err != nil || uint32(rootStat.Mode)&unix.S_IFMT != unix.S_IFDIR {
+		if err := unix.Lstat(realRoot, &rootStat); err != nil {
 			return Workspace{}, fmt.Errorf("bind workspace root %q: %w", realRoot, err)
+		}
+		if uint32(rootStat.Mode)&unix.S_IFMT != unix.S_IFDIR {
+			return Workspace{}, fmt.Errorf("bind workspace root %q: not a directory", realRoot)
 		}
 		return Workspace{
 			Root: realRoot, ConfigPath: filepath.Join(realRoot, ConfigFilename),

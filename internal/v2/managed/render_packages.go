@@ -203,8 +203,10 @@ func renderManagedDistTree(ctx context.Context, repositoryStage string, spec Man
 	if err != nil {
 		return "", err
 	}
-	if info, err := os.Lstat(root); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	if info, err := os.Lstat(root); err != nil {
 		return "", fmt.Errorf("managed: repository stage is not a real directory: %w", err)
+	} else if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("managed: repository stage is not a real directory: %s", root)
 	}
 	dists := filepath.Join(root, "dists")
 	if _, err := durableEnsureDir(dists, 0o755); err != nil {

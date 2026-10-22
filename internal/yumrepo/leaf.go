@@ -29,8 +29,10 @@ func GenerateRPMLeaf(ctx context.Context, dest string, revision uint64, packages
 		return nil, errors.New("yumrepo: unsafe RPM leaf destination")
 	}
 	parent := filepath.Dir(dest)
-	if info, err := os.Lstat(parent); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+	if info, err := os.Lstat(parent); err != nil {
 		return nil, fmt.Errorf("yumrepo: RPM leaf parent is not a real directory: %w", err)
+	} else if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("yumrepo: RPM leaf parent is not a real directory: %s", parent)
 	}
 	if _, err := os.Lstat(dest); err == nil {
 		return nil, fmt.Errorf("%w: %s", ErrGenerationExists, dest)

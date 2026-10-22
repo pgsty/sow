@@ -11,8 +11,9 @@ All notable changes to SOW are recorded here.
   Retain the bounded, parser-only RPM compatibility patch.
 - Move YAML parsing to the maintained `go.yaml.in/yaml/v3` v3.0.5 module while
   retaining the existing configuration format.
-- Report the offending parent path when `log export` rejects a non-directory or
-  symlink, instead of displaying a Go formatting error.
+- Report the offending path or armor type when log export, RPM metadata,
+  signature, and workspace validation reject invalid input, instead of displaying
+  a Go formatting error caused by wrapping a nil error.
 - Update pinned CI Actions, GoReleaser, deadcode, and govulncheck. Read the CI
   snapshot version from the Makefile so package builds follow the release version.
 

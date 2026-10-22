@@ -27,8 +27,11 @@ func DetachedSignatureCreationTime(signature io.Reader) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("yumrepo: nil detached signature")
 	}
 	block, err := armor.Decode(io.LimitReader(signature, maxOpenPGPKeyBytes+1))
-	if err != nil || block.Type != openpgp.SignatureType {
+	if err != nil {
 		return time.Time{}, fmt.Errorf("yumrepo: decode detached signature armor: %w", err)
+	}
+	if block.Type != openpgp.SignatureType {
+		return time.Time{}, fmt.Errorf("yumrepo: expected detached signature armor, got %q", block.Type)
 	}
 	reader := packet.NewReader(block.Body)
 	next, err := reader.Next()
