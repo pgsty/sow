@@ -4,6 +4,21 @@ All notable changes to SOW are recorded here.
 
 ## Unreleased
 
+## 0.6.1 - 2026-10-22
+
+- Require Go 1.27.3 and refresh runtime and test dependencies, including the
+  AWS SDK, ProtonMail OpenPGP, compression, SQLite, and Debian package libraries.
+  Retain the bounded, parser-only RPM compatibility patch.
+- Move YAML parsing to the maintained `go.yaml.in/yaml/v3` v3.0.5 module while
+  retaining the existing configuration format.
+- Report the offending parent path when `log export` rejects a non-directory or
+  symlink, instead of displaying a Go formatting error.
+- Update pinned CI Actions, GoReleaser, deadcode, and govulncheck. Read the CI
+  snapshot version from the Makefile so package builds follow the release version.
+
+This release keeps schema v13 and the existing CLI and public repository layout.
+Workspaces already on v0.5.0 or v0.6.0 do not require a schema migration.
+
 ## 0.6.0 - 2026-10-17
 
 - Bind metadata and payload authentication to stable file-descriptor identity,

@@ -157,8 +157,8 @@ func TestVersionStringIncludesVersionAndTarget(t *testing.T) {
 }
 
 func TestDefaultVersionIsRelease(t *testing.T) {
-	if Version != "0.6.0" {
-		t.Fatalf("default Version=%q, want release 0.6.0", Version)
+	if Version != "0.6.1" {
+		t.Fatalf("default Version=%q, want release 0.6.1", Version)
 	}
 }
 

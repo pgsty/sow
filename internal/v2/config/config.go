@@ -16,8 +16,8 @@ import (
 	"sort"
 	"strings"
 
+	"go.yaml.in/yaml/v3"
 	"golang.org/x/sys/unix"
-	"gopkg.in/yaml.v3"
 )
 
 const (

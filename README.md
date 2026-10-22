@@ -148,7 +148,7 @@ and RPM leaf export are specified in [Commands](https://sow.pgsty.com/docs/comma
 
 ## Build
 
-Building from source requires Go 1.27.2 or newer; repository signing additionally requires
+Building from source requires Go 1.27.3 or newer; repository signing additionally requires
 a usable GPG installation and key.
 
 ```bash
