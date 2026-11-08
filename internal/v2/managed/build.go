@@ -820,9 +820,9 @@ func priorAPTByHashObjects(ctx context.Context, liveDist string, architectures [
 }
 
 func persistMutationBuildPlan(ctx context.Context, store *state.Store, root, repoName, operationID string, generation state.GenerationID, dists []mutationBuildDist, pooled []string, retainedRPMKeys []state.RPMSigningKey, base []state.GenerationFile) error {
-	operation, err := store.LastOperation(ctx)
-	if err != nil || operation == nil || operation.ID != operationID {
-		return fmt.Errorf("%w: active mutation operation is not the latest journal entry", ErrIntegrity)
+	operation, err := store.ActiveOperation(ctx, operationID)
+	if err != nil {
+		return fmt.Errorf("%w: active mutation operation is not the sole active journal entry: %v", ErrIntegrity, err)
 	}
 	var payload mutationOperationPayload
 	if err := jsonUnmarshalStrict(operation.PayloadJSON, &payload); err != nil {
@@ -896,9 +896,9 @@ func loadMutationOperation(ctx context.Context, store *state.Store, root, repoNa
 }
 
 func loadMutationJournal(ctx context.Context, store *state.Store, root, repoName, operationID string) (state.Operation, mutationOperationPayload, mutationManifest, error) {
-	operation, err := store.LastOperation(ctx)
-	if err != nil || operation == nil || operation.ID != operationID {
-		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, fmt.Errorf("%w: active mutation operation is not the latest journal entry", ErrIntegrity)
+	operation, err := store.ActiveOperation(ctx, operationID)
+	if err != nil {
+		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, fmt.Errorf("%w: active mutation operation is not the sole active journal entry: %v", ErrIntegrity, err)
 	}
 	var payload mutationOperationPayload
 	if err := jsonUnmarshalStrict(operation.PayloadJSON, &payload); err != nil {

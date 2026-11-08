@@ -97,9 +97,6 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 		return result, err
 	}
 	backend := opts.backend
-	if err := preflightFilesystemTargetAliases(cfg, opts.Target); err != nil {
-		return result, err
-	}
 	if err := preflightPublicationTarget(targetConfig, filepath.Join(ws.Root, repoName), filepath.Join(ws.Root, ".sow"), backend); err != nil {
 		return result, err
 	}
@@ -509,21 +506,11 @@ func acquirePublicationLocks(ctx context.Context, ws config.Workspace, target st
 	if locked, ok := cfg.Targets[target]; !ok || locked.Repository != repo || locked != targetConfig {
 		return config.Config{}, "", "", nil, nil, errors.Join(fmt.Errorf("%w: target configuration changed while acquiring locks", ErrIntegrity), repoLock.Close(), workspaceLock.Close())
 	}
-	physicalRoots := map[string]string{}
-	for name, candidate := range cfg.Targets {
-		if candidate.Provider != "filesystem" {
-			continue
-		}
-		root, rootErr := filesystemPublicationRoot(candidate)
-		if rootErr != nil {
-			return config.Config{}, "", "", nil, nil, errors.Join(fmt.Errorf("%w: filesystem target %q: %v", ErrRejected, name, rootErr), repoLock.Close(), workspaceLock.Close())
-		}
-		for otherName, otherRoot := range physicalRoots {
-			if pathsOverlap(root, otherRoot) {
-				return config.Config{}, "", "", nil, nil, errors.Join(fmt.Errorf("%w: filesystem targets %q and %q overlap physically", ErrRejected, name, otherName), repoLock.Close(), workspaceLock.Close())
-			}
-		}
-		physicalRoots[name] = root
+	// Only the selected target is written. Compare it with the prospective
+	// physical paths of the others, so an unmounted unrelated target cannot
+	// block publication, abandonment, or maintenance of a reachable one.
+	if err := preflightFilesystemTargetAliases(cfg, target); err != nil {
+		return config.Config{}, "", "", nil, nil, errors.Join(err, repoLock.Close(), workspaceLock.Close())
 	}
 	return cfg, sha, repo, workspaceLock, repoLock, nil
 }
@@ -580,8 +567,10 @@ func projectedPublicationPointers(cfg config.Config, repoName string, dists []mu
 // rejectPublishedPointerWithdrawal prevents an ordinary local mutation from
 // creating a Generation that the configured target protocol cannot publish.
 // A target can be deliberately retired/unbound in workspace config first;
-// while it remains configured, every pointer in its applied checkpoint for an
-// affected Dist must remain present in the prospective view.
+// while it remains configured, every pointer of its published Generation for
+// an affected Dist must remain present in the prospective view. Checkpoint
+// views list only the pointers changed by the last attempt, so they are not
+// the complete published state that the publication plan protects.
 func rejectPublishedPointerWithdrawal(ctx context.Context, cfg config.Config, repoName string, store *state.Store, affectedDists []string, prospective map[string]struct{}) error {
 	if len(affectedDists) == 0 {
 		return nil
@@ -616,10 +605,17 @@ func rejectPublishedPointerWithdrawal(ctx context.Context, cfg config.Config, re
 		if err != nil {
 			return err
 		}
-		for _, view := range checkpoint.Views {
+		published, err := store.GenerationManifest(ctx, checkpoint.Generation)
+		if err != nil {
+			return err
+		}
+		for _, file := range published {
+			if file.Phase != "pointer" {
+				continue
+			}
 			touches := false
 			for prefix := range affected {
-				if view.ViewID == prefix || strings.HasPrefix(view.ViewID, prefix+"/") {
+				if strings.HasPrefix(file.Path, prefix+"/") {
 					touches = true
 					break
 				}
@@ -627,8 +623,8 @@ func rejectPublishedPointerWithdrawal(ctx context.Context, cfg config.Config, re
 			if !touches {
 				continue
 			}
-			if _, kept := prospective[view.PointerPath]; !kept {
-				return fmt.Errorf("%w: mutation would withdraw published pointer %q from configured target %q; retire or move that target binding/prefix before removing the view, architecture, or signing companion", ErrRejected, view.PointerPath, targetName)
+			if _, kept := prospective[file.Path]; !kept {
+				return fmt.Errorf("%w: mutation would withdraw published pointer %q from configured target %q; retire or move that target binding/prefix before removing the view, architecture, or signing companion", ErrRejected, file.Path, targetName)
 			}
 		}
 	}

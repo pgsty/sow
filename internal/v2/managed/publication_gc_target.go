@@ -81,9 +81,6 @@ func TargetGC(ctx context.Context, opts TargetGCOptions) (result TargetGCResult,
 		return result, err
 	}
 	backend := opts.backend
-	if err := preflightFilesystemTargetAliases(cfg, opts.Target); err != nil {
-		return result, err
-	}
 	if err := preflightPublicationTarget(targetConfig, filepath.Join(ws.Root, repoName), filepath.Join(ws.Root, ".sow"), backend); err != nil {
 		return result, err
 	}

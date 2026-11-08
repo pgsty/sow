@@ -20,6 +20,7 @@ internal/v2/state/publication_read.go: Store.ListPublicationTargetBindingRevisio
 internal/v2/state/signing_keys.go: Store.RetainRPMSigningKeys
 internal/v2/state/state.go: Store.AddDist
 internal/v2/state/state.go: Store.FinalizeDistRemoval
+internal/v2/state/state.go: Store.LastOperation
 internal/v2/state/state.go: Store.ReferencedArchitectures
 internal/v2/state/state.go: Store.RemoveDist
 internal/v2cli/app.go: Main

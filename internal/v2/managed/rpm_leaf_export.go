@@ -175,8 +175,10 @@ func ExportRPMLeaf(ctx context.Context, opts RPMLeafExportOptions) (result RPMLe
 	if err != nil || summary.BuiltGeneration == 0 || summary.Status != "clean" {
 		return result, fmt.Errorf("%w: RPM leaf export requires a clean Built Generation", ErrNotReady)
 	}
+	// A clean Dist that later builds did not touch keeps its earlier
+	// BuiltGeneration; its view is carried unchanged into the current one.
 	dist, err := store.GetDist(ctx, opts.Dist)
-	if err != nil || dist.Format != "rpm" || dist.BuiltGeneration != summary.BuiltGeneration || !distHasArchitecture(dist, opts.Arch) {
+	if err != nil || dist.Format != "rpm" || dist.BuiltGeneration == 0 || dist.BuiltGeneration > summary.BuiltGeneration || !distHasArchitecture(dist, opts.Arch) {
 		return result, fmt.Errorf("%w: requested RPM view is not bound to the current Built Generation", ErrRejected)
 	}
 	identity, err := store.RepositoryIdentity(ctx)

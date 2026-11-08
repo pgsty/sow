@@ -24,6 +24,45 @@ func newRejectionWorkspace(t *testing.T) (string, WorkspaceOptions) {
 	return root, WorkspaceOptions{Workdir: root, CWD: root}
 }
 
+// An earlier operation recorded while the host clock was ahead must not make
+// the active mutation look stale after the clock steps back.
+func TestMutationIgnoresWallClockOrderOfEarlierOperations(t *testing.T) {
+	ctx := context.Background()
+	root, ws := newRejectionWorkspace(t)
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, updateErr := store.DB().ExecContext(ctx, `UPDATE operations SET created_at = '2099-01-01T00:00:00.000000000Z', updated_at = '2099-01-01T00:00:00.000000000Z'`)
+	var updated int64
+	if updateErr == nil {
+		updated, updateErr = result.RowsAffected()
+	}
+	if err := errors.Join(updateErr, store.Close()); err != nil || updated == 0 {
+		t.Fatalf("future operation rows=%d err=%v", updated, err)
+	}
+	input, err := filepath.Abs("../../../third_party/cavaliergopher-rpm/testdata/epel-release-7-5.noarch.rpm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := errors.New("interrupt mutation after clock step")
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"el9"}, Paths: []string{input}, Jobs: 1, Fault: func(point string) error {
+		if point == "add.applied" {
+			return stop
+		}
+		return nil
+	}}); !errors.Is(err, stop) {
+		t.Fatalf("add after clock step did not reach interruption: %v", err)
+	}
+	if _, err := Build(ctx, BuildOptions{WorkspaceOptions: ws, Repository: "repo", Jobs: 1}); err != nil {
+		t.Fatalf("build after clock step: %v", err)
+	}
+	checked, err := Check(ctx, CheckOptions{WorkspaceOptions: ws, Repository: "repo", Jobs: 1})
+	if err != nil || checked.Status != "clean" {
+		t.Fatalf("check=%#v err=%v", checked, err)
+	}
+}
+
 func collidingRPMInputs(t *testing.T, root string) []string {
 	t.Helper()
 	paths := []string{}

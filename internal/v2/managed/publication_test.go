@@ -682,6 +682,112 @@ func TestConfiguredPublishedTargetRejectsPointerWithdrawalBeforeMutation(t *test
 	})
 }
 
+// Only the selected target is written. An unmounted unrelated target must not
+// block it, while a target that overlaps it must still be rejected.
+func TestFilesystemTargetOverlapChecksOnlySelectedTarget(t *testing.T) {
+	ctx := context.Background()
+	fixture, _, _ := filesystemPublishFixture(t)
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := cfg.Targets["local"]
+	offline := local
+	offline.Endpoint = (&url.URL{Scheme: "file", Path: filepath.Join(t.TempDir(), "unmounted")}).String()
+	offline.Prefix = "x"
+	offline.PublicEndpoint = "https://example.invalid/x/"
+	cfg.Targets["offline"] = offline
+	writeManagedConfig(t, fixture.root, cfg)
+	stop := errors.New("stop offline-target publication before commit")
+	_, err = Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", Fault: func(point string) error {
+		if point == "publish.payload" {
+			return stop
+		}
+		return nil
+	}})
+	if !errors.Is(err, stop) {
+		t.Fatalf("publication interruption: %v", err)
+	}
+	if _, err := AbandonPublication(ctx, PublicationAbandonOptions{WorkspaceOptions: fixture.options, Target: "local"}); err != nil {
+		t.Fatalf("abort with an unmounted unrelated target: %v", err)
+	}
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local"}); err != nil {
+		t.Fatalf("publish with an unmounted unrelated target: %v", err)
+	}
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "local"}); err != nil {
+		t.Fatalf("target gc with an unmounted unrelated target: %v", err)
+	}
+	endpoint, err := url.Parse(local.Endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(filepath.FromSlash(endpoint.Path), alias); err != nil {
+		t.Fatal(err)
+	}
+	nested := local
+	nested.Endpoint = (&url.URL{Scheme: "file", Path: alias}).String()
+	nested.Prefix = local.Prefix + "/nested"
+	nested.PublicEndpoint = "https://example.invalid/nested/"
+	cfg.Targets["nested"] = nested
+	writeManagedConfig(t, fixture.root, cfg)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local"}); !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), "overlap") {
+		t.Fatalf("overlapping target publish error=%v", err)
+	}
+}
+
+// The last attempt's views cover only changed Dists. Withdrawal protection
+// must still see every pointer of the published Generation.
+func TestPointerWithdrawalProtectsDistsUnchangedByLastPublish(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el8": {Format: "rpm"}, "el9": {Format: "rpm"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el8", "el9"}, Paths: []string{rpm}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	endpoint, err := realDirectory(t.TempDir(), false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefix := "mirror/repo"
+	cfg, err = config.Load(filepath.Join(root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Targets = map[string]config.TargetConfig{"local": {
+		Repository: "repo", Provider: "filesystem", Endpoint: (&url.URL{Scheme: "file", Path: endpoint}).String(), Prefix: prefix,
+		PublicEndpoint: (&url.URL{Scheme: "file", Path: filepath.Join(endpoint, filepath.FromSlash(prefix)) + string(filepath.Separator)}).String(), MaxCacheTTL: "0s",
+		AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: options, Target: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Remove(ctx, RemoveOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el8"}, Packages: []string{"pgdg-redhat-nonfree-repo"}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: options, Target: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RemoveDistResult(ctx, DistRemoveOptions{WorkspaceOptions: options, Repository: "repo", Name: "el9", Force: true}); !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), "withdraw published pointer") {
+		t.Fatalf("unchanged dist removal error=%v", err)
+	}
+	if published, err := Publish(ctx, PublishOptions{WorkspaceOptions: options, Target: "local"}); err != nil || !published.Noop {
+		t.Fatalf("publish after rejected removal=%#v err=%v", published, err)
+	}
+}
+
 func TestFilesystemTargetGCEvidenceDeletionCrashReplayAndLiveInventory(t *testing.T) {
 	ctx := context.Background()
 	fixture, _, targetRoot := filesystemPublishFixture(t)

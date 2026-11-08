@@ -1354,6 +1354,48 @@ func TestOperationJournalTransitionsAndPending(t *testing.T) {
 	}
 }
 
+func TestActiveOperationRequiresSolePendingID(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first := strings.Repeat("1", 64)
+	second := strings.Repeat("2", 64)
+	assertRejected := func(id string) {
+		t.Helper()
+		if _, err := store.ActiveOperation(ctx, id); !errors.Is(err, ErrConflict) {
+			t.Fatalf("ambiguous or inactive journal entry accepted: %v", err)
+		}
+	}
+	assertRejected(first)
+	for _, id := range []string{first, second} {
+		if err := store.BeginOperation(ctx, Operation{ID: id, Kind: "dist.new", State: OperationPlanned, PayloadJSON: `{}`}); err != nil {
+			t.Fatal(err)
+		}
+		if id == first {
+			if op, err := store.ActiveOperation(ctx, first); err != nil || op.ID != first {
+				t.Fatalf("sole operation=%v err=%v", op, err)
+			}
+			assertRejected(second)
+		}
+	}
+	assertRejected(first)
+	assertRejected(second)
+	if err := store.SetOperationState(ctx, second, OperationRolledBack, ""); err != nil {
+		t.Fatal(err)
+	}
+	assertRejected(second)
+	if op, err := store.ActiveOperation(ctx, first); err != nil || op.ID != first {
+		t.Fatalf("terminal entry interferes with active one: %v %v", op, err)
+	}
+	if err := store.SetOperationState(ctx, first, OperationRolledBack, ""); err != nil {
+		t.Fatal(err)
+	}
+	assertRejected(first)
+}
+
 func TestOperationPayloadWireLimit(t *testing.T) {
 	atLimit := `"` + strings.Repeat("x", MaxOperationPayloadBytes-2) + `"`
 	if len(atLimit) != MaxOperationPayloadBytes {

@@ -1,6 +1,7 @@
 package managed
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -449,6 +450,71 @@ func TestLocalGCCrashReplayBeforeAndAfterSQLiteCommit(t *testing.T) {
 			}
 			if _, err := os.Lstat(filepath.Join(fixture.root, "repo", filepath.FromSlash(fixture.object.PoolPath))); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("payload remains after replay: %v", err)
+			}
+			checked, err := Check(ctx, CheckOptions{WorkspaceOptions: fixture.options, Repository: "repo", Jobs: 1})
+			if err != nil || !checked.ReadyToCopy {
+				t.Fatalf("check=%#v err=%v", checked, err)
+			}
+		})
+	}
+}
+
+// An interrupted plan write leaves a short or empty plan while the operation
+// is still planned. Nothing was detached, so recovery must roll back instead
+// of blocking every later writer.
+func TestLocalGCPlannedRecoveryDiscardsIncompletePlan(t *testing.T) {
+	for name, keep := range map[string]int{"empty": 0, "short": 7, "contradictory": 0} {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := newLocalGCFixture(t, false)
+			injected := errors.New("crash after local GC plan")
+			if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo", Fault: func(point string) error {
+				if point == "gc.planned" {
+					return injected
+				}
+				return nil
+			}}); !errors.Is(err, injected) {
+				t.Fatalf("fault=%v", err)
+			}
+			plans, err := filepath.Glob(filepath.Join(fixture.root, ".sow", "repo", "recovery", "*", localGCPlanName))
+			if err != nil || len(plans) != 1 {
+				t.Fatalf("plans=%v err=%v", plans, err)
+			}
+			data, err := os.ReadFile(plans[0])
+			if err != nil || len(data) <= keep {
+				t.Fatalf("plan bytes=%d err=%v", len(data), err)
+			}
+			if err := os.WriteFile(plans[0], data[:keep], 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if name == "contradictory" {
+				foreign := filepath.Join(filepath.Dir(plans[0]), "unexpected")
+				if err := os.WriteFile(foreign, []byte("preserve evidence"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := Build(ctx, BuildOptions{WorkspaceOptions: fixture.options, Repository: "repo", Jobs: 1}); !errors.Is(err, ErrIntegrity) {
+					t.Fatalf("contradictory recovery was accepted: %v", err)
+				}
+				if got, err := os.ReadFile(plans[0]); err != nil || !bytes.Equal(got, data[:keep]) {
+					t.Fatalf("incomplete plan evidence changed: %q %v", got, err)
+				}
+				if got, err := os.ReadFile(foreign); err != nil || string(got) != "preserve evidence" {
+					t.Fatalf("unexpected evidence changed: %q %v", got, err)
+				}
+				return
+			}
+			if _, err := Build(ctx, BuildOptions{WorkspaceOptions: fixture.options, Repository: "repo", Jobs: 1}); err != nil {
+				t.Fatalf("build after incomplete GC plan: %v", err)
+			}
+			result, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"})
+			if err != nil || result.Noop || result.Objects != 1 {
+				t.Fatalf("gc after incomplete plan=%#v err=%v", result, err)
+			}
+			if entries, err := os.ReadDir(filepath.Join(fixture.root, ".sow", "repo", "recovery")); err != nil || len(entries) != 0 {
+				t.Fatalf("recovery remainder=%v err=%v", entries, err)
+			}
+			if _, err := os.Lstat(filepath.Join(fixture.root, "repo", filepath.FromSlash(fixture.object.PoolPath))); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("payload remains after gc: %v", err)
 			}
 			checked, err := Check(ctx, CheckOptions{WorkspaceOptions: fixture.options, Repository: "repo", Jobs: 1})
 			if err != nil || !checked.ReadyToCopy {

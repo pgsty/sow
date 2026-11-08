@@ -280,6 +280,55 @@ func TestRetainedGenerationVerifierAcceptsEmptyManifest(t *testing.T) {
 	}
 }
 
+// The tombstone rename follows a durable plan. A plan whose write was
+// interrupted is rebuilt from the untouched retained target.
+func TestRetainRemoveRebuildsIncompletePlan(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(root, "package.rpm"))
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := RetainAdd(ctx, RetainAddOptions{WorkspaceOptions: options, Repository: "repo", Generation: added.Generation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	planCrash := errors.New("crash after retained removal plan")
+	if _, err := RetainRemove(ctx, RetainRemoveOptions{WorkspaceOptions: options, Repository: "repo", Generation: added.Generation, Fault: func(point string) error {
+		if point == "retain.remove.planned" {
+			return planCrash
+		}
+		return nil
+	}}); !errors.Is(err, planCrash) {
+		t.Fatalf("retained removal plan fault=%v", err)
+	}
+	planPath := filepath.Join(root, ".sow", "repo", "stage", "retain-remove-"+added.Generation.String()+".plan.json")
+	data, err := os.ReadFile(planPath)
+	if err != nil || len(data) < 2 {
+		t.Fatalf("plan bytes=%d err=%v", len(data), err)
+	}
+	if err := os.WriteFile(planPath, data[:len(data)/2], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := RetainRemove(ctx, RetainRemoveOptions{WorkspaceOptions: options, Repository: "repo", Generation: added.Generation})
+	if err != nil || removed.RecordIdentity != retained.RecordIdentity {
+		t.Fatalf("retained removal after incomplete plan=%#v err=%v", removed, err)
+	}
+	for _, path := range []string{retained.Path, planPath} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s remains after removal: %v", path, err)
+		}
+	}
+}
+
 func TestRetainedGenerationCopiesMetadataButReferencesPayload(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()

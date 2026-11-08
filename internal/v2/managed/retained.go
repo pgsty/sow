@@ -804,8 +804,12 @@ func validateRetainedRemovalRemainder(ctx context.Context, root string, plan ret
 	return nil
 }
 
+// errIncompleteRetainedRemovalPlan marks a plan that cannot be parsed, such as
+// the empty or short file left when its write was interrupted.
+var errIncompleteRetainedRemovalPlan = errors.New("retained removal plan is incomplete")
+
 func loadRetainedRemovalPlan(stageRoot, name string) (retainedRemovalPlan, []byte, bool, error) {
-	data, err := readRootedPrivateRegular(stageRoot, name, maxRetainedRemovalBytes, false)
+	data, err := readRootedPrivateRegular(stageRoot, name, maxRetainedRemovalBytes, true)
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOENT) {
 		return retainedRemovalPlan{}, nil, false, nil
 	}
@@ -814,7 +818,7 @@ func loadRetainedRemovalPlan(stageRoot, name string) (retainedRemovalPlan, []byt
 	}
 	plan, canonical, err := parseRetainedRemovalPlan(data)
 	if err != nil {
-		return retainedRemovalPlan{}, nil, true, fmt.Errorf("%w: retained removal plan is invalid: %v", ErrIntegrity, err)
+		return retainedRemovalPlan{}, data, true, fmt.Errorf("%w: %w: %v", ErrIntegrity, errIncompleteRetainedRemovalPlan, err)
 	}
 	return plan, canonical, true, nil
 }
@@ -940,6 +944,14 @@ func RemoveRetainedGeneration(ctx context.Context, opts RetainRemoveOptions) (re
 		return result, fmt.Errorf("%w: retained Generation and removal tombstone both exist", ErrIntegrity)
 	}
 	plan, planBytes, planExists, err := loadRetainedRemovalPlan(stageRoot, planName)
+	if errors.Is(err, errIncompleteRetainedRemovalPlan) && targetExists {
+		// The tombstone rename happens only after the plan is durable. While
+		// the target is still in place, rebuild an interrupted plan from it.
+		if removeErr := removeRootedRegularExact(ctx, stageRoot, planName, int64(len(planBytes)), bytesSHA(planBytes)); removeErr != nil {
+			return result, errors.Join(err, removeErr)
+		}
+		plan, planBytes, planExists, err = retainedRemovalPlan{}, nil, false, nil
+	}
 	if err != nil {
 		return result, err
 	}

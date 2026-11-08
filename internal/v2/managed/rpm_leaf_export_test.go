@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -124,6 +125,33 @@ func TestExportRPMLeafCopyAndHardlinkExactWire(t *testing.T) {
 	closeErr := store.Close()
 	if err := errors.Join(summaryErr, manifestErr, closeErr); err != nil || before != after || !reflect.DeepEqual(beforeManifest, afterManifest) {
 		t.Fatalf("export changed repository state before=%#v after=%#v err=%v", before, after, err)
+	}
+}
+
+// Creating another Dist advances the Built Generation without rebuilding el9.
+// Its unchanged view is still current and must remain exportable.
+func TestRPMLeafExportAcceptsDistUnchangedByLaterGenerations(t *testing.T) {
+	for _, signed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("signed=%t", signed), func(t *testing.T) {
+			ctx := context.Background()
+			root, opts, _, trust := prepareRPMLeafExportFixture(t, signed)
+			created, err := NewDist(ctx, DistNewOptions{WorkspaceOptions: opts, Repository: "repo", Name: "el10", Format: "rpm"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(root, "export-unchanged")
+			result, err := ExportRPMLeaf(ctx, RPMLeafExportOptions{WorkspaceOptions: opts, Repository: "repo", Dist: "el9", Arch: "x86_64", Directory: target})
+			if err != nil || result.Packages != 1 || result.Generation != created.Generation || result.Signed != signed {
+				t.Fatalf("export=%#v err=%v", result, err)
+			}
+			marker, err := VerifyRPMLeafExportStandalone(ctx, target, trust)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sourceMarker, err := VerifyRPMLeafExportSourceBound(ctx, RPMLeafVerifySourceOptions{WorkspaceOptions: opts, Repository: "repo", Directory: target}); err != nil || sourceMarker != marker {
+				t.Fatalf("source-bound marker=%#v err=%v", sourceMarker, err)
+			}
+		})
 	}
 }
 

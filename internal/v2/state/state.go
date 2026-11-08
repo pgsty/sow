@@ -2468,6 +2468,21 @@ func (s *Store) PendingOperations(ctx context.Context) ([]Operation, error) {
 	return out, nil
 }
 
+// ActiveOperation returns the identified operation when it is the sole
+// non-terminal journal entry. Repository writers recover before beginning a
+// new operation, so this is the active-operation invariant. It deliberately
+// ignores created_at: a wall-clock step must not make it look stale.
+func (s *Store) ActiveOperation(ctx context.Context, id string) (*Operation, error) {
+	pending, err := s.PendingOperations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(pending) != 1 || pending[0].ID != id {
+		return nil, fmt.Errorf("%w: operation %q is not the sole active journal entry", ErrConflict, id)
+	}
+	return &pending[0], nil
+}
+
 func (s *Store) LastOperation(ctx context.Context) (*Operation, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, kind, state, payload_json, result_json, error_class, error_message, created_at, updated_at FROM operations ORDER BY created_at DESC, id DESC LIMIT 1`)
 	operation, err := scanOperation(row)

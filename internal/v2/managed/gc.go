@@ -442,9 +442,23 @@ func recoverLocalGCOperation(ctx context.Context, root, repoName string, store *
 	} else if statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.Join(fmt.Errorf("%w: local GC recovery directory is unsafe", ErrIntegrity), statErr)
 	}
-	data, readErr := readRootedPrivateRegular(recoveryRoot, localGCPlanName, maxLocalGCPlanBytes, false)
+	planned := operation.State == state.OperationPlanned
+	data, readErr := readRootedPrivateRegular(recoveryRoot, localGCPlanName, maxLocalGCPlanBytes, planned)
+	if planned && readErr == nil && bytesSHA(data) != payload.PlanSHA256 {
+		// The plan is written after the planned journal entry and before any
+		// detachment. Roll back an interrupted write only if the directory
+		// has no contradictory evidence of work having already started.
+		entries, err := listRootedDirectory(recoveryRoot)
+		if err != nil || len(entries) != 1 || entries[0].Name != localGCPlanName {
+			return errors.Join(fmt.Errorf("%w: incomplete local GC plan has unexpected recovery entries", ErrIntegrity), err)
+		}
+		if err := removeRootedRegularExact(ctx, recoveryRoot, localGCPlanName, int64(len(data)), bytesSHA(data)); err != nil {
+			return fmt.Errorf("%w: discard incomplete local GC plan: %v", ErrIntegrity, err)
+		}
+		readErr = os.ErrNotExist
+	}
 	if errors.Is(readErr, os.ErrNotExist) || errors.Is(readErr, unix.ENOENT) {
-		if operation.State != state.OperationPlanned {
+		if !planned {
 			return fmt.Errorf("%w: pending local GC lacks its immutable plan", ErrIntegrity)
 		}
 		if info, statErr := os.Lstat(recoveryRoot); statErr == nil {
@@ -468,7 +482,7 @@ func recoverLocalGCOperation(ctx context.Context, root, repoName string, store *
 		plan.OperationID != payload.OperationID || plan.BaseGeneration != payload.Base || plan.Generation != payload.Generation {
 		return errors.Join(fmt.Errorf("%w: local GC plan differs from operation journal", ErrIntegrity), err)
 	}
-	if operation.State == state.OperationPlanned {
+	if planned {
 		if err := store.SetOperationState(ctx, operation.ID, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
 			return errors.Join(err, ctx.Err())
 		}
