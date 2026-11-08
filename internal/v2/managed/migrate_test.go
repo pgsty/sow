@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/pgsty/sow/internal/v2/config"
+	"github.com/pgsty/sow/internal/v2/signing"
 	"github.com/pgsty/sow/internal/v2/state"
 )
 
@@ -489,8 +490,15 @@ func TestMigrateAPTOnlyPreservesByHashAndClassifiesNoAliases(t *testing.T) {
 func TestMigrateRejectsMetadataSignerDriftOnResume(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	keyOne, _ := managedTestPrivateKey(t, "migration-one")
-	keyTwo, _ := managedTestPrivateKey(t, "migration-two")
+	password := []byte("protected migration signer")
+	keyOne, _ := managedTestEncryptedPrivateKey(t, "migration-one", password)
+	keyTwo, _ := managedTestEncryptedPrivateKey(t, "migration-two", password)
+	passfile := filepath.Join(t.TempDir(), "pass")
+	if err := os.WriteFile(passfile, password, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx = signing.WithPassFile(ctx, passfile)
+	t.Setenv(signing.Environment, filepath.Join(t.TempDir(), "missing"))
 	const keyEnvironment = "SOW_TEST_MIGRATION_METADATA_KEY"
 	t.Setenv(keyEnvironment, string(keyOne))
 	cfg := config.Default()

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/pgsty/sow/internal/v2/signing"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
 
@@ -322,12 +323,22 @@ func signRPMWithCommand(ctx context.Context, path, key string, overwrite bool) e
 	if overwrite {
 		operation = "--resign"
 	}
+	source, err := signing.Select(ctx, "", "", "")
+	if err != nil {
+		return err
+	}
+	passfile, cleanup, err := signing.RPMFile(source)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 	args := []string{
 		"--define", "_signature gpg",
 		"--define", "_gpg_name " + key,
 		"--define", "_gpg_digest_algo sha256",
-		operation, path,
 	}
+	args = append(args, signing.RPMArgs(passfile)...)
+	args = append(args, operation, path)
 	command := exec.CommandContext(ctx, rpm, args...)
 	// The RPM/GPG environment may contain secret-bearing pinentry or macro
 	// diagnostics. Suppress child output rather than reflecting it through the

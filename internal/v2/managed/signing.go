@@ -21,6 +21,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/pgsty/sow/internal/openpgpkey"
 	"github.com/pgsty/sow/internal/v2/config"
+	"github.com/pgsty/sow/internal/v2/signing"
 	"github.com/pgsty/sow/internal/v2/state"
 	"github.com/pgsty/sow/internal/yumrepo"
 	"golang.org/x/sys/unix"
@@ -51,7 +52,7 @@ func init() {
 }
 
 func runRPMSigningChild(args []string) error {
-	if len(args) != 4 {
+	if len(args) != 4 && len(args) != 5 {
 		return errors.New("invalid RPM signing child arguments")
 	}
 	rpm, operation, keyID, name := args[0], args[1], args[2], args[3]
@@ -77,17 +78,28 @@ func runRPMSigningChild(args []string) error {
 	if err := unix.Close(3); err != nil {
 		return errors.New("cannot close RPM signing directory descriptor")
 	}
-	return unix.Exec(rpm, []string{
+	passfile := ""
+	if len(args) == 5 {
+		passfile = args[4]
+		if !strings.HasPrefix(passfile, "/tmp/sow-gpg-pass-") || filepath.Base(passfile) != "pass" || strings.ContainsAny(passfile, " \t\r\n%\x00") {
+			return errors.New("invalid RPM signing passfile")
+		}
+	}
+	rpmArgs := []string{
 		rpm,
 		"--define", "_signature gpg",
 		"--define", "_gpg_name " + strings.ToUpper(keyID),
 		"--define", "_gpg_digest_algo sha256",
-		operation, name,
-	}, os.Environ())
+	}
+	rpmArgs = append(rpmArgs, signing.RPMArgs(passfile)...)
+	rpmArgs = append(rpmArgs, operation, name)
+	return unix.Exec(rpm, rpmArgs, os.Environ())
 }
 
 type rpmSigningPolicy struct {
 	mode             string
+	passfile         string
+	workspaceRoot    string
 	keyID            string
 	current          openpgp.KeyRing
 	trusted          openpgp.KeyRing
@@ -99,7 +111,7 @@ type rpmSigningPolicy struct {
 }
 
 func loadRPMSigningPolicy(ctx context.Context, workspaceRoot string, cfg config.RPMPackageSigningConfig) (rpmSigningPolicy, error) {
-	policy := rpmSigningPolicy{mode: cfg.Mode}
+	policy := rpmSigningPolicy{mode: cfg.Mode, passfile: cfg.PassFile, workspaceRoot: workspaceRoot}
 	if policy.mode == "" {
 		policy.mode = "never"
 	}
@@ -294,17 +306,24 @@ func decodeRetainedEffectiveSigning(value string) (config.EffectiveSigningConfig
 		return config.EffectiveSigningConfig{}, fmt.Errorf("%w: retained RPM package signing snapshot is not canonical", ErrIntegrity)
 	}
 	if frozen.RPM.Metadata != nil {
-		if frozen.RPM.Metadata.Key == "" || !managedFingerprint.MatchString(frozen.RPM.Metadata.KeyFingerprint) || frozen.RPM.Metadata.KeyFingerprint != strings.ToUpper(frozen.RPM.Metadata.KeyFingerprint) {
+		if frozen.RPM.Metadata.PassFile != "" || frozen.RPM.Metadata.Key == "" || !managedFingerprint.MatchString(frozen.RPM.Metadata.KeyFingerprint) || frozen.RPM.Metadata.KeyFingerprint != strings.ToUpper(frozen.RPM.Metadata.KeyFingerprint) {
 			return config.EffectiveSigningConfig{}, fmt.Errorf("%w: retained RPM metadata signing snapshot is invalid", ErrIntegrity)
 		}
 	}
 	if frozen.DEB != nil {
 		metadata := frozen.DEB.Metadata
-		if metadata.Key == "" || !managedFingerprint.MatchString(metadata.KeyFingerprint) || metadata.KeyFingerprint != strings.ToUpper(metadata.KeyFingerprint) {
+		if metadata.PassFile != "" || metadata.Key == "" || !managedFingerprint.MatchString(metadata.KeyFingerprint) || metadata.KeyFingerprint != strings.ToUpper(metadata.KeyFingerprint) {
 			return config.EffectiveSigningConfig{}, fmt.Errorf("%w: retained DEB metadata signing snapshot is invalid", ErrIntegrity)
 		}
 	}
 	return frozen, nil
+}
+
+// Verification also loads this policy. Select credentials only when a signing
+// call or signing preflight needs them, so even a malformed env default cannot
+// interfere with read-only signature verification.
+func (policy rpmSigningPolicy) credential(ctx context.Context) (signing.Source, error) {
+	return signing.Select(ctx, policy.workspaceRoot, policy.passfile, "")
 }
 
 func (policy rpmSigningPolicy) prepare(ctx context.Context, snapshot, basename string, object state.PackageObject) (state.PackageObject, error) {
@@ -329,7 +348,11 @@ func (policy rpmSigningPolicy) prepare(ctx context.Context, snapshot, basename s
 		return state.PackageObject{}, err
 	}
 	neutralBefore := object.PayloadSHA256
-	if err := signManagedRPM(ctx, snapshot, policy.keyID, hadSignature); err != nil {
+	credential, err := policy.credential(ctx)
+	if err != nil {
+		return state.PackageObject{}, err
+	}
+	if err := signManagedRPM(ctx, snapshot, policy.keyID, hadSignature, credential); err != nil {
 		return state.PackageObject{}, err
 	}
 	final, err := inspectRPMSnapshot(ctx, snapshot, basename)
@@ -469,7 +492,7 @@ func hasStructuralRPMSignature(ctx context.Context, filename string) (bool, erro
 	return len(signatures) != 0, nil
 }
 
-func signManagedRPM(ctx context.Context, filename, keyID string, resign bool) error {
+func signManagedRPM(ctx context.Context, filename, keyID string, resign bool, credentials ...signing.Source) error {
 	rpm, err := exec.LookPath("rpm")
 	if err != nil {
 		return errors.New("managed: rpm executable is required by the configured package signing policy")
@@ -512,7 +535,23 @@ func signManagedRPM(ctx context.Context, filename, keyID string, resign bool) er
 	if err != nil {
 		return finish(errors.New("managed: current executable is unavailable for RPM signing"))
 	}
-	command := exec.CommandContext(ctx, executable, rpmSigningChildArg, rpm, operation, strings.ToUpper(keyID), name)
+	source, err := signing.Select(ctx, "", "", "")
+	if len(credentials) != 0 {
+		source, err = credentials[0], nil
+	}
+	if err != nil {
+		return finish(err)
+	}
+	passfile, cleanup, err := signing.RPMFile(source)
+	if err != nil {
+		return finish(err)
+	}
+	defer cleanup()
+	childArgs := []string{rpmSigningChildArg, rpm, operation, strings.ToUpper(keyID), name}
+	if passfile != "" {
+		childArgs = append(childArgs, passfile)
+	}
+	command := exec.CommandContext(ctx, executable, childArgs...)
 	command.ExtraFiles = []*os.File{parent.directory()}
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard
@@ -603,7 +642,7 @@ func validateGPGSecretIdentity(ctx context.Context, fingerprint string) error {
 	return nil
 }
 
-func probeGPGSigning(ctx context.Context, fingerprint string, at time.Time) (string, error) {
+func probeGPGSigning(ctx context.Context, fingerprint string, at time.Time, credential signing.Source) (string, error) {
 	gpg, err := exec.LookPath("gpg")
 	if err != nil {
 		return "", metadataSigningPolicyError("gpg executable is required")
@@ -616,9 +655,12 @@ func probeGPGSigning(ctx context.Context, fingerprint string, at time.Time) (str
 	command.Stdin = strings.NewReader("sow signing preflight\n")
 	var status bytes.Buffer
 	command.Stdout, command.Stderr = io.Discard, &status
-	if err := command.Run(); err != nil {
+	if err := signing.RunGPG(command, credential); err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
+		}
+		if errors.Is(err, signing.ErrCredential) {
+			return "", fmt.Errorf("%w: %v", metadataSigningPolicyError("cannot read GPG credential"), err)
 		}
 		return "", metadataSigningPolicyError("configured OpenPGP key cannot produce a non-interactive signature")
 	}
@@ -739,59 +781,6 @@ func resolveKeyReference(root, reference string) ([]byte, string, error) {
 		return nil, "", errors.New("key reference does not resolve to a bounded regular file")
 	}
 	return data, "", nil
-}
-
-const maxManagedPassphraseBytes = 64 << 10
-
-func resolvePassphraseReference(root, reference string) ([]byte, error) {
-	if reference == "" {
-		return nil, nil
-	}
-	var secret []byte
-	switch {
-	case strings.HasPrefix(reference, "env://"):
-		value, ok := os.LookupEnv(strings.TrimPrefix(reference, "env://"))
-		if !ok {
-			return nil, errors.New("environment passphrase reference is unset")
-		}
-		if len(value) > maxManagedPassphraseBytes {
-			return nil, errors.New("environment passphrase reference is unbounded")
-		}
-		secret = []byte(value)
-	case strings.HasPrefix(reference, "file://"):
-		filename := strings.TrimPrefix(reference, "file://")
-		if !filepath.IsAbs(filename) {
-			filename = filepath.Join(root, filename)
-		}
-		data, err := readBoundedRegularNoFollow(filename, maxManagedPassphraseBytes)
-		if err != nil {
-			return nil, errors.New("passphrase file reference is missing, unsafe, empty, or unbounded")
-		}
-		secret = data
-	default:
-		filename := reference
-		if !filepath.IsAbs(filename) {
-			filename = filepath.Join(root, filename)
-		}
-		data, err := readBoundedRegularNoFollow(filename, maxManagedPassphraseBytes)
-		if err != nil {
-			return nil, errors.New("passphrase file reference is missing, unsafe, empty, or unbounded")
-		}
-		secret = data
-	}
-	secret = bytes.TrimSuffix(secret, []byte("\n"))
-	secret = bytes.TrimSuffix(secret, []byte("\r"))
-	if len(secret) == 0 || len(secret) > maxManagedPassphraseBytes || bytes.IndexByte(secret, 0) >= 0 {
-		zeroSecret(secret)
-		return nil, errors.New("passphrase reference resolves to an empty, invalid, or unbounded secret")
-	}
-	return secret, nil
-}
-
-func zeroSecret(secret []byte) {
-	for index := range secret {
-		secret[index] = 0
-	}
 }
 
 func exportPublicKey(ctx context.Context, identity string) ([]byte, error) {

@@ -21,12 +21,14 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"github.com/pgsty/sow/internal/aptrepo"
 	"github.com/pgsty/sow/internal/v2/config"
+	"github.com/pgsty/sow/internal/v2/signing"
 	"github.com/pgsty/sow/internal/v2/state"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
 
 type gpgSignerCore struct {
 	identity           string
+	credential         signing.Source
 	fingerprint        string // retained primary certificate identity
 	signingFingerprint string // actual GPG key, pinned for this in-memory signer
 	public             []byte
@@ -106,7 +108,7 @@ func (signer *gpgSignerCore) Validate(ctx context.Context, at time.Time) error {
 	return err
 }
 
-func newGPGSignerCoreWithPublic(ctx context.Context, identity string, at time.Time) (*gpgSignerCore, []byte, error) {
+func newGPGSignerCoreWithPublic(ctx context.Context, identity string, at time.Time, credentials ...signing.Source) (*gpgSignerCore, []byte, error) {
 	if at.IsZero() {
 		return nil, nil, errors.New("managed: gpg metadata signing time is required")
 	}
@@ -116,8 +118,15 @@ func newGPGSignerCoreWithPublic(ctx context.Context, identity string, at time.Ti
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
+	credential, err := signing.Select(ctx, "", "", "")
+	if len(credentials) != 0 {
+		credential, err = credentials[0], nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
 	cache, _ := ctx.Value(metadataSignerCacheKey{}).(*metadataSignerCache)
-	cacheKey := identity + "/" + strconv.FormatInt(at.Unix(), 10)
+	cacheKey := identity + "/" + strconv.FormatInt(at.Unix(), 10) + "/" + credential.ID()
 	if cache != nil {
 		cache.Lock()
 		defer cache.Unlock()
@@ -137,11 +146,11 @@ func newGPGSignerCoreWithPublic(ctx context.Context, identity string, at time.Ti
 	if err != nil || len(fingerprints) != 1 {
 		return nil, nil, metadataSigningPolicyError("gpg identity must resolve to exactly one primary OpenPGP key")
 	}
-	selected, err := probeGPGSigning(ctx, fingerprints[0], at)
+	selected, err := probeGPGSigning(ctx, fingerprints[0], at, credential)
 	if err != nil {
 		return nil, nil, err
 	}
-	core := &gpgSignerCore{identity: identity, fingerprint: strings.ToUpper(fingerprints[0]), signingFingerprint: selected, public: public, at: at.UTC()}
+	core := &gpgSignerCore{identity: identity, credential: credential, fingerprint: strings.ToUpper(fingerprints[0]), signingFingerprint: selected, public: public, at: at.UTC()}
 	if err := core.Validate(ctx, at); err != nil {
 		return nil, nil, err
 	}
@@ -178,7 +187,7 @@ func (signer *gpgSignerCore) runSign(ctx context.Context, operation []string, me
 	args = append(args, operation...)
 	command := exec.CommandContext(ctx, gpg, args...)
 	command.Stdin, command.Stdout, command.Stderr = message, output, io.Discard
-	if err := command.Run(); err != nil {
+	if err := signing.RunGPG(command, signer.credential); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -337,26 +346,27 @@ func loadMetadataSignerSnapshotForFormats(ctx context.Context, root string, repo
 	}
 	at = at.UTC()
 	if reference := repository.Signing.RPM.Metadata.Key; wantRPM && reference != "" {
-		passphrase, err := resolvePassphraseReference(root, repository.Signing.RPM.Metadata.Passphrase)
+		credential, err := signing.Select(ctx, root, repository.Signing.RPM.Metadata.PassFile, repository.Signing.RPM.Metadata.Passphrase)
 		if err != nil {
 			return metadataSignerSnapshot{}, fmt.Errorf("managed: resolve RPM metadata passphrase: %w", err)
 		}
-		defer zeroSecret(passphrase)
 		material, identity, err := resolveKeyReference(root, reference)
 		if err != nil {
 			return metadataSignerSnapshot{}, fmt.Errorf("managed: resolve RPM metadata signing key: %w", err)
 		}
 		if identity != "" {
-			if len(passphrase) != 0 {
-				return metadataSignerSnapshot{}, errors.New("managed: gpg-agent metadata key cannot use an explicit passphrase reference")
-			}
-			core, public, err := newGPGSignerCoreWithPublic(ctx, identity, at)
+			core, public, err := newGPGSignerCoreWithPublic(ctx, identity, at, credential)
 			if err != nil {
 				return metadataSignerSnapshot{}, err
 			}
 			snapshot.RPMSigner = &gpgYUMMetadataSigner{gpgSignerCore: core}
 			snapshot.RPM = metadataSignerIdentity{Fingerprint: core.fingerprint, PublicKey: public, SelectedFingerprint: core.signingFingerprint}
 		} else {
+			passphrase, err := credential.Read()
+			if err != nil {
+				return metadataSignerSnapshot{}, err
+			}
+			defer signing.Clear(passphrase)
 			signer, err := yumrepo.NewOpenPGPSigner(bytes.NewReader(material), passphrase, at)
 			if err != nil {
 				return metadataSignerSnapshot{}, metadataSigningPolicyError("RPM metadata key is unusable for signing at the publication time")
@@ -369,26 +379,27 @@ func loadMetadataSignerSnapshotForFormats(ctx context.Context, root string, repo
 		}
 	}
 	if reference := repository.Signing.DEB.Metadata.Key; wantDEB && reference != "" {
-		passphrase, err := resolvePassphraseReference(root, repository.Signing.DEB.Metadata.Passphrase)
+		credential, err := signing.Select(ctx, root, repository.Signing.DEB.Metadata.PassFile, repository.Signing.DEB.Metadata.Passphrase)
 		if err != nil {
 			return metadataSignerSnapshot{}, fmt.Errorf("managed: resolve DEB metadata passphrase: %w", err)
 		}
-		defer zeroSecret(passphrase)
 		material, identity, err := resolveKeyReference(root, reference)
 		if err != nil {
 			return metadataSignerSnapshot{}, fmt.Errorf("managed: resolve DEB metadata signing key: %w", err)
 		}
 		if identity != "" {
-			if len(passphrase) != 0 {
-				return metadataSignerSnapshot{}, errors.New("managed: gpg-agent metadata key cannot use an explicit passphrase reference")
-			}
-			core, public, err := newGPGSignerCoreWithPublic(ctx, identity, at)
+			core, public, err := newGPGSignerCoreWithPublic(ctx, identity, at, credential)
 			if err != nil {
 				return metadataSignerSnapshot{}, err
 			}
 			snapshot.APTSigner = &gpgAPTMetadataSigner{gpgSignerCore: core}
 			snapshot.DEB = metadataSignerIdentity{Fingerprint: core.fingerprint, PublicKey: public, SelectedFingerprint: core.signingFingerprint}
 		} else {
+			passphrase, err := credential.Read()
+			if err != nil {
+				return metadataSignerSnapshot{}, err
+			}
+			defer signing.Clear(passphrase)
 			signer, err := aptrepo.NewSignerBytes(material, passphrase)
 			if err != nil {
 				return metadataSignerSnapshot{}, fmt.Errorf("managed: load DEB metadata signing key: %w", err)

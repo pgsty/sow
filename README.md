@@ -68,6 +68,17 @@ flat APT repository, and a mixed directory gets both. Serve it with any static w
 `--pigsty` enables the Pigsty layout conventions, and `sow help create` documents the
 complete option contract. Continue with the [Quick Start](https://sow.pgsty.com/docs/start/quickstart/).
 
+For a password-protected signing key, the current development version (Unreleased)
+supports `--passfile /run/secrets/gpg-password`. You can also set `SOW_GPG_PASSFILE`
+to that path or configure `passfile` next to a managed signing
+`key`. Priority is CLI, per-key config (including legacy `passphrase`), then environment.
+Use one nonempty UTF-8 line: one final LF or CRLF is removed, with no trimming of spaces
+or tabs. Keep the file outside the repository, normally mode `0600`. No default file
+is searched. For `create`, `--sign-with` still selects and enables signing.
+Signing and recovery commands share this interface; check `sow help COMMAND` in
+your installed binary and see
+[password files](https://sow.pgsty.com/docs/reference/config/#passfile) for the full contract.
+
 
 --------
 

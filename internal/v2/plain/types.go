@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pgsty/sow/internal/v2/signing"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
 
@@ -105,6 +106,7 @@ type Options struct {
 	Jobs      int
 	Pigsty    bool
 	SignWith  string
+	PassFile  string
 	Overwrite bool
 	Timeout   time.Duration
 	NoWait    bool
@@ -149,6 +151,14 @@ func normalizeOptions(ctx context.Context, opts Options) (Options, error) {
 	}
 	if opts.NoWait && opts.Timeout != 0 {
 		return Options{}, &Error{Kind: KindUsage, Op: "create", Err: errors.New("no-wait and non-zero timeout are mutually exclusive")}
+	}
+	if opts.PassFile != "" {
+		if opts.SignWith == "" {
+			return Options{}, &Error{Kind: KindUsage, Op: "create", Err: errors.New("passfile requires sign-with")}
+		}
+		if err := signing.ValidatePath(opts.PassFile); err != nil {
+			return Options{}, &Error{Kind: KindUsage, Op: "create", Err: err}
+		}
 	}
 	if opts.SignWith != "" {
 		key := opts.SignWith

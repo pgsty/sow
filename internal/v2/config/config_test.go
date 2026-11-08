@@ -138,7 +138,6 @@ func TestParseRejectsInvalidConfiguration(t *testing.T) {
 		{"unsupported key reference", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      deb:\n        metadata:\n          key: vault://secret\n", "unsupported key reference scheme"},
 		{"passphrase without key", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      deb:\n        metadata:\n          passphrase: env://PASSPHRASE\n", "passphrase requires key"},
 		{"invalid passphrase reference", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      deb:\n        metadata:\n          key: keys/repo.asc\n          passphrase: vault://secret\n", "unsupported passphrase reference scheme"},
-		{"agent key explicit passphrase", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        metadata:\n          key: agent://0123456789abcdef\n          passphrase: env://PASSPHRASE\n", "ambient gpg-agent"},
 		{"duplicate trusted key reference", "schema: sow/v3\nrepos:\n  pgsql:\n    signing:\n      rpm:\n        packages:\n          trusted_keys: [keys/a.asc, keys/a.asc]\n", "duplicate rpm trusted key"},
 	}
 	for _, tt := range tests {

@@ -367,6 +367,19 @@ func hashEffectiveDistWithContract(effectiveRepo config.EffectiveRepository, dis
 		return rank(architectures[i]) < rank(architectures[j])
 	})
 	effective.Architectures = architectures
+	// Passfile paths select runtime credentials, not rendered content. Keep old
+	// passphrase reference hashing intact for existing Built generations.
+	effectiveRepo.Signing.RPM.Packages.PassFile = ""
+	if effectiveRepo.Signing.RPM.Metadata != nil {
+		metadata := *effectiveRepo.Signing.RPM.Metadata
+		metadata.PassFile = ""
+		effectiveRepo.Signing.RPM.Metadata = &metadata
+	}
+	if effectiveRepo.Signing.DEB != nil {
+		deb := *effectiveRepo.Signing.DEB
+		deb.Metadata.PassFile = ""
+		effectiveRepo.Signing.DEB = &deb
+	}
 	var signing any
 	if effective.Format == "rpm" {
 		signing = effectiveRepo.Signing.RPM
@@ -401,6 +414,7 @@ func frozenEffectiveSigningForFormats(raw config.SigningConfig, rpmPolicy rpmSig
 		if err != nil {
 			return config.EffectiveSigningConfig{}, fmt.Errorf("managed: %w", err)
 		}
+		packages.PassFile = ""
 		effective.RPM.Packages = packages
 	}
 	if wantRPM && raw.RPM.Metadata.Key != "" {

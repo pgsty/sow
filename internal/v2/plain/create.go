@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/pgsty/sow/internal/v2/signing"
 )
 
 // Create builds flat RPM and/or DEB metadata for one directory. It does not
@@ -15,6 +17,7 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 	if err != nil {
 		return Result{}, err
 	}
+	ctx = signing.WithPassFile(ctx, opts.PassFile)
 	root, err := filepath.Abs(opts.Dir)
 	if err != nil {
 		return Result{}, &Error{Kind: KindRuntime, Op: "resolve directory", Path: opts.Dir, Err: err}

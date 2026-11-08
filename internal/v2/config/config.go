@@ -85,11 +85,13 @@ type DEBSigningConfig struct {
 type RPMPackageSigningConfig struct {
 	Mode        string   `yaml:"mode,omitempty" json:"mode"`
 	Key         string   `yaml:"key,omitempty" json:"key,omitempty"`
+	PassFile    string   `yaml:"passfile,omitempty" json:"passfile,omitempty"`
 	TrustedKeys []string `yaml:"trusted_keys,omitempty" json:"trusted_keys,omitempty"`
 }
 
 type MetadataSigningConfig struct {
 	Key        string `yaml:"key,omitempty" json:"key,omitempty"`
+	PassFile   string `yaml:"passfile,omitempty" json:"passfile,omitempty"`
 	Passphrase string `yaml:"passphrase,omitempty" json:"passphrase,omitempty"`
 }
 
@@ -576,17 +578,32 @@ func normalizeAndValidateSigning(signing *SigningConfig) error {
 		"rpm metadata": signing.RPM.Metadata,
 		"deb metadata": signing.DEB.Metadata,
 	} {
+		if metadata.PassFile != "" && metadata.Passphrase != "" {
+			return fmt.Errorf("%s passfile and passphrase are mutually exclusive", label)
+		}
 		if metadata.Passphrase == "" {
 			continue
 		}
 		if metadata.Key == "" {
 			return fmt.Errorf("%s passphrase requires key", label)
 		}
-		if strings.HasPrefix(metadata.Key, "agent://") {
-			return fmt.Errorf("%s agent key uses its ambient gpg-agent and cannot accept a passphrase reference", label)
-		}
 		if err := validatePassphraseReference(metadata.Passphrase); err != nil {
 			return fmt.Errorf("%s passphrase: %w", label, err)
+		}
+	}
+	for label, credential := range map[string]struct{ key, path string }{
+		"rpm packages": {packages.Key, packages.PassFile},
+		"rpm metadata": {signing.RPM.Metadata.Key, signing.RPM.Metadata.PassFile},
+		"deb metadata": {signing.DEB.Metadata.Key, signing.DEB.Metadata.PassFile},
+	} {
+		if credential.path == "" {
+			continue
+		}
+		if credential.key == "" {
+			return fmt.Errorf("%s passfile requires key", label)
+		}
+		if strings.TrimSpace(credential.path) == "" || strings.ContainsAny(credential.path, "\x00\r\n") {
+			return fmt.Errorf("%s passfile requires a non-empty path without NUL or line breaks", label)
 		}
 	}
 	seen := make(map[string]struct{}, len(packages.TrustedKeys))
@@ -849,6 +866,7 @@ type EffectiveDEBSigningConfig struct {
 type EffectiveRPMPackageSigningConfig struct {
 	Mode                      string   `yaml:"mode" json:"mode"`
 	Key                       string   `yaml:"key,omitempty" json:"key,omitempty"`
+	PassFile                  string   `yaml:"passfile,omitempty" json:"passfile,omitempty"`
 	KeyFingerprint            string   `yaml:"key_fingerprint,omitempty" json:"key_fingerprint,omitempty"`
 	KeySnapshotSHA256         string   `yaml:"key_snapshot_sha256,omitempty" json:"key_snapshot_sha256,omitempty"`
 	TrustedKeys               []string `yaml:"trusted_keys,omitempty" json:"trusted_keys,omitempty"`
@@ -858,6 +876,7 @@ type EffectiveRPMPackageSigningConfig struct {
 
 type EffectiveMetadataSigningConfig struct {
 	Key            string `yaml:"key,omitempty" json:"key,omitempty"`
+	PassFile       string `yaml:"passfile,omitempty" json:"passfile,omitempty"`
 	Passphrase     string `yaml:"passphrase,omitempty" json:"passphrase,omitempty"`
 	KeyFingerprint string `yaml:"key_fingerprint,omitempty" json:"key_fingerprint,omitempty"`
 }
@@ -912,6 +931,7 @@ func EffectiveView(input Config, opts ViewOptions) (EffectiveConfig, error) {
 					Packages: EffectiveRPMPackageSigningConfig{
 						Mode:        repo.Signing.RPM.Packages.Mode,
 						Key:         repo.Signing.RPM.Packages.Key,
+						PassFile:    repo.Signing.RPM.Packages.PassFile,
 						TrustedKeys: append([]string(nil), repo.Signing.RPM.Packages.TrustedKeys...),
 					},
 				},
@@ -919,10 +939,10 @@ func EffectiveView(input Config, opts ViewOptions) (EffectiveConfig, error) {
 			Dists: make(map[string]EffectiveDist),
 		}
 		if repo.Signing.RPM.Metadata.Key != "" {
-			effectiveRepo.Signing.RPM.Metadata = &EffectiveMetadataSigningConfig{Key: repo.Signing.RPM.Metadata.Key, Passphrase: repo.Signing.RPM.Metadata.Passphrase}
+			effectiveRepo.Signing.RPM.Metadata = &EffectiveMetadataSigningConfig{Key: repo.Signing.RPM.Metadata.Key, Passphrase: repo.Signing.RPM.Metadata.Passphrase, PassFile: repo.Signing.RPM.Metadata.PassFile}
 		}
 		if repo.Signing.DEB.Metadata.Key != "" {
-			effectiveRepo.Signing.DEB = &EffectiveDEBSigningConfig{Metadata: EffectiveMetadataSigningConfig{Key: repo.Signing.DEB.Metadata.Key, Passphrase: repo.Signing.DEB.Metadata.Passphrase}}
+			effectiveRepo.Signing.DEB = &EffectiveDEBSigningConfig{Metadata: EffectiveMetadataSigningConfig{Key: repo.Signing.DEB.Metadata.Key, Passphrase: repo.Signing.DEB.Metadata.Passphrase, PassFile: repo.Signing.DEB.Metadata.PassFile}}
 		}
 		for _, distName := range sortedDistNames(repo.Dists) {
 			if opts.Dist != "" && distName != opts.Dist {

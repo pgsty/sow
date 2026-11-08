@@ -15,19 +15,21 @@ import (
 // GlobalOptions are syntactically global but are accepted only when the
 // selected command's closed option matrix permits them.
 type GlobalOptions struct {
-	Workdir string
-	Repo    string
-	Dists   []string
-	Timeout time.Duration
-	NoWait  bool
-	JSON    bool
+	PassFile string
+	Workdir  string
+	Repo     string
+	Dists    []string
+	Timeout  time.Duration
+	NoWait   bool
+	JSON     bool
 
-	workdirSet bool
-	repoSet    bool
-	timeoutSet bool
-	noWaitSet  bool
-	jsonSet    bool
-	distSet    bool
+	passfileSet bool
+	workdirSet  bool
+	repoSet     bool
+	timeoutSet  bool
+	noWaitSet   bool
+	jsonSet     bool
+	distSet     bool
 }
 
 type Invocation struct {
@@ -63,6 +65,7 @@ const (
 	useTimeout
 	useNoWait
 	useJSON
+	usePassFile
 )
 
 type commandSpec struct {
@@ -87,37 +90,37 @@ type commandSpec struct {
 }
 
 var commandSpecs = map[string]commandSpec{
-	"create":          {globals: useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, pigsty: true, signWith: true, overwrite: true, metadataTimestamp: true},
-	"init":            {globals: useJSON, minArgs: 0, maxArgs: 1},
-	"config check":    {globals: useWorkdir | useJSON},
+	"create":          {globals: usePassFile | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, pigsty: true, signWith: true, overwrite: true, metadataTimestamp: true},
+	"init":            {globals: usePassFile | useJSON, minArgs: 0, maxArgs: 1},
+	"config check":    {globals: usePassFile | useWorkdir | useJSON},
 	"config show":     {globals: useWorkdir | useRepo | useDist | useJSON, all: true},
 	"repo ls":         {globals: useWorkdir | useJSON},
-	"repo new":        {globals: useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
+	"repo new":        {globals: usePassFile | useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
 	"repo show":       {globals: useWorkdir | useRepo | useJSON, minArgs: 0, maxArgs: 1},
-	"repo migrate":    {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, abort: true},
-	"repo rm":         {globals: useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, force: true},
+	"repo migrate":    {globals: usePassFile | useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, abort: true},
+	"repo rm":         {globals: usePassFile | useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, force: true},
 	"dist ls":         {globals: useWorkdir | useRepo | useJSON},
-	"dist new":        {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, format: true},
+	"dist new":        {globals: usePassFile | useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, format: true},
 	"dist show":       {globals: useWorkdir | useRepo | useJSON, minArgs: 1, maxArgs: 1},
-	"dist rm":         {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, force: true},
-	"add":             {globals: useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1 << 30, jobs: true, recursive: true, skip: true},
-	"rm":              {globals: useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1 << 30, jobs: true, skip: true, check: true},
+	"dist rm":         {globals: usePassFile | useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, force: true},
+	"add":             {globals: usePassFile | useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1 << 30, jobs: true, recursive: true, skip: true},
+	"rm":              {globals: usePassFile | useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1 << 30, jobs: true, skip: true, check: true},
 	"ls":              {globals: useWorkdir | useRepo | useDist | useJSON},
 	"show":            {globals: useWorkdir | useRepo | useDist | useJSON, minArgs: 1, maxArgs: 1},
 	"where":           {globals: useWorkdir | useRepo | useDist | useJSON, minArgs: 1, maxArgs: 1},
 	"status":          {globals: useWorkdir | useRepo | useDist | useJSON},
-	"build":           {globals: useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, jobs: true},
+	"build":           {globals: usePassFile | useWorkdir | useRepo | useDist | useTimeout | useNoWait | useJSON, jobs: true},
 	"check":           {globals: useWorkdir | useRepo | useDist | useJSON, jobs: true},
 	"changes":         {globals: useWorkdir | useRepo | useJSON, minArgs: 0, maxArgs: 1},
-	"publish":         {globals: useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, abort: true, rebind: true},
+	"publish":         {globals: usePassFile | useWorkdir | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, abort: true, rebind: true},
 	"retain add":      {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
 	"retain ls":       {globals: useWorkdir | useRepo | useJSON},
 	"retain rm":       {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
-	"gc":              {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1},
-	"export rpm-leaf": {globals: useWorkdir | useRepo | useJSON, minArgs: 3, maxArgs: 3, hardlink: true},
+	"gc":              {globals: usePassFile | useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1},
+	"export rpm-leaf": {globals: usePassFile | useWorkdir | useRepo | useJSON, minArgs: 3, maxArgs: 3, hardlink: true},
 	"log":             {globals: useWorkdir | useRepo | useDist | useJSON, minArgs: 0, maxArgs: 1},
 	"log export":      {globals: useWorkdir | useRepo | useDist, minArgs: 0, maxArgs: 1},
-	"log prune":       {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
+	"log prune":       {globals: usePassFile | useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
 }
 
 var errUsage = errors.New("usage error")
@@ -231,6 +234,9 @@ func Parse(args []string) (Invocation, error) {
 	if inv.Help {
 		return inv, nil
 	}
+	if key == "create" && global.passfileSet && inv.SignWith == "" {
+		return Invocation{}, usageError("--passfile requires --sign-with for create")
+	}
 	if inv.Overwrite && inv.SignWith == "" {
 		return Invocation{}, usageError("--overwrite requires --sign-with")
 	}
@@ -307,7 +313,7 @@ func extractGlobal(args []string) ([]string, GlobalOptions, bool, bool, error) {
 				return nil, out, false, false, usageError("--json is duplicated or has a value")
 			}
 			out.JSON, out.jsonSet = true, true
-		case "-C", "--workdir", "-r", "--repo", "-d", "--dist", "-T", "--timeout":
+		case "--passfile", "-C", "--workdir", "-r", "--repo", "-d", "--dist", "-T", "--timeout":
 			value := inline
 			if !hasInline {
 				if i+1 >= len(args) {
@@ -320,6 +326,14 @@ func extractGlobal(args []string) ([]string, GlobalOptions, bool, bool, error) {
 				return nil, out, false, false, usageError("%s requires a non-empty value", name)
 			}
 			switch name {
+			case "--passfile":
+				if out.passfileSet {
+					return nil, out, false, false, usageError("--passfile is duplicated")
+				}
+				if strings.TrimSpace(value) == "" || strings.ContainsAny(value, "\x00\r\n") {
+					return nil, out, false, false, usageError("--passfile requires a non-empty path without NUL or line breaks")
+				}
+				out.PassFile, out.passfileSet = value, true
 			case "-C", "--workdir":
 				if out.workdirSet {
 					return nil, out, false, false, usageError("--workdir is duplicated")
@@ -485,6 +499,7 @@ func validateGlobalUse(command string, global GlobalOptions, allowed optionUse) 
 		use  optionUse
 		name string
 	}{
+		{global.passfileSet, usePassFile, "--passfile"},
 		{global.workdirSet, useWorkdir, "--workdir"},
 		{global.repoSet, useRepo, "--repo"},
 		{global.distSet, useDist, "--dist"},

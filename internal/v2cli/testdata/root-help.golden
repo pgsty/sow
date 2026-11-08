@@ -6,6 +6,7 @@ Usage:
 Options:
   -h, --help                         Show help
       --version                      Show version
+      --passfile PATH                Signing password file; see command help
 
 Commands:
   create [DIR]                       Generate a flat RPM/DEB repository

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pgsty/sow/internal/v2/config"
+	signingauth "github.com/pgsty/sow/internal/v2/signing"
 	"github.com/pgsty/sow/internal/v2/state"
 )
 
@@ -98,7 +99,7 @@ func resolveEffectiveSigningFingerprintsForFormats(ctx context.Context, root str
 		}
 		if signing.RPM.Metadata.Key != "" {
 			if effective.RPM.Metadata == nil {
-				effective.RPM.Metadata = &config.EffectiveMetadataSigningConfig{Key: signing.RPM.Metadata.Key, Passphrase: signing.RPM.Metadata.Passphrase}
+				effective.RPM.Metadata = &config.EffectiveMetadataSigningConfig{Key: signing.RPM.Metadata.Key, Passphrase: signing.RPM.Metadata.Passphrase, PassFile: signing.RPM.Metadata.PassFile}
 			}
 			effective.RPM.Metadata.KeyFingerprint, err = resolveOne("rpm metadata key", signing.RPM.Metadata.Key)
 			if err != nil {
@@ -110,7 +111,7 @@ func resolveEffectiveSigningFingerprintsForFormats(ctx context.Context, root str
 	}
 	if wantDEB && signing.DEB.Metadata.Key != "" {
 		if effective.DEB == nil {
-			effective.DEB = &config.EffectiveDEBSigningConfig{Metadata: config.EffectiveMetadataSigningConfig{Key: signing.DEB.Metadata.Key, Passphrase: signing.DEB.Metadata.Passphrase}}
+			effective.DEB = &config.EffectiveDEBSigningConfig{Metadata: config.EffectiveMetadataSigningConfig{Key: signing.DEB.Metadata.Key, Passphrase: signing.DEB.Metadata.Passphrase, PassFile: signing.DEB.Metadata.PassFile}}
 		}
 		fingerprint, err := resolveOne("deb metadata key", signing.DEB.Metadata.Key)
 		if err != nil {
@@ -137,7 +138,7 @@ func canonicalEffectiveRPMPackages(raw config.RPMPackageSigningConfig, current s
 		}
 	}
 	effective := config.EffectiveRPMPackageSigningConfig{
-		Mode: mode, Key: raw.Key, TrustedKeys: append([]string(nil), raw.TrustedKeys...),
+		Mode: mode, Key: raw.Key, PassFile: raw.PassFile, TrustedKeys: append([]string(nil), raw.TrustedKeys...),
 	}
 	if mode == "never" {
 		return effective, nil
@@ -198,16 +199,28 @@ func resolveReferenceFingerprints(ctx context.Context, root, reference string) (
 	return stableUniqueStrings(fingerprints), nil
 }
 
-// validateSigningApplicabilityForFormats is the config-check preflight. It proves that
-// configured signing keys can actually sign at the current time without
-// mutating repository state. Agent keys use one small non-interactive probe.
+// validateSigningApplicabilityForFormats is the config-check preflight. It unlocks
+// metadata key files and validates their current suitability; metadata agent keys
+// use one small non-interactive signing probe. RPM packages check credential format,
+// tools and secret-key availability; the actual rpm call proves signing capability.
+// None of these checks mutates repository state.
 func validateSigningApplicabilityForFormats(ctx context.Context, root string, signing config.SigningConfig, wantRPM, wantDEB bool) error {
 	if _, err := resolveEffectiveSigningFingerprintsForFormats(ctx, root, signing, config.EffectiveSigningConfig{}, wantRPM, wantDEB); err != nil {
 		return err
 	}
 	if wantRPM && signing.RPM.Packages.Mode != "never" {
-		if _, err := loadRPMSigningPolicy(ctx, root, signing.RPM.Packages); err != nil {
+		policy, err := loadRPMSigningPolicy(ctx, root, signing.RPM.Packages)
+		if err != nil {
 			return fmt.Errorf("rpm packages policy is not usable: %w", err)
+		}
+		credential, err := policy.credential(ctx)
+		if err != nil {
+			return fmt.Errorf("rpm packages credential is not usable: %w", err)
+		}
+		secret, err := credential.Read()
+		signingauth.Clear(secret)
+		if err != nil {
+			return fmt.Errorf("rpm packages credential is not usable: %w", err)
 		}
 		if err := validateRPMPackageSigningKey(ctx, root, signing.RPM.Packages.Key); err != nil {
 			return fmt.Errorf("rpm packages key is not usable for signing: %w", err)

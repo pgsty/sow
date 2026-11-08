@@ -38,6 +38,7 @@ internal/v2/config/directory_access_darwin.go
 internal/v2/config/directory_access_linux.go
 internal/v2/config/discovery.go
 internal/v2/config/discovery_test.go
+internal/v2/config/passfile_test.go
 internal/v2/config/permissions_test.go
 internal/v2/config/selection_test.go
 internal/v2/config/targets.go
@@ -90,6 +91,7 @@ internal/v2/managed/mutation_rejection_test.go
 internal/v2/managed/package_facts.go
 internal/v2/managed/package_refs.go
 internal/v2/managed/package_refs_test.go
+internal/v2/managed/passfile_test.go
 internal/v2/managed/path.go
 internal/v2/managed/path_permissions_test.go
 internal/v2/managed/path_security_test.go
@@ -165,6 +167,13 @@ internal/v2/plain/scan.go
 internal/v2/plain/sign.go
 internal/v2/plain/timestamp_test.go
 internal/v2/plain/types.go
+internal/v2/signing/command.go
+internal/v2/signing/command_test.go
+internal/v2/signing/file.go
+internal/v2/signing/file_darwin.go
+internal/v2/signing/file_linux.go
+internal/v2/signing/passfile.go
+internal/v2/signing/passfile_test.go
 internal/v2/state/audit.go
 internal/v2/state/audit_maintenance_test.go
 internal/v2/state/database_file_darwin.go
@@ -226,6 +235,7 @@ internal/v2cli/output.go
 internal/v2cli/output_test.go
 internal/v2cli/parse.go
 internal/v2cli/parse_test.go
+internal/v2cli/passfile_test.go
 internal/v2cli/postcommit_test.go
 internal/v2cli/prune_maintenance_test.go
 internal/v2cli/testdata/root-help.golden

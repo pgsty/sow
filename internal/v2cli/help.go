@@ -42,8 +42,26 @@ func HelpTopic(parts ...string) (string, bool) {
 	}
 	key := strings.Join(parts, " ")
 	text, ok := helpText[key]
+	if ok && commandSpecs[key].globals&usePassFile != 0 {
+		text += signingHelp
+	}
 	return text, ok
 }
+
+const signingHelp = `
+Signing credentials:
+      --passfile PATH  Read the GPG password from a file; overrides per-key config
+  SOW_GPG_PASSFILE     Default password-file path when no CLI/config source is set
+
+Paths from CLI/environment are relative to the process working directory.
+Config passfile paths are relative to the workspace root. No default file is searched.
+Use one non-empty UTF-8 line without BOM, NUL or embedded CR/LF.
+The 64 KiB limit includes any final newline.
+An optional final LF or CRLF is removed; spaces and tabs are preserved literally.
+Keep the file outside the repository, normally mode 0600. Symlinks are rejected.
+Selected credentials never fall back to a prompt.
+Without a source, existing key/GPG/RPM behavior is unchanged.
+`
 
 var helpText = map[string]string{
 	"": `SOW local package repository manager
@@ -54,6 +72,7 @@ Usage:
 Options:
   -h, --help                         Show help
       --version                      Show version
+      --passfile PATH                Signing password file; see command help
 
 Commands:
   create [DIR]                       Generate a flat RPM/DEB repository
@@ -93,7 +112,7 @@ Commands:
 Use "sow help COMMAND" for command help.
 `,
 	"create": `Usage:
-  sow create [DIR] [-j N] [--metadata-timestamp SECONDS] [--pigsty] [-S KEY [--overwrite]] [-T DUR | -N] [--json]
+  sow create [DIR] [-j N] [--metadata-timestamp SECONDS] [--pigsty] [-S KEY [--overwrite] [--passfile PATH]] [-T DUR | -N] [--json]
 
 Options:
   -j, --jobs N          Workers for the single content pass; defaults to CPU count
@@ -106,6 +125,8 @@ Options:
   -N, --no-wait         Fail immediately when the lock is held
       --json            Emit the versioned JSON envelope
   -h, --help            Show help
+
+--passfile requires --sign-with; SOW_GPG_PASSFILE alone does not enable signing.
 `,
 	"export": `Usage:
   sow export COMMAND
@@ -116,7 +137,7 @@ Commands:
 Use "sow help export rpm-leaf" for command help.
 `,
 	"export rpm-leaf": `Usage:
-  sow export rpm-leaf DIST ARCH DIR [--hardlink] [-C DIR] [-r NAME] [--json]
+  sow export rpm-leaf DIST ARCH DIR [--hardlink] [-C DIR] [-r NAME] [--json] [--passfile PATH]
 
 Arguments:
   DIST                 Built RPM distribution name
@@ -131,7 +152,7 @@ Options:
   -h, --help           Show help
 `,
 	"init": `Usage:
-  sow init [DIR] [--json]
+  sow init [DIR] [--json] [--passfile PATH]
 
 Options:
       --json            Emit the versioned JSON envelope
@@ -147,7 +168,11 @@ Commands:
 Use "sow help config COMMAND" for command help.
 `,
 	"config check": `Usage:
-  sow config check [-C DIR] [--json]
+  sow config check [-C DIR] [--json] [--passfile PATH]
+
+Metadata checks unlock key files and validate their suitability; GPG keys also
+perform a signing probe. RPM package checks validate credential format, tools,
+and secret-key availability; they do not test the password by signing a package.
 
 Options:
   -C, --workdir DIR     Workspace discovery start directory
@@ -186,7 +211,7 @@ Options:
   -h, --help            Show help
 `,
 	"repo new": `Usage:
-  sow repo new NAME [-C DIR] [-T DUR | -N] [--json]
+  sow repo new NAME [-C DIR] [-T DUR | -N] [--json] [--passfile PATH]
 
 Options:
   -C, --workdir DIR     Workspace discovery start directory
@@ -205,7 +230,7 @@ Options:
   -h, --help            Show help
 `,
 	"repo migrate": `Usage:
-  sow repo migrate [NAME] [--abort] [-j N] [-C DIR] [-r NAME] [-T DUR | -N] [--json]
+  sow repo migrate [NAME] [--abort] [-j N] [-C DIR] [-r NAME] [-T DUR | -N] [--json] [--passfile PATH]
 
 Aborting preserves non-empty temporary stages under .sow/NAME/abandoned/.
 Cleanup problems produce warnings and do not prevent abandoning an uncommitted
@@ -222,7 +247,7 @@ Options:
   -h, --help            Show help
 `,
 	"repo rm": `Usage:
-  sow repo rm NAME [-f|--force] [-C DIR] [-T DUR | -N] [--json]
+  sow repo rm NAME [-f|--force] [-C DIR] [-T DUR | -N] [--json] [--passfile PATH]
 
 Options:
   -f, --force           Remove a non-empty unprotected repository
@@ -253,7 +278,7 @@ Options:
   -h, --help            Show help
 `,
 	"dist new": `Usage:
-  sow dist new NAME --format rpm|deb [-C DIR] [-r NAME] [-T DUR | -N] [--json]
+  sow dist new NAME --format rpm|deb [-C DIR] [-r NAME] [-T DUR | -N] [--json] [--passfile PATH]
 
 Options:
       --format FORMAT   Required; rpm or deb
@@ -274,7 +299,7 @@ Options:
   -h, --help            Show help
 `,
 	"dist rm": `Usage:
-  sow dist rm NAME [-f|--force] [-C DIR] [-r NAME] [-T DUR | -N] [--json]
+  sow dist rm NAME [-f|--force] [-C DIR] [-r NAME] [-T DUR | -N] [--json] [--passfile PATH]
 
 Options:
   -f, --force           Remove membership and indexes but retain pool packages
@@ -286,7 +311,7 @@ Options:
   -h, --help            Show help
 `,
 	"add": `Usage:
-  sow add PATH... [-R|--recursive] [--skip] [-j|--jobs N] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [-T|--timeout DUR | -N|--no-wait] [--json]
+  sow add PATH... [-R|--recursive] [--skip] [-j|--jobs N] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [-T|--timeout DUR | -N|--no-wait] [--json] [--passfile PATH]
 
 Arguments:
   PATH                  RPM/DEB file or directory to ingest
@@ -304,7 +329,7 @@ Options:
   -h, --help            Show help
 `,
 	"rm": `Usage:
-  sow rm PACKAGE... [-c|--check] [--skip] [-j|--jobs N] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [-T|--timeout DUR | -N|--no-wait] [--json]
+  sow rm PACKAGE... [-c|--check] [--skip] [-j|--jobs N] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [-T|--timeout DUR | -N|--no-wait] [--json] [--passfile PATH]
 
 Arguments:
   PACKAGE               Package name, coordinate, or sha256 reference
@@ -368,7 +393,7 @@ Options:
   -h, --help            Show help
 `,
 	"build": `Usage:
-  sow build [-j|--jobs N] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [-T|--timeout DUR | -N|--no-wait] [--json]
+  sow build [-j|--jobs N] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]... [-T|--timeout DUR | -N|--no-wait] [--json] [--passfile PATH]
 
 Options:
   -j, --jobs N          Parallel package inspection/render workers
@@ -404,7 +429,7 @@ Options:
   -h, --help            Show help
 `,
 	"publish": `Usage:
-  sow publish TARGET [--abort | --rebind] [-C|--workdir DIR] [-T|--timeout DUR | -N|--no-wait] [--json]
+  sow publish TARGET [--abort | --rebind] [-C|--workdir DIR] [-T|--timeout DUR | -N|--no-wait] [--json] [--passfile PATH]
 
 Arguments:
   TARGET                Configured filesystem or R2 target name
@@ -466,7 +491,7 @@ Options:
   -h, --help            Show help
 `,
 	"gc": `Usage:
-  sow gc [TARGET] [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json]
+  sow gc [TARGET] [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json] [--passfile PATH]
 
 Arguments:
   TARGET                Optional publication target; omitting it runs local GC
@@ -486,7 +511,7 @@ Options:
 	"log": `Usage:
   sow log [OPERATION] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME] [--json]
   sow log export [FILE] [-C|--workdir DIR] [-r|--repo NAME] [-d|--dist NAME]
-  sow log prune BEFORE [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json]
+  sow log prune BEFORE [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json] [--passfile PATH]
 
 Arguments:
   OPERATION             Optional operation ID for full detail
@@ -513,7 +538,7 @@ Options:
   -h, --help            Show help
 `,
 	"log prune": `Usage:
-  sow log prune BEFORE [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json]
+  sow log prune BEFORE [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json] [--passfile PATH]
 
 Arguments:
   BEFORE                YYYY-MM-DD or RFC 3339 cutoff

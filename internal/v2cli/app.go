@@ -14,6 +14,7 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/managed"
+	"github.com/pgsty/sow/internal/v2/signing"
 	"github.com/pgsty/sow/internal/v2/state"
 )
 
@@ -110,6 +111,7 @@ type managedOutput struct {
 var initWorkspace = managed.Init
 
 func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) {
+	ctx = signing.WithPassFile(ctx, inv.Global.PassFile)
 	workspaceOptions := managed.WorkspaceOptions{Workdir: inv.Global.Workdir}
 	lockOptions := managed.LockOptions{Timeout: inv.Global.Timeout, NoWait: inv.Global.NoWait}
 	switch invocationCommand(inv) {
@@ -610,7 +612,7 @@ func failureInvocationContext(args []string) (string, bool) {
 			if !inline {
 				jsonOutput = true
 			}
-		case "-C", "--workdir", "-r", "--repo", "-d", "--dist", "-T", "--timeout":
+		case "--passfile", "-C", "--workdir", "-r", "--repo", "-d", "--dist", "-T", "--timeout":
 			if !inline && index+1 < len(args) {
 				index++
 			}

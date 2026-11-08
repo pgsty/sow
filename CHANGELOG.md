@@ -4,6 +4,14 @@ All notable changes to SOW are recorded here.
 
 ## Unreleased
 
+- Add `--passfile PATH`, `SOW_GPG_PASSFILE`, and per-key `passfile` configuration
+  for protected RPM package and RPM/APT metadata signing keys, including GPG
+  agent keys. Preserve legacy metadata `passphrase` references. Apply the same
+  credential selection to initialization, signing probes, export, migration,
+  and interrupted-operation recovery. Password files preserve whitespace and
+  remove exactly one final LF or CRLF; no default file is searched. Credential
+  values stay out of process arguments, repository state, and public output.
+
 ## 0.6.1 - 2026-10-22
 
 - Require Go 1.27.3 and refresh runtime and test dependencies, including the
