@@ -99,6 +99,15 @@ func TestPassfilePrecedenceAndPathBases(t *testing.T) {
 	if _, err := Select(context.Background(), root, "", ""); err == nil {
 		t.Fatal("an explicitly empty environment path was ignored")
 	}
+	// Legacy passphrase references keep their file:// form; passfile paths do not.
+	for _, uri := range []string{"file:///run/secrets/gpg", "s3://bucket/key"} {
+		if _, err := Select(WithPassFile(context.Background(), uri), root, "", ""); err == nil || !strings.Contains(err.Error(), "not a URI") {
+			t.Fatalf("CLI passfile URI %q error=%v", uri, err)
+		}
+		if _, err := Select(context.Background(), root, uri, ""); err == nil || !strings.Contains(err.Error(), "not a URI") {
+			t.Fatalf("configured passfile URI %q error=%v", uri, err)
+		}
+	}
 	if err := os.Unsetenv(Environment); err != nil {
 		t.Fatal(err)
 	}

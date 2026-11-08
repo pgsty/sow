@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 
+	signingauth "github.com/pgsty/sow/internal/v2/signing"
 	"go.yaml.in/yaml/v4"
 	"golang.org/x/sys/unix"
 )
@@ -602,8 +603,8 @@ func normalizeAndValidateSigning(signing *SigningConfig) error {
 		if credential.key == "" {
 			return fmt.Errorf("%s passfile requires key", label)
 		}
-		if strings.TrimSpace(credential.path) == "" || strings.ContainsAny(credential.path, "\x00\r\n") {
-			return fmt.Errorf("%s passfile requires a non-empty path without NUL or line breaks", label)
+		if err := signingauth.ValidatePath(credential.path); err != nil {
+			return fmt.Errorf("%s %w", label, err)
 		}
 	}
 	seen := make(map[string]struct{}, len(packages.TrustedKeys))

@@ -9,6 +9,13 @@ import (
 	"github.com/pgsty/sow/internal/v2/plain"
 )
 
+func TestPassfileRejectsURIForm(t *testing.T) {
+	_, err := Parse([]string{"--passfile", "file:///run/secrets/gpg", "build"})
+	if ExitCode(err) != ExitUsage || !strings.Contains(err.Error(), "not a URI") {
+		t.Fatalf("passfile URI error=%v", err)
+	}
+}
+
 func TestPassfileCommandScopeAndRecoveryEntrypoints(t *testing.T) {
 	for _, args := range [][]string{
 		{"create", "-S", "0123456789ABCDEF"}, {"init"}, {"config", "check"},

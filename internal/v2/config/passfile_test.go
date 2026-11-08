@@ -49,6 +49,7 @@ func TestPassfileConfigurationRejectsConflictsAndInvalidPaths(t *testing.T) {
 		{"deb:\n        metadata:\n          passfile: a", "passfile requires key"},
 		{"rpm:\n        metadata:\n          key: keys/signing.asc\n          passfile: '   '", "non-empty path"},
 		{"rpm:\n        packages:\n          key: agent://0123456789ABCDEF\n          passfile: \"a\\nb\"", "line breaks"},
+		{"rpm:\n        metadata:\n          key: keys/signing.asc\n          passfile: file:///run/secrets/gpg", "not a URI"},
 	} {
 		_, err := Parse([]byte("schema: sow/v3\nrepos:\n  demo:\n    signing:\n      " + tc.stanza + "\n"))
 		if err == nil || !strings.Contains(err.Error(), tc.want) {

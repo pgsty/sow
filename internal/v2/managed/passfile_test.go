@@ -225,8 +225,12 @@ func TestPassfileInProcessLifecycleAndPublishRecovery(t *testing.T) {
 }
 
 func TestPassfileProtectedGPGAndRPMSigning(t *testing.T) {
+	required := os.Getenv("SOW_RUN_RPM_SIGNING") == "1"
 	gpg, err := exec.LookPath("gpg")
 	if err != nil {
+		if required {
+			t.Fatal("gpg is required for RPM signing integration")
+		}
 		t.Skip("gpg unavailable")
 	}
 	gpgHome, err := os.MkdirTemp("/tmp", "sow-passfile-gpg-")
@@ -319,6 +323,9 @@ func TestPassfileProtectedGPGAndRPMSigning(t *testing.T) {
 	t.Run("RPM", func(t *testing.T) {
 		rpm, err := exec.LookPath("rpm")
 		if err != nil {
+			if required {
+				t.Fatal("rpm is required for RPM signing integration")
+			}
 			t.Skip("rpm unavailable")
 		}
 		// Host RPM macros may pin a different homedir. Override only that
@@ -348,68 +355,81 @@ func TestPassfileProtectedGPGAndRPMSigning(t *testing.T) {
 			}
 		}
 		for _, mode := range []string{"plain", "managed", "repeated"} {
-			minimumSignatures := 1
-			if mode == "repeated" {
-				// rpmsign can request both header-only and header+payload
-				// signatures; rpm's compatibility command lacks --rpmv3.
-				rpmsign, err := exec.LookPath("rpmsign")
-				if err != nil {
-					t.Log("rpmsign unavailable; repeated invocation covered by password-file unit test")
-					continue
+			t.Run(mode, func(t *testing.T) {
+				minimumSignatures := 1
+				if mode == "repeated" {
+					// rpmsign can request both header-only and header+payload
+					// signatures; rpm's compatibility command lacks --rpmv3.
+					rpmsign, err := exec.LookPath("rpmsign")
+					if err != nil {
+						if required {
+							t.Fatal("rpmsign is required for RPM signing integration")
+						}
+						t.Skip("rpmsign unavailable; repeated invocation covered by password-file unit test")
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					help, err := exec.CommandContext(ctx, rpmsign, "--help").CombinedOutput()
+					if err != nil {
+						t.Fatalf("inspect rpmsign capabilities: %v: %s", err, help)
+					}
+					if !bytes.Contains(help, []byte("--rpmv3")) {
+						t.Skip("rpmsign lacks --rpmv3; plain and managed signing are still tested")
+					}
+					t.Setenv("SOW_TEST_RPM", rpmsign)
+					t.Setenv("SOW_TEST_RPM_V3", "1")
+					minimumSignatures = 2
 				}
-				t.Setenv("SOW_TEST_RPM", rpmsign)
-				t.Setenv("SOW_TEST_RPM_V3", "1")
-				minimumSignatures = 2
-			}
-			path := decodeManagedFixture(t, "../../testdata/pgdg-redhat-nonfree-repo.rpm.b64", filepath.Join(t.TempDir(), "package.rpm"))
-			if err := os.Chmod(path, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			killAgent()
-			if mode == "managed" {
-				policy, err := loadRPMSigningPolicy(context.Background(), "", config.RPMPackageSigningConfig{Mode: "always", Key: "agent://" + fingerprint, PassFile: passfile})
-				if err != nil {
+				path := decodeManagedFixture(t, "../../testdata/pgdg-redhat-nonfree-repo.rpm.b64", filepath.Join(t.TempDir(), "package.rpm"))
+				if err := os.Chmod(path, 0o600); err != nil {
 					t.Fatal(err)
 				}
-				credential, err := policy.credential(context.Background())
-				if err != nil {
-					t.Fatal(err)
+				killAgent()
+				if mode == "managed" {
+					policy, err := loadRPMSigningPolicy(context.Background(), "", config.RPMPackageSigningConfig{Mode: "always", Key: "agent://" + fingerprint, PassFile: passfile})
+					if err != nil {
+						t.Fatal(err)
+					}
+					credential, err := policy.credential(context.Background())
+					if err != nil {
+						t.Fatal(err)
+					}
+					err = signManagedRPM(context.Background(), path, fingerprint, true, credential)
+					if err != nil {
+						output, _ := os.ReadFile(rpmLog)
+						t.Fatalf("managed encrypted RPM signing: %v: %s", err, output)
+					}
+				} else {
+					_, err := plain.Create(context.Background(), plain.Options{Dir: filepath.Dir(path), SignWith: fingerprint, PassFile: passfile, Overwrite: true, Jobs: 1})
+					if err != nil {
+						output, _ := os.ReadFile(rpmLog)
+						t.Fatalf("plain encrypted RPM signing: %v: %s", err, output)
+					}
 				}
-				err = signManagedRPM(context.Background(), path, fingerprint, true, credential)
-				if err != nil {
-					output, _ := os.ReadFile(rpmLog)
-					t.Fatalf("managed encrypted RPM signing: %v: %s", err, output)
+				verify(path, minimumSignatures)
+				if mode == "managed" {
+					root := t.TempDir()
+					cfg := config.Default()
+					cfg.Repositories["repo"] = config.RepositoryConfig{
+						Signing: config.SigningConfig{RPM: config.RPMSigningConfig{Packages: config.RPMPackageSigningConfig{Mode: "always", Key: "agent://" + fingerprint}}},
+						Dists:   map[string]config.DistConfig{"el9": {Format: "rpm", Architectures: []string{"x86_64"}}},
+					}
+					writeManagedConfig(t, root, cfg)
+					ctx := signing.WithPassFile(context.Background(), passfile)
+					if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+						t.Fatal(err)
+					}
+					ws := WorkspaceOptions{Workdir: root, CWD: root}
+					if _, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"el9"}, Paths: []string{path}, Jobs: 1}); err != nil {
+						t.Fatal(err)
+					}
+					t.Setenv(signing.Environment, "")
+					if result, err := Check(context.Background(), CheckOptions{WorkspaceOptions: ws, Repository: "repo", Jobs: 1}); err != nil || !result.ReadyToCopy {
+						t.Fatalf("public RPM verification required a password: %+v %v", result, err)
+					}
+					t.Setenv(signing.Environment, passfile)
 				}
-			} else {
-				_, err := plain.Create(context.Background(), plain.Options{Dir: filepath.Dir(path), SignWith: fingerprint, PassFile: passfile, Overwrite: true, Jobs: 1})
-				if err != nil {
-					output, _ := os.ReadFile(rpmLog)
-					t.Fatalf("plain encrypted RPM signing: %v: %s", err, output)
-				}
-			}
-			verify(path, minimumSignatures)
-			if mode == "managed" {
-				root := t.TempDir()
-				cfg := config.Default()
-				cfg.Repositories["repo"] = config.RepositoryConfig{
-					Signing: config.SigningConfig{RPM: config.RPMSigningConfig{Packages: config.RPMPackageSigningConfig{Mode: "always", Key: "agent://" + fingerprint}}},
-					Dists:   map[string]config.DistConfig{"el9": {Format: "rpm", Architectures: []string{"x86_64"}}},
-				}
-				writeManagedConfig(t, root, cfg)
-				ctx := signing.WithPassFile(context.Background(), passfile)
-				if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
-					t.Fatal(err)
-				}
-				ws := WorkspaceOptions{Workdir: root, CWD: root}
-				if _, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"el9"}, Paths: []string{path}, Jobs: 1}); err != nil {
-					t.Fatal(err)
-				}
-				t.Setenv(signing.Environment, "")
-				if result, err := Check(context.Background(), CheckOptions{WorkspaceOptions: ws, Repository: "repo", Jobs: 1}); err != nil || !result.ReadyToCopy {
-					t.Fatalf("public RPM verification required a password: %+v %v", result, err)
-				}
-				t.Setenv(signing.Environment, passfile)
-			}
+			})
 		}
 	})
 }

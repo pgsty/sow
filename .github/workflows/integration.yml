@@ -15,6 +15,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rpm-passfile:
+    name: RPM Passfile (EL${{ matrix.el }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        el: [8, 9, 10]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build signing test
+        run: CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/passfile.test" ./internal/v2/managed
+
+      - name: Verify protected-key signing with native RPM tools
+        run: |
+          docker run --rm -e SOW_RUN_RPM_SIGNING=1 \
+            -v "$GITHUB_WORKSPACE:/src:ro" \
+            -v "$RUNNER_TEMP/passfile.test:/tmp/passfile.test:ro" \
+            -w /src/internal/v2/managed almalinux:${{ matrix.el }} bash -euc '
+              dnf -y install gnupg2 rpm-sign
+              rpm --version
+              /tmp/passfile.test -test.timeout=10m -test.v -test.run="^TestPassfileProtectedGPGAndRPMSigning$"
+            '
+
   repository-clients:
     name: Repository End-to-End
     runs-on: ubuntu-latest

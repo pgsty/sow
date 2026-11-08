@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -1216,6 +1217,85 @@ func TestVerifyEmbeddedRPMSignaturesLegacyPacketCoversHeaderAndPayload(t *testin
 	if !errors.Is(err, ErrRPMPackageSignature) || !strings.Contains(err.Error(), "not valid under the trusted keyring") {
 		t.Fatalf("legacy payload tamper error=%v", err)
 	}
+}
+
+// rpm 4.16 and later place ECDSA and EdDSA header signatures in
+// RPMSIGTAG_DSA, and GnuPG 2.4 creates Ed25519 keys by default.
+func TestVerifyEmbeddedRPMSignaturesAcceptsECCHeaderSignatures(t *testing.T) {
+	const payload = "fixture payload"
+	payloadDigest := sha256.Sum256([]byte(payload))
+	digestTags := []fixtureTag{
+		{id: rpmTagPayloadDigest, typ: 8, count: 1, data: append([]byte(hex.EncodeToString(payloadDigest[:])), 0)},
+		intTag(rpmTagPayloadDigestAlgo, rpmHashSHA256),
+	}
+	sign := func(t *testing.T, config *packet.Config, tagID uint32) (*openpgp.Entity, []byte) {
+		t.Helper()
+		filename := filepath.Join(t.TempDir(), "header-signed.rpm")
+		writeRPMFixture(t, filename, "header-signed", digestTags...)
+		unsigned, err := os.ReadFile(filename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		config.Time = func() time.Time { return rpmSignatureVerificationTime.Add(-time.Hour) }
+		entity, err := openpgp.NewEntity("Header signer", "", "header-signer@example.invalid", config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var signature bytes.Buffer
+		// writeRPMFixture emits a 96-byte lead and an empty 16-byte signature header.
+		header := unsigned[112 : len(unsigned)-len(payload)]
+		if err := openpgp.DetachSign(&signature, entity, bytes.NewReader(header), &packet.Config{
+			DefaultHash: crypto.SHA256, Time: func() time.Time { return rpmSignatureVerificationTime.Add(-time.Minute) },
+		}); err != nil {
+			t.Fatal(err)
+		}
+		insertFixtureSignatureTag(t, filename, tagID, signature.Bytes())
+		signed, err := os.ReadFile(filename)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entity, signed
+	}
+	for _, test := range []struct {
+		name      string
+		config    *packet.Config
+		algorithm int
+	}{
+		{"EdDSA", &packet.Config{Algorithm: packet.PubKeyAlgoEdDSA}, 22},
+		{"ECDSA", &packet.Config{Algorithm: packet.PubKeyAlgoECDSA, Curve: packet.CurveNistP256}, 19},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			entity, signed := sign(t, test.config, 267)
+			embedded, err := InspectEmbeddedRPMSignatures(context.Background(), bytes.NewReader(signed))
+			if err != nil || len(embedded) != 1 || embedded[0].HeaderTagID != 267 || embedded[0].PublicKeyAlgorithm != test.algorithm {
+				t.Fatalf("embedded=%+v err=%v", embedded, err)
+			}
+			results, err := VerifyEmbeddedRPMSignaturesMulti(context.Background(), bytes.NewReader(signed), []RPMSignatureTrustRing{{Identity: "signer", Keyring: openpgp.EntityList{entity}}}, rpmSignatureVerificationTime)
+			if err != nil || len(results) != 1 || !results[0].Verified || results[0].Err != nil {
+				t.Fatalf("results=%+v err=%v", results, err)
+			}
+			other, _ := sign(t, test.config, 267)
+			for _, negative := range []struct {
+				name string
+				body []byte
+				key  *openpgp.Entity
+			}{
+				{"untrusted", signed, other},
+				{"tampered", append(append([]byte(nil), signed[:len(signed)-1]...), signed[len(signed)-1]^1), entity},
+			} {
+				results, err := VerifyEmbeddedRPMSignaturesMulti(context.Background(), bytes.NewReader(negative.body), []RPMSignatureTrustRing{{Identity: "signer", Keyring: openpgp.EntityList{negative.key}}}, rpmSignatureVerificationTime)
+				if err == nil && len(results) == 1 && results[0].Verified && results[0].Err == nil {
+					t.Fatalf("%s ECC signature accepted", negative.name)
+				}
+			}
+		})
+	}
+	t.Run("RSA in DSA tag", func(t *testing.T) {
+		_, signed := sign(t, &packet.Config{RSABits: 2048}, 267)
+		if _, err := InspectEmbeddedRPMSignatures(context.Background(), bytes.NewReader(signed)); !errors.Is(err, ErrEmbeddedSignature) || !strings.Contains(err.Error(), "want DSA, ECDSA, or EdDSA") {
+			t.Fatalf("RSA packet in RPMSIGTAG_DSA error=%v", err)
+		}
+	})
 }
 
 func TestVerifyEmbeddedRPMSignaturesMultiDoesNotCrossAssembleDualSignerPackets(t *testing.T) {

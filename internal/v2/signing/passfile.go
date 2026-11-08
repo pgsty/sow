@@ -50,9 +50,17 @@ func (source Source) ID() string {
 	return "file:" + source.path
 }
 
+// ValidatePath checks the syntax shared by --passfile, SOW_GPG_PASSFILE and
+// per-key passfile configuration.
 func ValidatePath(path string) error {
 	if strings.TrimSpace(path) == "" || strings.ContainsAny(path, "\x00\r\n") {
 		return errors.New("passfile requires a non-empty path without NUL or line breaks")
+	}
+	// Neighboring key and legacy passphrase settings use file:// URIs. A
+	// passfile is a plain path, so reject the URI form instead of resolving
+	// it as a relative path that fails only when signing.
+	if strings.Contains(path, "://") {
+		return errors.New("passfile takes a filesystem path, not a URI such as file://")
 	}
 	return nil
 }

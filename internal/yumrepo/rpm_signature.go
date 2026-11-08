@@ -126,8 +126,10 @@ func inspectEmbeddedRPMSignaturePackets(ctx context.Context, r io.Reader) ([]emb
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s creation time: %v", ErrEmbeddedSignature, known.name, err)
 		}
-		if known.id == 267 && publicKeyAlgorithm != 17 {
-			return nil, fmt.Errorf("%w: %s carries public-key algorithm %d, want DSA", ErrEmbeddedSignature, known.name, publicKeyAlgorithm)
+		// rpm 4.16 and later store DSA, ECDSA and EdDSA header signatures in
+		// RPMSIGTAG_DSA; only RSA has its own header signature tag.
+		if known.id == 267 && publicKeyAlgorithm != 17 && publicKeyAlgorithm != 19 && publicKeyAlgorithm != 22 {
+			return nil, fmt.Errorf("%w: %s carries public-key algorithm %d, want DSA, ECDSA, or EdDSA", ErrEmbeddedSignature, known.name, publicKeyAlgorithm)
 		}
 		if known.id == 268 && publicKeyAlgorithm != 1 && publicKeyAlgorithm != 3 {
 			return nil, fmt.Errorf("%w: %s carries public-key algorithm %d, want RSA", ErrEmbeddedSignature, known.name, publicKeyAlgorithm)
