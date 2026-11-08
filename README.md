@@ -88,13 +88,17 @@ sow prune ./packages --protect age_18 --protect age_18-llvmjit
 ```
 
 Prune keeps the highest Epoch/Version/Release per package name and architecture.
-`--protect` keeps every version of an exact package name. It checks replacement
-RPM digests, refreshes an existing `repo_complete` marker, and can be rerun after
-an interruption. It operates on top-level regular binary RPMs in a local
+`--protect` keeps every version of an exact package name and must match a package.
+It binds replacement RPM digests and indexed bytes to a stable file identity,
+checks that identity before each deletion and completion, refreshes an existing
+`repo_complete` marker, and can be rerun after an
+interruption. It operates on top-level regular binary RPMs in a local
 publication source; managed workspaces, mixed RPM/DEB directories, equal-version
-files, and repositories with `repomd.xml.asc` are rejected. `--dry-run` changes no
-files. Publishing the result and accommodating clients with cached old indexes
-remain part of the publication workflow.
+files, RPM v6 packages, repositories with `repomd.xml.asc`, and a `repomd.xml`
+that lists metadata SOW does not generate (such as comps groups) are rejected.
+`--metadata-timestamp` works as for `create`. `--dry-run` changes no files.
+Publishing the result and accommodating clients with cached old indexes remain
+part of the publication workflow.
 
 
 --------
@@ -126,7 +130,9 @@ indexes before replacing `repomd.xml`. It retains indexes referenced by the curr
 immediately previous distinct `repomd.xml`; unchanged runs preserve that window. After a
 successful pointer switch, or a rerun that completes interrupted cleanup, it removes
 older SOW hash-named indexes. Other files, including an external `repomd.xml.asc`, stay
-untouched and external signatures must be refreshed separately.
+untouched and external signatures must be refreshed separately. An existing `repomd.xml`
+that lists metadata SOW does not generate, such as comps groups, updateinfo, or modules,
+is rejected instead of being replaced without it.
 
 The bounded `.sow-plain-rpm-history.json` file records at most three reference sets so a
 rerun can identify the predecessor on either side of an interrupted pointer switch.

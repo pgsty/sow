@@ -2,7 +2,7 @@
 
 All notable changes to SOW are recorded here.
 
-## 0.7.0 - 2026-11-08
+## 0.7.0 - 2026-11-09
 
 - Add `--passfile PATH`, `SOW_GPG_PASSFILE`, and per-key `passfile` configuration
   for protected RPM package and RPM/APT metadata signing keys, including GPG
@@ -11,10 +11,35 @@ All notable changes to SOW are recorded here.
   and interrupted-operation recovery. Password files preserve whitespace and
   remove exactly one final LF or CRLF; no default file is searched. Credential
   values stay out of process arguments, repository state, and public output.
+  Passfile settings take plain paths; `file://` URIs are rejected.
 - Add `sow prune DIR` for flat RPM repositories. Keep the highest EVR per package
   name and architecture, verify replacement digests, publish the filtered index,
-  then delete old packages. Support read-only `--dry-run` and repeatable
-  `--protect NAME`; preserve completion markers across interrupted cleanup.
+  then delete old packages. Support read-only `--dry-run`, repeatable
+  `--protect NAME` (each name must match a package), and `--metadata-timestamp`;
+  preserve completion markers across interrupted cleanup. Bind replacement
+  digests and indexed bytes to a stable file identity, checked before each old
+  version is deleted and before completion. An in-place rewrite with restored
+  size and mtime stops further deletion. RPM v6 packages are
+  not supported and are reported as such.
+- `create` and `prune` reject an existing `repomd.xml` that also lists metadata
+  SOW does not generate, such as comps groups, updateinfo, or modules, before
+  changing any file, instead of silently dropping it from the rebuilt index.
+- Accept ECDSA and EdDSA header signatures in `RPMSIGTAG_DSA`, where rpm 4.16 and
+  later store them. RPM packages signed with GnuPG's default Ed25519 keys now
+  verify, including after managed package signing.
+- Fix configured publication targets becoming unpublishable after removing a Dist,
+  architecture, or signing companion that the last publish did not change. The
+  withdrawal guard now checks every pointer of the published Generation.
+- Fix an unreachable filesystem target blocking publication, `--abort`, and
+  target GC of other targets. Only the selected target is checked against the
+  others, using prospective physical paths.
+- Recover from an interrupted local GC or retained-removal plan write. An empty
+  or partial plan previously blocked every later writer; nothing has been
+  applied at that point, so the plan is now discarded or rebuilt.
+- Allow `export rpm-leaf` for a clean Dist that later Generations did not rebuild.
+- Identify the active mutation by the sole pending operation instead of
+  wall-clock order, so a backward clock step no longer blocks `add`, `rm`,
+  `build`, and their recovery.
 - Fix Repositories migrated from the C2 layout of v0.3/v0.4 workspaces: after
   the first later Generation, `check`, `build`, `add`, and `gc` reported an
   invalid transition control target. The retained migration anchor now binds
