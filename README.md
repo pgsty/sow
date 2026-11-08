@@ -79,6 +79,23 @@ Signing and recovery commands share this interface; check `sow help COMMAND` in
 your installed binary and see
 [password files](https://sow.pgsty.com/docs/reference/config/#passfile) for the full contract.
 
+To remove old versions from a flat RPM repository, use `sow prune`:
+
+```bash
+sow prune ./packages --dry-run            # preview superseded RPMs
+sow prune ./packages                      # rebuild the index, then delete old RPMs
+sow prune ./packages --protect age_18 --protect age_18-llvmjit
+```
+
+Prune keeps the highest Epoch/Version/Release per package name and architecture.
+`--protect` keeps every version of an exact package name. It checks replacement
+RPM digests, refreshes an existing `repo_complete` marker, and can be rerun after
+an interruption. It operates on top-level regular binary RPMs in a local
+publication source; managed workspaces, mixed RPM/DEB directories, equal-version
+files, and repositories with `repomd.xml.asc` are rejected. `--dry-run` changes no
+files. Publishing the result and accommodating clients with cached old indexes
+remain part of the publication workflow.
+
 
 --------
 

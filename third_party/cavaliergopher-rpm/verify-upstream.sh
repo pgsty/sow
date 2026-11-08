@@ -39,7 +39,7 @@ fi
 
 allowed_patch() {
   case "$1" in
-    README.md|doc.go|go.mod|go.sum|header.go|lead.go|package.go|signature.go|signature_test.go|SOW-PATCHES.md|sow_hardening_test.go|verify-upstream.sh)
+    README.md|doc.go|go.mod|go.sum|header.go|lead.go|package.go|signature.go|signature_test.go|version.go|SOW-PATCHES.md|sow_hardening_test.go|sow_version_test.go|verify-upstream.sh)
       return 0
       ;;
   esac

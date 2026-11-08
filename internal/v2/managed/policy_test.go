@@ -15,6 +15,7 @@ import (
 func FuzzApplyPolicyInputOrderStable(f *testing.F) {
 	f.Add("1.0,1.0~rc1,2:0.1,9.9", uint8(2), true)
 	f.Add("1.9,1.10,2.0", uint8(1), false)
+	f.Add("2.0,2.0^20250611,2.0.1", uint8(1), false)
 	f.Fuzz(func(t *testing.T, encoded string, rawLimit uint8, excludeDebug bool) {
 		if len(encoded) > 4096 {
 			t.Skip()
@@ -108,6 +109,35 @@ func TestApplyPolicyExcludeTruthTableBeforeNativeVersionLimit(t *testing.T) {
 	reversed, err := ApplyPolicy(objects, dist)
 	if err != nil || !reflect.DeepEqual(result, reversed) {
 		t.Fatalf("input order changed policy result: result=%#v reversed=%#v err=%v", result, reversed, err)
+	}
+}
+
+func TestApplyPolicyKeepsReleaseAfterCaretSnapshot(t *testing.T) {
+	tests := []struct {
+		name    string
+		objects []state.PackageObject
+	}{
+		{"version", []state.PackageObject{
+			policyRPM("1", "pkg", "2.0", "1", "x86_64"),
+			policyRPM("2", "pkg", "2.0^20250611", "1", "x86_64"),
+			policyRPM("3", "pkg", "2.0.1", "1", "x86_64"),
+		}},
+		{"release", []state.PackageObject{
+			policyRPM("1", "pkg", "2.0", "1", "x86_64"),
+			policyRPM("2", "pkg", "2.0", "1^20250611", "x86_64"),
+			policyRPM("3", "pkg", "2.0", "1.1", "x86_64"),
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := ApplyPolicy(tt.objects, config.EffectiveDist{Format: "rpm", Architectures: []string{"x86_64"}, Limit: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Kept) != 1 || result.Kept[0].SHA256 != tt.objects[2].SHA256 || len(result.Limited) != 2 {
+				t.Fatalf("latest release was not retained: kept=%v limited=%v", objectCoordinates(result.Kept), objectCoordinates(result.Limited))
+			}
+		})
 	}
 }
 

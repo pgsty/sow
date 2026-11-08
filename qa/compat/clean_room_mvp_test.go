@@ -347,7 +347,7 @@ func assertCleanRoomV2RootCommands(t *testing.T, output string) {
 		commands = append(commands, command)
 	}
 	sort.Strings(commands)
-	want := []string{"add", "build", "changes", "check", "config", "create", "dist", "export", "gc", "help", "init", "log", "ls", "publish", "repo", "retain", "rm", "show", "status", "version", "where"}
+	want := []string{"add", "build", "changes", "check", "config", "create", "dist", "export", "gc", "help", "init", "log", "ls", "prune", "publish", "repo", "retain", "rm", "show", "status", "version", "where"}
 	if fmt.Sprint(commands) != fmt.Sprint(want) {
 		t.Fatalf("root help command surface=%v want=%v\n%s", commands, want, output)
 	}

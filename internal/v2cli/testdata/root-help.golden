@@ -10,6 +10,7 @@ Options:
 
 Commands:
   create [DIR]                       Generate a flat RPM/DEB repository
+  prune DIR                          Keep latest RPMs and rebuild a flat repository
   init [DIR]                         Initialize a workspace
   config check                       Validate workspace configuration
   config show [--all]                Show workspace configuration

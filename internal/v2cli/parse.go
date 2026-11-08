@@ -52,6 +52,8 @@ type Invocation struct {
 	Hardlink    bool
 	Abort       bool
 	Rebind      bool
+	DryRun      bool
+	Protect     []string
 
 	MetadataTimestamp int64
 }
@@ -85,12 +87,14 @@ type commandSpec struct {
 	hardlink  bool
 	abort     bool
 	rebind    bool
+	prune     bool
 
 	metadataTimestamp bool
 }
 
 var commandSpecs = map[string]commandSpec{
 	"create":          {globals: usePassFile | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, pigsty: true, signWith: true, overwrite: true, metadataTimestamp: true},
+	"prune":           {globals: useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, jobs: true, prune: true},
 	"init":            {globals: usePassFile | useJSON, minArgs: 0, maxArgs: 1},
 	"config check":    {globals: usePassFile | useWorkdir | useJSON},
 	"config show":     {globals: useWorkdir | useRepo | useDist | useJSON, all: true},
@@ -381,6 +385,24 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 		}
 		name, inline, hasInline := splitOption(token)
 		switch name {
+		case "--dry-run":
+			if !spec.prune || inv.DryRun || hasInline {
+				return nil, usageError("option --dry-run is not allowed, duplicated, or has a value")
+			}
+			inv.DryRun = true
+		case "--protect":
+			if !spec.prune {
+				return nil, usageError("option --protect is not allowed")
+			}
+			value, next, err := optionValue(args, i, name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			if value == "" || strings.ContainsAny(value, "/*?[]\\\x00\r\n\t ") {
+				return nil, usageError("--protect requires an exact RPM package name")
+			}
+			i = next
+			inv.Protect = append(inv.Protect, value)
 		case "-j", "--jobs":
 			if !spec.jobs || jobsSet {
 				return nil, usageError("option %s is not allowed or is duplicated", name)

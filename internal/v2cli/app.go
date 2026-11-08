@@ -50,6 +50,9 @@ func MainContext(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	if inv.Command == "create" {
 		return ExecuteCreate(ctx, inv, stdout, stderr, nil)
 	}
+	if inv.Command == "prune" {
+		return executePrune(ctx, inv, stdout, stderr)
+	}
 	if invocationCommand(inv) == "log export" {
 		return executeLogExport(ctx, inv, stdout, stderr)
 	}
@@ -628,7 +631,7 @@ func failureInvocationContext(args []string) (string, bool) {
 	}
 	command := remaining[0]
 	switch command {
-	case "create", "init", "help", "version", "add", "rm", "ls", "show", "where", "status", "build", "check", "changes", "gc", "publish":
+	case "create", "prune", "init", "help", "version", "add", "rm", "ls", "show", "where", "status", "build", "check", "changes", "gc", "publish":
 		return command, jsonOutput
 	case "export":
 		if len(remaining) > 1 && remaining[1] == "rpm-leaf" {

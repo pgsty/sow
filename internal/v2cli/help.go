@@ -76,6 +76,7 @@ Options:
 
 Commands:
   create [DIR]                       Generate a flat RPM/DEB repository
+  prune DIR                          Keep latest RPMs and rebuild a flat repository
   init [DIR]                         Initialize a workspace
   config check                       Validate workspace configuration
   config show [--all]                Show workspace configuration
@@ -127,6 +128,26 @@ Options:
   -h, --help            Show help
 
 --passfile requires --sign-with; SOW_GPG_PASSFILE alone does not enable signing.
+`,
+	"prune": `Usage:
+  sow prune DIR [--dry-run] [--protect NAME]... [-j N] [-T DUR | -N] [--json]
+
+Keep the highest RPM Epoch/Version/Release for each package name and architecture.
+By default, rebuild the flat index and then delete superseded RPM files.
+The directory must contain only top-level regular binary RPM packages; subdirectories
+are not scanned. Equal-version files are rejected. Replacement RPMs must pass
+embedded digest checks. Managed workspaces, DEB repositories and signed repomd.xml
+are not supported. An existing repo_complete marker is refreshed after success.
+Use on a local publication source; clients caching old indexes may still need old RPMs.
+
+Options:
+      --dry-run        Preview candidates without changing any files
+      --protect NAME   Keep every version of this exact package name; repeatable
+  -j, --jobs N         Package inspection workers; defaults to CPU count
+  -T, --timeout DUR    Maximum lock wait; 0 waits indefinitely
+  -N, --no-wait        Fail immediately when the lock is held
+      --json           Emit the versioned JSON envelope
+  -h, --help           Show help
 `,
 	"export": `Usage:
   sow export COMMAND

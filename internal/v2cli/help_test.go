@@ -22,7 +22,7 @@ func TestRootHelpSnapshot(t *testing.T) {
 func TestHelpTreeIncludesApprovedLocalLifecycle(t *testing.T) {
 	wantTopics := []string{
 		"", "add", "build", "changes", "check", "config", "config check", "config show", "create", "dist", "dist ls", "dist new", "dist rm", "dist show",
-		"export", "export rpm-leaf", "gc", "help", "init", "log", "log export", "log prune", "ls", "publish", "repo", "repo ls", "repo migrate", "repo new", "repo rm", "repo show",
+		"export", "export rpm-leaf", "gc", "help", "init", "log", "log export", "log prune", "ls", "prune", "publish", "repo", "repo ls", "repo migrate", "repo new", "repo rm", "repo show",
 		"retain", "retain add", "retain ls", "retain rm", "rm", "show", "status", "version", "where",
 	}
 	gotTopics := make([]string, 0, len(helpText))
@@ -55,7 +55,7 @@ func TestHelpSupportsRootGroupsLeavesAndInvocation(t *testing.T) {
 		{"add"}, {"rm"}, {"ls"}, {"show"}, {"where"}, {"status"}, {"build"}, {"check"}, {"changes"}, {"publish"},
 		{"log"}, {"log", "export"}, {"log", "prune"},
 		{"export"}, {"export", "rpm-leaf"},
-		{"create"}, {"init"}, {"help"}, {"version"},
+		{"create"}, {"prune"}, {"init"}, {"help"}, {"version"},
 	} {
 		if text, ok := HelpTopic(topic...); !ok || text == "" {
 			t.Errorf("HelpTopic(%q) missing", topic)
@@ -90,6 +90,7 @@ func TestLeafHelpMatchesClosedOptionMatrix(t *testing.T) {
 		deny  []string
 	}{
 		{topic: "create", want: []string{"--jobs", "--pigsty", "--sign-with", "--overwrite", "--timeout", "--no-wait", "--json"}, deny: []string{"--workdir", "--repo", "--dist", "--force", "--all", "--format"}},
+		{topic: "prune", want: []string{"--dry-run", "--protect", "--jobs", "--timeout", "--no-wait", "--json"}, deny: []string{"--workdir", "--repo ", "--dist", "--keep", "--apply", "--pigsty", "--sign-with"}},
 		{topic: "init", want: []string{"--json"}, deny: []string{"--workdir", "--timeout", "--no-wait", "--repo", "--dist"}},
 		{topic: "config check", want: []string{"--workdir", "--json"}, deny: []string{"--repo", "--dist", "--timeout", "--no-wait", "--all"}},
 		{topic: "config show", want: []string{"--all", "--workdir", "--repo", "--dist", "--json"}, deny: []string{"--timeout", "--no-wait", "--force"}},

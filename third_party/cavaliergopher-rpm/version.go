@@ -7,9 +7,9 @@ import (
 	"unicode"
 )
 
-// alphanumPattern is a regular expression to match all sequences of numeric
-// characters or alphanumeric characters.
-var alphanumPattern = regexp.MustCompile("([a-zA-Z]+)|([0-9]+)|(~)")
+// alphanumPattern matches alphabetic and numeric segments, plus RPM's
+// pre-release (~) and post-release snapshot (^) operators.
+var alphanumPattern = regexp.MustCompile("([a-zA-Z]+)|([0-9]+)|([~^])")
 
 // Version is an interface which holds version information for a package in EVR
 // form.
@@ -57,19 +57,19 @@ func Compare(a, b Version) int {
 	return CompareVersions(a.Release(), b.Release())
 }
 
-// CompareVersion compares version strings. It does not consider package epochs
+// CompareVersions compares version strings. It does not consider package epochs
 // or release numbers like Compare.
 //
 // If a is more recent than b, 1 is returned. If a is less recent than b, -1 is
 // returned. If a and b are equal, 0 is returned.
 func CompareVersions(a, b string) int {
-	// For the original C implementation, see:
-	// https://github.com/rpm-software-management/rpm/blob/master/lib/rpmvercmp.c#L16
+	// RPM's comparison contract is documented at:
+	// https://rpm.org/docs/6.0.x/man/rpm-version.7
 	if a == b {
 		return 0
 	}
 
-	// get alpha/numeric segements
+	// get alpha/numeric segments and version operators
 	segsa := alphanumPattern.FindAllString(a, -1)
 	segsb := alphanumPattern.FindAllString(b, -1)
 	segs := int(math.Min(float64(len(segsa)), float64(len(segsb))))
@@ -85,6 +85,18 @@ func CompareVersions(a, b string) int {
 				return 1
 			}
 			if []rune(b)[0] != '~' {
+				return -1
+			}
+		}
+
+		// A caret sorts before any ordinary segment, but after an exhausted
+		// base version (handled by the remaining-segment check below).
+		// Tilde takes precedence, including when paired with a caret.
+		if a == "^" || b == "^" {
+			if a != "^" {
+				return 1
+			}
+			if b != "^" {
 				return -1
 			}
 		}

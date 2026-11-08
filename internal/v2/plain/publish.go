@@ -21,6 +21,9 @@ type publicationPlan struct {
 	removeDEB        []string
 	rpmHistory       bool
 	removeRPMHistory bool
+	prune            bool
+	removed          []string
+	rpmPublished     bool
 }
 
 func preparePublication(ctx context.Context, root string, staged stagedBuild, scan scanResult, opts Options) (publicationPlan, error) {
@@ -196,7 +199,7 @@ func regularFilesEqual(ctx context.Context, source, target string) (bool, error)
 	return sourceDigest == targetDigest, nil
 }
 
-func publishStage(ctx context.Context, root string, staged stagedBuild, scan scanResult, opts Options, plan publicationPlan) (resultErr error) {
+func publishStage(ctx context.Context, root string, staged stagedBuild, scan scanResult, opts Options, plan *publicationPlan) (resultErr error) {
 	defer func() {
 		resultErr = errors.Join(resultErr, os.RemoveAll(staged.dir))
 	}()
@@ -271,6 +274,7 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 		if err := installStagedFile(filepath.Join(staged.dir, "repodata", "repomd.xml"), filepath.Join(liveDir, "repomd.xml")); err != nil {
 			return err
 		}
+		plan.rpmPublished = true
 		if err := inject(opts.Fault, FaultAfterRPMPointer, "", -1); err != nil {
 			return err
 		}
@@ -347,15 +351,39 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 		}
 	}
 
-	if opts.Pigsty {
-		for sequence, fact := range scan.removed {
-			if err := removeRegularFile(filepath.Join(root, fact.base), false); err != nil {
-				return err
-			}
-			if err := inject(opts.Fault, FaultAfterPackageRename, fact.base, sequence); err != nil {
-				return err
+	if plan.prune {
+		if err := validatePruneDirectory(root); err != nil {
+			return err
+		}
+		if err := verifyStableInputs(ctx, root, scan); err != nil {
+			return err
+		}
+	}
+	for sequence, fact := range scan.removed {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		path := filepath.Join(root, fact.base)
+		if plan.prune {
+			current, err := os.Lstat(path)
+			if err != nil || !samePackageStat(fact.sourceInfo, current) {
+				return &Error{Kind: KindIntegrity, Op: "remove changed package", Path: path, Err: errors.Join(err, errors.New("package changed after inspection"))}
 			}
 		}
+		if err := removeRegularFile(path, false); err != nil {
+			return err
+		}
+		plan.removed = append(plan.removed, fact.base)
+		if err := inject(opts.Fault, FaultAfterPackageRename, fact.base, sequence); err != nil {
+			return err
+		}
+	}
+	if len(scan.removed) != 0 {
+		if err := syncDir(root); err != nil {
+			return err
+		}
+	}
+	if opts.Pigsty {
 		if err := inject(opts.Fault, FaultBeforeMarker, "", -1); err != nil {
 			return err
 		}

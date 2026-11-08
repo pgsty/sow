@@ -12,6 +12,21 @@ All notable changes to SOW are recorded here.
   remove exactly one final LF or CRLF; no default file is searched. Credential
   values stay out of process arguments, repository state, and public output.
 
+- Update the AWS SDK, SQLite and its matching libc, Debian package parsing, and
+  transitive test dependencies to their latest versions. Upgrade YAML to
+  `go.yaml.in/yaml/v4` v4.0.0 with the compatible decoder and encoder, retaining
+  strict single-document validation and canonical configuration output.
+- Update GoReleaser to v2.20.0 in CI and release workflows.
+
+- Add `sow prune DIR` for flat RPM repositories. Keep the highest EVR per package
+  name and architecture, verify replacement digests, publish the filtered index,
+  then delete old packages. Support read-only `--dry-run` and repeatable
+  `--protect NAME`; preserve completion markers across interrupted cleanup.
+
+- Fix RPM caret snapshot ordering in Version and Release comparisons, so
+  `2.0^20250611` sorts before `2.0.1` and managed version limits retain the
+  newer release instead of its earlier snapshot.
+
 ## 0.6.1 - 2026-10-22
 
 - Require Go 1.27.3 and refresh runtime and test dependencies, including the

@@ -110,6 +110,10 @@ func TestParseRejectsInvalidConfiguration(t *testing.T) {
 		want string
 	}{
 		{"empty", "", "schema"},
+		{"empty document", "---\n", "schema"},
+		{"multiple documents", "schema: sow/v3\n---\nschema: sow/v3\n", "multiple YAML documents"},
+		{"trailing empty document", "schema: sow/v3\n---\n", "multiple YAML documents"},
+		{"invalid field type", "schema: sow/v3\nrepos:\n  pgsql:\n    protected: [true]\n", "bool"},
 		{"wrong schema", "schema: sow/v1\n", "schema"},
 		{"unknown root", "schema: sow/v3\nfuture: true\n", "field future"},
 		{"duplicate root", "schema: sow/v3\nschema: sow/v3\n", "already defined"},

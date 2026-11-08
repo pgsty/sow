@@ -158,6 +158,8 @@ internal/v2/plain/create_test.go
 internal/v2/plain/lock.go
 internal/v2/plain/lock_test.go
 internal/v2/plain/pigsty_test.go
+internal/v2/plain/prune.go
+internal/v2/plain/prune_test.go
 internal/v2/plain/publish.go
 internal/v2/plain/rebuild_test.go
 internal/v2/plain/render.go
@@ -237,7 +239,9 @@ internal/v2cli/parse.go
 internal/v2cli/parse_test.go
 internal/v2cli/passfile_test.go
 internal/v2cli/postcommit_test.go
+internal/v2cli/prune.go
 internal/v2cli/prune_maintenance_test.go
+internal/v2cli/prune_test.go
 internal/v2cli/testdata/root-help.golden
 internal/v2cli/timestamp_test.go
 internal/workmetrics/metrics.go
@@ -259,6 +263,8 @@ internal/yumrepo/managed_path_test.go
 internal/yumrepo/package_keyring.go
 internal/yumrepo/plain.go
 internal/yumrepo/rpm.go
+internal/yumrepo/rpm_digest.go
+internal/yumrepo/rpm_digest_test.go
 internal/yumrepo/rpm_facts.go
 internal/yumrepo/rpm_hardening_test.go
 internal/yumrepo/rpm_metadata_test.go
@@ -305,6 +311,7 @@ third_party/cavaliergopher-rpm/package_test.go
 third_party/cavaliergopher-rpm/signature.go
 third_party/cavaliergopher-rpm/signature_test.go
 third_party/cavaliergopher-rpm/sow_hardening_test.go
+third_party/cavaliergopher-rpm/sow_version_test.go
 third_party/cavaliergopher-rpm/tag.go
 third_party/cavaliergopher-rpm/testdata/RPM-GPG-KEY-CentOS-2
 third_party/cavaliergopher-rpm/testdata/RPM-GPG-KEY-CentOS-3

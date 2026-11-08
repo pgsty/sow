@@ -9,6 +9,8 @@ import (
 func FuzzCompareEVRAntisymmetric(f *testing.F) {
 	f.Add(int64(0), "1.0~rc1", "1", int64(0), "1.0", "1")
 	f.Add(int64(1), "0.1", "2.el9", int64(0), "99", "9")
+	f.Add(int64(0), "2.0^20250611", "1", int64(0), "2.0.1", "1")
+	f.Add(int64(0), "2.0", "1^20250611", int64(0), "2.0", "1.1")
 	f.Fuzz(func(t *testing.T, leftEpoch int64, leftVersion, leftRelease string, rightEpoch int64, rightVersion, rightRelease string) {
 		if len(leftVersion) > 1024 || len(leftRelease) > 1024 || len(rightVersion) > 1024 || len(rightRelease) > 1024 {
 			t.Skip()
@@ -24,6 +26,29 @@ func FuzzCompareEVRAntisymmetric(f *testing.F) {
 			t.Fatalf("RPM EVR comparison is not reflexive: %d", self)
 		}
 	})
+}
+
+func TestCompareEVRCaretOrdering(t *testing.T) {
+	tests := []struct {
+		name                       string
+		leftEpoch, rightEpoch      int64
+		leftVersion, leftRelease   string
+		rightVersion, rightRelease string
+		want                       int
+	}{
+		{"version snapshot before next release", 0, 0, "2.0^20250611", "1", "2.0.1", "1", -1},
+		{"release snapshot before next revision", 0, 0, "2.0", "1^20250611", "2.0", "1.1", -1},
+		{"epoch precedes snapshot ordering", 1, 0, "2.0^20250611", "1", "2.0.1", "1", 1},
+		{"version precedes release ordering", 0, 0, "2.0.1", "1", "2.0", "1^20250611", 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CompareEVR(tt.leftEpoch, tt.leftVersion, tt.leftRelease, tt.rightEpoch, tt.rightVersion, tt.rightRelease)
+			if got != tt.want {
+				t.Fatalf("CompareEVR() = %d, want %d", got, tt.want)
+			}
+		})
+	}
 }
 
 func rpmComparisonSign(value int) int {

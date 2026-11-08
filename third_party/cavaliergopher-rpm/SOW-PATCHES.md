@@ -9,11 +9,11 @@ Upstream module checksum:
 patch ledger are the review anchors for future refreshes.
 
 SOW narrows the copied module to its production use: bounded RPM header and
-metadata parsing. The upstream `GPGCheck` helpers depended on the abandoned
-`golang.org/x/crypto/openpgp` package (GO-2026-5932) and are not used by SOW, so
-they are removed instead of silently substituting a verifier that cannot parse
-legacy v3 RPM signatures. `GPGSignature.String` retains bounded metadata
-display without making a verification claim; embedded signature bytes remain
+metadata parsing, plus version comparison. The upstream `GPGCheck` helpers
+depended on the abandoned `golang.org/x/crypto/openpgp` package (GO-2026-5932)
+and are not used by SOW, so they are removed instead of silently substituting
+a verifier that cannot parse legacy v3 RPM signatures. `GPGSignature.String`
+retains bounded metadata display without making a verification claim; embedded signature bytes remain
 unchanged and real `rpm -K`/DNF clients provide package-level validation.
 
 This deliberately removes the unused GPG-checking API from the local module.
@@ -41,11 +41,21 @@ embedded signature evidence. This strict signature-only path also rejects
 duplicate tag IDs instead of inheriting the general parser's historical
 last-value-wins map projection.
 
+`version.go` recognizes RPM's `^` post-release snapshot operator instead of
+discarding it as punctuation. A snapshot sorts after its base version and before
+the next ordinary segment, so `2.0 < 2.0^20250611 < 2.0.1`. Tilde ordering still
+takes precedence; Epoch and Release retain their existing EVR precedence.
+This follows the [RPM version contract](https://rpm.org/docs/6.0.x/man/rpm-version.7).
+`sow_version_test.go` covers numeric and alphabetic snapshots, interaction with
+tilde, repeated/trailing operators, and both Version and Release comparisons.
+SOW also tests that a managed `limit: 1` retains the release after a snapshot.
+
 `sow_hardening_test.go` carries allocation-bomb, malformed descriptor,
 unterminated string, signed-size and fuzz regressions. `verify-upstream.sh`
 checks the pinned module sum and rejects drift outside the explicit patch-file
 allowlist; CI also scans this nested module independently with `govulncheck`.
 
-When updating the upstream snapshot, run `verify-upstream.sh`, diff all patched files against the tagged source,
-reapply this parser-only patch, run this module's tests, run SOW's RPM tests and
-real DNF compatibility suite, and rerun `govulncheck ./...`.
+When updating the upstream snapshot, run `verify-upstream.sh`, diff all patched
+files against the tagged source, reapply these parser and version patches, run
+this module's tests, run SOW's RPM tests and real DNF compatibility suite, and
+rerun `govulncheck ./...`.

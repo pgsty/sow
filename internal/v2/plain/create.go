@@ -92,7 +92,7 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 		_ = os.RemoveAll(staged.dir)
 		return Result{}, err
 	}
-	if err := publishStage(ctx, root, staged, scan, opts, plan); err != nil {
+	if err := publishStage(ctx, root, staged, scan, opts, &plan); err != nil {
 		return Result{}, err
 	}
 	populateResult(&result, scan, staged, opts, plan.changed)
