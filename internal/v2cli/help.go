@@ -136,7 +136,8 @@ Keep the highest RPM Epoch/Version/Release for each package name and architectur
 By default, rebuild the flat index and then delete superseded RPM files.
 Only top-level regular binary RPM packages are indexed; subdirectories are not
 scanned. Equal-version files are rejected. Replacement RPMs must pass embedded
-digest checks and are hashed again around deletion. Managed workspaces, DEB
+digest checks; their verified file identity is checked before each deletion and
+completion. Managed workspaces, DEB
 repositories, signed repomd.xml, repomd.xml entries SOW does not generate (such as
 comps groups), and RPM v6 packages are not supported. Each --protect NAME must
 match a package. An existing repo_complete marker is refreshed after success.
