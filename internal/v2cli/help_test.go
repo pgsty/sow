@@ -157,9 +157,21 @@ func TestVersionStringIncludesVersionAndTarget(t *testing.T) {
 	}
 }
 
+// go install and plain go build use this default instead of the Makefile ldflags.
 func TestDefaultVersionIsRelease(t *testing.T) {
-	if Version != "0.6.1" {
-		t.Fatalf("default Version=%q, want release 0.6.1", Version)
+	data, err := os.ReadFile("../../Makefile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ""
+	for _, line := range strings.Split(string(data), "\n") {
+		if value, ok := strings.CutPrefix(line, "VERSION ?= "); ok {
+			want = strings.TrimSpace(value)
+			break
+		}
+	}
+	if want == "" || Version != want {
+		t.Fatalf("default Version=%q, want Makefile release %q", Version, want)
 	}
 }
 

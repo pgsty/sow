@@ -68,8 +68,8 @@ flat APT repository, and a mixed directory gets both. Serve it with any static w
 `--pigsty` enables the Pigsty layout conventions, and `sow help create` documents the
 complete option contract. Continue with the [Quick Start](https://sow.pgsty.com/docs/start/quickstart/).
 
-For a password-protected signing key, the current development version (Unreleased)
-supports `--passfile /run/secrets/gpg-password`. You can also set `SOW_GPG_PASSFILE`
+For a password-protected signing key, SOW 0.7 and later accept
+`--passfile /run/secrets/gpg-password`. You can also set `SOW_GPG_PASSFILE`
 to that path or configure `passfile` next to a managed signing
 `key`. Priority is CLI, per-key config (including legacy `passphrase`), then environment.
 Use one nonempty UTF-8 line: one final LF or CRLF is removed, with no trimming of spaces
@@ -160,13 +160,15 @@ authoritative CLI reference shipped with the binary; machine consumers can rely 
 closed `--json` envelopes and the documented exit-code contract.
 
 Upgrading a workspace created by SOW v0.3 or v0.4? Stop writers, back up the workspace,
-and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Versions 0.5 and 0.6 use
+and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Versions 0.5 through 0.7 use
 schema v13 to index pool-path ownership without scanning unrelated publication history;
 configuration and public layout stay unchanged. Then run `sow build` and `sow check`:
 the updated RPM authentication and APT metadata contracts require one rebuild of affected
 Dists. Later unchanged RPMs reuse matching Built evidence instead of repeated payload
 verification. Do not reopen the migrated database with an older binary.
-Upgrading from v0.5 to v0.6 requires no schema migration or public-layout change.
+Upgrading from v0.5 or v0.6 to v0.7 requires no schema migration or public-layout change.
+If a Repository migrated by v0.5 or v0.6 reports an invalid transition control target
+after a later build, upgrade to v0.7; no manual repair is needed.
 Publication ordering, recovery, target rebinding, the one-copy boundary,
 and RPM leaf export are specified in [Commands](https://sow.pgsty.com/docs/command/) and
 [Design Records](https://sow.pgsty.com/blog/design/).

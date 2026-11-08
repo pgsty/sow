@@ -57,6 +57,22 @@ func findModuleRoot(t *testing.T) string {
 	return root
 }
 
+// makefileVersion returns the release version that plain go builds must embed.
+func makefileVersion(t *testing.T, moduleRoot string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(moduleRoot, "Makefile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if value, ok := strings.CutPrefix(line, "VERSION ?= "); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	t.Fatal("Makefile has no VERSION default")
+	return ""
+}
+
 func writeSigningKey(t *testing.T, root string) (string, string) {
 	t.Helper()
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)

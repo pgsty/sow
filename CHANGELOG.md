@@ -2,7 +2,7 @@
 
 All notable changes to SOW are recorded here.
 
-## Unreleased
+## 0.7.0 - 2026-11-08
 
 - Add `--passfile PATH`, `SOW_GPG_PASSFILE`, and per-key `passfile` configuration
   for protected RPM package and RPM/APT metadata signing keys, including GPG
@@ -11,21 +11,29 @@ All notable changes to SOW are recorded here.
   and interrupted-operation recovery. Password files preserve whitespace and
   remove exactly one final LF or CRLF; no default file is searched. Credential
   values stay out of process arguments, repository state, and public output.
-
+- Add `sow prune DIR` for flat RPM repositories. Keep the highest EVR per package
+  name and architecture, verify replacement digests, publish the filtered index,
+  then delete old packages. Support read-only `--dry-run` and repeatable
+  `--protect NAME`; preserve completion markers across interrupted cleanup.
+- Fix Repositories migrated from the C2 layout of v0.3/v0.4 workspaces: after
+  the first later Generation, `check`, `build`, `add`, and `gc` reported an
+  invalid transition control target. The retained migration anchor now binds
+  the Generation the migration created, so affected Repositories recover without
+  manual repair. `repo rm` also accepts a completed migration instead of
+  treating its retained anchor as an active transition.
+- Fix RPM caret snapshot ordering in Version and Release comparisons, so
+  `2.0^20250611` sorts before `2.0.1` and managed version limits retain the
+  newer release instead of its earlier snapshot.
 - Update the AWS SDK, SQLite and its matching libc, Debian package parsing, and
   transitive test dependencies to their latest versions. Upgrade YAML to
   `go.yaml.in/yaml/v4` v4.0.0 with the compatible decoder and encoder, retaining
   strict single-document validation and canonical configuration output.
 - Update GoReleaser to v2.20.0 in CI and release workflows.
 
-- Add `sow prune DIR` for flat RPM repositories. Keep the highest EVR per package
-  name and architecture, verify replacement digests, publish the filtered index,
-  then delete old packages. Support read-only `--dry-run` and repeatable
-  `--protect NAME`; preserve completion markers across interrupted cleanup.
-
-- Fix RPM caret snapshot ordering in Version and Release comparisons, so
-  `2.0^20250611` sorts before `2.0.1` and managed version limits retain the
-  newer release instead of its earlier snapshot.
+This release keeps schema v13 and the existing public repository layout.
+Workspaces already on v0.5.0 through v0.6.1 do not require a schema migration.
+A `sow.yml` that uses `passfile` cannot be loaded by v0.6.1 or older; remove those
+keys before downgrading.
 
 ## 0.6.1 - 2026-10-22
 

@@ -19,7 +19,7 @@ repos:
     #     metadata:
     #       key: file:///srv/sow-secrets/repo-signing.asc
     #       passfile: /run/secrets/metadata-password
-    # Passfile support is currently Unreleased. Priority: --passfile > per-key
+    # Passfile support requires SOW 0.7 or later. Priority: --passfile > per-key
     # passfile (or legacy metadata passphrase) > SOW_GPG_PASSFILE.
     # Config-relative paths start at the workspace root; no default file is searched.
     # The file is one nonempty UTF-8 line (<= 64 KiB including an optional LF/CRLF).
