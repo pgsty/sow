@@ -1140,6 +1140,70 @@ func TestMigrateMixedRepositoryRollsForwardAfterCommitAndGrace(t *testing.T) {
 	}
 }
 
+// A completed migration keeps its control row as the anchor of the Generation
+// it created. Later Generations must not invalidate that anchor.
+func TestMigratedRepositoryAcceptsLaterGenerations(t *testing.T) {
+	ctx := context.Background()
+	root, opts := migrationAbortTwoViewFixture(t)
+	if _, err := MigrateRepositoryLayout(ctx, opts); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("migration before grace error=%v", err)
+	}
+	opts.now = func() time.Time { return time.Date(2026, 8, 5, 14, 0, 0, 0, time.UTC).Add(31 * 24 * time.Hour) }
+	migrated, err := MigrateRepositoryLayout(ctx, opts)
+	if err != nil || !migrated.Complete {
+		t.Fatalf("migration=%#v err=%v", migrated, err)
+	}
+	options := opts.WorkspaceOptions
+	requireClean := func(step string) {
+		t.Helper()
+		checked, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})
+		if err != nil || checked.Status != "clean" {
+			t.Fatalf("%s: check=%#v err=%v", step, checked, err)
+		}
+	}
+	requireClean("after migration")
+	if _, err := NewDist(ctx, DistNewOptions{WorkspaceOptions: options, Repository: "repo", Name: "el10", Format: "rpm"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1}); err != nil {
+		t.Fatalf("build after migration: %v", err)
+	}
+	requireClean("after dist new")
+	removed, err := Remove(ctx, RemoveOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Packages: []string{"pgdg-redhat-nonfree-repo"}, Jobs: 1})
+	if err != nil || removed.Generation <= migrated.Generation {
+		t.Fatalf("remove=%#v err=%v", removed, err)
+	}
+	requireClean("after remove")
+	input := filepath.Join(root, "input.rpm")
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{input}, Jobs: 1}); err != nil {
+		t.Fatalf("add after migration: %v", err)
+	}
+	requireClean("after add")
+	if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: options, Repository: "repo"}); err != nil {
+		t.Fatalf("local gc after migration: %v", err)
+	}
+	requireClean("after gc")
+	// The anchor must still bind the exact migration Generation.
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, tamperErr := store.DB().ExecContext(ctx, `UPDATE layout_transition_control SET target_manifest_sha256 = ?`, strings.Repeat("0", 64))
+	checkErr := store.Check(ctx)
+	_, restoreErr := store.DB().ExecContext(ctx, `UPDATE layout_transition_control SET target_manifest_sha256 = (SELECT manifest_sha256 FROM generations WHERE generation = ?)`, migrated.Generation)
+	closeErr := store.Close()
+	if err := errors.Join(tamperErr, restoreErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if checkErr == nil || !strings.Contains(checkErr.Error(), "differs from the migration Generation") {
+		t.Fatalf("tampered transition anchor check=%v", checkErr)
+	}
+	requireClean("after restoring the anchor")
+	if err := RemoveRepository(ctx, RepositoryRemoveOptions{WorkspaceOptions: options, Name: "repo", Force: true}); err != nil {
+		t.Fatalf("remove migrated repository: %v", err)
+	}
+}
+
 // prepareStartedC2MigrationFixture models an older binary that durably began
 // the transition before interruption. New C2 transitions are no longer started.
 func prepareStartedC2MigrationFixture(t *testing.T, root string, addRPMAliases bool) (state.GenerationID, []string, string) {

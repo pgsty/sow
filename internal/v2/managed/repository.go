@@ -421,11 +421,12 @@ func removeRepository(ctx context.Context, opts RepositoryRemoveOptions, result 
 		store.Close()
 		return fmt.Errorf("%w: repository removal is forbidden during layout transition: %v", ErrNotReady, err)
 	}
-	transition, _, transitionErr := loadTransitionJournal(ws.Root, opts.Name)
-	control, controlErr := store.LayoutTransitionControl(ctx)
-	if transitionErr != nil || controlErr != nil || transition != nil || control != nil {
+	// A completed migration intentionally retains its control row; only an
+	// unfinished or inconsistent transition blocks removal.
+	layout := inspectRepositoryReadLayout(ctx, ws.Root, opts.Name, store)
+	if layout.IdentityErr != nil || layout.TransitionErr != nil || layout.ControlErr != nil || layout.Transition != nil || layout.transitionActive() {
 		store.Close()
-		return errors.Join(fmt.Errorf("%w: repository removal requires no transition evidence", ErrNotReady), transitionErr, controlErr)
+		return errors.Join(fmt.Errorf("%w: repository removal requires no active transition evidence", ErrNotReady), layout.IdentityErr, layout.TransitionErr, layout.ControlErr)
 	}
 	if err := recoverDistOperations(ctx, ws.Root, opts.Name, store); err != nil {
 		store.Close()

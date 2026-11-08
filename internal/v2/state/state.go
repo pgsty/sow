@@ -1564,10 +1564,18 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 					issues = append(issues, errors.Join(errors.New("Repository layout transition control differs from identity/base/layout"), headErr))
 				}
 				if identity.LayoutVersion == LayoutSinglePayloadV1 && headErr == nil {
-					var headManifest string
-					manifestErr := q.QueryRowContext(ctx, `SELECT manifest_sha256 FROM generations WHERE generation = ?`, head).Scan(&headManifest)
-					if manifestErr != nil || headManifest != control.TargetManifestSHA256 {
-						issues = append(issues, errors.Join(errors.New("Repository layout transition control target differs from head Generation"), manifestErr))
+					// A completed migration retains this row as the durable anchor of
+					// the Generation it created. Later builds legitimately advance the
+					// head, so bind the anchor to the migration Generation instead.
+					var targetGeneration GenerationID
+					var targetManifest string
+					targetErr := q.QueryRowContext(ctx, `
+SELECT g.generation, g.manifest_sha256
+FROM generations AS g
+JOIN operations AS o ON o.id = g.operation_id
+WHERE o.kind = 'layout.migrate' AND o.state = 'done' AND g.previous_generation = ?`, control.BaseGeneration).Scan(&targetGeneration, &targetManifest)
+					if targetErr != nil || targetManifest != control.TargetManifestSHA256 || head < targetGeneration {
+						issues = append(issues, errors.Join(errors.New("Repository layout transition control target differs from the migration Generation"), targetErr))
 					}
 				}
 			} else if identity.LayoutVersion == LayoutSinglePayloadV1 && identity.TransitionReceiptSHA256 != "" {
@@ -1607,7 +1615,7 @@ WHERE d.effective_config_sha256 != d.built_config_sha256
 					linkErr := q.QueryRowContext(ctx, `SELECT count(*) FROM generations WHERE operation_id = ? AND generation = ? AND previous_generation = ?`, operationID, wire.TargetGeneration, wire.BaseGeneration).Scan(&generationLinkCount)
 					if decodeErr != nil || trailingErr != io.EOF || headErr != nil ||
 						identity.LayoutVersion != LayoutSinglePayloadV1 || identity.TransitionReceiptSHA256 == "" ||
-						wire.TransitionReceiptSHA256 != identity.TransitionReceiptSHA256 || wire.TargetGeneration != head ||
+						wire.TransitionReceiptSHA256 != identity.TransitionReceiptSHA256 || head < wire.TargetGeneration ||
 						nextErr != nil || wire.TargetGeneration != next || linkErr != nil || generationLinkCount != 1 {
 						issues = append(issues, errors.Join(errors.New("Repository layout migration identity/layout/receipt/generation coupling is invalid"), decodeErr, headErr, nextErr, linkErr))
 					}
