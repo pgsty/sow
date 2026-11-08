@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pgsty/sow/internal/v2/signing"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
 
@@ -94,7 +95,7 @@ type commandSpec struct {
 
 var commandSpecs = map[string]commandSpec{
 	"create":          {globals: usePassFile | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, pigsty: true, signWith: true, overwrite: true, metadataTimestamp: true},
-	"prune":           {globals: useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, jobs: true, prune: true},
+	"prune":           {globals: useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, jobs: true, prune: true, metadataTimestamp: true},
 	"init":            {globals: usePassFile | useJSON, minArgs: 0, maxArgs: 1},
 	"config check":    {globals: usePassFile | useWorkdir | useJSON},
 	"config show":     {globals: useWorkdir | useRepo | useDist | useJSON, all: true},
@@ -334,8 +335,8 @@ func extractGlobal(args []string) ([]string, GlobalOptions, bool, bool, error) {
 				if out.passfileSet {
 					return nil, out, false, false, usageError("--passfile is duplicated")
 				}
-				if strings.TrimSpace(value) == "" || strings.ContainsAny(value, "\x00\r\n") {
-					return nil, out, false, false, usageError("--passfile requires a non-empty path without NUL or line breaks")
+				if err := signing.ValidatePath(value); err != nil {
+					return nil, out, false, false, usageError("--%v", err)
 				}
 				out.PassFile, out.passfileSet = value, true
 			case "-C", "--workdir":

@@ -12,7 +12,8 @@ import (
 func executePrune(ctx context.Context, inv Invocation, stdout, stderr io.Writer) int {
 	result, err := plain.Prune(ctx, plain.PruneOptions{
 		Dir: inv.Positionals[0], DryRun: inv.DryRun, Protect: inv.Protect,
-		Jobs: inv.Jobs, Timeout: inv.Global.Timeout, NoWait: inv.Global.NoWait,
+		Jobs: inv.Jobs, MetadataTimestamp: inv.MetadataTimestamp,
+		Timeout: inv.Global.Timeout, NoWait: inv.Global.NoWait,
 	})
 	if err != nil {
 		err = classifyPlainError(markCommandInterrupted(ctx, err))

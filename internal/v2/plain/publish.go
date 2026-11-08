@@ -2,11 +2,16 @@ package plain
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 )
 
 const legacyPlainJournal = ".sow-plain-operation.json"
@@ -15,18 +20,22 @@ const legacyPlainJournal = ".sow-plain-operation.json"
 // identity is already captured by the one content pass; publication never
 // reopens a retained package merely to prove a durable transaction journal.
 type publicationPlan struct {
-	changed          bool
-	staleRPM         []string
-	removeRPM        []string
-	removeDEB        []string
-	rpmHistory       bool
-	removeRPMHistory bool
-	prune            bool
-	removed          []string
-	rpmPublished     bool
+	changed           bool
+	staleRPM          []string
+	removeRPM         []string
+	removeDEB         []string
+	rpmHistory        bool
+	removeRPMHistory  bool
+	pruneReplacements map[string]pruneReplacement
+	prune             bool
+	removed           []string
+	rpmPublished      bool
 }
 
 func preparePublication(ctx context.Context, root string, staged stagedBuild, scan scanResult, opts Options) (publicationPlan, error) {
+	if err := rejectUnsupportedRPMMetadata(root); err != nil {
+		return publicationPlan{}, err
+	}
 	plan := publicationPlan{}
 	if err := prepareRPMPublication(ctx, root, staged, &plan); err != nil {
 		return publicationPlan{}, err
@@ -144,6 +153,68 @@ func isSOWRPMMetadataName(name string) bool {
 		}
 	}
 	return false
+}
+
+const maxPriorRepomdBytes = 16 << 20
+
+// droppableRPMMetadataTypes are the package indexes SOW regenerates, plus
+// alternate encodings of the same indexes that clients do not require.
+var droppableRPMMetadataTypes = map[string]bool{
+	"primary": true, "filelists": true, "other": true,
+	"primary_db": true, "filelists_db": true, "other_db": true,
+	"primary_zck": true, "filelists_zck": true, "other_zck": true,
+	"filelists-ext": true, "filelists-ext_db": true, "filelists-ext_zck": true,
+}
+
+// rejectUnsupportedRPMMetadata refuses to replace a repomd.xml that also
+// publishes metadata SOW cannot regenerate, such as comps groups, updateinfo
+// or modules; replacing it would silently drop that metadata. A malformed old
+// repomd.xml still does not block rebuilding.
+func rejectUnsupportedRPMMetadata(root string) error {
+	repodata := filepath.Join(root, "repodata")
+	if info, err := os.Lstat(repodata); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil // Missing indexes need no check; unsafe paths fail during publication planning.
+	}
+	path := filepath.Join(repodata, "repomd.xml")
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ELOOP) {
+		return nil
+	}
+	if err != nil {
+		return &Error{Kind: KindRuntime, Op: "inspect prior rpm index", Path: path, Err: err}
+	}
+	defer file.Close()
+	if info, err := file.Stat(); err != nil || !info.Mode().IsRegular() {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxPriorRepomdBytes+1))
+	if err != nil {
+		return &Error{Kind: KindRuntime, Op: "inspect prior rpm index", Path: path, Err: err}
+	}
+	if len(data) > maxPriorRepomdBytes {
+		return &Error{Kind: KindRejected, Op: "inspect prior rpm index", Path: path, Err: errors.New("repomd.xml exceeds the inspection limit; remove it explicitly to rebuild without its metadata")}
+	}
+	var repomd struct {
+		Data []struct {
+			Type string `xml:"type,attr"`
+		} `xml:"data"`
+	}
+	if err := xml.Unmarshal(data, &repomd); err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var unsupported []string
+	for _, data := range repomd.Data {
+		if !droppableRPMMetadataTypes[data.Type] && !seen[data.Type] {
+			seen[data.Type] = true
+			unsupported = append(unsupported, strconv.Quote(data.Type))
+		}
+	}
+	if len(unsupported) == 0 {
+		return nil
+	}
+	sort.Strings(unsupported)
+	return &Error{Kind: KindRejected, Op: "inspect prior rpm index", Path: path, Err: fmt.Errorf("repomd.xml also publishes %s metadata that SOW does not generate; remove repodata/repomd.xml to rebuild without it", strings.Join(unsupported, ", "))}
 }
 
 func prepareDEBPublication(ctx context.Context, root string, staged stagedBuild, plan *publicationPlan) error {
@@ -358,6 +429,9 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 		if err := verifyStableInputs(ctx, root, scan); err != nil {
 			return err
 		}
+		if err := verifyPruneReplacementIdentities(ctx, plan.pruneReplacements); err != nil {
+			return err
+		}
 	}
 	for sequence, fact := range scan.removed {
 		if err := ctx.Err(); err != nil {
@@ -365,6 +439,13 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 		}
 		path := filepath.Join(root, fact.base)
 		if plan.prune {
+			replacement, ok := plan.pruneReplacements[fact.name+"\x00"+fact.arch]
+			if !ok {
+				return &Error{Kind: KindIntegrity, Op: "remove package", Path: path, Err: errors.New("verified replacement is missing")}
+			}
+			if err := replacement.verify(); err != nil {
+				return err
+			}
 			current, err := os.Lstat(path)
 			if err != nil || !samePackageStat(fact.sourceInfo, current) {
 				return &Error{Kind: KindIntegrity, Op: "remove changed package", Path: path, Err: errors.Join(err, errors.New("package changed after inspection"))}
@@ -383,10 +464,17 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 			return err
 		}
 	}
+	// Deletion is not atomic. Never report success, or restore a completion
+	// marker, if a replacement changed while its old versions were removed.
 	if opts.Pigsty {
 		if err := inject(opts.Fault, FaultBeforeMarker, "", -1); err != nil {
 			return err
 		}
+	}
+	if err := verifyPruneReplacementIdentities(ctx, plan.pruneReplacements); err != nil {
+		return err
+	}
+	if opts.Pigsty {
 		if err := installStagedFile(filepath.Join(staged.dir, "repo_complete"), filepath.Join(root, "repo_complete")); err != nil {
 			return err
 		}

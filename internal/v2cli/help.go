@@ -130,20 +130,24 @@ Options:
 --passfile requires --sign-with; SOW_GPG_PASSFILE alone does not enable signing.
 `,
 	"prune": `Usage:
-  sow prune DIR [--dry-run] [--protect NAME]... [-j N] [-T DUR | -N] [--json]
+  sow prune DIR [--dry-run] [--protect NAME]... [-j N] [--metadata-timestamp SECONDS] [-T DUR | -N] [--json]
 
 Keep the highest RPM Epoch/Version/Release for each package name and architecture.
 By default, rebuild the flat index and then delete superseded RPM files.
-The directory must contain only top-level regular binary RPM packages; subdirectories
-are not scanned. Equal-version files are rejected. Replacement RPMs must pass
-embedded digest checks. Managed workspaces, DEB repositories and signed repomd.xml
-are not supported. An existing repo_complete marker is refreshed after success.
+Only top-level regular binary RPM packages are indexed; subdirectories are not
+scanned. Equal-version files are rejected. Replacement RPMs must pass embedded
+digest checks and are hashed again around deletion. Managed workspaces, DEB
+repositories, signed repomd.xml, repomd.xml entries SOW does not generate (such as
+comps groups), and RPM v6 packages are not supported. Each --protect NAME must
+match a package. An existing repo_complete marker is refreshed after success.
 Use on a local publication source; clients caching old indexes may still need old RPMs.
 
 Options:
       --dry-run        Preview candidates without changing any files
       --protect NAME   Keep every version of this exact package name; repeatable
   -j, --jobs N         Package inspection workers; defaults to CPU count
+      --metadata-timestamp SECONDS
+                       RPM data timestamps; nonnegative Unix seconds, default 0
   -T, --timeout DUR    Maximum lock wait; 0 waits indefinitely
   -N, --no-wait        Fail immediately when the lock is held
       --json           Emit the versioned JSON envelope

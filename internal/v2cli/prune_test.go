@@ -20,8 +20,8 @@ func TestParsePruneDefaultsAndOptions(t *testing.T) {
 	if err != nil || inv.Command != "prune" || inv.DryRun || len(inv.Protect) != 0 || !reflect.DeepEqual(inv.Positionals, []string{"packages"}) {
 		t.Fatalf("default prune=%+v err=%v", inv, err)
 	}
-	inv, err = Parse([]string{"--json", "prune", "--dry-run", "--protect", "age_18", "packages", "--protect=age_18-llvmjit", "-j", "2", "-T", "1s"})
-	if err != nil || !inv.DryRun || !inv.Global.JSON || inv.Jobs != 2 || inv.Global.Timeout != time.Second || !reflect.DeepEqual(inv.Protect, []string{"age_18", "age_18-llvmjit"}) {
+	inv, err = Parse([]string{"--json", "prune", "--dry-run", "--protect", "age_18", "packages", "--protect=age_18-llvmjit", "-j", "2", "-T", "1s", "--metadata-timestamp", "1790049000"})
+	if err != nil || !inv.DryRun || !inv.Global.JSON || inv.Jobs != 2 || inv.Global.Timeout != time.Second || !reflect.DeepEqual(inv.Protect, []string{"age_18", "age_18-llvmjit"}) || inv.MetadataTimestamp != 1790049000 {
 		t.Fatalf("prune options=%+v err=%v", inv, err)
 	}
 	for _, args := range [][]string{
@@ -33,7 +33,7 @@ func TestParsePruneDefaultsAndOptions(t *testing.T) {
 		{"prune", "packages", "--pigsty"}, {"prune", "packages", "--recursive"},
 		{"prune", "packages", "-C", "workspace"}, {"prune", "packages", "-r", "repo"},
 		{"prune", "packages", "-d", "el9"}, {"prune", "packages", "-j", "0"},
-		{"prune", "packages", "-N", "-T", "1s"},
+		{"prune", "packages", "-N", "-T", "1s"}, {"prune", "packages", "--metadata-timestamp", "-1"},
 		{"create", "packages", "--dry-run"}, {"create", "packages", "--protect", "pkg"},
 	} {
 		if _, err := Parse(args); ExitCode(err) != ExitUsage {

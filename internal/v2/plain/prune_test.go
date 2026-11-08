@@ -156,6 +156,7 @@ func TestPruneRejectsInvalidInputsBeforeChanges(t *testing.T) {
 		{"signed metadata", func(t *testing.T, dir string) {
 			mustWritePruneFile(t, filepath.Join(dir, "repodata", "repomd.xml.asc"), []byte("signature"))
 		}},
+		{"group metadata", addRepomdGroupData},
 		{"managed state", func(t *testing.T, dir string) { mustMkdir(t, filepath.Join(dir, ".sow")) }},
 		{"marker symlink", func(t *testing.T, dir string) {
 			if err := os.Remove(filepath.Join(dir, "repo_complete")); err != nil {
@@ -291,6 +292,167 @@ func TestPruneRejectsChangedInputsAndCancellationBeforeDeleting(t *testing.T) {
 			}
 			if change == "cancel after pointer" && !errors.Is(err, context.Canceled) {
 				t.Fatalf("cancellation lost: %v", err)
+			}
+		})
+	}
+}
+
+// A same-size in-place rewrite that restores mtime passes stat checks. Prune
+// must still refuse to delete old versions, and must not report success when
+// the rewrite happens while old versions are being removed.
+func TestPruneDetectsInPlaceReplacementRewrite(t *testing.T) {
+	rewrite := func(t *testing.T, path string) {
+		t.Helper()
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data[len(data)-1] ^= 0xff
+		if err := os.WriteFile(path, data, info.Mode().Perm()); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("before removal", func(t *testing.T) {
+		dir := pruneFixture(t, true)
+		result, err := Prune(context.Background(), PruneOptions{Dir: dir, Fault: func(event Fault) error {
+			if event.Point == FaultAfterRPMPointer {
+				rewrite(t, filepath.Join(dir, "new.rpm"))
+			}
+			return nil
+		}})
+		if KindOf(err) != KindIntegrity || len(result.Removed) != 0 {
+			t.Fatalf("prune=%+v err=%v", result, err)
+		}
+		for _, name := range []string{"old1.rpm", "old2.rpm"} {
+			if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	t.Run("during removal", func(t *testing.T) {
+		dir := pruneFixture(t, true)
+		result, err := Prune(context.Background(), PruneOptions{Dir: dir, Fault: func(event Fault) error {
+			if event.Point == FaultAfterPackageRename && event.Sequence == 0 {
+				rewrite(t, filepath.Join(dir, "new.rpm"))
+			}
+			return nil
+		}})
+		if KindOf(err) != KindIntegrity || len(result.Removed) != 1 || result.Noop {
+			t.Fatalf("prune=%+v err=%v", result, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "old2.rpm")); err != nil {
+			t.Fatalf("last old package was not preserved: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "repo_complete")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("completion marker restored: %v", err)
+		}
+	})
+	t.Run("before marker", func(t *testing.T) {
+		dir := pruneFixture(t, true)
+		result, err := Prune(context.Background(), PruneOptions{Dir: dir, Fault: func(event Fault) error {
+			if event.Point == FaultBeforeMarker {
+				rewrite(t, filepath.Join(dir, "new.rpm"))
+			}
+			return nil
+		}})
+		if KindOf(err) != KindIntegrity || len(result.Removed) != 2 {
+			t.Fatalf("prune=%+v err=%v", result, err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "repo_complete")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("completion marker restored: %v", err)
+		}
+	})
+}
+
+func TestPruneRejectsProtectionThatMatchesNoPackage(t *testing.T) {
+	dir := pruneFixture(t, true)
+	before := pruneTreeSnapshot(t, dir)
+	for _, dry := range []bool{true, false} {
+		result, err := Prune(context.Background(), PruneOptions{Dir: dir, DryRun: dry, Protect: []string{"pkg", "pgk"}})
+		if KindOf(err) != KindUsage || !strings.Contains(err.Error(), "pgk") || len(result.Removed) != 0 {
+			t.Fatalf("misspelled protection dry=%t result=%+v err=%v", dry, result, err)
+		}
+	}
+	if after := pruneTreeSnapshot(t, dir); !reflect.DeepEqual(before, after) {
+		t.Fatal("rejected protection changed directory")
+	}
+}
+
+func TestPruneKeepsExplicitMetadataTimestamp(t *testing.T) {
+	dir := pruneFixture(t, false)
+	const timestamp = 1790049000
+	if _, err := Create(context.Background(), Options{Dir: dir, MetadataTimestamp: timestamp}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Prune(context.Background(), PruneOptions{Dir: dir, MetadataTimestamp: timestamp}); err != nil {
+		t.Fatal(err)
+	}
+	repomd := mustRead(t, filepath.Join(dir, "repodata", "repomd.xml"))
+	if !bytes.Contains(repomd, []byte("<timestamp>1790049000</timestamp>")) || bytes.Contains(repomd, []byte("<timestamp>0</timestamp>")) {
+		t.Fatalf("prune changed metadata timestamps: %s", repomd)
+	}
+}
+
+// addRepomdGroupData models an index produced by createrepo_c -g comps.xml.
+func addRepomdGroupData(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, "repodata", "repomd.xml")
+	data := mustRead(t, path)
+	group := []byte(`<data type="group"><location href="repodata/comps.xml"/></data></repomd>`)
+	if !bytes.Contains(data, []byte("</repomd>")) {
+		t.Fatalf("repomd.xml has no closing element: %s", data)
+	}
+	mustWritePruneFile(t, path, bytes.Replace(data, []byte("</repomd>"), group, 1))
+	mustWritePruneFile(t, filepath.Join(dir, "repodata", "comps.xml"), []byte("<comps/>\n"))
+}
+
+func TestCreateRejectsIndexWithUnsupportedMetadata(t *testing.T) {
+	dir := pruneFixture(t, true)
+	addRepomdGroupData(t, dir)
+	stage := mustMkdir(t, filepath.Join(dir, ".sow-plain-stage-preserved"))
+	mustWritePruneFile(t, filepath.Join(stage, "evidence"), []byte("preserve"))
+	before := pruneTreeSnapshot(t, dir)
+	_, err := Create(context.Background(), Options{Dir: dir, Pigsty: true})
+	if KindOf(err) != KindRejected || !strings.Contains(err.Error(), `"group"`) {
+		t.Fatalf("create over group metadata error=%v", err)
+	}
+	if after := pruneTreeSnapshot(t, dir); !reflect.DeepEqual(before, after) {
+		t.Fatal("rejected create changed directory")
+	}
+	if err := os.Remove(filepath.Join(dir, "repodata", "repomd.xml")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(context.Background(), Options{Dir: dir, Pigsty: true}); err != nil {
+		t.Fatalf("create after removing foreign repomd.xml: %v", err)
+	}
+}
+
+func TestPlainRejectsOversizedPriorIndex(t *testing.T) {
+	for _, command := range []string{"create", "prune", "dry-run"} {
+		t.Run(command, func(t *testing.T) {
+			dir := pruneFixture(t, true)
+			path := filepath.Join(dir, "repodata", "repomd.xml")
+			body := `<repomd><!--` + strings.Repeat("x", maxPriorRepomdBytes) + `--><data type="group"/></repomd>`
+			mustWritePruneFile(t, path, []byte(body))
+			before := pruneTreeSnapshot(t, dir)
+			var err error
+			if command == "create" {
+				_, err = Create(context.Background(), Options{Dir: dir, Pigsty: true})
+			} else {
+				_, err = Prune(context.Background(), PruneOptions{Dir: dir, DryRun: command == "dry-run"})
+			}
+			if KindOf(err) != KindRejected {
+				t.Fatalf("oversized index accepted: %v", err)
+			}
+			if !reflect.DeepEqual(before, pruneTreeSnapshot(t, dir)) {
+				t.Fatal("rejected command changed repository")
 			}
 		})
 	}

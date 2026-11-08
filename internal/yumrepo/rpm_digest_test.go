@@ -38,6 +38,21 @@ func TestVerifyPackageDigestsRealRPMs(t *testing.T) {
 	}
 }
 
+// RPM v6 writes PAYLOADSHA256 without PAYLOADSHA256ALGO. Report the format
+// rather than an opaque "algorithm 0" failure.
+func TestVerifyPackageDigestsNamesUnsupportedRPMv6(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v6.rpm")
+	writeRPMFixture(t, path, "v6", fixtureTag{id: rpmTagPayloadDigest, typ: 8, count: 1, data: append([]byte(strings.Repeat("0", 64)), 0)})
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = VerifyPackageDigests(context.Background(), bytes.NewReader(data))
+	if !errors.Is(err, ErrInvalidPackage) || !strings.Contains(err.Error(), "RPM v6 packages are not supported") {
+		t.Fatalf("v6 digest error=%v", err)
+	}
+}
+
 func TestVerifyPackageDigestsRejectsDamagedOrUncoveredBytes(t *testing.T) {
 	data := withoutSignatureDigestTags(readPGDGRPMFixture(t), 1004)
 	layout := testRPMVerificationLayout(t, data)

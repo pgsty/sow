@@ -44,6 +44,9 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 	result.Dir = root
 	result.Kept = []string{}
 	result.Removed = []string{}
+	if err := rejectUnsupportedRPMMetadata(root); err != nil {
+		return Result{}, err
+	}
 	if err := cleanupStalePlainState(root); err != nil {
 		return Result{}, err
 	}

@@ -2,8 +2,11 @@ package plain
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -11,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pgsty/sow/internal/yumrepo"
+	"golang.org/x/sys/unix"
 )
 
 // An interrupted prune keeps the old completion marker here until its rerun
@@ -22,9 +26,11 @@ type PruneOptions struct {
 	DryRun  bool
 	Protect []string
 	Jobs    int
-	Timeout time.Duration
-	NoWait  bool
-	Fault   func(Fault) error
+	// MetadataTimestamp is the RPM index publication time, as for Create.
+	MetadataTimestamp int64
+	Timeout           time.Duration
+	NoWait            bool
+	Fault             func(Fault) error
 }
 
 type PruneCandidate struct {
@@ -49,7 +55,7 @@ func Prune(ctx context.Context, opts PruneOptions) (result PruneResult, resultEr
 	if strings.TrimSpace(opts.Dir) == "" {
 		return result, &Error{Kind: KindUsage, Op: "prune", Err: errors.New("directory is required")}
 	}
-	base, err := normalizeOptions(ctx, Options{Dir: opts.Dir, Jobs: opts.Jobs, Timeout: opts.Timeout, NoWait: opts.NoWait, Fault: opts.Fault})
+	base, err := normalizeOptions(ctx, Options{Dir: opts.Dir, Jobs: opts.Jobs, MetadataTimestamp: opts.MetadataTimestamp, Timeout: opts.Timeout, NoWait: opts.NoWait, Fault: opts.Fault})
 	if err != nil {
 		return result, err
 	}
@@ -81,6 +87,9 @@ func Prune(ctx context.Context, opts PruneOptions) (result PruneResult, resultEr
 	if err := validatePruneDirectory(root); err != nil {
 		return result, err
 	}
+	if err := rejectUnsupportedRPMMetadata(root); err != nil {
+		return result, err
+	}
 	marker, err := pruneMarkerExists(filepath.Join(root, "repo_complete"))
 	if err != nil {
 		return result, err
@@ -107,7 +116,8 @@ func Prune(ctx context.Context, opts PruneOptions) (result PruneResult, resultEr
 	if err := inject(base.Fault, FaultAfterContentScan, "", -1); err != nil {
 		return result, err
 	}
-	if err := verifyPruneReplacements(ctx, scan, candidates); err != nil {
+	replacements, err := verifyPruneReplacements(ctx, scan, candidates)
+	if err != nil {
 		return result, err
 	}
 	if err := verifyStableInputs(ctx, root, scan); err != nil {
@@ -143,7 +153,11 @@ func Prune(ctx context.Context, opts PruneOptions) (result PruneResult, resultEr
 	if err := lock.Validate(); err != nil {
 		return result, err
 	}
+	if err := verifyPruneReplacementIdentities(ctx, replacements); err != nil {
+		return result, err
+	}
 	plan.prune = true
+	plan.pruneReplacements = replacements
 	plan.changed = plan.changed || pendingMarker
 	if plan.changed && marker && !pendingMarker {
 		if err := os.Rename(filepath.Join(root, "repo_complete"), filepath.Join(root, pruneMarkerName)); err != nil {
@@ -225,12 +239,20 @@ func selectPrunePackages(scan scanResult, protect []string) (scanResult, []Prune
 		protected[name] = true
 	}
 	groups := make(map[string][]packageFact)
+	present := make(map[string]bool, len(scan.all))
 	for _, fact := range scan.all {
 		if fact.format != formatRPM {
 			return scanResult{}, nil, &Error{Kind: KindRejected, Op: "prune", Path: fact.path, Err: errors.New("prune supports RPM packages only")}
 		}
 		key := fact.name + "\x00" + fact.arch
 		groups[key] = append(groups[key], fact)
+		present[fact.name] = true
+	}
+	// A misspelled protection would silently delete the versions it meant to keep.
+	for _, name := range protect {
+		if !present[name] {
+			return scanResult{}, nil, &Error{Kind: KindUsage, Op: "protect", Path: name, Err: errors.New("no RPM package in the directory has this exact name")}
+		}
 	}
 	compare := func(a, b packageFact) int {
 		return yumrepo.CompareEVR(a.rpm.Epoch, a.rpm.Version, a.rpm.Release, b.rpm.Epoch, b.rpm.Version, b.rpm.Release)
@@ -266,33 +288,92 @@ func selectPrunePackages(scan scanResult, protect []string) (scanResult, []Prune
 	return result, candidates, nil
 }
 
-func verifyPruneReplacements(ctx context.Context, scan scanResult, candidates []PruneCandidate) error {
-	replacements := map[string]bool{}
-	for _, candidate := range candidates {
-		replacements[candidate.Latest] = true
+// pruneReplacement binds verified RPM digests and indexed bytes to a single
+// stable inode. Ctime detects in-place rewrites even if size and mtime are restored.
+// Subsequent deletion checks use this command-local identity, not repeated full
+// reads of every replacement for every old package.
+type pruneReplacement struct {
+	path     string
+	identity unix.Stat_t
+}
+
+func samePruneIdentity(a, b unix.Stat_t) bool {
+	return a.Dev == b.Dev && a.Ino == b.Ino && a.Mode == b.Mode &&
+		a.Nlink == b.Nlink && a.Size == b.Size && a.Mtim == b.Mtim && a.Ctim == b.Ctim
+}
+
+func (replacement pruneReplacement) verify() error {
+	var current unix.Stat_t
+	err := unix.Lstat(replacement.path, &current)
+	if err == nil && !samePruneIdentity(replacement.identity, current) {
+		err = errors.New("replacement RPM changed after verification")
 	}
-	for _, fact := range scan.kept {
-		if !replacements[fact.base] {
-			continue
-		}
-		file, err := os.Open(fact.path)
-		if err != nil {
+	if err != nil {
+		return &Error{Kind: KindIntegrity, Op: "verify replacement RPM", Path: replacement.path, Err: err}
+	}
+	return nil
+}
+
+func verifyPruneReplacementIdentities(ctx context.Context, replacements map[string]pruneReplacement) error {
+	for _, replacement := range replacements {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		before, err := file.Stat()
-		if err == nil && !samePackageStat(fact.sourceInfo, before) {
-			err = errors.New("replacement RPM changed before verification")
+		if err := replacement.verify(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyPruneReplacements(ctx context.Context, scan scanResult, candidates []PruneCandidate) (map[string]pruneReplacement, error) {
+	needed := map[string]bool{}
+	for _, candidate := range candidates {
+		needed[candidate.Latest] = true
+	}
+	replacements := make(map[string]pruneReplacement, len(needed))
+	for _, fact := range scan.kept {
+		if !needed[fact.base] {
+			continue
+		}
+		file, err := os.OpenFile(fact.path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+		if err != nil {
+			return nil, &Error{Kind: KindIntegrity, Op: "verify replacement RPM", Path: fact.path, Err: err}
+		}
+		replacement := pruneReplacement{path: fact.path}
+		err = unix.Fstat(int(file.Fd()), &replacement.identity)
+		if err == nil {
+			var before os.FileInfo
+			before, err = file.Stat()
+			if err == nil && !samePackageStat(fact.sourceInfo, before) {
+				err = errors.New("replacement RPM changed before verification")
+			}
 		}
 		if err == nil {
 			err = yumrepo.VerifyPackageDigests(ctx, file)
 		}
-		after, statErr := file.Stat()
-		if statErr == nil && !samePackageStat(fact.sourceInfo, after) {
+		if err == nil {
+			_, err = file.Seek(0, io.SeekStart)
+		}
+		hash := sha256.New()
+		if err == nil {
+			_, err = io.Copy(hash, &contextReader{ctx: ctx, reader: file})
+		}
+		if err == nil && hex.EncodeToString(hash.Sum(nil)) != fact.sha256 {
+			err = errors.New("replacement RPM content differs from the published index")
+		}
+		var after unix.Stat_t
+		statErr := unix.Fstat(int(file.Fd()), &after)
+		if statErr == nil && !samePruneIdentity(replacement.identity, after) {
 			statErr = errors.New("replacement RPM changed during verification")
 		}
 		if err = errors.Join(err, statErr, file.Close()); err != nil {
-			return &Error{Kind: KindIntegrity, Op: "verify replacement RPM", Path: fact.path, Err: err}
+			return nil, &Error{Kind: KindIntegrity, Op: "verify replacement RPM", Path: fact.path, Err: err}
 		}
+		if err := replacement.verify(); err != nil {
+			return nil, err
+		}
+		replacements[fact.name+"\x00"+fact.arch] = replacement
 	}
-	return nil
+	return replacements, nil
 }
