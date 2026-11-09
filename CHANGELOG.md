@@ -21,9 +21,12 @@ All notable changes to SOW are recorded here.
   version is deleted and before completion. An in-place rewrite with restored
   size and mtime stops further deletion. RPM v6 packages are
   not supported and are reported as such.
-- `create` and `prune` reject an existing `repomd.xml` that also lists metadata
-  SOW does not generate, such as comps groups, updateinfo, or modules, before
-  changing any file, instead of silently dropping it from the rebuilt index.
+- `prune` rejects an existing `repomd.xml` that also lists metadata SOW does not
+  generate, such as comps groups, updateinfo, or modules, before changing any
+  file. `create` keeps replacing such an index, as createrepo_c does, so that
+  existing repositories, including EL8/9 repositories with legacy module metadata
+  from Pigsty v4.4 or earlier, still rebuild. It now reports the dropped data
+  types as a warning and in the JSON `dropped_metadata` result field.
 - Accept ECDSA and EdDSA header signatures in `RPMSIGTAG_DSA`, where rpm 4.16 and
   later store them. RPM packages signed with GnuPG's default Ed25519 keys now
   verify, including after managed package signing.

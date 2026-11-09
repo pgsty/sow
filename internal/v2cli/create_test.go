@@ -33,6 +33,32 @@ func TestExecuteCreateJSONAndOptionMapping(t *testing.T) {
 	}
 }
 
+func TestExecuteCreateReportsDroppedMetadata(t *testing.T) {
+	result := plain.Result{Dir: "/tmp/repo", RPM: 1, Kept: []string{"pkg.rpm"}, Removed: []string{}, DroppedMetadata: []string{"group", "modules"}}
+	create := func(context.Context, plain.Options) (plain.Result, error) { return result, nil }
+	for _, jsonOutput := range []bool{false, true} {
+		args := []string{"create", "repo"}
+		if jsonOutput {
+			args = append(args, "--json")
+		}
+		inv, err := Parse(args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stdout, stderr bytes.Buffer
+		if code := ExecuteCreate(context.Background(), inv, &stdout, &stderr, create); code != ExitOK {
+			t.Fatalf("json=%t code=%d stderr=%q", jsonOutput, code, stderr.String())
+		}
+		if jsonOutput {
+			if !strings.Contains(stdout.String(), `"dropped_metadata":["group","modules"]`) || stderr.Len() != 0 {
+				t.Fatalf("json stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+		} else if !strings.HasPrefix(stdout.String(), "created /tmp/repo:") || !strings.Contains(stderr.String(), "warning: replaced repodata/repomd.xml without metadata that SOW does not generate: group, modules") {
+			t.Fatalf("human stdout=%q stderr=%q", stdout.String(), stderr.String())
+		}
+	}
+}
+
 func TestExecuteCreateErrorMapping(t *testing.T) {
 	tests := []struct {
 		kind  plain.ErrorKind

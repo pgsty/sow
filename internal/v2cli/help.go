@@ -128,6 +128,8 @@ Options:
   -h, --help            Show help
 
 --passfile requires --sign-with; SOW_GPG_PASSFILE alone does not enable signing.
+An existing repomd.xml is replaced. Data types SOW does not generate, such as
+group or modules, are reported as dropped.
 `,
 	"prune": `Usage:
   sow prune DIR [--dry-run] [--protect NAME]... [-j N] [--metadata-timestamp SECONDS] [-T DUR | -N] [--json]

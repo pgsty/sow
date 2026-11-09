@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/pgsty/sow/internal/v2/plain"
 )
@@ -53,6 +54,9 @@ func ExecuteCreate(ctx context.Context, inv Invocation, stdout, stderr io.Writer
 		result.Dir, result.RPM, result.DEB, len(result.Signed), len(result.Removed), result.Marker, result.Noop, result.Recovered); err != nil {
 		fmt.Fprintln(stderr, err)
 		return ExitRuntime
+	}
+	if len(result.DroppedMetadata) != 0 {
+		fmt.Fprintf(stderr, "warning: replaced repodata/repomd.xml without metadata that SOW does not generate: %s\n", strings.Join(result.DroppedMetadata, ", "))
 	}
 	return ExitOK
 }

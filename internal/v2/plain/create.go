@@ -44,9 +44,6 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 	result.Dir = root
 	result.Kept = []string{}
 	result.Removed = []string{}
-	if err := rejectUnsupportedRPMMetadata(root); err != nil {
-		return Result{}, err
-	}
 	if err := cleanupStalePlainState(root); err != nil {
 		return Result{}, err
 	}
@@ -95,10 +92,19 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 		_ = os.RemoveAll(staged.dir)
 		return Result{}, err
 	}
+	// Create replaces a foreign repomd.xml, as createrepo_c does; for example,
+	// Pigsty relies on this to retire legacy synthetic module metadata. Report
+	// the data types that the rebuilt index no longer carries.
+	prior, err := inspectPriorRPMMetadata(root)
+	if err != nil {
+		_ = os.RemoveAll(staged.dir)
+		return Result{}, err
+	}
 	if err := publishStage(ctx, root, staged, scan, opts, &plan); err != nil {
 		return Result{}, err
 	}
 	populateResult(&result, scan, staged, opts, plan.changed)
+	result.DroppedMetadata = prior.unsupported
 	return result, nil
 }
 
