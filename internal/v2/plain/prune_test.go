@@ -157,6 +157,7 @@ func TestPruneRejectsInvalidInputsBeforeChanges(t *testing.T) {
 			mustWritePruneFile(t, filepath.Join(dir, "repodata", "repomd.xml.asc"), []byte("signature"))
 		}},
 		{"group metadata", addRepomdGroupData},
+		{"module metadata", addRepomdModulesData},
 		{"managed state", func(t *testing.T, dir string) { mustMkdir(t, filepath.Join(dir, ".sow")) }},
 		{"marker symlink", func(t *testing.T, dir string) {
 			if err := os.Remove(filepath.Join(dir, "repo_complete")); err != nil {
@@ -413,42 +414,64 @@ func addRepomdGroupData(t *testing.T, dir string) {
 	mustWritePruneFile(t, filepath.Join(dir, "repodata", "comps.xml"), []byte("<comps/>\n"))
 }
 
-func TestCreateRejectsIndexWithUnsupportedMetadata(t *testing.T) {
-	dir := pruneFixture(t, true)
-	addRepomdGroupData(t, dir)
-	stage := mustMkdir(t, filepath.Join(dir, ".sow-plain-stage-preserved"))
-	mustWritePruneFile(t, filepath.Join(stage, "evidence"), []byte("preserve"))
-	before := pruneTreeSnapshot(t, dir)
-	_, err := Create(context.Background(), Options{Dir: dir, Pigsty: true})
-	if KindOf(err) != KindRejected || !strings.Contains(err.Error(), `"group"`) {
-		t.Fatalf("create over group metadata error=%v", err)
-	}
-	if after := pruneTreeSnapshot(t, dir); !reflect.DeepEqual(before, after) {
-		t.Fatal("rejected create changed directory")
-	}
-	if err := os.Remove(filepath.Join(dir, "repodata", "repomd.xml")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Create(context.Background(), Options{Dir: dir, Pigsty: true}); err != nil {
-		t.Fatalf("create after removing foreign repomd.xml: %v", err)
+// addRepomdModulesData models an EL8/9 repository built by Pigsty v4.4 or
+// earlier with repo2module and modifyrepo_c --mdtype=modules.
+func addRepomdModulesData(t *testing.T, dir string) {
+	t.Helper()
+	path := filepath.Join(dir, "repodata", "repomd.xml")
+	data := mustRead(t, path)
+	modules := []byte(`<data type="modules"><location href="repodata/legacy-modules.yaml.gz"/></data></repomd>`)
+	mustWritePruneFile(t, path, bytes.Replace(data, []byte("</repomd>"), modules, 1))
+	mustWritePruneFile(t, filepath.Join(dir, "repodata", "legacy-modules.yaml.gz"), []byte("modules"))
+}
+
+// Create keeps replacing a foreign repomd.xml, as createrepo_c does, so that
+// existing Pigsty repositories with legacy module metadata still rebuild. It
+// reports the data types the rebuilt index no longer carries.
+func TestCreateReplacesForeignIndexAndReportsDroppedMetadata(t *testing.T) {
+	for name, test := range map[string]struct {
+		add  func(*testing.T, string)
+		want []string
+	}{
+		"Pigsty legacy modules": {addRepomdModulesData, []string{"modules"}},
+		"groups and modules": {func(t *testing.T, dir string) {
+			addRepomdGroupData(t, dir)
+			addRepomdModulesData(t, dir)
+		}, []string{"group", "modules"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := pruneFixture(t, true)
+			test.add(t, dir)
+			result, err := Create(context.Background(), Options{Dir: dir, Pigsty: true})
+			if err != nil || result.Noop || !reflect.DeepEqual(result.DroppedMetadata, test.want) {
+				t.Fatalf("create over foreign index=%+v err=%v", result, err)
+			}
+			repomd := mustRead(t, filepath.Join(dir, "repodata", "repomd.xml"))
+			if bytes.Contains(repomd, []byte(`type="modules"`)) || bytes.Contains(repomd, []byte(`type="group"`)) {
+				t.Fatalf("rebuilt index kept foreign data: %s", repomd)
+			}
+			again, err := Create(context.Background(), Options{Dir: dir, Pigsty: true})
+			if err != nil || !again.Noop || len(again.DroppedMetadata) != 0 {
+				t.Fatalf("repeat create=%+v err=%v", again, err)
+			}
+		})
 	}
 }
 
 func TestPlainRejectsOversizedPriorIndex(t *testing.T) {
-	for _, command := range []string{"create", "prune", "dry-run"} {
-		t.Run(command, func(t *testing.T) {
-			dir := pruneFixture(t, true)
-			path := filepath.Join(dir, "repodata", "repomd.xml")
-			body := `<repomd><!--` + strings.Repeat("x", maxPriorRepomdBytes) + `--><data type="group"/></repomd>`
-			mustWritePruneFile(t, path, []byte(body))
+	oversized := func(t *testing.T) string {
+		t.Helper()
+		dir := pruneFixture(t, true)
+		path := filepath.Join(dir, "repodata", "repomd.xml")
+		body := `<repomd><!--` + strings.Repeat("x", maxPriorRepomdBytes) + `--><data type="group"/></repomd>`
+		mustWritePruneFile(t, path, []byte(body))
+		return dir
+	}
+	for _, dry := range []bool{false, true} {
+		t.Run(fmt.Sprintf("prune dry=%t", dry), func(t *testing.T) {
+			dir := oversized(t)
 			before := pruneTreeSnapshot(t, dir)
-			var err error
-			if command == "create" {
-				_, err = Create(context.Background(), Options{Dir: dir, Pigsty: true})
-			} else {
-				_, err = Prune(context.Background(), PruneOptions{Dir: dir, DryRun: command == "dry-run"})
-			}
-			if KindOf(err) != KindRejected {
+			if _, err := Prune(context.Background(), PruneOptions{Dir: dir, DryRun: dry}); KindOf(err) != KindRejected {
 				t.Fatalf("oversized index accepted: %v", err)
 			}
 			if !reflect.DeepEqual(before, pruneTreeSnapshot(t, dir)) {
@@ -456,6 +479,18 @@ func TestPlainRejectsOversizedPriorIndex(t *testing.T) {
 			}
 		})
 	}
+	// Create cannot list the types of an index it cannot inspect, but keeps
+	// its established behavior of replacing the old index.
+	t.Run("create", func(t *testing.T) {
+		dir := oversized(t)
+		result, err := Create(context.Background(), Options{Dir: dir, Pigsty: true})
+		if err != nil || len(result.DroppedMetadata) != 0 {
+			t.Fatalf("create over oversized index=%+v err=%v", result, err)
+		}
+		if info, err := os.Stat(filepath.Join(dir, "repodata", "repomd.xml")); err != nil || info.Size() > maxPriorRepomdBytes {
+			t.Fatalf("oversized index was not replaced: info=%v err=%v", info, err)
+		}
+	})
 }
 
 func pruneFixture(t *testing.T, indexed bool) string {

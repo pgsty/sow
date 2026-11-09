@@ -128,6 +128,9 @@ type Result struct {
 	MarkerSHA256 string   `json:"marker_sha256,omitempty"`
 	Noop         bool     `json:"noop"`
 	Recovered    bool     `json:"recovered"`
+	// DroppedMetadata lists repomd.xml data types, such as group or modules,
+	// that the replaced index carried but SOW does not generate.
+	DroppedMetadata []string `json:"dropped_metadata,omitempty"`
 }
 
 func normalizeOptions(ctx context.Context, opts Options) (Options, error) {

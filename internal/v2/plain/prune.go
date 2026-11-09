@@ -146,6 +146,9 @@ func Prune(ctx context.Context, opts PruneOptions) (result PruneResult, resultEr
 	if err := validatePruneDirectory(root); err != nil {
 		return result, err
 	}
+	if err := rejectUnsupportedRPMMetadata(root); err != nil {
+		return result, err
+	}
 	plan, err := preparePublication(ctx, root, staged, scan, base)
 	if err != nil {
 		return result, err

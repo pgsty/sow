@@ -132,7 +132,8 @@ successful pointer switch, or a rerun that completes interrupted cleanup, it rem
 older SOW hash-named indexes. Other files, including an external `repomd.xml.asc`, stay
 untouched and external signatures must be refreshed separately. An existing `repomd.xml`
 that lists metadata SOW does not generate, such as comps groups, updateinfo, or modules,
-is rejected instead of being replaced without it.
+is replaced without it; `create` reports those data types as a warning and in the JSON
+`dropped_metadata` field. `prune` rejects such an index instead.
 
 The bounded `.sow-plain-rpm-history.json` file records at most three reference sets so a
 rerun can identify the predecessor on either side of an interrupted pointer switch.

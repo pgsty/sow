@@ -33,9 +33,6 @@ type publicationPlan struct {
 }
 
 func preparePublication(ctx context.Context, root string, staged stagedBuild, scan scanResult, opts Options) (publicationPlan, error) {
-	if err := rejectUnsupportedRPMMetadata(root); err != nil {
-		return publicationPlan{}, err
-	}
 	plan := publicationPlan{}
 	if err := prepareRPMPublication(ctx, root, staged, &plan); err != nil {
 		return publicationPlan{}, err
@@ -166,33 +163,41 @@ var droppableRPMMetadataTypes = map[string]bool{
 	"filelists-ext": true, "filelists-ext_db": true, "filelists-ext_zck": true,
 }
 
-// rejectUnsupportedRPMMetadata refuses to replace a repomd.xml that also
-// publishes metadata SOW cannot regenerate, such as comps groups, updateinfo
-// or modules; replacing it would silently drop that metadata. A malformed old
-// repomd.xml still does not block rebuilding.
-func rejectUnsupportedRPMMetadata(root string) error {
+// priorRPMMetadata describes data types in an existing repomd.xml that SOW
+// does not regenerate, such as comps groups, updateinfo, or modules.
+type priorRPMMetadata struct {
+	path        string
+	unsupported []string // sorted and deduplicated
+	oversized   bool     // too large to inspect
+}
+
+// inspectPriorRPMMetadata reads only the data types of an existing repomd.xml.
+// Missing, unsafe, or malformed indexes report nothing: publication planning
+// handles unsafe paths, and a malformed old index never blocks rebuilding.
+func inspectPriorRPMMetadata(root string) (priorRPMMetadata, error) {
 	repodata := filepath.Join(root, "repodata")
+	prior := priorRPMMetadata{path: filepath.Join(repodata, "repomd.xml")}
 	if info, err := os.Lstat(repodata); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil // Missing indexes need no check; unsafe paths fail during publication planning.
+		return prior, nil
 	}
-	path := filepath.Join(repodata, "repomd.xml")
-	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	file, err := os.OpenFile(prior.path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ELOOP) {
-		return nil
+		return prior, nil
 	}
 	if err != nil {
-		return &Error{Kind: KindRuntime, Op: "inspect prior rpm index", Path: path, Err: err}
+		return prior, &Error{Kind: KindRuntime, Op: "inspect prior rpm index", Path: prior.path, Err: err}
 	}
 	defer file.Close()
 	if info, err := file.Stat(); err != nil || !info.Mode().IsRegular() {
-		return nil
+		return prior, nil
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxPriorRepomdBytes+1))
 	if err != nil {
-		return &Error{Kind: KindRuntime, Op: "inspect prior rpm index", Path: path, Err: err}
+		return prior, &Error{Kind: KindRuntime, Op: "inspect prior rpm index", Path: prior.path, Err: err}
 	}
 	if len(data) > maxPriorRepomdBytes {
-		return &Error{Kind: KindRejected, Op: "inspect prior rpm index", Path: path, Err: errors.New("repomd.xml exceeds the inspection limit; remove it explicitly to rebuild without its metadata")}
+		prior.oversized = true
+		return prior, nil
 	}
 	var repomd struct {
 		Data []struct {
@@ -200,21 +205,37 @@ func rejectUnsupportedRPMMetadata(root string) error {
 		} `xml:"data"`
 	}
 	if err := xml.Unmarshal(data, &repomd); err != nil {
-		return nil
+		return prior, nil
 	}
 	seen := map[string]bool{}
-	var unsupported []string
 	for _, data := range repomd.Data {
 		if !droppableRPMMetadataTypes[data.Type] && !seen[data.Type] {
 			seen[data.Type] = true
-			unsupported = append(unsupported, strconv.Quote(data.Type))
+			prior.unsupported = append(prior.unsupported, data.Type)
 		}
 	}
-	if len(unsupported) == 0 {
+	sort.Strings(prior.unsupported)
+	return prior, nil
+}
+
+// rejectUnsupportedRPMMetadata is prune's guard. Create keeps its established
+// replacement behavior and reports dropped types instead (see Result).
+func rejectUnsupportedRPMMetadata(root string) error {
+	prior, err := inspectPriorRPMMetadata(root)
+	if err != nil {
+		return err
+	}
+	if prior.oversized {
+		return &Error{Kind: KindRejected, Op: "inspect prior rpm index", Path: prior.path, Err: errors.New("repomd.xml exceeds the inspection limit; remove it explicitly to rebuild without its metadata")}
+	}
+	if len(prior.unsupported) == 0 {
 		return nil
 	}
-	sort.Strings(unsupported)
-	return &Error{Kind: KindRejected, Op: "inspect prior rpm index", Path: path, Err: fmt.Errorf("repomd.xml also publishes %s metadata that SOW does not generate; remove repodata/repomd.xml to rebuild without it", strings.Join(unsupported, ", "))}
+	quoted := make([]string, len(prior.unsupported))
+	for i, name := range prior.unsupported {
+		quoted[i] = strconv.Quote(name)
+	}
+	return &Error{Kind: KindRejected, Op: "inspect prior rpm index", Path: prior.path, Err: fmt.Errorf("repomd.xml also publishes %s metadata that SOW does not generate; remove repodata/repomd.xml to rebuild without it", strings.Join(quoted, ", "))}
 }
 
 func prepareDEBPublication(ctx context.Context, root string, staged stagedBuild, plan *publicationPlan) error {
