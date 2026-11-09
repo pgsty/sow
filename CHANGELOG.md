@@ -23,9 +23,9 @@ All notable changes to SOW are recorded here.
   not supported and are reported as such.
 - `prune` rejects an existing `repomd.xml` that also lists metadata SOW does not
   generate, such as comps groups, updateinfo, or modules, before changing any
-  file. `create` keeps replacing such an index, as createrepo_c does, so that
-  existing repositories, including EL8/9 repositories with legacy module metadata
-  from Pigsty v4.4 or earlier, still rebuild. It now reports the dropped data
+  file. `create` keeps its existing index-replacement behavior so that
+  repositories with legacy module metadata, including those built by Pigsty
+  v4.4.0 on EL8/9, still rebuild. It now reports the dropped data
   types as a warning and in the JSON `dropped_metadata` result field.
 - Accept ECDSA and EdDSA header signatures in `RPMSIGTAG_DSA`, where rpm 4.16 and
   later store them. RPM packages signed with GnuPG's default Ed25519 keys now
@@ -52,11 +52,15 @@ All notable changes to SOW are recorded here.
 - Fix RPM caret snapshot ordering in Version and Release comparisons, so
   `2.0^20250611` sorts before `2.0.1` and managed version limits retain the
   newer release instead of its earlier snapshot.
-- Update the AWS SDK, SQLite and its matching libc, Debian package parsing, and
-  transitive test dependencies to their latest versions. Upgrade YAML to
+- Update the AWS SDK core to v1.47.8, S3 to v1.114.9, Smithy to v1.28.8,
+  SQLite to v1.62.0, libc to v1.80.1, and Debian package parsing to v0.21.3,
+  with corresponding transitive dependency updates. Upgrade YAML to
   `go.yaml.in/yaml/v4` v4.0.0 with the compatible decoder and encoder, retaining
   strict single-document validation and canonical configuration output.
 - Update GoReleaser to v2.20.0 in CI and release workflows.
+- Add required protected-key signing checks on EL8, EL9, and EL10. Detect the
+  available `rpmsign` capabilities so EL8 skips only the unsupported repeated
+  signature scenario. Keep Go 1.27.3 as the build baseline.
 
 This release keeps schema v13 and the existing public repository layout.
 Workspaces already on v0.5.0 through v0.6.1 do not require a schema migration.

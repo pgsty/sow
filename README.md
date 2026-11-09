@@ -2,11 +2,10 @@
 
 [![Website: sow.pgsty.com](https://img.shields.io/badge/Website-sow.pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://sow.pgsty.com)
 [![Docs](https://img.shields.io/badge/Docs-sow.pgsty.com%2Fdocs-slategray?style=flat)](https://sow.pgsty.com/docs/)
-[![Version](https://img.shields.io/github/v/release/pgsty/sow?style=flat&label=version&color=slategray&logo=github&logoColor=white)](https://github.com/pgsty/sow/releases)
+[![Version: 0.7.0](https://img.shields.io/badge/version-0.7.0-slategray?style=flat&logo=github&logoColor=white)](https://github.com/pgsty/sow/tree/v0.7.0)
 [![CI](https://img.shields.io/github/actions/workflow/status/pgsty/sow/ci.yml?style=flat&branch=main&label=CI&logo=githubactions&logoColor=white)](https://github.com/pgsty/sow/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/github/go-mod/go-version/pgsty/sow?style=flat&logo=go&logoColor=white&color=slategray)](go.mod)
 [![License: Apache-2.0](https://img.shields.io/github/license/pgsty/sow?logo=opensourceinitiative&logoColor=green&color=slategray)](LICENSE)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/pgsty/sow)
 
 [**sow**](https://sow.pgsty.com) is an open-source RPM / DEB repository manager from [Pigsty](https://pigsty.io).
 One self-contained binary turns a directory of packages into a working YUM / APT repository,
@@ -68,7 +67,7 @@ flat APT repository, and a mixed directory gets both. Serve it with any static w
 `--pigsty` enables the Pigsty layout conventions, and `sow help create` documents the
 complete option contract. Continue with the [Quick Start](https://sow.pgsty.com/docs/start/quickstart/).
 
-For a password-protected signing key, SOW 0.7 and later accept
+For a password-protected signing key, SOW 0.7.0 and later accept
 `--passfile /run/secrets/gpg-password`. You can also set `SOW_GPG_PASSFILE`
 to that path or configure `passfile` next to a managed signing
 `key`. Priority is CLI, per-key config (including legacy `passphrase`), then environment.
@@ -167,15 +166,17 @@ authoritative CLI reference shipped with the binary; machine consumers can rely 
 closed `--json` envelopes and the documented exit-code contract.
 
 Upgrading a workspace created by SOW v0.3 or v0.4? Stop writers, back up the workspace,
-and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Versions 0.5 through 0.7 use
+and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Versions 0.5.0 through 0.7.0 use
 schema v13 to index pool-path ownership without scanning unrelated publication history;
 configuration and public layout stay unchanged. Then run `sow build` and `sow check`:
 the updated RPM authentication and APT metadata contracts require one rebuild of affected
 Dists. Later unchanged RPMs reuse matching Built evidence instead of repeated payload
 verification. Do not reopen the migrated database with an older binary.
-Upgrading from v0.5 or v0.6 to v0.7 requires no schema migration or public-layout change.
+Upgrading from v0.5.0 through v0.6.1 to v0.7.0 requires no schema migration or public-layout change.
 If a Repository migrated by v0.5 or v0.6 reports an invalid transition control target
-after a later build, upgrade to v0.7; no manual repair is needed.
+after a later build, upgrade to v0.7.0; no manual repair is needed.
+A configuration using `passfile` cannot be loaded by v0.6.1 or older; remove those
+keys before downgrading.
 Publication ordering, recovery, target rebinding, the one-copy boundary,
 and RPM leaf export are specified in [Commands](https://sow.pgsty.com/docs/command/) and
 [Design Records](https://sow.pgsty.com/blog/design/).
