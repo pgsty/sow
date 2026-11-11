@@ -396,15 +396,27 @@ func (s *Store) GetAppliedCheckpointForAttempt(ctx context.Context, attemptIdent
 	if !validSHA256Text(attemptIdentity) {
 		return AppliedCheckpoint{}, errors.New("invalid publication attempt identity")
 	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return AppliedCheckpoint{}, err
+	}
+	defer tx.Rollback()
 	var checkpointIdentity string
-	err := s.db.QueryRowContext(ctx, `SELECT checkpoint_identity FROM publication_checkpoints WHERE attempt_identity = ?`, attemptIdentity).Scan(&checkpointIdentity)
+	err = tx.QueryRowContext(ctx, `SELECT checkpoint_identity FROM publication_checkpoints WHERE attempt_identity = ?`, attemptIdentity).Scan(&checkpointIdentity)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AppliedCheckpoint{}, fmt.Errorf("%w: publication checkpoint for attempt", ErrNotFound)
 	}
 	if err != nil {
 		return AppliedCheckpoint{}, err
 	}
-	return s.GetAppliedCheckpoint(ctx, checkpointIdentity)
+	out, err := getAppliedCheckpointTx(ctx, tx, checkpointIdentity)
+	if err != nil {
+		return AppliedCheckpoint{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AppliedCheckpoint{}, err
+	}
+	return out, nil
 }
 
 func (s *Store) GetGraceRecord(ctx context.Context, checkpointIdentity string) (GraceRecord, error) {

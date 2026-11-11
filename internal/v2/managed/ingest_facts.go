@@ -240,7 +240,7 @@ func collectInputFiles(ctx context.Context, inputs []string, recursive bool) ([]
 			return false
 		}
 		if _, duplicate := seen[absolute]; duplicate {
-			return false
+			return true
 		}
 		opened, err := openRootedRegular(filepath.Dir(absolute), filepath.Base(absolute))
 		if err != nil {

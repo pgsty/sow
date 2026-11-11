@@ -15,6 +15,9 @@ func (s *Store) ObserveRepositoryTime(ctx context.Context, observed time.Time) e
 		return fmt.Errorf("%w: repository clock observation is zero", ErrConflict)
 	}
 	observed = observed.UTC()
+	if observed.Year() < 1 || observed.Year() > 9999 {
+		return fmt.Errorf("%w: repository clock observation year %d is outside 1..9999", ErrConflict, observed.Year())
+	}
 	observedText := formatTimestamp(observed)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -26,13 +29,13 @@ func (s *Store) ObserveRepositoryTime(ctx context.Context, observed time.Time) e
 		return err
 	}
 	current, err := time.Parse(time.RFC3339Nano, currentText)
-	if err != nil || currentText != formatTimestamp(current) {
+	if err != nil || current.Year() < 1 || current.Year() > 9999 || (currentText != formatTimestamp(current) && currentText != current.UTC().Format(time.RFC3339Nano)) {
 		return fmt.Errorf("%w: repository time witness is invalid", ErrSchema)
 	}
 	if observed.Before(current) {
 		return fmt.Errorf("%w: repository clock moved backwards from %s to %s", ErrConflict, currentText, observedText)
 	}
-	if observed.After(current) {
+	if observed.After(current) || currentText != formatTimestamp(current) {
 		if _, err := tx.ExecContext(ctx, `UPDATE repository_time_witness SET max_observed_at = ? WHERE singleton = 1`, observedText); err != nil {
 			return err
 		}

@@ -247,8 +247,14 @@ func (signer *gpgAPTMetadataSigner) Verify(ctx context.Context, release, inRelea
 }
 
 func (signer *inProcessAPTMetadataSigner) Validate(ctx context.Context, at time.Time) error {
-	if ctx == nil || ctx.Err() != nil || signer == nil || signer.signer == nil {
-		return context.Canceled
+	if ctx == nil {
+		return errors.New("managed: nil APT metadata signing context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if signer == nil || signer.signer == nil {
+		return errors.New("managed: APT metadata signer is unavailable")
 	}
 	return signer.signer.Validate(at)
 }

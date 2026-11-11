@@ -458,3 +458,47 @@ func TestRPMLeafOutputEvidenceRebindsDescriptors(t *testing.T) {
 		})
 	}
 }
+
+func TestExportRPMLeafIgnoresUnmountedPeerTargetAndUsesDistBuiltGeneration(t *testing.T) {
+	ctx := context.Background()
+	root, opts, _, trust := prepareRPMLeafExportFixture(t, true)
+
+	if _, err := NewDist(ctx, DistNewOptions{WorkspaceOptions: opts, Repository: "repo", Name: "el8", Format: "rpm"}); err != nil {
+		t.Fatal(err)
+	}
+
+	unmountedEndpoint := filepath.Join(root, "unmounted-mountpoint")
+	unmountedPubRoot := filepath.Join(unmountedEndpoint, "published", "repo")
+	cfg, err := config.Load(filepath.Join(root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Targets = map[string]config.TargetConfig{
+		"unmounted-peer": {
+			Repository:              "repo",
+			Provider:                "filesystem",
+			Endpoint:                (&url.URL{Scheme: "file", Path: unmountedEndpoint}).String(),
+			Prefix:                  "published/repo",
+			PublicEndpoint:          (&url.URL{Scheme: "file", Path: unmountedPubRoot + string(filepath.Separator)}).String(),
+			MaxCacheTTL:             "0s",
+			AuthoritativeWorkspace:  true,
+			SingleWriter:            true,
+			ExclusiveWriteAuthority: true,
+		},
+	}
+	writeManagedConfig(t, root, cfg)
+
+	exportDir := filepath.Join(root, "leaf-out")
+	result, err := ExportRPMLeaf(ctx, RPMLeafExportOptions{
+		WorkspaceOptions: opts, Repository: "repo", Dist: "el9", Arch: "x86_64", Directory: exportDir,
+	})
+	if err != nil {
+		t.Fatalf("ExportRPMLeaf failed when peer filesystem target parent is absent: %v", err)
+	}
+	if !result.Signed {
+		t.Fatalf("expected signed leaf export, got %+v", result)
+	}
+	if _, err := VerifyRPMLeafExportStandalone(ctx, exportDir, trust); err != nil {
+		t.Fatalf("VerifyRPMLeafExportStandalone: %v", err)
+	}
+}

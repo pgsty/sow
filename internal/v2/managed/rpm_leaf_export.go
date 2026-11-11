@@ -207,7 +207,7 @@ func ExportRPMLeaf(ctx context.Context, opts RPMLeafExportOptions) (result RPMLe
 		if publicationTarget.Provider != "filesystem" {
 			continue
 		}
-		publicationRoot, err := filesystemPublicationRoot(publicationTarget)
+		_, publicationRoot, err := filesystemConfiguredPublicationRoot(publicationTarget)
 		if err != nil {
 			return result, err
 		}
@@ -232,17 +232,13 @@ func ExportRPMLeaf(ctx context.Context, opts RPMLeafExportOptions) (result RPMLe
 		}
 		inputs = append(inputs, yumrepo.PackageInput{Path: filepath.Join(target, filepath.FromSlash(object.PoolPath)), Basename: object.Filename, PoolPath: object.PoolPath})
 	}
-	generationInfo, err := store.GetGeneration(ctx, summary.BuiltGeneration)
+	publicationAt, err := builtGenerationPublicationTime(ctx, store, dist.BuiltGeneration)
 	if err != nil {
-		return result, err
-	}
-	operation, err := store.GetOperation(ctx, generationInfo.OperationID)
-	if err != nil || operation.Operation.CreatedAt.IsZero() {
-		return result, fmt.Errorf("%w: Built Generation has no publication time", ErrIntegrity)
+		return result, fmt.Errorf("%w: Built Generation has no publication time: %v", ErrIntegrity, err)
 	}
 	var signer yumrepo.DetachedSigner
 	if signing.SignerIdentity != "none" {
-		snapshot, err := loadMetadataSignerSnapshotForFormats(ctx, ws.Root, cfg.Repositories[repoName], operation.Operation.CreatedAt.UTC(), true, false)
+		snapshot, err := loadMetadataSignerSnapshotForFormats(ctx, ws.Root, cfg.Repositories[repoName], publicationAt, true, false)
 		if err != nil {
 			return result, fmt.Errorf("%w: signed export requires the bound private metadata signer: %v", ErrRejected, err)
 		}

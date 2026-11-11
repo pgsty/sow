@@ -1230,11 +1230,15 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 				if err != nil {
 					return fmt.Errorf("%w: recover Dist metadata signer identity: %v", ErrIntegrity, err)
 				}
-				effectiveSigningJSON, err := json.Marshal(payload.EffectiveSigning)
-				if err != nil {
-					return err
+				effectiveSigningText := ""
+				if payload.EffectiveSigning != nil {
+					effectiveSigningJSON, err := json.Marshal(payload.EffectiveSigning)
+					if err != nil {
+						return err
+					}
+					effectiveSigningText = string(effectiveSigningJSON)
 				}
-				dist := state.Dist{Name: payload.Name, Format: payload.Format, EffectiveConfigSHA256: payload.EffectiveConfigSHA256, BuiltGeneration: payload.Generation, Architectures: payload.Architectures, MetadataSignerFingerprint: identity.Fingerprint, MetadataSignerPublicKey: identity.PublicKey, EffectiveSigningJSON: string(effectiveSigningJSON)}
+				dist := state.Dist{Name: payload.Name, Format: payload.Format, EffectiveConfigSHA256: payload.EffectiveConfigSHA256, BuiltGeneration: payload.Generation, Architectures: payload.Architectures, MetadataSignerFingerprint: identity.Fingerprint, MetadataSignerPublicKey: identity.PublicKey, EffectiveSigningJSON: effectiveSigningText}
 				manifest, changes, err := distLifecycleGeneration(ctx, root, repoName, payload.Name, payload.Generation, store, publicSnapshot)
 				if err != nil {
 					return err

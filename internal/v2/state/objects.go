@@ -355,6 +355,8 @@ func (s *Store) ListPriorBuiltPackageObjects(ctx context.Context, distNames []st
 	return s.listPackageObjectsByMembershipTable(ctx, distNames, "prior_built_memberships")
 }
 
+const distMembershipBatchSize = 500
+
 func (s *Store) listPackageObjectsByMembershipTable(ctx context.Context, distNames []string, table string) ([]PackageObject, error) {
 	if !validPackageMembershipTable(table) {
 		return nil, errors.New("list package objects: invalid membership table")
@@ -364,39 +366,92 @@ func (s *Store) listPackageObjectsByMembershipTable(ctx context.Context, distNam
 		return nil, err
 	}
 	defer tx.Rollback()
-	query := `SELECT DISTINCT p.sha256, p.format, p.coordinate, p.architecture, p.canonical_arch,
+	baseSelect := `SELECT DISTINCT p.sha256, p.format, p.coordinate, p.architecture, p.canonical_arch,
        p.pool_path, p.filename, p.size, p.name, p.source, p.version, p.epoch,
        p.release, p.kind, p.payload_sha256, p.signature_key, p.warning, p.storage,
        p.created_revision
 FROM package_objects AS p`
-	args := make([]any, 0, len(distNames))
-	if len(distNames) != 0 {
-		query += ` JOIN ` + table + ` AS m ON m.package_sha256 = p.sha256 WHERE m.dist_name IN (`
-		for index, name := range distNames {
-			if index != 0 {
-				query += `,`
-			}
-			query += `?`
-			args = append(args, name)
-		}
-		query += `)`
-	}
-	query += ` ORDER BY p.format, p.name, p.coordinate, p.sha256`
-	rows, err := tx.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("list package objects: %w", err)
-	}
-	defer rows.Close()
 	objects := []PackageObject{}
-	for rows.Next() {
-		object, err := scanPackageObject(rows)
+	if len(distNames) == 0 {
+		rows, err := tx.QueryContext(ctx, baseSelect+` ORDER BY p.format, p.name, p.coordinate, p.sha256`)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("list package objects: %w", err)
 		}
-		objects = append(objects, object)
-	}
-	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-		return nil, fmt.Errorf("list package objects: %w", err)
+		defer rows.Close()
+		for rows.Next() {
+			object, err := scanPackageObject(rows)
+			if err != nil {
+				return nil, err
+			}
+			objects = append(objects, object)
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return nil, fmt.Errorf("list package objects: %w", err)
+		}
+	} else {
+		uniqueDists := make([]string, 0, len(distNames))
+		seenDists := make(map[string]struct{}, len(distNames))
+		for _, name := range distNames {
+			if _, exists := seenDists[name]; exists {
+				continue
+			}
+			seenDists[name] = struct{}{}
+			uniqueDists = append(uniqueDists, name)
+		}
+		multiBatch := len(uniqueDists) > distMembershipBatchSize
+		seenObjects := make(map[string]struct{})
+		for start := 0; start < len(uniqueDists); start += distMembershipBatchSize {
+			batch := uniqueDists[start:min(start+distMembershipBatchSize, len(uniqueDists))]
+			var query strings.Builder
+			query.WriteString(baseSelect)
+			query.WriteString(` JOIN `)
+			query.WriteString(table)
+			query.WriteString(` AS m ON m.package_sha256 = p.sha256 WHERE m.dist_name IN (`)
+			args := make([]any, 0, len(batch))
+			for index, name := range batch {
+				if index != 0 {
+					query.WriteByte(',')
+				}
+				query.WriteByte('?')
+				args = append(args, name)
+			}
+			query.WriteString(`) ORDER BY p.format, p.name, p.coordinate, p.sha256`)
+			rows, err := tx.QueryContext(ctx, query.String(), args...)
+			if err != nil {
+				return nil, fmt.Errorf("list package objects: %w", err)
+			}
+			for rows.Next() {
+				object, scanErr := scanPackageObject(rows)
+				if scanErr != nil {
+					_ = rows.Close()
+					return nil, scanErr
+				}
+				if multiBatch {
+					if _, exists := seenObjects[object.SHA256]; exists {
+						continue
+					}
+					seenObjects[object.SHA256] = struct{}{}
+				}
+				objects = append(objects, object)
+			}
+			if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+				return nil, fmt.Errorf("list package objects: %w", err)
+			}
+		}
+		if multiBatch {
+			sort.Slice(objects, func(i, j int) bool {
+				if objects[i].Format != objects[j].Format {
+					return objects[i].Format < objects[j].Format
+				}
+				if objects[i].Name != objects[j].Name {
+					return objects[i].Name < objects[j].Name
+				}
+				if objects[i].Coordinate != objects[j].Coordinate {
+					return objects[i].Coordinate < objects[j].Coordinate
+				}
+				return objects[i].SHA256 < objects[j].SHA256
+			})
+		}
 	}
 	dists, err := packageDistsForObjects(ctx, tx, objects, "memberships", len(distNames) == 0)
 	if err != nil {

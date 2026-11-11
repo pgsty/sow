@@ -83,7 +83,7 @@ func (NativeDirectoryExchanger) Exchange(first, second string) error {
 		return err
 	}
 	if err := nativeExchange(first, second); err != nil {
-		if errors.Is(err, errNativeExchangeUnsupported) {
+		if isNativeExchangeUnsupported(err) {
 			return fmt.Errorf("%w: %v", ErrAtomicUnsupported, err)
 		}
 		return fmt.Errorf("yumrepo: atomic directory exchange: %w", err)

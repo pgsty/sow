@@ -368,3 +368,35 @@ func TestUnverifiedCoordinateProbeUsesBoundedControlReads(t *testing.T) {
 		t.Fatal("unverified coordinate satisfied Known digest contract")
 	}
 }
+
+func TestInspectPackageRejectsOversizedDecompressedControlTar(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		members int
+		wantErr bool
+	}{
+		{"small PAX headers", 2, false},
+		// Below the member-count limit, with only a small control file, but
+		// more than 132 MiB of PAX metadata hidden from returned tar headers.
+		{"oversized PAX headers", 2200, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			debPath := writeDebWithControlPAXHeaders(t, t.TempDir(), "pax_1.0-1_amd64.deb", tc.members)
+			_, inspectErr := InspectPackage(context.Background(), debPath, "main")
+			data, err := os.ReadFile(debPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, probeErr := ProbePackageCoordinateReader(context.Background(), bytes.NewReader(data), "main", filepath.Base(debPath), int64(len(data)))
+			for name, err := range map[string]error{"inspect": inspectErr, "probe": probeErr} {
+				if tc.wantErr {
+					if err == nil || !strings.Contains(err.Error(), "control archive expands beyond") {
+						t.Fatalf("%s: expected decompressed stream limit error, got %v", name, err)
+					}
+				} else if err != nil {
+					t.Fatalf("%s rejected a small valid PAX archive: %v", name, err)
+				}
+			}
+		})
+	}
+}

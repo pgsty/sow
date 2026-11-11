@@ -128,13 +128,14 @@ func (g *sqliteDatabaseGuard) Close() error {
 	if g == nil || g.tls == nil {
 		return nil
 	}
+	var err error
 	if g.db != 0 {
 		if rc := sqlite3.Xsqlite3_close_v2(g.tls, g.db); rc != sqlite3.SQLITE_OK {
-			return fmt.Errorf("close sqlite database guard: rc=%d", rc)
+			err = fmt.Errorf("close sqlite database guard: rc=%d", rc)
 		}
 		g.db = 0
 	}
 	g.tls.Close()
 	g.tls = nil
-	return nil
+	return err
 }

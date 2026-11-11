@@ -490,6 +490,7 @@ func writeArMember(t *testing.T, out *bytes.Buffer, name string, data []byte) {
 type rpmFixture struct {
 	Name, Version, Release, Arch, Payload string
 	Epoch                                 uint32
+	ExtraTags                             []rpmTag
 }
 
 type rpmTag struct {
@@ -529,6 +530,7 @@ func writeRPMFixture(t *testing.T, filename string, fixture rpmFixture) {
 		rpmStringTag(1047, fixture.Name), rpmIntTag(1112, 1<<3), rpmStringTag(1113, fmt.Sprintf("%d:%s-%s", fixture.Epoch, fixture.Version, fixture.Release)),
 		rpmIntTag(1116, 0), rpmStringTag(1117, "fixture.conf"), rpmStringTag(1118, "/etc/"),
 	}
+	tags = append(tags, fixture.ExtraTags...)
 	sort.Slice(tags, func(i, j int) bool { return tags[i].id < tags[j].id })
 	var store bytes.Buffer
 	indexes := make([]byte, 16*len(tags))

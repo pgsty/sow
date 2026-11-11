@@ -149,6 +149,24 @@ func MigrateRepositoryLayout(ctx context.Context, opts RepositoryMigrationOption
 				return result, err
 			}
 		}
+		stage := migrationStageRoot(ws.Root, repoName)
+		if _, err := os.Lstat(stage); err == nil {
+			if journal == nil {
+				// A terminal layout alone does not prove ownership of leftover
+				// stage bytes. Preserve them outside the active recovery roots.
+				retained, err := preserveMigrationStage(ws.Root, repoName)
+				if err != nil {
+					return result, err
+				}
+				if retained != "" {
+					result.Warnings = append(result.Warnings, "previous migration stage retained at "+retained)
+				}
+			} else if err := removeOwnedDirectory(stage, filepath.Join(ws.Root, ".sow", repoName, "stage")); err != nil {
+				return result, err
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return result, err
+		}
 		summary, err := store.Summary(ctx)
 		if err != nil {
 			return result, err

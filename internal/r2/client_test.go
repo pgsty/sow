@@ -754,3 +754,44 @@ func TestPutRejectsConflictingConditionsWithoutRequest(t *testing.T) {
 		t.Fatal("conflicting conditions were accepted")
 	}
 }
+
+func TestS3HTTPStatusMultipart404AbortAndListErrorCap(t *testing.T) {
+	joined := errors.Join(
+		errors.New("outer"),
+		&s3ResponseLimitError{statusCode: 0, maximum: 10},
+		fmt.Errorf("wrapped: %w", &s3ResponseLimitError{statusCode: http.StatusNotFound, maximum: 10}),
+	)
+	if got := s3HTTPStatus(joined); got != http.StatusNotFound {
+		t.Fatalf("s3HTTPStatus(joined) = %d, want %d", got, http.StatusNotFound)
+	}
+
+	var abortCalls, listErrorBytes int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch {
+		case request.Method == http.MethodDelete && request.URL.Query().Has("uploadId"):
+			abortCalls++
+			writer.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(writer, `<Error><Code>NoSuchUpload</Code></Error>`)
+		case request.Method == http.MethodGet && request.URL.Query().Has("list-type"):
+			writer.WriteHeader(http.StatusBadRequest)
+			written, _ := io.CopyN(writer, repeatingByteReader{}, maxErrorResponseSize+1)
+			listErrorBytes += int(written)
+		default:
+			writer.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(Config{
+		Bucket: "bucket", ObjectBaseURL: server.URL + "/bucket", Client: server.Client(), AllowInsecure: true,
+		Credentials: S3Credentials{AccessKeyID: "access", SecretAccessKey: "secret", Region: "auto"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.objects.abortMultipart("repos/prod/pkg.rpm", "missing-upload"); err != nil || abortCalls != 1 {
+		t.Fatalf("abortMultipart 404 err=%v calls=%d", err, abortCalls)
+	}
+	if _, err := client.ListObjectsV2Prefix(context.Background(), "repos/prod/", ""); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%d bytes", maxErrorResponseSize)) {
+		t.Fatalf("oversized non-2xx list response was not capped at maxErrorResponseSize: %v", err)
+	}
+}

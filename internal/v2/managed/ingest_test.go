@@ -1610,3 +1610,41 @@ func TestIngestSourceCaseConflictBeforeAndWithinBatch(t *testing.T) {
 		})
 	}
 }
+
+func TestAddDeduplicatesExplicitFileAndParentDirectoryAndRemoveLargeDirectory(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm", Architectures: []string{"x86_64"}}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	inputs := filepath.Join(root, "inputs")
+	if err := os.Mkdir(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(inputs, "package.rpm"))
+	opts := WorkspaceOptions{Workdir: root, CWD: root}
+	res, err := Add(ctx, AddOptions{WorkspaceOptions: opts, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm, inputs, inputs}, Jobs: 1})
+	if err != nil || res.Accepted != 1 {
+		t.Fatalf("Add(file + dir + dir) = %+v, err=%v", res, err)
+	}
+
+	parent := filepath.Join(root, "cleanup-parent")
+	large := filepath.Join(parent, "many")
+	if err := os.MkdirAll(large, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 1200 {
+		if err := os.WriteFile(filepath.Join(large, fmt.Sprintf("f-%04d", i)), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := removeOwnedDirectory(large, parent); err != nil {
+		t.Fatalf("removeOwnedDirectory failed on >1024 entries: %v", err)
+	}
+	if _, err := os.Lstat(large); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("directory still exists after removeOwnedDirectory: %v", err)
+	}
+}

@@ -797,7 +797,12 @@ func (s *Store) PutAppliedCheckpoint(ctx context.Context, checkpoint *AppliedChe
 	if err := validateAppliedCheckpoint(*checkpoint); err != nil {
 		return err
 	}
-	manifest, err := s.GenerationManifest(ctx, checkpoint.Generation)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	manifest, err := generationManifestOn(ctx, tx, checkpoint.Generation)
 	if err != nil {
 		return err
 	}
@@ -821,11 +826,6 @@ func (s *Store) PutAppliedCheckpoint(ctx context.Context, checkpoint *AppliedChe
 		return err
 	}
 	checkpoint.CheckpointIdentity = computedCheckpoint
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 	if err := requirePublicationBindingTx(ctx, tx, checkpoint.RepositoryID, checkpoint.TargetIdentity); err != nil {
 		return err
 	}

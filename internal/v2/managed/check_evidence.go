@@ -40,8 +40,6 @@ type checkPayloadEvidence struct {
 	Identity          rootedRegularIdentity
 	File              state.GenerationFile
 	Object            state.PackageObject
-	RPMFacts          *yumrepo.PackageFacts
-	DEBFacts          *aptrepo.Package
 	RPMNeutralSHA256  string
 	StructuralSigner  string
 	SignatureResults  map[string]yumrepo.RPMSignatureTrustRingResult
@@ -228,17 +226,15 @@ func readOpenedPackageEvidence(ctx context.Context, opened *rootedRegularFile, b
 		Identity: before, File: state.GenerationFile{Path: object.PoolPath, Phase: "payload", Size: object.Size, SHA256: digest},
 		Object: object, RPMNeutralSHA256: neutral, SignatureResults: make(map[string]yumrepo.RPMSignatureTrustRingResult),
 	}
-	decoded := ManagedPackageSource{}
 	if stored != nil && !stored.Corrupt {
-		decoded, err = decodeManagedPackageFact(source, *stored)
+		_, err = decodeManagedPackageFact(source, *stored)
 	}
 	if err != nil || stored == nil || stored.Corrupt {
-		decoded, err = inspectKnownPackageFacts(ctx, opened.file, source)
+		_, err = inspectKnownPackageFacts(ctx, opened.file, source)
 	}
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("%w: package %s facts differ from SQLite/bytes", ErrIntegrity, object.SHA256), err)
 	}
-	evidence.RPMFacts, evidence.DEBFacts = decoded.RPMFacts, decoded.DEBFacts
 	if object.Format == "rpm" {
 		evidence.StructuralSigner, err = inspectStructuralRPMKeyIDReader(ctx, opened.file)
 		if err == nil && evidence.StructuralSigner != "" && len(trust.Rings) != 0 {

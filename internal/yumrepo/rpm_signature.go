@@ -1249,6 +1249,9 @@ func inspectRPMVerificationLayout(ctx context.Context, r io.ReadSeeker, wantMain
 	layout := rpmVerificationLayout{mainHeaderStart: int64(mainStart), mainHeaderEnd: int64(mainEnd), fileEnd: fileEnd}
 	digestTag := pkg.Header.GetTag(rpmTagPayloadDigest)
 	algorithmTag := pkg.Header.GetTag(rpmTagPayloadDigestAlgo)
+	if digestTag != nil && algorithmTag == nil {
+		return rpmVerificationLayout{}, fmt.Errorf("%w: RPM v6 packages are not supported (payload digest has no algorithm tag)", ErrRPMPackageSignature)
+	}
 	if digestTag != nil {
 		layout.payloadDigests = append([]string(nil), digestTag.StringSlice()...)
 	}

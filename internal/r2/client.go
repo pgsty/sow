@@ -346,6 +346,9 @@ func (c *signedObjectHTTP) abortMultipart(key, uploadID string) error {
 	_, err := c.sdk.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket: aws.String(c.bucket), Key: aws.String(key), UploadId: aws.String(uploadID),
 	})
+	if s3HTTPStatus(err) == http.StatusNotFound {
+		return nil
+	}
 	return err
 }
 
@@ -563,10 +566,13 @@ func (c *s3SDKHTTPClient) Do(request *http.Request) (*http.Response, error) {
 		response.Header.Set("Content-Length", fmt.Sprintf("%d", response.ContentLength))
 	}
 	maximum, expectedRoot := int64(0), ""
+	query := request.URL.Query()
 	switch {
-	case request.URL.Query().Has("list-type"):
-		maximum, expectedRoot = maxListResponseSize, "ListBucketResult"
 	case response.StatusCode < 200 || response.StatusCode >= 300:
+		maximum = maxErrorResponseSize
+	case query.Has("list-type"):
+		maximum, expectedRoot = maxListResponseSize, "ListBucketResult"
+	case request.Method == http.MethodPost && (query.Has("uploads") || query.Has("uploadId")):
 		maximum = maxErrorResponseSize
 	}
 	if maximum == 0 {
@@ -699,15 +705,23 @@ func (r *idleReadCloser) Close() error {
 }
 
 func s3HTTPStatus(err error) int {
-	for err != nil {
-		if responseError, ok := err.(interface{ HTTPStatusCode() int }); ok {
-			if status := responseError.HTTPStatusCode(); status != 0 {
-				return status
+	if err == nil {
+		return 0
+	}
+	if responseError, ok := err.(interface{ HTTPStatusCode() int }); ok {
+		if code := responseError.HTTPStatusCode(); code != 0 {
+			return code
+		}
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range multi.Unwrap() {
+			if code := s3HTTPStatus(child); code != 0 {
+				return code
 			}
 		}
-		err = errors.Unwrap(err)
+		return 0
 	}
-	return 0
+	return s3HTTPStatus(errors.Unwrap(err))
 }
 
 func s3ContentLength(value *int64) int64 {

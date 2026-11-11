@@ -493,6 +493,62 @@ func TestPlainRejectsOversizedPriorIndex(t *testing.T) {
 	})
 }
 
+func TestPruneAndCreateRejectRPMv6AcrossAllRoles(t *testing.T) {
+	v6Tags := []rpmTag{rpmStringTag(5092, strings.Repeat("a", 64))}
+	for _, tc := range []struct {
+		name    string
+		protect []string
+		setup   func(*testing.T, string)
+	}{
+		{
+			name: "single-version",
+			setup: func(t *testing.T, dir string) {
+				writePruneRPM(t, filepath.Join(dir, "only.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64", ExtraTags: v6Tags})
+			},
+		},
+		{
+			name:    "protected",
+			protect: []string{"protected-pkg"},
+			setup: func(t *testing.T, dir string) {
+				writePruneRPM(t, filepath.Join(dir, "protected.rpm"), rpmFixture{Name: "protected-pkg", Version: "1", Release: "1", Arch: "x86_64", ExtraTags: v6Tags})
+				writePruneRPM(t, filepath.Join(dir, "old.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64"})
+				writePruneRPM(t, filepath.Join(dir, "new.rpm"), rpmFixture{Name: "pkg", Version: "2", Release: "1", Arch: "x86_64"})
+			},
+		},
+		{
+			name: "superseded",
+			setup: func(t *testing.T, dir string) {
+				writePruneRPM(t, filepath.Join(dir, "old-v6.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64", ExtraTags: v6Tags})
+				writePruneRPM(t, filepath.Join(dir, "new.rpm"), rpmFixture{Name: "pkg", Version: "2", Release: "1", Arch: "x86_64"})
+			},
+		},
+		{
+			name: "latest-replacement",
+			setup: func(t *testing.T, dir string) {
+				writePruneRPM(t, filepath.Join(dir, "old.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64"})
+				writePruneRPM(t, filepath.Join(dir, "new-v6.rpm"), rpmFixture{Name: "pkg", Version: "2", Release: "1", Arch: "x86_64", ExtraTags: v6Tags})
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tc.setup(t, dir)
+			before := pruneTreeSnapshot(t, dir)
+			for _, dry := range []bool{true, false} {
+				if result, err := Prune(context.Background(), PruneOptions{Dir: dir, DryRun: dry, Protect: tc.protect}); err == nil || !strings.Contains(err.Error(), "RPM v6") || len(result.Removed) != 0 || result.IndexUpdated {
+					t.Fatalf("Prune dry=%t accepted RPM v6 (%s): result=%+v err=%v", dry, tc.name, result, err)
+				}
+			}
+			if _, err := Create(context.Background(), Options{Dir: dir}); err == nil || !strings.Contains(err.Error(), "RPM v6") {
+				t.Fatalf("Create accepted RPM v6 (%s): %v", tc.name, err)
+			}
+			if !reflect.DeepEqual(before, pruneTreeSnapshot(t, dir)) {
+				t.Fatalf("rejected RPM v6 (%s) mutated directory", tc.name)
+			}
+		})
+	}
+}
+
 func pruneFixture(t *testing.T, indexed bool) string {
 	t.Helper()
 	dir := t.TempDir()

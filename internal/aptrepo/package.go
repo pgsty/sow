@@ -473,7 +473,9 @@ func loadDebControlArchive(ctx context.Context, member *deb.ArEntry) (parsed deb
 	defer func() {
 		resultErr = errors.Join(resultErr, stream.Close())
 	}()
-	archive := tar.NewReader(stream)
+	const maxDebControlTarOverhead = 4 << 20
+	limitedStream := &io.LimitedReader{R: stream, N: maxDebControlExpanded + maxDebControlTarOverhead + 1}
+	archive := tar.NewReader(limitedStream)
 	found := false
 	expanded := int64(0)
 	for members := 0; ; members++ {
@@ -484,6 +486,9 @@ func loadDebControlArchive(ctx context.Context, member *deb.ArEntry) (parsed deb
 			return deb.Control{}, fmt.Errorf("control archive exceeds %d members", maxDebControlMembers)
 		}
 		header, err := archive.Next()
+		if limitedStream.N == 0 {
+			return deb.Control{}, fmt.Errorf("control archive expands beyond %d bytes", maxDebControlExpanded)
+		}
 		if errors.Is(err, io.EOF) {
 			break
 		}

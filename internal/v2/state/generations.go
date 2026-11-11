@@ -656,21 +656,26 @@ func ManifestBytesForLayout(input []GenerationFile, layout string) ([]byte, stri
 // heterogeneous RPM signing identities cannot be represented by retained/v1
 // and is rejected rather than silently collapsed.
 func (s *Store) GenerationRetentionIdentity(ctx context.Context, generation GenerationID) (string, string, error) {
-	info, err := s.GetGeneration(ctx, generation)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return "", "", err
 	}
-	manifest, err := s.GenerationManifest(ctx, generation)
+	defer tx.Rollback()
+	info, err := getGenerationOn(ctx, tx, generation)
 	if err != nil {
 		return "", "", err
 	}
-	if err := validateGenerationViewSignerCoverage(ctx, s.db, generation, manifest); err != nil {
+	manifest, err := generationManifestOn(ctx, tx, generation)
+	if err != nil {
 		return "", "", err
 	}
-	if err := requireVerifiedGenerationSigners(ctx, s.db, generation); err != nil {
+	if err := validateGenerationViewSignerCoverage(ctx, tx, generation, manifest); err != nil {
 		return "", "", err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT signer_identity FROM generation_view_signers WHERE generation = ? ORDER BY signer_identity`, generation)
+	if err := requireVerifiedGenerationSigners(ctx, tx, generation); err != nil {
+		return "", "", err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT signer_identity FROM generation_view_signers WHERE generation = ? ORDER BY signer_identity`, generation)
 	if err != nil {
 		return "", "", err
 	}
@@ -683,7 +688,7 @@ func (s *Store) GenerationRetentionIdentity(ctx context.Context, generation Gene
 		}
 		identities = append(identities, identity)
 	}
-	if err := rows.Err(); err != nil {
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return "", "", err
 	}
 	if len(identities) > 1 {
@@ -692,6 +697,9 @@ func (s *Store) GenerationRetentionIdentity(ctx context.Context, generation Gene
 	signer := "none"
 	if len(identities) == 1 {
 		signer = identities[0]
+	}
+	if err := tx.Commit(); err != nil {
+		return "", "", err
 	}
 	return info.RendererIdentity, signer, nil
 }
@@ -794,7 +802,19 @@ func getGenerationOn(ctx context.Context, q schemaQuerier, generation Generation
 }
 
 func (s *Store) GenerationChanges(ctx context.Context, generation GenerationID) ([]FileChange, error) {
-	return generationChangesOn(ctx, s.db, generation)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	changes, err := generationChangesOn(ctx, tx, generation)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return changes, nil
 }
 
 func generationChangesOn(ctx context.Context, q schemaQuerier, generation GenerationID) ([]FileChange, error) {
@@ -822,7 +842,22 @@ func generationChangesOn(ctx context.Context, q schemaQuerier, generation Genera
 }
 
 func (s *Store) GenerationManifest(ctx context.Context, generation GenerationID) ([]GenerationFile, error) {
-	return generationManifestOn(ctx, s.db, generation)
+	if generation == 0 {
+		return []GenerationFile{}, nil
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	files, err := generationManifestOn(ctx, tx, generation)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 func generationManifestOn(ctx context.Context, q schemaQuerier, generation GenerationID) ([]GenerationFile, error) {

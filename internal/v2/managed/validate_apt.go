@@ -80,15 +80,15 @@ func validateManagedAPTIndexWithEvidence(ctx context.Context, repositoryRoot, di
 	expectedReleasePaths := map[string]struct{}{}
 	for _, architecture := range architectures {
 		plainRelativeRoot := filepath.ToSlash(filepath.Join("dists", distName, "main", "binary-"+architecture.EcosystemArch, "Packages"))
-		plainDigest, plainSize, err := digestManagedIndex(ctx, repositoryRoot, plainRelativeRoot, false)
+		plainDigest, plainSize, err := digestManagedIndex(ctx, repositoryRoot, plainRelativeRoot, false, -1)
 		if err != nil {
 			return err
 		}
-		decodedDigest, decodedSize, err := digestManagedIndex(ctx, repositoryRoot, plainRelativeRoot+".gz", true)
+		decodedDigest, decodedSize, err := digestManagedIndex(ctx, repositoryRoot, plainRelativeRoot+".gz", true, plainSize)
 		if err != nil || decodedDigest != plainDigest || decodedSize != plainSize {
 			return fmt.Errorf("Packages.gz does not expand exactly to Packages for %s", architecture.EcosystemArch)
 		}
-		gzipDigest, gzipSize, err := digestManagedIndex(ctx, repositoryRoot, plainRelativeRoot+".gz", false)
+		gzipDigest, gzipSize, err := digestManagedIndex(ctx, repositoryRoot, plainRelativeRoot+".gz", false, -1)
 		if err != nil {
 			return err
 		}
@@ -307,7 +307,7 @@ func parseReleaseSHA256(data []byte) (map[string]releaseChecksum, error) {
 	return result, nil
 }
 
-func digestManagedIndex(ctx context.Context, root, relative string, compressed bool) (string, int64, error) {
+func digestManagedIndex(ctx context.Context, root, relative string, compressed bool, maxDecodedBytes int64) (string, int64, error) {
 	opened, err := openRootedRegular(root, relative)
 	if err != nil {
 		return "", 0, err
@@ -321,6 +321,9 @@ func digestManagedIndex(ctx context.Context, root, relative string, compressed b
 			return "", 0, err
 		}
 		reader = zipper
+		if maxDecodedBytes >= 0 && maxDecodedBytes < int64(^uint64(0)>>1) {
+			reader = io.LimitReader(reader, maxDecodedBytes+1)
+		}
 	}
 	hash := sha256.New()
 	size, copyErr := io.Copy(hash, &managedContextReader{ctx: ctx, reader: reader})

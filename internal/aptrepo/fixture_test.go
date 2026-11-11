@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -66,4 +67,47 @@ func writeArMember(t *testing.T, out *bytes.Buffer, name string, data []byte) {
 	if len(data)%2 != 0 {
 		out.WriteByte('\n')
 	}
+}
+
+func writeDebWithControlPAXHeaders(t *testing.T, dir, filename string, members int) string {
+	t.Helper()
+	var controlBuf bytes.Buffer
+	gz, err := gzip.NewWriterLevel(&controlBuf, gzip.BestSpeed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tw := tar.NewWriter(gz)
+	// archive/tar consumes PAX records inside Next. Their bodies must count
+	// toward the stream limit even though each returned file has Size == 0.
+	comment := strings.Repeat("x", 64<<10)
+	for i := range members {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: fmt.Sprintf("padding-%04d", i), Mode: 0o644,
+			Format: tar.FormatPAX, PAXRecords: map[string]string{"comment": comment},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "control", Mode: 0o644, Size: int64(len(fixtureControl))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte(fixtureControl)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var archive bytes.Buffer
+	archive.WriteString("!<arch>\n")
+	writeArMember(t, &archive, "debian-binary", []byte("2.0\n"))
+	writeArMember(t, &archive, "control.tar.gz", controlBuf.Bytes())
+	writeArMember(t, &archive, "data.tar.gz", tarGzip(t, map[string][]byte{"usr/share/doc/sow/README": []byte("x\n")}))
+	filePath := filepath.Join(dir, filename)
+	if err := os.WriteFile(filePath, archive.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return filePath
 }

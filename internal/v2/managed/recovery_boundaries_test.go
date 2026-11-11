@@ -703,3 +703,58 @@ func TestMissingAddStageOnlyTerminatesUncommittedOperation(t *testing.T) {
 		})
 	}
 }
+
+func TestRecoverLegacyV1DistNewWithNilEffectiveSigning(t *testing.T) {
+	ctx := context.Background()
+	root, ws := newRejectionWorkspace(t)
+	crash := errors.New("stop at dist.new.applied")
+	_, err := NewDist(ctx, DistNewOptions{
+		WorkspaceOptions: ws, Repository: "repo", Name: "el8", Format: "rpm",
+		Fault: func(point string) error {
+			if point == "dist.new.applied" {
+				return crash
+			}
+			return nil
+		},
+	})
+	if !errors.Is(err, crash) {
+		t.Fatalf("NewDist err=%v, want %v", err, crash)
+	}
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.PendingOperations(ctx)
+	if err != nil || len(pending) != 1 {
+		store.Close()
+		t.Fatalf("pending=%+v err=%v", pending, err)
+	}
+	payload, err := decodeDistPayload(pending[0].PayloadJSON)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	payload.Version = 1
+	payload.EffectiveSigning = nil
+	payload.MetadataSignerSnapshotSHA256 = ""
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE operations SET payload_json = ? WHERE id = ?`, string(rawPayload), pending[0].ID); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Build(ctx, BuildOptions{WorkspaceOptions: ws, Repository: "repo", Jobs: 1}); err != nil {
+		t.Fatalf("Build failed to recover legacy v1 dist.new operation: %v", err)
+	}
+	distInfo, err := ShowDist(ctx, DistShowOptions{WorkspaceOptions: ws, Repository: "repo", Name: "el8"})
+	if err != nil || distInfo.Name != "el8" {
+		t.Fatalf("ShowDist(el8) = %+v, err=%v", distInfo, err)
+	}
+}

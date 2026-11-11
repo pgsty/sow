@@ -40,11 +40,11 @@ func validateFlatPackages(ctx context.Context, packagesPath, gzipPath string, ex
 	if err != nil {
 		return err
 	}
-	rawDigest, rawSize, err := digestFile(ctx, packagesPath, false)
+	rawDigest, rawSize, err := digestFile(ctx, packagesPath, false, -1)
 	if err != nil {
 		return err
 	}
-	decodedDigest, decodedSize, err := digestFile(ctx, gzipPath, true)
+	decodedDigest, decodedSize, err := digestFile(ctx, gzipPath, true, rawSize)
 	if err != nil {
 		return err
 	}
@@ -143,7 +143,7 @@ func unchangedRegularFile(path string, before os.FileInfo) error {
 	return nil
 }
 
-func digestFile(ctx context.Context, path string, compressed bool) (string, int64, error) {
+func digestFile(ctx context.Context, path string, compressed bool, maxDecodedBytes int64) (string, int64, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return "", 0, fmt.Errorf("aptrepo: open staged flat index %q: %w", path, err)
@@ -154,9 +154,12 @@ func digestFile(ctx context.Context, path string, compressed bool) (string, int6
 		zipper, err = gzip.NewReader(file)
 		if err != nil {
 			_ = file.Close()
-			return "", 0, fmt.Errorf("aptrepo: open staged Packages.gz: %w", err)
+			return "", 0, fmt.Errorf("aptrepo: open staged Packages.gz %q: %w", path, err)
 		}
 		reader = zipper
+		if maxDecodedBytes >= 0 && maxDecodedBytes < int64(^uint64(0)>>1) {
+			reader = io.LimitReader(reader, maxDecodedBytes+1)
+		}
 	}
 	h := sha256.New()
 	size, copyErr := io.Copy(h, &contextReader{ctx: ctx, r: reader})

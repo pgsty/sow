@@ -2531,8 +2531,34 @@ func emptyRootedDirectory(directory *os.File, ownerDevice uint64) error {
 	if directory == nil {
 		return errors.New("managed: invalid rooted removal directory")
 	}
+	var dirStat unix.Stat_t
+	if err := unix.Fstat(int(directory.Fd()), &dirStat); err != nil || uint32(dirStat.Mode)&unix.S_IFMT != unix.S_IFDIR {
+		return errors.Join(fmt.Errorf("%w: invalid removal directory descriptor", ErrIntegrity), err)
+	}
+	const batchSize = 1024
 	for {
-		names, readErr := directory.Readdirnames(128)
+		// Unlinking entries can reshuffle directory cookies on APFS/BSD streams
+		// (Go issue #20841). Open a fresh cursor on the bound inode each pass.
+		scanFD, err := unix.Openat(int(directory.Fd()), ".", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
+		if err != nil {
+			return err
+		}
+		scanDir := os.NewFile(uintptr(scanFD), directory.Name())
+		var scanStat unix.Stat_t
+		if statErr := unix.Fstat(scanFD, &scanStat); statErr != nil || scanStat.Dev != dirStat.Dev || scanStat.Ino != dirStat.Ino || uint32(scanStat.Mode)&unix.S_IFMT != unix.S_IFDIR {
+			return errors.Join(fmt.Errorf("%w: removal directory changed while scanning", ErrIntegrity), statErr, scanDir.Close())
+		}
+		names, readErr := scanDir.Readdirnames(batchSize)
+		closeErr := scanDir.Close()
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return errors.Join(readErr, closeErr)
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if len(names) == 0 {
+			return directory.Sync()
+		}
 		for _, name := range names {
 			if name == "" || name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
 				return fmt.Errorf("%w: unsafe entry in removal directory", ErrIntegrity)
@@ -2575,11 +2601,8 @@ func emptyRootedDirectory(directory *os.File, ownerDevice uint64) error {
 				}
 			}
 		}
-		if errors.Is(readErr, io.EOF) {
+		if len(names) < batchSize && errors.Is(readErr, io.EOF) {
 			return directory.Sync()
-		}
-		if readErr != nil {
-			return readErr
 		}
 	}
 }

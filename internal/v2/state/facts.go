@@ -134,6 +134,17 @@ func (s *Store) ListPackageFactsForDigests(ctx context.Context, requested []stri
 		digests = append(digests, digest)
 	}
 	sort.Strings(digests)
+	var queryer interface {
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	} = s.db
+	if len(digests) > packageFactDigestBatchSize {
+		tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		queryer = tx
+	}
 	result := make([]PackageFact, 0, len(digests))
 	for start := 0; start < len(digests); start += packageFactDigestBatchSize {
 		end := min(start+packageFactDigestBatchSize, len(digests))
@@ -148,7 +159,7 @@ func (s *Store) ListPackageFactsForDigests(ctx context.Context, requested []stri
 			arguments = append(arguments, digest)
 		}
 		query.WriteString(`) ORDER BY package_sha256`)
-		rows, err := s.db.QueryContext(ctx, query.String(), arguments...)
+		rows, err := queryer.QueryContext(ctx, query.String(), arguments...)
 		if err != nil {
 			return nil, err
 		}

@@ -45,6 +45,14 @@ func (owners PoolPathOwners) Add(object PackageObject) {
 // PackagePoolPathOwners loads only the candidate paths. An empty batch performs
 // no query; unrelated retained history never enters the admission working set.
 func (s *Store) PackagePoolPathOwners(ctx context.Context, paths []string) (PoolPathOwners, error) {
+	if len(paths) > poolPathBatchSize {
+		tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		return packagePoolPathOwners(ctx, tx, paths)
+	}
 	return packagePoolPathOwners(ctx, s.db, paths)
 }
 
@@ -99,6 +107,17 @@ func packagePoolPathOwners(ctx context.Context, db interface {
 // lookup is one range on the lower(pool_path) index; objects outside the
 // candidate directories and all publication history stay unread.
 func (s *Store) PackagePoolDirectorySpellings(ctx context.Context, directories []string) (map[string][]string, error) {
+	var queryer interface {
+		QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	} = s.db
+	if len(directories) > 1 {
+		tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return nil, err
+		}
+		defer tx.Rollback()
+		queryer = tx
+	}
 	result := make(map[string][]string, len(directories))
 	for _, directory := range directories {
 		prefix := strings.ToLower(strings.TrimSuffix(directory, "/")) + "/"
@@ -107,7 +126,7 @@ func (s *Store) PackagePoolDirectorySpellings(ctx context.Context, directories [
 		}
 		// '0' sorts immediately after '/', so the range is exactly this directory.
 		upper := strings.TrimSuffix(prefix, "/") + "0"
-		rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT substr(pool_path, 1, ?) FROM package_objects WHERE lower(pool_path) >= ? AND lower(pool_path) < ?`, len(prefix), prefix, upper)
+		rows, err := queryer.QueryContext(ctx, `SELECT DISTINCT substr(pool_path, 1, ?) FROM package_objects WHERE lower(pool_path) >= ? AND lower(pool_path) < ?`, len(prefix), prefix, upper)
 		if err != nil {
 			return nil, fmt.Errorf("read pool directory spellings: %w", err)
 		}

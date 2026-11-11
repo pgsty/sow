@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1035,5 +1036,86 @@ func TestFilesystemDeletionRequiresExactReceiptsAndProjectsLiveInventory(t *test
 	}
 	if err := store.Check(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestObserveRepositoryTimeNormalizesLegacySeedAndBoundsYear(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.DB().ExecContext(ctx, `UPDATE repository_time_witness SET max_observed_at = '1970-01-01T00:00:00Z' WHERE singleton = 1`); err != nil {
+		t.Fatal(err)
+	}
+	epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := store.ObserveRepositoryTime(ctx, epoch); err != nil {
+		t.Fatalf("ObserveRepositoryTime rejected legacy RFC3339Nano seed: %v", err)
+	}
+	var stored string
+	if err := store.DB().QueryRowContext(ctx, `SELECT max_observed_at FROM repository_time_witness WHERE singleton = 1`).Scan(&stored); err != nil || stored != "1970-01-01T00:00:00.000000000Z" {
+		t.Fatalf("stored witness=%q err=%v", stored, err)
+	}
+	for _, outOfRange := range []time.Time{
+		time.Date(0, 12, 31, 23, 59, 59, 0, time.UTC),
+		time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		if err := store.ObserveRepositoryTime(ctx, outOfRange); !errors.Is(err, ErrConflict) {
+			t.Fatalf("ObserveRepositoryTime(%v) = %v, want ErrConflict", outOfRange, err)
+		}
+	}
+	next := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+	if err := store.ObserveRepositoryTime(ctx, next); err != nil {
+		t.Fatalf("ObserveRepositoryTime after rejected out-of-range year failed: %v", err)
+	}
+}
+
+func TestListPackageObjectsBatchesManyDists(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	const distCount = 520
+	distNames := make([]string, 0, distCount)
+	desired := make(map[string][]string, distCount)
+	shaA := strings.Repeat("a", 64)
+	shaB := strings.Repeat("b", 64)
+	for i := range distCount {
+		name := fmt.Sprintf("el-%04d", i)
+		distNames = append(distNames, name)
+		if err := store.AddDist(ctx, Dist{
+			Name: name, Format: "rpm", EffectiveConfigSHA256: "cfg",
+			Architectures: []Architecture{{Family: "x86_64", EcosystemArch: "x86_64"}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if i%2 == 0 {
+			desired[name] = []string{shaA, shaB}
+		} else {
+			desired[name] = []string{shaA}
+		}
+	}
+	opID := strings.Repeat("1", 64)
+	if err := store.BeginOperation(ctx, Operation{ID: opID, Kind: "add", State: OperationPlanned, PayloadJSON: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetOperationState(ctx, opID, OperationStaged, ""); err != nil {
+		t.Fatal(err)
+	}
+	objs := []PackageObject{
+		{SHA256: shaB, Format: "rpm", Coordinate: "beta-0:1-1.x86_64", Architecture: "x86_64", CanonicalArch: "x86_64", PoolPath: "pool/b/beta/beta-1-1.x86_64.rpm", Filename: "beta-1-1.x86_64.rpm", Size: 10, Name: "beta", Source: "beta", Version: "1", Release: "1", Kind: "main", Storage: "pending"},
+		{SHA256: shaA, Format: "rpm", Coordinate: "alpha-0:1-1.x86_64", Architecture: "x86_64", CanonicalArch: "x86_64", PoolPath: "pool/a/alpha/alpha-1-1.x86_64.rpm", Filename: "alpha-1-1.x86_64.rpm", Size: 10, Name: "alpha", Source: "alpha", Version: "1", Release: "1", Kind: "main", Storage: "pending"},
+	}
+	if _, err := store.ApplyDesiredMutation(ctx, opID, objs, desired, `{}`); err != nil {
+		t.Fatal(err)
+	}
+	listed, err := store.ListPackageObjects(ctx, append(distNames, distNames[0]), false)
+	if err != nil || len(listed) != 2 || listed[0].Name != "alpha" || listed[1].Name != "beta" || len(listed[0].Dists) != distCount || len(listed[1].Dists) != distCount/2 {
+		t.Fatalf("ListPackageObjects across %d dists: len=%d err=%v listed=%+v", distCount, len(listed), err, listed)
 	}
 }

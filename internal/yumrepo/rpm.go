@@ -562,6 +562,9 @@ func validatePackageSizeTags(pkg *crpm.Package) error {
 	if pkg == nil {
 		return fmt.Errorf("nil RPM package")
 	}
+	if pkg.Header.GetTag(rpmTagPayloadDigest) != nil && pkg.Header.GetTag(rpmTagPayloadDigestAlgo) == nil {
+		return fmt.Errorf("RPM v6 packages are not supported (payload digest has no algorithm tag)")
+	}
 	checks := []struct {
 		label  string
 		header *crpm.Header

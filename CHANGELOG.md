@@ -12,6 +12,29 @@ All notable changes to SOW are recorded here.
 - S3/R2 requests inherit the AWS SDK's updated default retry policy, including
   retries for bodyless HTTP 429 responses. Cover successful throttling retries
   and preservation of the HTTP error after retry exhaustion.
+- Harden S3/R2 error status extraction across joined errors, treat HTTP 404 on
+  multipart upload abort as already cleaned up, and bound non-2xx list and
+  multipart XML responses.
+- Reject RPM v6 packages consistently across `sow prune` (including single-version,
+  `--protect`, superseded, and `--dry-run` inputs), `sow create`, and managed
+  ingestion.
+- Bound decompressed `.deb` control tar streams and compressed APT/RPM metadata
+  streams against header and decompression expansion bombs, and broaden Linux
+  `renameat2` unsupported-filesystem error recognition (`ENOSYS`, `EINVAL`,
+  `ENOTSUP`) while preserving the fallback implementation on other platforms.
+- Fix crash recovery for legacy v1 `dist.new`/`dist.init` operations with nil
+  effective signing. Move unproven `c2-to-single-v1` migration stage leftovers
+  intact to `abandoned/` and report their location so local GC is not blocked.
+  Reopen rooted directory cursors per batch when unlinking large directories on
+  macOS APFS and BSD.
+- Fix `export rpm-leaf` when an unrelated peer filesystem target is unmounted,
+  record the Dist's built Generation timestamp rather than the repository head
+  timestamp, and accept duplicate file inputs when combining explicit files with
+  parent directories in `sow add`.
+- Ensure multi-statement SQLite reads run inside read-only transactions, batch
+  `ListPackageObjects` Dist membership filters below SQLite's bind limit, and
+  normalize legacy `RFC3339Nano` repository time-witness seeds while bounding
+  observed years to `1..9999`.
 - Update GoReleaser to v2.20.1 in CI and release workflows, and regenerate
   third-party notices for the Go 1.27.4 release builds.
 

@@ -2244,3 +2244,84 @@ func TestMigrationAbortPartialStagePreservesUnprovenEntries(t *testing.T) {
 		})
 	}
 }
+
+func TestRepositorySchemaMigrationFastPathPreservesLeftoverStageForLocalGC(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	opts := WorkspaceOptions{Workdir: root, CWD: root}
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm", Architectures: []string{"x86_64"}}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	leftover := migrationStageRoot(root, "repo")
+	if err := os.MkdirAll(leftover, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("unproven migration output")
+	if err := os.WriteFile(filepath.Join(leftover, "stale"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	external := filepath.Join(t.TempDir(), "external")
+	if err := os.WriteFile(external, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(leftover, "link")); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(leftover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := MigrateRepository(ctx, RepositoryMigrationOptions{WorkspaceOptions: opts, Repository: "repo", Jobs: 1})
+	if err != nil || !migrated.Complete {
+		t.Fatalf("MigrateRepository=%+v err=%v", migrated, err)
+	}
+	if _, err := os.Lstat(leftover); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("leftover migration stage directory still exists: %v", err)
+	}
+	retained, err := filepath.Glob(filepath.Join(root, ".sow", "repo", "abandoned", "c2-*"))
+	if err != nil || len(retained) != 1 {
+		t.Fatalf("expected one preserved stage, got %v, err=%v", retained, err)
+	}
+	after, err := os.Stat(retained[0])
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("unproven stage was not moved intact: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(retained[0], "stale")); err != nil || !bytes.Equal(data, content) {
+		t.Fatalf("unproven output was not preserved: %q, err=%v", data, err)
+	}
+	if link, err := os.Readlink(filepath.Join(retained[0], "link")); err != nil || link != external {
+		t.Fatalf("unproven symlink was not preserved: %q, err=%v", link, err)
+	}
+	if data, err := os.ReadFile(external); err != nil || !bytes.Equal(data, content) {
+		t.Fatalf("external symlink target changed: %q, err=%v", data, err)
+	}
+	if len(migrated.Warnings) != 1 || !strings.Contains(migrated.Warnings[0], retained[0]) {
+		t.Fatalf("migration did not report retained output: %+v", migrated)
+	}
+	if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: opts, Repository: "repo"}); err != nil {
+		t.Fatalf("LocalGC blocked after migration fast-path cleanup: %v", err)
+	}
+	// Repeating migration must neither relocate the retained output again nor
+	// create empty abandoned directories when the active stage is absent/empty.
+	for _, emptyStage := range []bool{false, true} {
+		if emptyStage {
+			if err := os.MkdirAll(leftover, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		repeated, err := MigrateRepository(ctx, RepositoryMigrationOptions{WorkspaceOptions: opts, Repository: "repo", Jobs: 1})
+		if err != nil || !repeated.Complete || len(repeated.Warnings) != 0 {
+			t.Fatalf("repeated migration with emptyStage=%t: %+v, err=%v", emptyStage, repeated, err)
+		}
+		if _, err := os.Lstat(leftover); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("active migration stage remains: %v", err)
+		}
+		remaining, err := filepath.Glob(filepath.Join(root, ".sow", "repo", "abandoned", "c2-*"))
+		if err != nil || !reflect.DeepEqual(remaining, retained) {
+			t.Fatalf("repeated migration changed retained output: %v, err=%v", remaining, err)
+		}
+	}
+}

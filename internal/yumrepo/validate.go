@@ -522,7 +522,7 @@ func validateArtifactRoot(ctx context.Context, root *os.Root, kind string, recor
 	if err := file.Reset(); err != nil {
 		return Artifact{}, 0, "", validatedRegularEntry{}, err
 	}
-	openSHA, openSize, count, identities, err := validateOpenXML(ctx, file.file, kind, compression, flatCompatibility, managed, identityTemp, requireEmpty, viewValidation)
+	openSHA, openSize, count, identities, err := validateOpenXML(ctx, file.file, record.OpenSize, kind, compression, flatCompatibility, managed, identityTemp, requireEmpty, viewValidation)
 	if err != nil {
 		return Artifact{}, 0, "", validatedRegularEntry{}, err
 	}
@@ -543,7 +543,7 @@ func validateArtifactRoot(ctx context.Context, root *os.Root, kind string, recor
 	}, count, identities, validatedEntry, nil
 }
 
-func validateOpenXML(ctx context.Context, source io.Reader, kind string, compression Compression, flatCompatibility, managed bool, identityTemp string, requireEmpty bool, viewValidation rpmViewValidation) (string, int64, int64, string, error) {
+func validateOpenXML(ctx context.Context, source io.Reader, expectedOpenSize int64, kind string, compression Compression, flatCompatibility, managed bool, identityTemp string, requireEmpty bool, viewValidation rpmViewValidation) (string, int64, int64, string, error) {
 	var reader io.Reader
 	var closer io.Closer
 	switch compression {
@@ -563,6 +563,9 @@ func validateOpenXML(ctx context.Context, source io.Reader, kind string, compres
 		return "", 0, 0, "", fmt.Errorf("%w: unsupported compression", ErrInvalidRepodata)
 	}
 	defer closer.Close()
+	if expectedOpenSize >= 0 && expectedOpenSize < int64(^uint64(0)>>1) {
+		reader = io.LimitReader(reader, expectedOpenSize+1)
+	}
 	h := sha256.New()
 	counter := &countingWriter{w: h}
 	tee := io.TeeReader(&contextReader{ctx: ctx, r: reader}, counter)
