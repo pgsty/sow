@@ -2,7 +2,7 @@
 
 [![Website: sow.pgsty.com](https://img.shields.io/badge/Website-sow.pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://sow.pgsty.com)
 [![Docs](https://img.shields.io/badge/Docs-sow.pgsty.com%2Fdocs-slategray?style=flat)](https://sow.pgsty.com/docs/)
-[![Version: 0.7.0](https://img.shields.io/badge/version-0.7.0-slategray?style=flat&logo=github&logoColor=white)](https://github.com/pgsty/sow/tree/v0.7.0)
+[![Version: 0.7.1](https://img.shields.io/badge/version-0.7.1-slategray?style=flat&logo=github&logoColor=white)](https://github.com/pgsty/sow/tree/v0.7.1)
 [![CI](https://img.shields.io/github/actions/workflow/status/pgsty/sow/ci.yml?style=flat&branch=main&label=CI&logo=githubactions&logoColor=white)](https://github.com/pgsty/sow/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/github/go-mod/go-version/pgsty/sow?style=flat&logo=go&logoColor=white&color=slategray)](go.mod)
 [![License: Apache-2.0](https://img.shields.io/github/license/pgsty/sow?logo=opensourceinitiative&logoColor=green&color=slategray)](LICENSE)
@@ -166,15 +166,15 @@ authoritative CLI reference shipped with the binary; machine consumers can rely 
 closed `--json` envelopes and the documented exit-code contract.
 
 Upgrading a workspace created by SOW v0.3 or v0.4? Stop writers, back up the workspace,
-and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Versions 0.5.0 through 0.7.0 use
+and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Versions 0.5.0 through 0.7.1 use
 schema v13 to index pool-path ownership without scanning unrelated publication history;
 configuration and public layout stay unchanged. Then run `sow build` and `sow check`:
 the updated RPM authentication and APT metadata contracts require one rebuild of affected
 Dists. Later unchanged RPMs reuse matching Built evidence instead of repeated payload
 verification. Do not reopen the migrated database with an older binary.
-Upgrading from v0.5.0 through v0.6.1 to v0.7.0 requires no schema migration or public-layout change.
+Upgrading from v0.5.0 through v0.7.0 to v0.7.1 requires no schema migration or public-layout change.
 If a Repository migrated by v0.5 or v0.6 reports an invalid transition control target
-after a later build, upgrade to v0.7.0; no manual repair is needed.
+after a later build, upgrade to v0.7.0 or newer; no manual repair is needed.
 A configuration using `passfile` cannot be loaded by v0.6.1 or older; remove those
 keys before downgrading.
 Publication ordering, recovery, target rebinding, the one-copy boundary,
@@ -186,7 +186,7 @@ and RPM leaf export are specified in [Commands](https://sow.pgsty.com/docs/comma
 
 ## Build
 
-Building from source requires Go 1.27.3 or newer; repository signing additionally requires
+Building from source requires Go 1.27.4 or newer; repository signing additionally requires
 a usable GPG installation and key.
 
 ```bash

@@ -2,6 +2,22 @@
 
 All notable changes to SOW are recorded here.
 
+## 0.7.1 - 2026-11-11
+
+- Require Go 1.27.4 and refresh runtime and test dependencies to their latest
+  available versions. Update the AWS SDK core to v1.48.0, S3 to v1.114.10,
+  Smithy to v1.28.9, compression to v1.20.4, libc to v1.81.0, and `x/sys`
+  to v0.50.0, along with AWS internals, pprof, `x/mod`, `x/sync`, and modernc
+  compiler dependencies.
+- S3/R2 requests inherit the AWS SDK's updated default retry policy, including
+  retries for bodyless HTTP 429 responses. Cover successful throttling retries
+  and preservation of the HTTP error after retry exhaustion.
+- Update GoReleaser to v2.20.1 in CI and release workflows, and regenerate
+  third-party notices for the Go 1.27.4 release builds.
+
+This release keeps schema v13 and the existing CLI and public repository layout.
+Workspaces already on v0.5.0 through v0.7.0 do not require a schema migration.
+
 ## 0.7.0 - 2026-11-09
 
 - Add `--passfile PATH`, `SOW_GPG_PASSFILE`, and per-key `passfile` configuration

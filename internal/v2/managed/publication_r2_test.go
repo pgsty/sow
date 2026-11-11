@@ -755,9 +755,10 @@ func TestR2InventoryHTTPPreservesSDKFailuresAndRetries(t *testing.T) {
 		{"hit", http.StatusOK, 0, 1, false},
 		{"missing", http.StatusNotFound, 1, 1, true},
 		{"forbidden", http.StatusForbidden, 1, 1, true},
-		// A bodyless HEAD 429 carries no SDK throttle error code. Preserve the
-		// transport's current terminal classification instead of adding retries.
-		{"rate limited", http.StatusTooManyRequests, 1, 1, true},
+		// The SDK retries bodyless HEAD 429 responses as throttling errors.
+		// Keep the retry bound and preserve the HTTP status after exhaustion.
+		{"rate limited retry", http.StatusTooManyRequests, 1, 2, false},
+		{"rate limited exhausted", http.StatusTooManyRequests, 3, 3, true},
 		{"service retry", http.StatusServiceUnavailable, 1, 2, false},
 		{"service exhausted", http.StatusInternalServerError, 3, 3, true},
 		{"conflict", http.StatusPreconditionFailed, 1, 1, true},
