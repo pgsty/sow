@@ -78,9 +78,16 @@ All notable changes to SOW are recorded here.
   is present without `sow.yml`, pin reproducible GoReleaser build and package
   timestamps, add macOS CI coverage and signed Managed APT/DNF container tests,
   and refresh `THIRD_PARTY_NOTICES`.
+- Refresh dependencies with Go 1.27.4, including S3 v1.116.0, SQLite v1.63.0,
+  libc v1.82.12, compress v1.20.5, x/crypto v0.59.0, and go/debian v0.21.4.
+  Update the Silo integration fixture to the 20261112 release, GoReleaser to
+  v2.20.3, deadcode to v0.53.0, and govulncheck to v1.10.0.
 
 This release keeps schema v13 and the existing public repository layout.
 Workspaces already on v0.5.0 through v0.7.1 do not require a schema migration.
+If local GC was interrupted under v0.7.1, complete it with the v0.7.1 binary
+(`sow gc -r REPOSITORY -C WORKSPACE`) before switching to v0.8.0. An old plan
+with an empty `manifest` array requires the old binary to finish recovery.
 
 ## 0.7.1 - 2026-11-11
 

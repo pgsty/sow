@@ -2136,7 +2136,7 @@ github.com/aws/aws-sdk-go-v2/service/internal/s3shared v1.20.12/LICENSE.txt
    limitations under the License.
 
 ==============================================================================
-github.com/aws/aws-sdk-go-v2/service/s3 v1.114.10/LICENSE.txt
+github.com/aws/aws-sdk-go-v2/service/s3 v1.116.0/LICENSE.txt
 ==============================================================================
 
 
@@ -2712,7 +2712,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-github.com/klauspost/compress v1.20.4/LICENSE
+github.com/klauspost/compress v1.20.5/LICENSE
 ==============================================================================
 
 Copyright (c) 2012 The Go Authors. All rights reserved.
@@ -3021,7 +3021,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-github.com/klauspost/compress v1.20.4/internal/snapref/LICENSE
+github.com/klauspost/compress v1.20.5/internal/snapref/LICENSE
 ==============================================================================
 
 Copyright (c) 2011 The Snappy-Go Authors. All rights reserved.
@@ -3053,7 +3053,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-github.com/klauspost/compress v1.20.4/zstd/internal/xxhash/LICENSE.txt
+github.com/klauspost/compress v1.20.5/zstd/internal/xxhash/LICENSE.txt
 ==============================================================================
 
 Copyright (c) 2016 Caleb Spare
@@ -3408,7 +3408,7 @@ Copyright 2025 The go-yaml Project Contributors
 http://www.apache.org/licenses/LICENSE-2.0
 
 ==============================================================================
-golang.org/x/crypto v0.58.0/LICENSE
+golang.org/x/crypto v0.59.0/LICENSE
 ==============================================================================
 
 Copyright 2009 The Go Authors.
@@ -3472,7 +3472,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-modernc.org/libc v1.81.0/LICENSE
+modernc.org/libc v1.82.12/LICENSE
 ==============================================================================
 
 Copyright (c) 2017 The Libc Authors. All rights reserved.
@@ -3504,7 +3504,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-modernc.org/libc v1.81.0/LICENSE-3RD-PARTY.md
+modernc.org/libc v1.82.12/LICENSE-3RD-PARTY.md
 ==============================================================================
 
 # Third-Party Software Notices
@@ -3814,7 +3814,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ==============================================================================
-modernc.org/libc v1.81.0/int128.go (source header)
+modernc.org/libc v1.82.12/int128.go (source header)
 ==============================================================================
 
 // Copyright 2020 The Libc Authors. All rights reserved.
@@ -3882,7 +3882,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-modernc.org/memory v1.12.1/LICENSE
+modernc.org/memory v1.13.0/LICENSE
 ==============================================================================
 
 Copyright (c) 2017 The Memory Authors. All rights reserved.
@@ -3914,7 +3914,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-modernc.org/memory v1.12.1/LICENSE-GO
+modernc.org/memory v1.13.0/LICENSE-GO
 ==============================================================================
 
 Copyright (c) 2009 The Go Authors. All rights reserved.
@@ -3946,13 +3946,13 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-modernc.org/memory v1.12.1/LICENSE-LOGO
+modernc.org/memory v1.13.0/LICENSE-LOGO
 ==============================================================================
 
 https://commons.wikimedia.org/wiki/File:Memory_infra_logo.png
 
 ==============================================================================
-modernc.org/memory v1.12.1/LICENSE-MMAP-GO
+modernc.org/memory v1.13.0/LICENSE-MMAP-GO
 ==============================================================================
 
 Copyright (c) 2011, Evan Shaw <edsrzf@gmail.com>
@@ -3981,7 +3981,7 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-modernc.org/sqlite v1.62.0/LICENSE
+modernc.org/sqlite v1.63.0/LICENSE
 ==============================================================================
 
 Copyright (c) 2017 The Sqlite Authors. All rights reserved.
@@ -4012,7 +4012,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ==============================================================================
-modernc.org/sqlite v1.62.0/LICENSE-3RD-PARTY.md
+modernc.org/sqlite v1.63.0/LICENSE-3RD-PARTY.md
 ==============================================================================
 
 # Third-Party Licenses
@@ -5631,7 +5631,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ---
 
 ==============================================================================
-modernc.org/sqlite v1.62.0/LICENSE-SQLITE
+modernc.org/sqlite v1.63.0/LICENSE-SQLITE
 ==============================================================================
 
 SQLite Is Public Domain
@@ -5661,7 +5661,7 @@ public domain dedications on file. So the SQLite code base is clean and is
 uncontaminated with licensed code from other projects.
 
 ==============================================================================
-modernc.org/sqlite v1.62.0/LICENSE-SQLITE_VEC
+modernc.org/sqlite v1.63.0/LICENSE-SQLITE_VEC
 ==============================================================================
 
 MIT License
@@ -5687,7 +5687,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ==============================================================================
-pault.ag/go/debian v0.21.3/LICENSE
+pault.ag/go/debian v0.21.4/LICENSE
 ==============================================================================
 
 Copyright (c) Paul R. Tagliamonte <paultag@debian.org>, 2015-2016

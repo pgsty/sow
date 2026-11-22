@@ -1,3 +1,3 @@
 module github.com/cavaliergopher/rpm
 
-go 1.17
+go 1.27.4

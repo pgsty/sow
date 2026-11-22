@@ -22,7 +22,7 @@ import (
 // than an implicit dependency on a floating container tag. Silo is the
 // MinIO-compatible object store maintained by PGSTY; it keeps the MINIO_*
 // variables and /minio/* routes used below.
-const siloCompatibilityImage = "pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46"
+const siloCompatibilityImage = "pgsty/silo@sha256:c20d112390b9a9ce8c11b8af95ad35bcaa62f4759663c09c936cd8d2b511f329"
 
 func TestSiloS3Compatibility(t *testing.T) {
 	if os.Getenv("SOW_SILO_TEST") != "1" {

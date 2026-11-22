@@ -4,6 +4,8 @@ This directory is a source snapshot of
 `github.com/cavaliergopher/rpm@v1.3.0`, retained under its original MIT
 license.
 
+The local module uses SOW's Go 1.27.4 build baseline.
+
 Upstream module checksum:
 `h1:UHX46sasX8MesUXXQ+UbkFLUX4eUWTlEcX8jcnRBIgI=`. The tag, checksum and this
 patch ledger are the review anchors for future refreshes.

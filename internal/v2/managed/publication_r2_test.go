@@ -1150,7 +1150,7 @@ func TestSiloManagedR2DeleteRepublishAndNoop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	const siloImage = "pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46"
+	const siloImage = "pgsty/silo@sha256:c20d112390b9a9ce8c11b8af95ad35bcaa62f4759663c09c936cd8d2b511f329"
 	container := fmt.Sprintf("sow-managed-silo-%d", time.Now().UnixNano())
 	cmd := exec.CommandContext(ctx, docker,
 		"run", "-d", "--rm", "--name", container,
