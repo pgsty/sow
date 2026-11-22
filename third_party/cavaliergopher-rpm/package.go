@@ -74,9 +74,17 @@ func (c *Package) dependencies(nevrsTagID, flagsTagID, namesTagID, versionsTagID
 	vers := c.Header.GetTag(versionsTagID).StringSlice()
 	deps := make([]Dependency, len(names))
 	for i := 0; i < len(names); i++ {
-		epoch, ver, rel := parseVersion(vers[i])
+		var verStr string
+		if i < len(vers) {
+			verStr = vers[i]
+		}
+		var flagVal int
+		if i < len(flgs) {
+			flagVal = int(flgs[i])
+		}
+		epoch, ver, rel := parseVersion(verStr)
 		deps[i] = &dependency{
-			flags:   int(flgs[i]),
+			flags:   flagVal,
 			name:    names[i],
 			epoch:   epoch,
 			version: ver,
@@ -170,16 +178,52 @@ func (c *Package) Files() []FileInfo {
 	linknames := c.Header.GetTag(1036).StringSlice()
 	a := make([]FileInfo, len(names))
 	for i := 0; i < len(names); i++ {
+		var dir string
+		if i < len(ixs) && ixs[i] >= 0 && int(ixs[i]) < len(dirs) {
+			dir = dirs[ixs[i]]
+		}
+		var mode os.FileMode
+		if i < len(modes) {
+			mode = fileModeFromInt64(modes[i])
+		}
+		var size int64
+		if i < len(sizes) {
+			size = sizes[i]
+		}
+		var modTime time.Time
+		if i < len(times) {
+			modTime = time.Unix(times[i], 0)
+		}
+		var flag int64
+		if i < len(flags) {
+			flag = flags[i]
+		}
+		var owner string
+		if i < len(owners) {
+			owner = owners[i]
+		}
+		var group string
+		if i < len(groups) {
+			group = groups[i]
+		}
+		var digest string
+		if i < len(digests) {
+			digest = digests[i]
+		}
+		var linkname string
+		if i < len(linknames) {
+			linkname = linknames[i]
+		}
 		a[i] = FileInfo{
-			name:     dirs[ixs[i]] + names[i],
-			mode:     fileModeFromInt64(modes[i]),
-			size:     sizes[i],
-			modTime:  time.Unix(times[i], 0),
-			flags:    flags[i],
-			owner:    owners[i],
-			group:    groups[i],
-			digest:   digests[i],
-			linkname: linknames[i],
+			name:     dir + names[i],
+			mode:     mode,
+			size:     size,
+			modTime:  modTime,
+			flags:    flag,
+			owner:    owner,
+			group:    group,
+			digest:   digest,
+			linkname: linkname,
 		}
 	}
 	return a

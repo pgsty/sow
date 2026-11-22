@@ -23,8 +23,8 @@ repos:
     # passfile (or legacy metadata passphrase) > SOW_GPG_PASSFILE.
     # Config-relative paths start at the workspace root; no default file is searched.
     # The file is one nonempty UTF-8 line (<= 64 KiB including an optional LF/CRLF).
-    # Only that final newline is removed; spaces/tabs are literal. Use a regular
-    # file without symlinks, outside the repository, normally mode 0600.
+    # Only that final newline is removed; spaces/tabs are literal. Keep the file
+    # outside the repository, normally mode 0600; symlinks inside the workspace are rejected.
     # Full format and compatibility: https://sow.pgsty.com/docs/reference/config/#passfile
     dists:
       el9:
@@ -37,3 +37,27 @@ repos:
 # Publication targets are optional. Add a validated filesystem or R2 target
 # only when this workspace is ready to publish.
 targets: {}
+# targets:
+#   mirror-local:
+#     repository: pgsql
+#     provider: filesystem
+#     endpoint: file:///srv/www
+#     prefix: repos/pgsql
+#     public_endpoint: https://mirror.example.com/repos/pgsql/
+#     max_cache_ttl: 5m
+#     authoritative_workspace: true
+#     single_writer: true
+#     exclusive_write_authority: true
+#   mirror-r2:
+#     repository: pgsql
+#     provider: r2
+#     endpoint: https://REPLACE_WITH_ACCOUNT_ID.r2.cloudflarestorage.com
+#     region: auto
+#     bucket: sow-repos
+#     prefix: repos/pgsql
+#     credential: env://SOW_R2_CREDENTIAL
+#     public_endpoint: https://dl.example.com/repos/pgsql/
+#     max_cache_ttl: 5m
+#     authoritative_workspace: true
+#     single_writer: true
+#     exclusive_write_authority: true

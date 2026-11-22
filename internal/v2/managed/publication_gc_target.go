@@ -14,6 +14,7 @@ type TargetGCOptions struct {
 	WorkspaceOptions
 	LockOptions
 	Target  string
+	Delete  bool
 	Fault   func(string) error
 	now     func() time.Time
 	backend publicationBackend
@@ -35,13 +36,15 @@ type TargetGCResult struct {
 }
 
 // TargetGC is the only explicit remote-maintenance entry point. Filesystem
-// targets use report-bound exact deletion receipts; R2 persists the same exact
-// candidate report but never calls DeleteObject and reports every candidate as
-// retained.
+// targets use report-bound exact deletion receipts; R2 defaults to report-only
+// retention and performs report-bound conditional deletion only when Delete is
+// explicitly requested.
 func TargetGC(ctx context.Context, opts TargetGCOptions) (result TargetGCResult, resultErr error) {
 	if ctx == nil || opts.Target == "" {
 		return result, fmt.Errorf("%w: target GC requires a context and target", ErrRejected)
 	}
+	var maintenanceErr error
+	defer func() { resultErr = errors.Join(maintenanceErr, resultErr) }()
 	ws, _, rootGuard, err := workspace(opts.WorkspaceOptions)
 	if err != nil {
 		return result, err
@@ -67,7 +70,13 @@ func TargetGC(ctx context.Context, opts TargetGCOptions) (result TargetGCResult,
 	}
 	now := publicationObservedTime(opts.now)
 	if err := store.ObserveRepositoryTime(ctx, now); err != nil {
-		return result, fmt.Errorf("%w: target GC clock preflight: %v", ErrIntegrity, err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return result, err
+		}
+		if !stateTransactionCommitted(err) {
+			return result, fmt.Errorf("%w: target GC clock preflight: %w", ErrIntegrity, err)
+		}
+		maintenanceErr = errors.Join(maintenanceErr, err)
 	}
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
 		return result, err
@@ -98,7 +107,11 @@ func TargetGC(ctx context.Context, opts TargetGCOptions) (result TargetGCResult,
 			return result, err
 		}
 	}
-	maintenance, err := store.ListPublicationMaintenance(ctx, binding.TargetIdentity)
+	if r2Backend, ok := backend.(*r2PublicationBackend); ok {
+		r2Backend.allowDelete = opts.Delete
+	}
+	includeRetained := opts.Delete && backend.Provider() == "r2"
+	maintenance, err := store.ListPublicationMaintenance(ctx, binding.TargetIdentity, includeRetained)
 	if err != nil {
 		return result, err
 	}
@@ -106,8 +119,9 @@ func TargetGC(ctx context.Context, opts TargetGCOptions) (result TargetGCResult,
 		result.Phase, result.Noop = "done", true
 		return result, nil
 	}
+	inventoryVerifiedExact := false
 	for _, item := range maintenance {
-		if item.AttemptPhase == "deletion_verified" || item.AttemptPhase == "retained_reported" {
+		if item.AttemptPhase == "deletion_verified" || (item.AttemptPhase == "retained_reported" && !includeRetained) {
 			report, err := store.GetPublicationCandidateReport(ctx, item.CheckpointIdentity)
 			if err != nil {
 				return result, err
@@ -115,7 +129,71 @@ func TargetGC(ctx context.Context, opts TargetGCOptions) (result TargetGCResult,
 			if err := store.CompletePublicationAttempt(ctx, item.AttemptIdentity, report.ReportIdentity); err != nil {
 				return result, err
 			}
+			inventoryVerifiedExact = false
 			result.CompletedAttempts++
+			continue
+		}
+		if includeRetained && item.GraceState == "retained_reported" && (item.AttemptPhase == "done" || item.AttemptPhase == "retained_reported") {
+			if now.Before(item.NotBefore) {
+				result.PendingGrace++
+				continue
+			}
+			if !inventoryVerifiedExact {
+				if err := verifyTargetMaintenanceInventory(ctx, store, backend, binding.TargetIdentity, nil, false); err != nil {
+					return result, err
+				}
+				inventoryVerifiedExact = true
+			}
+			report, err := store.PromoteRetainedReportToConditionalDelete(ctx, item.CheckpointIdentity, now)
+			if err != nil {
+				return result, err
+			}
+			hadCandidates := len(report.Candidates) > 0
+			if hadCandidates {
+				result.Reports++
+			}
+			if err := callFault(opts.Fault, "target_gc.report"); err != nil {
+				return result, err
+			}
+			result.Candidates += len(report.Candidates)
+			for _, candidate := range report.Candidates {
+				inventoryVerifiedExact = false
+				if err := backend.DeleteConditional(ctx, candidate); err != nil {
+					return result, err
+				}
+				if err := callFault(opts.Fault, "target_gc.deleted."+candidate.Path); err != nil {
+					return result, err
+				}
+				if err := backend.VerifyPublicAbsent(ctx, candidate.Path); err != nil {
+					return result, err
+				}
+				receipt := state.PublicationDeletionReceipt{
+					ReportIdentity: report.ReportIdentity, Path: candidate.Path, Phase: candidate.Phase,
+					Size: candidate.Size, SHA256: candidate.SHA256, RemoteIdentity: candidate.RemoteIdentity,
+					StorageAbsent: true, PublicAbsent: true, ObservedAt: now,
+				}
+				if err := store.PutPublicationDeletionReceipt(ctx, &receipt); err != nil {
+					return result, err
+				}
+				if err := callFault(opts.Fault, "target_gc.receipt."+candidate.Path); err != nil {
+					return result, err
+				}
+				result.DeletedObjects++
+				result.DeletedBytes += candidate.Size
+			}
+			if err := store.MarkPublicationDeletionVerified(ctx, item.AttemptIdentity, report.ReportIdentity, now); err != nil {
+				return result, err
+			}
+			if err := callFault(opts.Fault, "target_gc.deletion_verified"); err != nil {
+				return result, err
+			}
+			if err := store.CompletePublicationAttempt(ctx, item.AttemptIdentity, report.ReportIdentity); err != nil {
+				return result, err
+			}
+			if hadCandidates || item.AttemptPhase != "done" {
+				inventoryVerifiedExact = false
+				result.CompletedAttempts++
+			}
 			continue
 		}
 		if item.AttemptPhase != "grace" || item.GraceState != "grace" {
@@ -135,15 +213,18 @@ func TargetGC(ctx context.Context, opts TargetGCOptions) (result TargetGCResult,
 		}
 		report, reportErr := store.GetPublicationCandidateReport(ctx, item.CheckpointIdentity)
 		if errors.Is(reportErr, state.ErrNotFound) {
-			if err := verifyTargetMaintenanceInventory(ctx, store, backend, binding.TargetIdentity, nil, false); err != nil {
-				return result, err
+			if !inventoryVerifiedExact {
+				if err := verifyTargetMaintenanceInventory(ctx, store, backend, binding.TargetIdentity, nil, false); err != nil {
+					return result, err
+				}
+				inventoryVerifiedExact = true
 			}
 			candidates, err := store.ExactPublicationCandidates(ctx, item.CheckpointIdentity, now)
 			if err != nil {
 				return result, err
 			}
 			mode := "conditional_delete"
-			if backend.Provider() == "r2" {
+			if backend.Provider() == "r2" && !opts.Delete {
 				mode = "report_only"
 			}
 			report = state.PublicationCandidateReport{
@@ -159,14 +240,23 @@ func TargetGC(ctx context.Context, opts TargetGCOptions) (result TargetGCResult,
 			}
 		} else if reportErr != nil {
 			return result, reportErr
-		} else if report.TargetIdentity != binding.TargetIdentity || report.CheckpointIdentity != checkpoint.CheckpointIdentity || report.InventoryIdentity != checkpoint.InventoryIdentity || backend.Provider() == "r2" && report.Mode != "report_only" || backend.Provider() == "filesystem" && report.Mode != "conditional_delete" {
-			return result, fmt.Errorf("%w: persisted target maintenance report differs from provider checkpoint", ErrIntegrity)
+		} else {
+			if report.TargetIdentity != binding.TargetIdentity || report.CheckpointIdentity != checkpoint.CheckpointIdentity || report.InventoryIdentity != checkpoint.InventoryIdentity ||
+				backend.Provider() == "filesystem" && report.Mode != "conditional_delete" ||
+				backend.Provider() == "r2" && report.Mode != "report_only" && report.Mode != "conditional_delete" {
+				return result, fmt.Errorf("%w: persisted target maintenance report differs from provider checkpoint", ErrIntegrity)
+			}
+			if backend.Provider() == "r2" && report.Mode == "conditional_delete" && !opts.Delete {
+				return result, fmt.Errorf("%w: target %q has an unfinished conditional-delete report; resume with gc %s --delete", ErrNotReady, opts.Target, opts.Target)
+			}
 		}
-		if err := verifyTargetMaintenanceInventory(ctx, store, backend, binding.TargetIdentity, report.Candidates, true); err != nil {
-			return result, err
+		if !inventoryVerifiedExact {
+			if err := verifyTargetMaintenanceInventory(ctx, store, backend, binding.TargetIdentity, report.Candidates, true); err != nil {
+				return result, err
+			}
 		}
 		result.Candidates += len(report.Candidates)
-		if backend.Provider() == "r2" {
+		if report.Mode == "report_only" {
 			if err := store.MarkPublicationRetainedReported(ctx, item.AttemptIdentity, report.ReportIdentity, now); err != nil {
 				return result, err
 			}
@@ -181,6 +271,7 @@ func TargetGC(ctx context.Context, opts TargetGCOptions) (result TargetGCResult,
 			continue
 		}
 		for _, candidate := range report.Candidates {
+			inventoryVerifiedExact = false
 			if err := backend.DeleteConditional(ctx, candidate); err != nil {
 				return result, err
 			}
@@ -213,6 +304,7 @@ func TargetGC(ctx context.Context, opts TargetGCOptions) (result TargetGCResult,
 		if err := store.CompletePublicationAttempt(ctx, item.AttemptIdentity, report.ReportIdentity); err != nil {
 			return result, err
 		}
+		inventoryVerifiedExact = false
 		result.CompletedAttempts++
 	}
 	if result.PendingGrace != 0 {
@@ -239,11 +331,14 @@ func verifyTargetMaintenanceInventory(ctx context.Context, store *state.Store, b
 	if err != nil {
 		return err
 	}
-	remote, err := backend.List(ctx, nil)
+	abandoned, err := store.ListPublicationAbandonedObjects(ctx, targetIdentity)
 	if err != nil {
 		return err
 	}
-	abandoned, err := store.ListPublicationAbandonedObjects(ctx, targetIdentity)
+	if r2Backend, ok := backend.(*r2PublicationBackend); ok {
+		r2Backend.setKnownInventory(expected, abandonedObjectsToInventory(abandoned))
+	}
+	remote, err := backend.List(ctx, nil)
 	if err != nil {
 		return err
 	}

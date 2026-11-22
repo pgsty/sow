@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -243,36 +244,122 @@ WHERE target_identity = ? AND phase IN (
 }
 
 // ListPublicationAbandonedObjects returns exact, path-deduplicated orphan
-// inventory for one target. Conflicting evidence is corruption, not a choice
-// for the caller to resolve.
+// inventory for one target, ignoring historical abandoned rows that have been
+// terminally deleted in a later causal epoch. Conflicting live evidence is
+// corruption, not a choice for the caller to resolve.
 func (s *Store) ListPublicationAbandonedObjects(ctx context.Context, targetIdentity string) ([]PublicationAbandonedObject, error) {
 	if !validSHA256Text(targetIdentity) {
 		return nil, errors.New("invalid publication target identity")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT o.path, o.phase, o.size, o.sha256, o.remote_identity
-FROM publication_abandoned_objects AS o
-JOIN publication_attempts AS a ON a.attempt_identity = o.attempt_identity
-WHERE a.target_identity = ? ORDER BY o.path, o.attempt_identity`, targetIdentity)
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	result := []PublicationAbandonedObject{}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT o.path, o.phase, o.size, o.sha256, o.remote_identity, COALESCE(a.base_checkpoint, '')
+FROM publication_abandoned_objects AS o
+JOIN publication_attempts AS a ON a.attempt_identity = o.attempt_identity
+WHERE a.target_identity = ? AND a.phase = 'abandoned'
+ORDER BY o.path, o.attempt_identity`, targetIdentity)
+	if err != nil {
+		return nil, err
+	}
+	type abandonedRow struct {
+		object         PublicationAbandonedObject
+		baseCheckpoint string
+	}
+	raw := []abandonedRow{}
 	for rows.Next() {
-		var object PublicationAbandonedObject
-		if err := rows.Scan(&object.Path, &object.Phase, &object.Size, &object.SHA256, &object.RemoteIdentity); err != nil {
+		var entry abandonedRow
+		if err := rows.Scan(&entry.object.Path, &entry.object.Phase, &entry.object.Size, &entry.object.SHA256, &entry.object.RemoteIdentity, &entry.baseCheckpoint); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		if len(result) != 0 && result[len(result)-1].Path == object.Path {
-			if result[len(result)-1] != object {
-				return nil, fmt.Errorf("%w: conflicting abandoned object evidence for %q", ErrConflict, object.Path)
+		raw = append(raw, entry)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return []PublicationAbandonedObject{}, nil
+	}
+	var deletedMaxEpoch map[string]int
+	var causalOrder map[string]int
+	receiptRows, err := tx.QueryContext(ctx, `SELECT d.path, d.phase, d.size, d.sha256, d.remote_identity, r.checkpoint_identity
+FROM publication_deletion_receipts AS d
+JOIN publication_candidate_reports AS r ON r.report_identity = d.report_identity
+JOIN publication_checkpoints AS c ON c.checkpoint_identity = r.checkpoint_identity
+JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
+JOIN publication_grace_records AS g ON g.checkpoint_identity = c.checkpoint_identity
+WHERE r.target_identity = ? AND r.mode = 'conditional_delete'
+  AND g.state = 'deletion_verified' AND a.phase IN ('deletion_verified', 'done')`, targetIdentity)
+	if err != nil {
+		return nil, err
+	}
+	type receiptRef struct {
+		path, phase, sha, remote, checkpoint string
+		size                                 int64
+	}
+	receipts := []receiptRef{}
+	for receiptRows.Next() {
+		var rec receiptRef
+		if err := receiptRows.Scan(&rec.path, &rec.phase, &rec.size, &rec.sha, &rec.remote, &rec.checkpoint); err != nil {
+			receiptRows.Close()
+			return nil, err
+		}
+		receipts = append(receipts, rec)
+	}
+	if err := errors.Join(receiptRows.Err(), receiptRows.Close()); err != nil {
+		return nil, err
+	}
+	if len(receipts) > 0 {
+		causalOrder, _, err = checkpointCausalChainTx(ctx, tx, targetIdentity)
+		if err != nil {
+			return nil, err
+		}
+		deletedMaxEpoch = make(map[string]int, len(receipts))
+		for _, rec := range receipts {
+			reportSeq, ok := causalOrder[rec.checkpoint]
+			if !ok {
+				continue
+			}
+			reportEpoch := checkpointCausalEpoch(reportSeq)
+			key := publicationObjectEvidenceKey(rec.path, rec.phase, rec.size, rec.sha, rec.remote)
+			if prev, exists := deletedMaxEpoch[key]; !exists || reportEpoch > prev {
+				deletedMaxEpoch[key] = reportEpoch
+			}
+		}
+	}
+	result := []PublicationAbandonedObject{}
+	for _, entry := range raw {
+		if len(deletedMaxEpoch) > 0 {
+			epoch := -1
+			if entry.baseCheckpoint != "" {
+				if baseSeq, ok := causalOrder[entry.baseCheckpoint]; ok {
+					epoch = abandonedCausalEpoch(baseSeq)
+				}
+			}
+			key := publicationObjectEvidenceKey(entry.object.Path, entry.object.Phase, entry.object.Size, entry.object.SHA256, entry.object.RemoteIdentity)
+			if reportEpoch, deleted := deletedMaxEpoch[key]; deleted && reportEpoch > epoch {
+				continue
+			}
+		}
+		if len(result) != 0 && result[len(result)-1].Path == entry.object.Path {
+			if result[len(result)-1] != entry.object {
+				return nil, fmt.Errorf("%w: conflicting abandoned object evidence for %q", ErrConflict, entry.object.Path)
 			}
 			continue
 		}
-		result = append(result, object)
+		result = append(result, entry.object)
 	}
-	if err := rows.Err(); err != nil || !sortedAbandonedObjects(result) {
-		return nil, errors.Join(fmt.Errorf("%w: invalid abandoned object evidence", ErrConflict), err)
+	if !sortedAbandonedObjects(result) {
+		return nil, fmt.Errorf("%w: invalid abandoned object evidence", ErrConflict)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	return result, nil
 }
@@ -306,37 +393,108 @@ WHERE r.target_identity = ? AND a.phase != 'done'`, targetIdentity).Scan(&count)
 	return count != 0, err
 }
 
-func (s *Store) ListPublicationMaintenance(ctx context.Context, targetIdentity string) ([]PublicationMaintenance, error) {
+func (s *Store) ListPublicationMaintenance(ctx context.Context, targetIdentity string, includeRetained bool) ([]PublicationMaintenance, error) {
 	if !validSHA256Text(targetIdentity) {
 		return nil, errors.New("invalid publication target identity")
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT a.attempt_identity, c.checkpoint_identity, g.grace_identity,
-	 a.phase, g.state, g.not_before, c.applied_at, b.max_cache_ttl_ns
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	causalOrder, orderedNodes, err := checkpointCausalChainTx(ctx, tx, targetIdentity)
+	if err != nil {
+		return nil, err
+	}
+	causalDeadlines, err := effectiveCausalGraceDeadlinesTx(ctx, tx, targetIdentity, orderedNodes)
+	if err != nil {
+		return nil, err
+	}
+	query := `SELECT a.attempt_identity, c.checkpoint_identity, g.grace_identity,
+	 a.phase, g.state, g.not_before, c.applied_at, b.max_cache_ttl_ns, COALESCE(r.mode, '')
 	FROM publication_grace_records AS g
 	JOIN publication_checkpoints AS c ON c.checkpoint_identity = g.checkpoint_identity
 	JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
 	JOIN publication_target_bindings AS b ON b.target_identity = g.target_identity
-WHERE g.target_identity = ? AND a.phase != 'done'
-ORDER BY g.not_before, c.checkpoint_identity`, targetIdentity)
+	LEFT JOIN publication_candidate_reports AS r ON r.target_identity = g.target_identity AND r.checkpoint_identity = g.checkpoint_identity AND r.inventory_identity = c.inventory_identity
+	WHERE g.target_identity = ? AND a.phase != 'done'`
+	if includeRetained {
+		query = `SELECT a.attempt_identity, c.checkpoint_identity, g.grace_identity,
+	 a.phase, g.state, g.not_before, c.applied_at, b.max_cache_ttl_ns, COALESCE(r.mode, '')
+	FROM publication_grace_records AS g
+	JOIN publication_checkpoints AS c ON c.checkpoint_identity = g.checkpoint_identity
+	JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
+	JOIN publication_target_bindings AS b ON b.target_identity = g.target_identity
+	LEFT JOIN publication_candidate_reports AS r ON r.target_identity = g.target_identity AND r.checkpoint_identity = g.checkpoint_identity AND r.inventory_identity = c.inventory_identity
+	WHERE g.target_identity = ? AND (a.phase != 'done' OR (b.provider = 'r2' AND g.state = 'retained_reported' AND r.mode = 'report_only'))`
+	}
+	rows, err := tx.QueryContext(ctx, query, targetIdentity)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	result := []PublicationMaintenance{}
+	type maintenanceEntry struct {
+		item     PublicationMaintenance
+		priority int
+	}
+	entries := []maintenanceEntry{}
 	for rows.Next() {
 		var item PublicationMaintenance
-		var notBefore, appliedAt string
+		var notBefore, appliedAt, reportMode string
 		var ttlNS int64
-		if err := rows.Scan(&item.AttemptIdentity, &item.CheckpointIdentity, &item.GraceIdentity, &item.AttemptPhase, &item.GraceState, &notBefore, &appliedAt, &ttlNS); err != nil {
+		if err := rows.Scan(&item.AttemptIdentity, &item.CheckpointIdentity, &item.GraceIdentity, &item.AttemptPhase, &item.GraceState, &notBefore, &appliedAt, &ttlNS, &reportMode); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		item.NotBefore, err = effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
+		baseDeadline, err := effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
 		if err != nil || !validSHA256Text(item.AttemptIdentity) || !validSHA256Text(item.CheckpointIdentity) || !validSHA256Text(item.GraceIdentity) || publicationPhaseRank(item.AttemptPhase) < publicationPhaseRank("grace") || item.GraceState != "grace" && item.GraceState != "deletion_verified" && item.GraceState != "retained_reported" {
+			rows.Close()
 			return nil, fmt.Errorf("%w: invalid publication maintenance state", ErrConflict)
 		}
-		result = append(result, item)
+		unfinishedConditionalDelete := item.AttemptPhase == "grace" && item.GraceState == "grace" && reportMode == "conditional_delete"
+		unfinishedReportOnly := item.AttemptPhase == "grace" && item.GraceState == "grace" && reportMode == "report_only"
+		if unfinishedConditionalDelete || unfinishedReportOnly {
+			item.NotBefore = baseDeadline
+		} else if causalDeadline, ok := causalDeadlines[item.CheckpointIdentity]; ok {
+			item.NotBefore = causalDeadline
+		} else {
+			item.NotBefore = baseDeadline
+		}
+		priority := 3
+		switch {
+		case item.AttemptPhase == "deletion_verified" || (item.AttemptPhase == "retained_reported" && !includeRetained):
+			priority = 0
+		case unfinishedConditionalDelete:
+			priority = 1
+		case unfinishedReportOnly:
+			priority = 2
+		}
+		entries = append(entries, maintenanceEntry{item: item, priority: priority})
 	}
-	return result, rows.Err()
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].priority != entries[j].priority {
+			return entries[i].priority < entries[j].priority
+		}
+		if !entries[i].item.NotBefore.Equal(entries[j].item.NotBefore) {
+			return entries[i].item.NotBefore.Before(entries[j].item.NotBefore)
+		}
+		seqI, okI := causalOrder[entries[i].item.CheckpointIdentity]
+		seqJ, okJ := causalOrder[entries[j].item.CheckpointIdentity]
+		if okI && okJ && seqI != seqJ {
+			return seqI < seqJ
+		}
+		return entries[i].item.CheckpointIdentity < entries[j].item.CheckpointIdentity
+	})
+	result := make([]PublicationMaintenance, len(entries))
+	for index, entry := range entries {
+		result[index] = entry.item
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (s *Store) GetAppliedCheckpoint(ctx context.Context, checkpointIdentity string) (AppliedCheckpoint, error) {
@@ -529,17 +687,15 @@ func (s *Store) ExactPublicationCandidates(ctx context.Context, checkpointIdenti
 		return nil, err
 	}
 	defer tx.Rollback()
-	var targetIdentity, graceState, attemptPhase, notBefore, appliedAt string
-	var ttlNS int64
-	if err := tx.QueryRowContext(ctx, `SELECT c.target_identity, g.state, a.phase, g.not_before, c.applied_at, b.max_cache_ttl_ns
+	var targetIdentity, graceState, attemptPhase string
+	if err := tx.QueryRowContext(ctx, `SELECT c.target_identity, g.state, a.phase
 	FROM publication_checkpoints AS c
 	JOIN publication_grace_records AS g ON g.target_identity = c.target_identity AND g.checkpoint_identity = c.checkpoint_identity
 	JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
-	JOIN publication_target_bindings AS b ON b.target_identity = c.target_identity
-	WHERE c.checkpoint_identity = ?`, checkpointIdentity).Scan(&targetIdentity, &graceState, &attemptPhase, &notBefore, &appliedAt, &ttlNS); err != nil {
+	WHERE c.checkpoint_identity = ?`, checkpointIdentity).Scan(&targetIdentity, &graceState, &attemptPhase); err != nil {
 		return nil, err
 	}
-	deadline, err := effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
+	deadline, err := effectiveCausalGraceDeadlineTx(ctx, tx, targetIdentity, checkpointIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -609,11 +765,23 @@ func (s *Store) PublicationLiveInventory(ctx context.Context, checkpointIdentity
 		return nil, err
 	}
 	defer tx.Rollback()
+	result, err := publicationLiveInventoryTx(ctx, tx, checkpointIdentity)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func publicationLiveInventoryTx(ctx context.Context, tx *sql.Tx, checkpointIdentity string) ([]PublicationInventoryObject, error) {
 	checkpoint, err := getAppliedCheckpointTx(ctx, tx, checkpointIdentity)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT d.report_identity, d.path
+	rows, err := tx.QueryContext(ctx, `SELECT d.receipt_identity, d.report_identity, d.path, d.phase, d.size, d.sha256,
+ d.remote_identity, d.storage_absent, d.public_absent, d.observed_at, r.checkpoint_identity
 FROM publication_deletion_receipts AS d
 JOIN publication_candidate_reports AS r ON r.report_identity = d.report_identity
 JOIN publication_checkpoints AS c ON c.checkpoint_identity = r.checkpoint_identity
@@ -625,36 +793,99 @@ ORDER BY d.path, d.report_identity`, checkpoint.TargetIdentity)
 	if err != nil {
 		return nil, err
 	}
-	type receiptKey struct{ report, path string }
-	keys := []receiptKey{}
+	type verifiedReceipt struct {
+		receipt    PublicationDeletionReceipt
+		checkpoint string
+	}
+	receipts := []verifiedReceipt{}
 	for rows.Next() {
-		var key receiptKey
-		if err := rows.Scan(&key.report, &key.path); err != nil {
+		var entry verifiedReceipt
+		var storageAbsent, publicAbsent int
+		var observed string
+		if err := rows.Scan(
+			&entry.receipt.ReceiptIdentity, &entry.receipt.ReportIdentity, &entry.receipt.Path,
+			&entry.receipt.Phase, &entry.receipt.Size, &entry.receipt.SHA256, &entry.receipt.RemoteIdentity,
+			&storageAbsent, &publicAbsent, &observed, &entry.checkpoint,
+		); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		keys = append(keys, key)
+		entry.receipt.StorageAbsent, entry.receipt.PublicAbsent = storageAbsent == 1, publicAbsent == 1
+		entry.receipt.ObservedAt, err = time.Parse(time.RFC3339Nano, observed)
+		if err != nil || !entry.receipt.StorageAbsent || !entry.receipt.PublicAbsent || deletionReceiptSemanticIdentity(entry.receipt) != entry.receipt.ReceiptIdentity {
+			rows.Close()
+			return nil, fmt.Errorf("%w: deletion receipt semantic identity is corrupt", ErrConflict)
+		}
+		receipts = append(receipts, entry)
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return nil, err
 	}
-	deleted := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		receipt, found, err := publicationDeletionReceiptByPathTx(ctx, tx, key.report, key.path)
-		if err != nil || !found {
-			return nil, errors.Join(fmt.Errorf("%w: missing terminal deletion receipt", ErrConflict), err)
+	if len(receipts) == 0 {
+		return checkpoint.Inventory, nil
+	}
+	causalOrder, orderedNodes, err := checkpointCausalChainTx(ctx, tx, checkpoint.TargetIdentity)
+	if err != nil {
+		return nil, err
+	}
+	targetSeq, hasTargetSeq := causalOrder[checkpointIdentity]
+	if !hasTargetSeq {
+		return nil, fmt.Errorf("%w: publication checkpoint %s missing from target chain", ErrConflict, checkpointIdentity)
+	}
+	targetEpoch := checkpointCausalEpoch(targetSeq)
+	deletedMaxEpoch := make(map[string]int, len(receipts))
+	deletedPaths := make(map[string]struct{}, len(receipts))
+	for _, entry := range receipts {
+		reportSeq, ok := causalOrder[entry.checkpoint]
+		if !ok {
+			continue
 		}
-		deleted[publicationObjectEvidenceKey(receipt.Path, receipt.Phase, receipt.Size, receipt.SHA256, receipt.RemoteIdentity)] = struct{}{}
+		reportEpoch := checkpointCausalEpoch(reportSeq)
+		if reportEpoch > targetEpoch {
+			continue
+		}
+		deletedPaths[entry.receipt.Path] = struct{}{}
+		evidenceKey := publicationObjectEvidenceKey(entry.receipt.Path, entry.receipt.Phase, entry.receipt.Size, entry.receipt.SHA256, entry.receipt.RemoteIdentity)
+		if prev, exists := deletedMaxEpoch[evidenceKey]; !exists || reportEpoch > prev {
+			deletedMaxEpoch[evidenceKey] = reportEpoch
+		}
+	}
+	matchedPaths := make([]string, 0, len(deletedPaths))
+	for _, object := range checkpoint.Inventory {
+		if _, hasPath := deletedPaths[object.Path]; !hasPath {
+			continue
+		}
+		evidenceKey := publicationObjectEvidenceKey(object.Path, object.Phase, object.Size, object.SHA256, object.RemoteIdentity)
+		if _, hasReceipt := deletedMaxEpoch[evidenceKey]; hasReceipt {
+			matchedPaths = append(matchedPaths, object.Path)
+		}
+	}
+	if len(matchedPaths) == 0 {
+		return checkpoint.Inventory, nil
+	}
+	lastAppearanceEpoch, err := lastObjectAppearanceOrderForPathsTx(ctx, tx, checkpoint.TargetIdentity, causalOrder, orderedNodes, targetEpoch, matchedPaths)
+	if err != nil {
+		return nil, err
 	}
 	result := make([]PublicationInventoryObject, 0, len(checkpoint.Inventory))
 	for _, object := range checkpoint.Inventory {
+		if _, hasPath := deletedPaths[object.Path]; !hasPath {
+			result = append(result, object)
+			continue
+		}
 		key := publicationObjectEvidenceKey(object.Path, object.Phase, object.Size, object.SHA256, object.RemoteIdentity)
-		if _, absent := deleted[key]; !absent {
+		reportEpoch, hasReceipt := deletedMaxEpoch[key]
+		if !hasReceipt {
+			result = append(result, object)
+			continue
+		}
+		lastEpoch := -1
+		if epoch, ok := lastAppearanceEpoch[publicationManifestKey(object.Path, object.Phase, object.Size, object.SHA256)]; ok {
+			lastEpoch = epoch
+		}
+		if reportEpoch <= lastEpoch {
 			result = append(result, object)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
 	}
 	return result, nil
 }

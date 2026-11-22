@@ -17,10 +17,11 @@ import (
 )
 
 const (
-	localGCSchema       = "sow/local-gc/v1"
-	localGCPlanName     = "plan.json"
-	localGCPayloadDir   = "payload"
-	maxLocalGCPlanBytes = 64 << 20
+	localGCSchema          = "sow/local-gc/v1"
+	localGCPlanName        = "plan.json"
+	localGCPayloadDir      = "payload"
+	maxLocalGCPlanBytes    = 64 << 20
+	maxLocalGCBatchObjects = 25000
 )
 
 // LocalGCPublicationRootProvider attests a complete exact root set against one
@@ -81,7 +82,7 @@ type localGCPlan struct {
 	ManifestSHA256     string                 `json:"manifest_sha256"`
 	Entries            []localGCEntry         `json:"entries"`
 	Objects            []state.PackageObject  `json:"objects"`
-	Manifest           []state.GenerationFile `json:"manifest"`
+	Manifest           []state.GenerationFile `json:"manifest,omitempty"`
 	Changes            []state.FileChange     `json:"changes"`
 }
 
@@ -133,6 +134,9 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 		return result, err
 	}
 	if err := cleanupRetainedAddStagesLocked(ctx, ws.Root, repoName, store); err != nil {
+		return result, err
+	}
+	if err := replayRetainedRemovalTombstonesLocked(ctx, ws.Root, repoName, store); err != nil {
 		return result, err
 	}
 	if err := requireLocalGCPrivateRootsSettled(ws.Root, repoName); err != nil {
@@ -199,7 +203,22 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 		if err := requireAttestedMinimumRoots(attestation.Roots, requirement.MinimumRoots); err != nil {
 			return result, err
 		}
-		if err := mergeLocalGCPayloadRoots(protected, attestation.Roots, objectByPath, "publication"); err != nil {
+		minRootByPath := make(map[string]state.GenerationFile, len(requirement.MinimumRoots))
+		for _, root := range requirement.MinimumRoots {
+			minRootByPath[root.Path] = root
+		}
+		attestedRoots := make([]state.GenerationFile, 0, len(attestation.Roots))
+		for _, root := range attestation.Roots {
+			if _, local := objectByPath[root.Path]; !local {
+				if minRoot, isMin := minRootByPath[root.Path]; isMin && minRoot == root {
+					if _, generationRoot := requirement.GenerationRootPaths[root.Path]; !generationRoot {
+						continue
+					}
+				}
+			}
+			attestedRoots = append(attestedRoots, root)
+		}
+		if err := mergeLocalGCPayloadRoots(protected, attestedRoots, objectByPath, "publication"); err != nil {
 			return result, err
 		}
 	}
@@ -217,67 +236,100 @@ func LocalGC(ctx context.Context, opts LocalGCOptions) (result LocalGCResult, re
 	if err != nil {
 		return result, err
 	}
-	plan, planBytes, err := buildLocalGCPlan(repoName, inventory, candidates, baseManifest)
-	if err != nil {
-		return result, err
-	}
-	for _, entry := range plan.Entries {
-		public := filepath.Join(repoName, filepath.FromSlash(entry.Path))
-		ok, err := exactLocalGCFile(ctx, ws.Root, public, entry.Size, entry.SHA256, evidence)
+	currentGeneration := inventory.Generation
+	remaining := candidates
+	for len(remaining) > 0 {
+		chunkSize := min(len(remaining), maxLocalGCBatchObjects)
+		var (
+			plan         localGCPlan
+			planBytes    []byte
+			nextManifest []state.GenerationFile
+			buildErr     error
+		)
+		for {
+			batchInventory := state.LocalGCInventory{
+				RepositoryID: inventory.RepositoryID,
+				Generation:   currentGeneration,
+				Candidates:   remaining[:chunkSize],
+			}
+			plan, planBytes, nextManifest, buildErr = buildLocalGCPlan(repoName, batchInventory, remaining[:chunkSize], baseManifest)
+			if buildErr == nil || !errors.Is(buildErr, ErrRejected) || chunkSize == 1 {
+				break
+			}
+			chunkSize /= 2
+		}
+		if buildErr != nil {
+			return result, buildErr
+		}
+		for _, entry := range plan.Entries {
+			public := filepath.Join(repoName, filepath.FromSlash(entry.Path))
+			ok, err := exactLocalGCFile(ctx, ws.Root, public, entry.Size, entry.SHA256, evidence)
+			if err != nil {
+				return result, err
+			}
+			if !ok {
+				return result, fmt.Errorf("%w: local GC Generation path %q is absent", ErrIntegrity, entry.Path)
+			}
+		}
+		payload := localGCOperationPayload{
+			Schema: localGCSchema, Repository: repoName, RepositoryID: inventory.RepositoryID, OperationID: plan.OperationID,
+			Base: plan.BaseGeneration, Generation: plan.Generation, PlanSHA256: bytesSHA(planBytes),
+		}
+		payloadBytes, err := json.Marshal(payload)
 		if err != nil {
 			return result, err
 		}
-		if !ok {
-			return result, fmt.Errorf("%w: local GC Generation path %q is absent", ErrIntegrity, entry.Path)
+		if err := store.BeginOperation(ctx, state.Operation{ID: plan.OperationID, Kind: "local.gc", State: state.OperationPlanned, PayloadJSON: string(payloadBytes)}); err != nil || ctx.Err() != nil {
+			return result, errors.Join(err, ctx.Err())
 		}
+		recoveryRoot := localGCRecoveryRoot(ws.Root, repoName, plan.OperationID)
+		if err := durableMkdir(recoveryRoot, 0o700); err != nil {
+			return result, err
+		}
+		if err := writeRootedNewRegular(recoveryRoot, localGCPlanName, planBytes, 0o600); err != nil {
+			return result, err
+		}
+		if err := callFault(opts.Fault, "gc.planned"); err != nil {
+			return result, err
+		}
+		if err := store.SetOperationState(ctx, plan.OperationID, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
+			return result, errors.Join(err, ctx.Err())
+		}
+		committed, err := applyLocalGCPlan(ctx, ws.Root, repoName, store, plan, opts.Fault, evidence)
+		if committed {
+			batchResult := localGCResult(plan)
+			result.Operation = batchResult.Operation
+			result.Generation = batchResult.Generation
+			result.Objects += batchResult.Objects
+			result.Bytes += batchResult.Bytes
+			result.Noop = false
+		}
+		if err != nil {
+			return result, err
+		}
+		currentGeneration = plan.Generation
+		baseManifest = nextManifest
+		remaining = remaining[chunkSize:]
 	}
-	payload := localGCOperationPayload{
-		Schema: localGCSchema, Repository: repoName, RepositoryID: inventory.RepositoryID, OperationID: plan.OperationID,
-		Base: plan.BaseGeneration, Generation: plan.Generation, PlanSHA256: bytesSHA(planBytes),
-	}
-	payloadBytes, err := json.Marshal(payload)
-	if err != nil {
-		return result, err
-	}
-	if err := store.BeginOperation(ctx, state.Operation{ID: plan.OperationID, Kind: "local.gc", State: state.OperationPlanned, PayloadJSON: string(payloadBytes)}); err != nil || ctx.Err() != nil {
-		return result, errors.Join(err, ctx.Err())
-	}
-	recoveryRoot := localGCRecoveryRoot(ws.Root, repoName, plan.OperationID)
-	if err := durableMkdir(recoveryRoot, 0o700); err != nil {
-		return result, err
-	}
-	if err := writeRootedNewRegular(recoveryRoot, localGCPlanName, planBytes, 0o600); err != nil {
-		return result, err
-	}
-	if err := callFault(opts.Fault, "gc.planned"); err != nil {
-		return result, err
-	}
-	if err := store.SetOperationState(ctx, plan.OperationID, state.OperationStaged, ""); err != nil || ctx.Err() != nil {
-		return result, errors.Join(err, ctx.Err())
-	}
-	committed, err := applyLocalGCPlan(ctx, ws.Root, repoName, store, plan, opts.Fault, evidence)
-	if committed {
-		result = localGCResult(plan)
-	}
-	return result, err
+	return result, nil
 }
 
-func buildLocalGCPlan(repoName string, inventory state.LocalGCInventory, candidates []state.PackageObject, base []state.GenerationFile) (localGCPlan, []byte, error) {
+func buildLocalGCPlan(repoName string, inventory state.LocalGCInventory, candidates []state.PackageObject, base []state.GenerationFile) (localGCPlan, []byte, []state.GenerationFile, error) {
 	id, err := operationID()
 	if err != nil {
-		return localGCPlan{}, nil, err
+		return localGCPlan{}, nil, nil, err
 	}
 	next, err := inventory.Generation.Next()
 	if err != nil {
-		return localGCPlan{}, nil, err
+		return localGCPlan{}, nil, nil, err
 	}
 	baseBytes, baseSHA, err := state.ManifestBytes(base)
 	if err != nil || len(baseBytes) == 0 {
-		return localGCPlan{}, nil, errors.Join(errors.New("local GC has no canonical base manifest"), err)
+		return localGCPlan{}, nil, nil, errors.Join(errors.New("local GC has no canonical base manifest"), err)
 	}
 	target, removals, err := state.SubtractLocalGCObjects(base, candidates)
 	if err != nil {
-		return localGCPlan{}, nil, fmt.Errorf("%w: %v", ErrIntegrity, err)
+		return localGCPlan{}, nil, nil, fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
 	entries := make([]localGCEntry, 0, len(removals))
 	objects := make([]state.PackageObject, 0, len(removals))
@@ -291,18 +343,18 @@ func buildLocalGCPlan(repoName string, inventory state.LocalGCInventory, candida
 	}
 	_, targetSHA, err := state.ManifestBytes(target)
 	if err != nil {
-		return localGCPlan{}, nil, err
+		return localGCPlan{}, nil, nil, err
 	}
 	plan := localGCPlan{
 		Schema: localGCSchema, Repository: repoName, RepositoryID: inventory.RepositoryID, OperationID: id,
 		BaseGeneration: inventory.Generation, Generation: next, BaseManifestSHA256: baseSHA, ManifestSHA256: targetSHA,
-		Entries: entries, Objects: objects, Manifest: target, Changes: state.DiffManifests(base, target),
+		Entries: entries, Objects: objects, Changes: state.DiffManifests(base, target),
 	}
 	planBytes, err := json.Marshal(plan)
 	if err != nil || len(planBytes) > maxLocalGCPlanBytes {
-		return localGCPlan{}, nil, errors.Join(fmt.Errorf("%w: local GC plan exceeds its bound", ErrRejected), err)
+		return localGCPlan{}, nil, nil, errors.Join(fmt.Errorf("%w: local GC plan exceeds its bound", ErrRejected), err)
 	}
-	return plan, planBytes, nil
+	return plan, planBytes, target, nil
 }
 
 func parseLocalGCPlan(data []byte) (localGCPlan, error) {
@@ -343,9 +395,11 @@ func validateLocalGCPlan(plan localGCPlan) error {
 	if err != nil || plan.Generation != next {
 		return errors.New("invalid local GC plan Generation sequence")
 	}
-	_, targetSHA, err := state.ManifestBytes(plan.Manifest)
-	if err != nil || targetSHA != plan.ManifestSHA256 {
-		return errors.Join(errors.New("local GC target manifest differs from plan"), err)
+	if len(plan.Manifest) != 0 {
+		_, targetSHA, err := state.ManifestBytes(plan.Manifest)
+		if err != nil || targetSHA != plan.ManifestSHA256 {
+			return errors.Join(errors.New("local GC target manifest differs from plan"), err)
+		}
 	}
 	entryPaths := make(map[string]struct{}, len(plan.Entries))
 	for index, entry := range plan.Entries {
@@ -413,9 +467,29 @@ func applyLocalGCPlan(ctx context.Context, root, repoName string, store *state.S
 	if err := callFault(fault, "gc.applied"); err != nil {
 		return false, err
 	}
+	targetManifest := plan.Manifest
+	if len(targetManifest) == 0 && operation.Operation.State != state.OperationDone {
+		baseManifest, baseErr := store.GenerationManifest(ctx, plan.BaseGeneration)
+		if baseErr != nil {
+			return false, baseErr
+		}
+		_, baseSHA, shaErr := state.ManifestBytes(baseManifest)
+		if shaErr != nil || baseSHA != plan.BaseManifestSHA256 {
+			return false, errors.Join(fmt.Errorf("%w: local GC base manifest differs from plan", ErrIntegrity), shaErr)
+		}
+		subtracted, _, subErr := state.SubtractLocalGCObjects(baseManifest, plan.Objects)
+		if subErr != nil {
+			return false, fmt.Errorf("%w: %v", ErrIntegrity, subErr)
+		}
+		_, targetSHA, targetSHAErr := state.ManifestBytes(subtracted)
+		if targetSHAErr != nil || targetSHA != plan.ManifestSHA256 {
+			return false, errors.Join(fmt.Errorf("%w: local GC target manifest differs from plan", ErrIntegrity), targetSHAErr)
+		}
+		targetManifest = subtracted
+	}
 	finalizeErr := store.FinalizeLocalGC(ctx, state.FinalizeLocalGCInput{
 		OperationID: plan.OperationID, RepositoryID: plan.RepositoryID, BaseGeneration: plan.BaseGeneration,
-		Generation: plan.Generation, Objects: plan.Objects, Manifest: plan.Manifest, Changes: plan.Changes,
+		Generation: plan.Generation, Objects: plan.Objects, Manifest: targetManifest, Changes: plan.Changes,
 	})
 	if !stateTransactionCommitted(finalizeErr) {
 		return false, finalizeErr

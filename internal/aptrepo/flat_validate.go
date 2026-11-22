@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"pault.ag/go/debian/control"
+	"pault.ag/go/debian/version"
 )
 
 // ValidateFlatPackages also reauthenticates every package source.
@@ -90,8 +91,9 @@ func validateFlatPackages(ctx context.Context, packagesPath, gzipPath string, ex
 		base := filepath.Base(pkg.SourcePath)
 		wantFilename := "./" + base
 		values := paragraph.Values
-		if values["Package"] != pkg.Name || values["Version"] != pkg.Version || values["Architecture"] != pkg.Architecture ||
-			values["Filename"] != wantFilename || values["Size"] != strconv.FormatInt(pkg.Size, 10) || values["SHA256"] != pkg.SHA256 {
+		parsedVersion, versionErr := version.Parse(values["Version"])
+		if values["Package"] != pkg.Name || versionErr != nil || version.Compare(parsedVersion, pkg.debianVersion) != 0 || parsedVersion.String() != pkg.Version ||
+			values["Architecture"] != pkg.Architecture || values["Filename"] != wantFilename || values["Size"] != strconv.FormatInt(pkg.Size, 10) || values["SHA256"] != pkg.SHA256 {
 			_ = index.Close()
 			return fmt.Errorf("aptrepo: staged Packages entry %d does not match %s", position, base)
 		}

@@ -1,12 +1,15 @@
 package managed
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -846,5 +849,220 @@ func TestGenerationZeroRequiresEmptyPublicDeliveryTree(t *testing.T) {
 	}
 	if changes, err := Changes(ctx, ChangesOptions{WorkspaceOptions: options, Repository: "repo", Base: &zero}); !errors.Is(err, ErrIntegrity) || len(changes.Changes) != 0 {
 		t.Fatalf("tampered Generation 0 changes=%#v err=%v", changes, err)
+	}
+}
+
+func TestLegacySubpackageWithDifferentSRPMVersionUpgradesCleanly(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	targetDir := filepath.Join(t.TempDir(), "published")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	physicalTarget := realPathForManagedTest(t, targetDir)
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+
+	cfg := config.Default()
+	cfg.Architectures = []string{"x86_64"}
+	cfg.Repositories["repo"] = config.RepositoryConfig{
+		Dists: map[string]config.DistConfig{"el9": {Format: "rpm", Architectures: []string{"x86_64"}}},
+	}
+	cfg.Targets = map[string]config.TargetConfig{"local": {
+		Repository: "repo", Provider: "filesystem",
+		Endpoint: "file://" + physicalTarget, PublicEndpoint: "file://" + physicalTarget + "/",
+		MaxCacheTTL: "0s", AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+
+	inputs := filepath.Join(root, "inputs")
+	if err := os.MkdirAll(inputs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	subpkg1 := filepath.Join(inputs, "subpkg-2.0-1.el9.x86_64.rpm")
+	writeSyntheticSubpackageRPM(t, subpkg1, "subpkg", "2.0", "1.el9", "parent-1.0-1.el9.src.rpm")
+	added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{subpkg1}, Jobs: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewrite the admitted subpackage into the exact v0.7.1 persisted layout:
+	// Source="parent-1.0-1.el9", PoolPath="pool/p/parent-1.0-1.el9/subpkg-2.0-1.el9.x86_64.rpm",
+	// then rebuild repodata so XML <location href="..."/> matches v0.7.1 output.
+	newRel := "pool/p/parent/subpkg-2.0-1.el9.x86_64.rpm"
+	legacyRel := "pool/p/parent-1.0-1.el9/subpkg-2.0-1.el9.x86_64.rpm"
+	legacyAbs := filepath.Join(root, "repo", filepath.FromSlash(legacyRel))
+	if err := os.MkdirAll(filepath.Dir(legacyAbs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(root, "repo", filepath.FromSlash(newRel)), legacyAbs); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "repo", "pool", "p", "parent")); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE package_objects SET source = ?, pool_path = ? WHERE filename = ?`, "parent-1.0-1.el9", legacyRel, "subpkg-2.0-1.el9.x86_64.rpm"); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE generation_files SET path = ? WHERE generation = ? AND path = ?`, legacyRel, added.Generation, newRel); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE operation_files SET path = ? WHERE operation_id = ? AND path = ?`, legacyRel, added.Operation, newRel); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	updatedManifest, err := store.GenerationManifest(ctx, added.Generation)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	_, updatedSHA, err := state.ManifestBytes(updatedManifest)
+	if err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE generations SET manifest_sha256 = ? WHERE generation = ?`, updatedSHA, added.Generation); err != nil {
+		_ = store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg.Repositories["repo"] = config.RepositoryConfig{
+		Dists: map[string]config.DistConfig{"el9": {Format: "rpm", Architectures: []string{"x86_64"}, Limit: 5}},
+	}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1}); err != nil {
+		t.Fatalf("Build on legacy v0.7.1 subpackage layout failed: %v", err)
+	}
+
+	// 1. Check with cached package_facts.
+	checked, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})
+	if err != nil || !checked.ReadyToCopy {
+		t.Fatalf("Check with cached package_facts failed on v0.7.1 subpackage: checked=%#v err=%v", checked, err)
+	}
+
+	// 2. Check without cached package_facts (forces inspectKnownPackageFacts).
+	store, err = state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, delErr := store.DB().ExecContext(ctx, `DELETE FROM package_facts`)
+	if err := errors.Join(delErr, store.Close()); err != nil {
+		t.Fatal(err)
+	}
+	checkedUncached, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})
+	if err != nil || !checkedUncached.ReadyToCopy {
+		t.Fatalf("Check without cached package_facts failed on v0.7.1 subpackage: checked=%#v err=%v", checkedUncached, err)
+	}
+
+	// 3. Add a new subpackage from the same SRPM: new object uses canonical Source="parent",
+	// while existing object stays at legacy PoolPath.
+	subpkg2 := filepath.Join(inputs, "subpkg-devel-2.0-1.el9.x86_64.rpm")
+	writeSyntheticSubpackageRPM(t, subpkg2, "subpkg-devel", "2.0", "1.el9", "parent-1.0-1.el9.src.rpm")
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{subpkg2}, Jobs: 1}); err != nil {
+		t.Fatalf("Add sibling subpackage into upgraded repo failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "repo", "pool", "p", "parent", "subpkg-devel-2.0-1.el9.x86_64.rpm")); err != nil {
+		t.Fatalf("new subpackage did not use canonical source directory: %v", err)
+	}
+	if _, err := os.Stat(legacyAbs); err != nil {
+		t.Fatalf("legacy subpackage pool file moved or disappeared: %v", err)
+	}
+
+	// 4. Check, Publish, and ExportRPMLeaf all succeed.
+	if afterAddCheck, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1}); err != nil || !afterAddCheck.ReadyToCopy {
+		t.Fatalf("Check after adding sibling subpackage=%#v err=%v", afterAddCheck, err)
+	}
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: options, Target: "local"}); err != nil {
+		t.Fatalf("Publish upgraded subpackage repo failed: %v", err)
+	}
+	leafOut := filepath.Join(t.TempDir(), "leaf")
+	if _, err := ExportRPMLeaf(ctx, RPMLeafExportOptions{WorkspaceOptions: options, Repository: "repo", Dist: "el9", Arch: "x86_64", Directory: leafOut}); err != nil {
+		t.Fatalf("ExportRPMLeaf upgraded subpackage repo failed: %v", err)
+	}
+}
+
+func writeSyntheticSubpackageRPM(t *testing.T, filename, name, version, release, sourceRPM string) {
+	t.Helper()
+	type rpmTag struct {
+		id, typ, count uint32
+		data           []byte
+	}
+	strTag := func(id uint32, val string) rpmTag {
+		return rpmTag{id: id, typ: 6, count: 1, data: append([]byte(val), 0)}
+	}
+	strArrTag := func(id uint32, vals ...string) rpmTag {
+		var buf bytes.Buffer
+		for _, v := range vals {
+			buf.WriteString(v)
+			buf.WriteByte(0)
+		}
+		return rpmTag{id: id, typ: 8, count: uint32(len(vals)), data: buf.Bytes()}
+	}
+	int32Tag := func(id uint32, vals ...uint32) rpmTag {
+		buf := make([]byte, 4*len(vals))
+		for i, v := range vals {
+			binary.BigEndian.PutUint32(buf[i*4:], v)
+		}
+		return rpmTag{id: id, typ: 4, count: uint32(len(vals)), data: buf}
+	}
+	int16Tag := func(id uint32, vals ...uint16) rpmTag {
+		buf := make([]byte, 2*len(vals))
+		for i, v := range vals {
+			binary.BigEndian.PutUint16(buf[i*2:], v)
+		}
+		return rpmTag{id: id, typ: 3, count: uint32(len(vals)), data: buf}
+	}
+	tags := []rpmTag{
+		strTag(1000, name), strTag(1001, version), strTag(1002, release), int32Tag(1003, 0),
+		strArrTag(1004, "subpackage summary"), strArrTag(1005, "subpackage description"),
+		int32Tag(1006, 1_700_000_000), strTag(1007, "builder.example.invalid"), int32Tag(1009, 128),
+		strTag(1011, "Pigsty"), strTag(1014, "Apache-2.0"), strTag(1015, "SOW Test"),
+		strArrTag(1016, "System Environment/Base"), strTag(1020, "https://example.invalid"),
+		strTag(1022, "x86_64"), int16Tag(1030, 0o100644), int32Tag(1037, 1), strTag(1044, sourceRPM),
+		strArrTag(1047, name), int32Tag(1112, 1<<3), strArrTag(1113, "0:"+version+"-"+release),
+		int32Tag(1048, (1<<2)|(1<<3)), strArrTag(1049, "bash"), strArrTag(1050, "0:4.0-1"),
+		int32Tag(1080, 1_700_000_000), strArrTag(1081, "SOW Test"), strArrTag(1082, "initial"),
+		int32Tag(1116, 0), strArrTag(1117, name+".conf"), strArrTag(1118, "/etc/"),
+	}
+	sort.Slice(tags, func(i, j int) bool { return tags[i].id < tags[j].id })
+	var store bytes.Buffer
+	indexes := make([]byte, 16*len(tags))
+	for i, tag := range tags {
+		if tag.typ == 3 && store.Len()%2 != 0 {
+			store.WriteByte(0)
+		} else if tag.typ == 4 && store.Len()%4 != 0 {
+			store.Write(make([]byte, 4-store.Len()%4))
+		}
+		offset := uint32(store.Len())
+		binary.BigEndian.PutUint32(indexes[i*16:], tag.id)
+		binary.BigEndian.PutUint32(indexes[i*16+4:], tag.typ)
+		binary.BigEndian.PutUint32(indexes[i*16+8:], offset)
+		binary.BigEndian.PutUint32(indexes[i*16+12:], tag.count)
+		store.Write(tag.data)
+	}
+	lead := make([]byte, 96)
+	copy(lead, []byte{0xed, 0xab, 0xee, 0xdb, 3, 0})
+	copy(lead[10:76], name+"-"+version+"-"+release)
+	binary.BigEndian.PutUint16(lead[78:80], 5)
+	sigHeader := make([]byte, 16)
+	copy(sigHeader, []byte{0x8e, 0xad, 0xe8, 1})
+	hdr := make([]byte, 16)
+	copy(hdr, []byte{0x8e, 0xad, 0xe8, 1})
+	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(tags)))
+	binary.BigEndian.PutUint32(hdr[12:16], uint32(store.Len()))
+	payload := []byte("payload-" + name + "-" + version + "-" + release)
+	if err := os.WriteFile(filename, bytes.Join([][]byte{lead, sigHeader, hdr, indexes, store.Bytes(), payload}, nil), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -47,6 +47,9 @@ type phaseContextKey struct{}
 
 // Ensure installs a collector unless the context already carries one.
 func Ensure(ctx context.Context) (context.Context, *Collector) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if collector := FromContext(ctx); collector != nil {
 		return ctx, collector
 	}

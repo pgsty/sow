@@ -241,6 +241,44 @@ func TestManagedPackageLocationRequiresPortableLowercaseShard(t *testing.T) {
 	}
 }
 
+func TestManagedFactsSanitizeLegacyDisplayStringsAndNormalizeSourceAndEVR(t *testing.T) {
+	if got := sourceNameFromRPM("perl-5.32.1-480.el9.src.rpm", "perl-ExtUtils-MakeMaker", "7.62", "480.el9"); got != "perl" {
+		t.Fatalf("sourceNameFromRPM subpackage override = %q, want perl", got)
+	}
+	if epoch, ver, rel := splitEVR(":1.2.3-4"); epoch != "0" || ver != "1.2.3" || rel != "4" {
+		t.Fatalf("splitEVR(:1.2.3-4) = (%q,%q,%q), want (0,1.2.3,4)", epoch, ver, rel)
+	}
+	if epoch, ver, rel := splitEVR("00:1.2.3-4"); epoch != "0" || ver != "1.2.3" || rel != "4" {
+		t.Fatalf("splitEVR(00:1.2.3-4) = (%q,%q,%q), want (0,1.2.3,4)", epoch, ver, rel)
+	}
+	dedup := normalizeRPMRequires([]dependency{
+		{Name: "alpha", Flags: "GE", Epoch: "0", Version: "1.0"},
+		{Name: "beta"},
+		{Name: "alpha", Flags: "GE", Epoch: "0", Version: "1.0"},
+	}, nil, nil)
+	if len(dedup) != 2 || dedup[0].Name != "alpha" || dedup[1].Name != "beta" {
+		t.Fatalf("non-adjacent duplicate requires not deduplicated: %+v", dedup)
+	}
+
+	rpmPath := filepath.Join(t.TempDir(), "legacy-latin1-1.2.3-4.x86_64.rpm")
+	writeRPMFixture(t, rpmPath, "legacy-latin1",
+		stringTag(tagDescription, "formfeed\fand latin1 \xe9"),
+		stringTag(tagChangelogName, "Author \xf6 <a@example.invalid>"),
+		intTag(tagChangelogTime, 1_700_000_000),
+		stringTag(tagChangelogText, "- note\fwith control"),
+	)
+	facts, info, err := InspectManagedPackageFacts(context.Background(), PackageInput{Path: rpmPath})
+	if err != nil {
+		t.Fatalf("InspectManagedPackageFacts rejected legacy display text: %v", err)
+	}
+	if info.Name != "legacy-latin1" {
+		t.Fatalf("info.Name = %q", info.Name)
+	}
+	if _, err := facts.MarshalBinary(); err != nil {
+		t.Fatalf("facts.MarshalBinary: %v", err)
+	}
+}
+
 func TestWeakDependencyTagAlignmentRejected(t *testing.T) {
 	rpmPath := filepath.Join(t.TempDir(), "misaligned-1.2.3-4.x86_64.rpm")
 	writeRPMFixture(t, rpmPath, "misaligned",

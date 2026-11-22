@@ -41,8 +41,10 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 		fingerprintByDigest[fingerprint.PackageSHA256] = fingerprint
 	}
 	objectByPath := make(map[string]state.PackageObject, len(objects))
+	objectByLowerPath := make(map[string]state.PackageObject, len(objects))
 	for _, object := range objects {
 		objectByPath[object.PoolPath] = object
+		objectByLowerPath[strings.ToLower(object.PoolPath)] = object
 	}
 	expected := make(map[string]state.GenerationFile, len(retained))
 	payloads := make(map[string]publicPayloadExpectation)
@@ -55,6 +57,9 @@ func scanCurrentPublicGenerationFast(ctx context.Context, repositoryRoot string,
 			continue
 		}
 		object, exists := objectByPath[file.Path]
+		if !exists {
+			object, exists = objectByLowerPath[strings.ToLower(file.Path)]
+		}
 		if !exists || object.SHA256 != file.SHA256 || object.Size != file.Size {
 			return nil, nil, fmt.Errorf("%w: retained payload %s differs from PackageObject", ErrIntegrity, file.Path)
 		}

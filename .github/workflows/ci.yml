@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Normal CI remains secret-free. Live service compatibility tests that require
 # external credentials live in integration.yml; quality gates may download
@@ -24,7 +24,7 @@ jobs:
   quality:
     name: Format, Vet, Staticcheck
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -39,7 +39,10 @@ jobs:
         run: make fmt-check tidy-check notices-check
 
       - name: Vet
-        run: go vet ./...
+        run: |
+          make vet
+          GOOS=darwin GOARCH=amd64 go vet ./...
+          GOOS=darwin GOARCH=arm64 go vet ./...
 
       - name: Staticcheck
         run: |
@@ -62,7 +65,7 @@ jobs:
         run: make verify-rpm-upstream
 
       - name: Compile performance contracts and verify fixtures
-        run: make test-perf-contract
+        run: make test-perf-contract test-perf
 
       - name: Check GoReleaser configuration
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
@@ -89,6 +92,23 @@ jobs:
 
       - name: Test patched RPM parser module
         run: (cd third_party/cavaliergopher-rpm && go test -count=1 ./...)
+
+  test-macos:
+    name: Core Contract Tests (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Test core repository packages and patched RPM parser on Darwin
+        run: make CORE_TEST_TIMEOUT=35m test-core test-rpm
 
   race:
     name: Core Race Tests

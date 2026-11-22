@@ -40,6 +40,7 @@ type r2PublicationObjectClient interface {
 	Head(context.Context, string) (r2.ObjectInfo, error)
 	OpenObject(context.Context, string) (r2.ObjectContent, error)
 	Put(context.Context, string, r2.ReadSeekReaderAt, int64, string, r2.PutCondition) (string, error)
+	Delete(context.Context, string) error
 }
 
 type managedContextReadSeekAt struct {
@@ -78,6 +79,54 @@ type r2PublicationBackend struct {
 	publicReadIdleTimeout time.Duration
 	verificationSleep     func(context.Context, time.Duration) error
 	verificationNow       func() time.Time
+	allowDelete           bool
+	knownMu               sync.RWMutex
+	knownImmutable        map[string]state.PublicationInventoryObject
+}
+
+func (b *r2PublicationBackend) setKnownInventory(sets ...[]state.PublicationInventoryObject) {
+	known := map[string]state.PublicationInventoryObject{}
+	for _, set := range sets {
+		for _, object := range set {
+			if object.RemoteIdentity == "" || !lowercaseSHA256.MatchString(object.SHA256) || object.Size < 0 {
+				continue
+			}
+			if mutableR2PublicationPath(state.PublicationPlanOperation{Path: object.Path, Phase: object.Phase}) {
+				continue
+			}
+			known[object.Path] = object
+		}
+	}
+	b.knownMu.Lock()
+	b.knownImmutable = known
+	b.knownMu.Unlock()
+}
+
+func (b *r2PublicationBackend) lookupKnownImmutable(relative string) (state.PublicationInventoryObject, bool) {
+	b.knownMu.RLock()
+	defer b.knownMu.RUnlock()
+	if b.knownImmutable == nil {
+		return state.PublicationInventoryObject{}, false
+	}
+	object, ok := b.knownImmutable[relative]
+	return object, ok
+}
+
+func (b *r2PublicationBackend) recordKnownImmutable(object state.PublicationInventoryObject) {
+	b.knownMu.Lock()
+	defer b.knownMu.Unlock()
+	if b.knownImmutable == nil {
+		return
+	}
+	b.knownImmutable[object.Path] = object
+}
+
+func (b *r2PublicationBackend) deleteKnownImmutable(relative string) {
+	b.knownMu.Lock()
+	defer b.knownMu.Unlock()
+	if b.knownImmutable != nil {
+		delete(b.knownImmutable, relative)
+	}
 }
 
 func newR2PublicationBackend(target config.TargetConfig) (*r2PublicationBackend, error) {
@@ -295,10 +344,16 @@ func (b *r2PublicationBackend) headInventoryObject(ctx context.Context, listed r
 	if err != nil {
 		return publicationRemoteObject{}, err
 	}
-	var info r2.ObjectInfo
-	if err = ctx.Err(); err == nil {
-		info, err = b.objects.Head(ctx, listed.Key)
+	if err := ctx.Err(); err != nil {
+		return publicationRemoteObject{}, errors.Join(fmt.Errorf("%w: R2 listed object %q lacks exact HEAD evidence", ErrIntegrity, relative), err)
 	}
+	phase := publicFilePhase(relative)
+	if phase != "" && !mutableR2PublicationPath(state.PublicationPlanOperation{Path: relative, Phase: phase}) {
+		if known, ok := b.lookupKnownImmutable(relative); ok && listed.Size == known.Size && listed.ETag != "" && listed.ETag == known.RemoteIdentity && lowercaseSHA256.MatchString(known.SHA256) {
+			return publicationRemoteObject{Path: relative, Size: listed.Size, SHA256: known.SHA256, RemoteIdentity: listed.ETag}, nil
+		}
+	}
+	info, err := b.objects.Head(ctx, listed.Key)
 	if err != nil || !info.Exists || info.Size != listed.Size || info.ETag == "" || info.ETag != listed.ETag || !lowercaseSHA256.MatchString(info.SHA256) {
 		return publicationRemoteObject{}, errors.Join(fmt.Errorf("%w: R2 listed object %q lacks exact HEAD evidence", ErrIntegrity, relative), err)
 	}
@@ -374,6 +429,12 @@ func (b *r2PublicationBackend) Put(ctx context.Context, sourceRoot string, opera
 	if err != nil || !ok || installed.Size != operation.Size || installed.SHA256 != operation.SHA256 || installed.RemoteIdentity != etag {
 		return "", errors.Join(fmt.Errorf("%w: R2 write did not install exact object %q", ErrIntegrity, operation.Path), err)
 	}
+	if !mutableR2PublicationPath(operation) {
+		b.recordKnownImmutable(state.PublicationInventoryObject{
+			Path: operation.Path, Phase: operation.Phase, Size: operation.Size,
+			SHA256: operation.SHA256, RemoteIdentity: installed.RemoteIdentity,
+		})
+	}
 	return installed.RemoteIdentity, nil
 }
 
@@ -393,10 +454,43 @@ func (b *r2PublicationBackend) VerifyPublic(ctx context.Context, expected state.
 	}).Verify(ctx, expected)
 }
 
-func (b *r2PublicationBackend) DeleteConditional(context.Context, state.PublicationCandidate) error {
-	return fmt.Errorf("%w: R2 physical deletion is disabled", ErrRejected)
+func (b *r2PublicationBackend) DeleteConditional(ctx context.Context, candidate state.PublicationCandidate) error {
+	if !b.allowDelete {
+		return fmt.Errorf("%w: R2 physical deletion is disabled", ErrRejected)
+	}
+	if candidate.Phase != "payload" && candidate.Phase != "metadata" || candidate.Size < 0 || !lowercaseSHA256.MatchString(candidate.SHA256) || candidate.RemoteIdentity == "" {
+		return fmt.Errorf("%w: invalid R2 conditional delete candidate", ErrRejected)
+	}
+	key, err := b.objectKey(candidate.Path)
+	if err != nil {
+		return err
+	}
+	current, exists, err := b.Head(ctx, candidate.Path)
+	if err != nil {
+		return err
+	}
+	if exists {
+		if current.Size != candidate.Size || current.SHA256 != candidate.SHA256 || current.RemoteIdentity != candidate.RemoteIdentity {
+			return fmt.Errorf("%w: R2 conditional delete candidate %q changed remotely", ErrIntegrity, candidate.Path)
+		}
+		if err := b.objects.Delete(ctx, key); err != nil {
+			return err
+		}
+		if _, stillExists, err := b.Head(ctx, candidate.Path); err != nil || stillExists {
+			return errors.Join(fmt.Errorf("%w: R2 object %q remained present after delete", ErrIntegrity, candidate.Path), err)
+		}
+	}
+	b.deleteKnownImmutable(candidate.Path)
+	return nil
 }
 
-func (b *r2PublicationBackend) VerifyPublicAbsent(context.Context, string) error {
-	return fmt.Errorf("%w: R2 physical deletion is disabled", ErrRejected)
+func (b *r2PublicationBackend) VerifyPublicAbsent(ctx context.Context, objectPath string) error {
+	if !b.allowDelete {
+		return fmt.Errorf("%w: R2 physical deletion is disabled", ErrRejected)
+	}
+	return (httpPublicationVerifier{
+		client: b.publicClient, base: b.publicBase, maxCacheTTL: b.maxCacheTTL,
+		transientRetryWindow: b.transientRetryWindow, readIdleTimeout: b.publicReadIdleTimeout,
+		sleep: b.verificationSleep, now: b.verificationNow,
+	}).VerifyAbsent(ctx, objectPath)
 }

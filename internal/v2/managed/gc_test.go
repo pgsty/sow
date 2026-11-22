@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -42,7 +43,7 @@ func TestBuildLocalGCPlanRecordsCaseFoldedGenerationPath(t *testing.T) {
 	}
 	actual := state.GenerationFile{Path: "pool/p/pgFormatter/package.deb", Phase: "payload", Size: object.Size, SHA256: object.SHA256}
 	inventory := state.LocalGCInventory{RepositoryID: "12345678-1234-4123-8123-123456789abc", Generation: 11, Candidates: []state.PackageObject{object}}
-	plan, data, err := buildLocalGCPlan("repo", inventory, inventory.Candidates, []state.GenerationFile{actual})
+	plan, data, _, err := buildLocalGCPlan("repo", inventory, inventory.Candidates, []state.GenerationFile{actual})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +64,7 @@ func TestParseLocalGCPlanRejectsUnrelatedObjectPath(t *testing.T) {
 	}
 	actual := state.GenerationFile{Path: "pool/p/pgFormatter/package.deb", Phase: "payload", Size: object.Size, SHA256: object.SHA256}
 	inventory := state.LocalGCInventory{RepositoryID: "12345678-1234-4123-8123-123456789abc", Generation: 11, Candidates: []state.PackageObject{object}}
-	plan, _, err := buildLocalGCPlan("repo", inventory, inventory.Candidates, []state.GenerationFile{actual})
+	plan, _, _, err := buildLocalGCPlan("repo", inventory, inventory.Candidates, []state.GenerationFile{actual})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -631,5 +632,104 @@ func TestLocalGCIgnoresRemoteOnlyInventoryRoots(t *testing.T) {
 		}
 		now = now.Add(31 * 24 * time.Hour)
 		targetGC()
+	}
+}
+
+func TestLocalGCAndCheckHandleInterruptedExchangeProbeDirectory(t *testing.T) {
+	ctx := context.Background()
+	fixture := newLocalGCFixture(t, false)
+	stageDir := filepath.Join(fixture.root, ".sow", "repo", "stage")
+	emptyProbe := filepath.Join(stageDir, ".sow-exchange-probe-a-leftover")
+	if err := os.MkdirAll(emptyProbe, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	checked, checkErr := Check(ctx, CheckOptions{WorkspaceOptions: fixture.options, Repository: "repo", Jobs: 1})
+	if checkErr == nil || checked.ReadyToCopy {
+		t.Fatalf("Check ignored leftover exchange probe directory: checked=%#v err=%v", checked, checkErr)
+	}
+
+	nonEmptyProbe := filepath.Join(stageDir, ".sow-exchange-probe-b-nonempty")
+	if err := os.MkdirAll(nonEmptyProbe, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nonEmptyProbe, "foreign"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); !errors.Is(err, ErrIntegrity) {
+		t.Fatalf("non-empty probe directory was not rejected fail-closed: %v", err)
+	}
+	if err := os.RemoveAll(nonEmptyProbe); err != nil {
+		t.Fatal(err)
+	}
+
+	collected, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"})
+	if err != nil || collected.Objects != 1 {
+		t.Fatalf("LocalGC after empty exchange probe leftover=%#v err=%v", collected, err)
+	}
+	if _, err := os.Lstat(emptyProbe); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty exchange probe directory remained after LocalGC recovery: %v", err)
+	}
+	afterCheck, err := Check(ctx, CheckOptions{WorkspaceOptions: fixture.options, Repository: "repo", Jobs: 1})
+	if err != nil || !afterCheck.ReadyToCopy {
+		t.Fatalf("Check after LocalGC probe cleanup=%#v err=%v", afterCheck, err)
+	}
+}
+
+func TestLocalGCBatches100kUnreachableCandidatesBelowPlanCap(t *testing.T) {
+	const count = 100_000
+	candidates := make([]state.PackageObject, count)
+	base := make([]state.GenerationFile, count+1)
+	base[0] = state.GenerationFile{Path: "dists/el9/x86_64/repodata/repomd.xml", Phase: "pointer", Size: 128, SHA256: strings.Repeat("1", 64)}
+	for i := 0; i < count; i++ {
+		sha := fmt.Sprintf("%064x", i+1)
+		filename := fmt.Sprintf("synthetic-backlog-package-%06d-1.0.0-1.el9.x86_64.rpm", i)
+		poolPath := fmt.Sprintf("pool/s/synthetic-backlog-package-%06d/%s", i, filename)
+		candidates[i] = state.PackageObject{
+			SHA256: sha, Format: "rpm", Coordinate: fmt.Sprintf("synthetic-%06d-0:1.0.0-1.el9.x86_64", i),
+			Architecture: "x86_64", CanonicalArch: "x86_64", PoolPath: poolPath, Filename: filename,
+			Size: 1024, Name: fmt.Sprintf("synthetic-%06d", i), Source: fmt.Sprintf("synthetic-backlog-package-%06d", i),
+			Version: "1.0.0", Epoch: "0", Release: "1.el9", Kind: "main", PayloadSHA256: sha, Storage: "pool",
+		}
+		base[i+1] = state.GenerationFile{Path: poolPath, Phase: "payload", Size: 1024, SHA256: sha}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].PoolPath < candidates[j].PoolPath })
+	sort.Slice(base, func(i, j int) bool { return base[i].Path < base[j].Path })
+
+	fullInventory := state.LocalGCInventory{
+		RepositoryID: "12345678-1234-4123-8123-123456789abc",
+		Generation:   10,
+		Candidates:   candidates,
+	}
+	if _, _, _, err := buildLocalGCPlan("repo", fullInventory, candidates, base); !errors.Is(err, ErrRejected) {
+		t.Fatalf("unbatched 100k plan error=%v, want ErrRejected (>64 MiB)", err)
+	}
+
+	currentGen := state.GenerationID(10)
+	currentBase := base
+	remaining := candidates
+	totalRemoved := 0
+	batches := 0
+	for len(remaining) > 0 {
+		chunk := min(len(remaining), maxLocalGCBatchObjects)
+		batchInv := state.LocalGCInventory{
+			RepositoryID: fullInventory.RepositoryID,
+			Generation:   currentGen,
+			Candidates:   remaining[:chunk],
+		}
+		plan, planBytes, nextBase, err := buildLocalGCPlan("repo", batchInv, remaining[:chunk], currentBase)
+		if err != nil {
+			t.Fatalf("batch %d buildLocalGCPlan failed: %v", batches, err)
+		}
+		if len(planBytes) > maxLocalGCPlanBytes {
+			t.Fatalf("batch %d planBytes=%d exceeds maxLocalGCPlanBytes=%d", batches, len(planBytes), maxLocalGCPlanBytes)
+		}
+		totalRemoved += len(plan.Entries)
+		currentGen = plan.Generation
+		currentBase = nextBase
+		remaining = remaining[chunk:]
+		batches++
+	}
+	if totalRemoved != count || len(currentBase) != 1 || batches < 4 {
+		t.Fatalf("batched 100k GC removed=%d surviving=%d batches=%d", totalRemoved, len(currentBase), batches)
 	}
 }

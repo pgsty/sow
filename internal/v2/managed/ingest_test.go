@@ -3,6 +3,7 @@ package managed
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -22,11 +23,11 @@ import (
 )
 
 func holdRepositoryWALSnapshot(ctx context.Context, database string) (func(), error) {
-	reader, err := state.OpenExisting(database)
+	reader, err := state.OpenReadOnly(database)
 	if err != nil {
 		return nil, err
 	}
-	tx, err := reader.DB().BeginTx(ctx, nil)
+	tx, err := reader.DB().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		reader.Close()
 		return nil, err

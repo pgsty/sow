@@ -8,8 +8,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/pgsty/sow/internal/v2/signing"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
@@ -47,7 +51,7 @@ func applyFileMetadata(file *os.File, source os.FileInfo) error {
 		return err
 	}
 	if currentOwner != wantOwner {
-		if err := file.Chown(wantOwner.uid, wantOwner.gid); err != nil {
+		if err := file.Chown(wantOwner.uid, wantOwner.gid); err != nil && !errors.Is(err, syscall.EPERM) {
 			return err
 		}
 	}
@@ -57,7 +61,7 @@ func applyFileMetadata(file *os.File, source os.FileInfo) error {
 // stageSignedRPMs applies the explicit signing policy only to private copies.
 // The returned facts point at those final bytes so metadata and markers bind
 // the exact packages that publication will later install.
-func stageSignedRPMs(ctx context.Context, stage string, scan scanResult, opts Options) (scanResult, error) {
+func stageSignedRPMs(ctx context.Context, root, stage string, scan scanResult, opts Options) (scanResult, error) {
 	if opts.SignWith == "" {
 		return scan, nil
 	}
@@ -83,8 +87,16 @@ func stageSignedRPMs(ctx context.Context, stage string, scan scanResult, opts Op
 	}
 
 	signer := opts.SignRPM
+	var signKeyring openpgp.KeyRing
 	if signer == nil {
-		signer = signRPMWithCommand
+		signer = func(ctx context.Context, path, key string, overwrite bool) error {
+			return signRPMWithCommand(ctx, root, path, key, overwrite)
+		}
+		var err error
+		signKeyring, err = exportCommandSignKeyring(ctx, opts.SignWith)
+		if err != nil {
+			return scanResult{}, &Error{Kind: KindRuntime, Op: "export rpm signing key", Err: err}
+		}
 	}
 	updates := make(map[string]packageFact)
 	packageDir := filepath.Join(stage, "packages")
@@ -93,11 +105,16 @@ func stageSignedRPMs(ctx context.Context, stage string, scan scanResult, opts Op
 		representative := current.facts[0]
 		needsSigning := opts.Overwrite
 		if !needsSigning {
-			present, err := hasEmbeddedRPMSignature(ctx, representative.originalPath)
+			signatures, err := embeddedRPMSignaturesAllowUnsigned(ctx, representative.originalPath)
 			if err != nil {
 				return scanResult{}, &Error{Kind: KindRuntime, Op: "inspect rpm signature", Path: representative.originalPath, Err: err}
 			}
-			needsSigning = !present
+			needsSigning = len(signatures) == 0
+			if !needsSigning && signKeyring != nil {
+				if err := verifyExistingSignedRPM(ctx, representative.originalPath, signatures, signKeyring); err != nil {
+					return scanResult{}, &Error{Kind: KindIntegrity, Op: "verify existing rpm signature", Path: representative.originalPath, Err: err}
+				}
+			}
 		}
 		if !needsSigning {
 			continue
@@ -126,6 +143,11 @@ func stageSignedRPMs(ctx context.Context, stage string, scan scanResult, opts Op
 		signatures, err := embeddedRPMSignatures(ctx, signedPath)
 		if err != nil || len(signatures) == 0 {
 			return scanResult{}, &Error{Kind: KindRuntime, Op: "verify signed rpm", Path: representative.base, Err: errors.Join(err, errors.New("signing helper did not produce a structurally valid embedded signature"))}
+		}
+		if signKeyring != nil {
+			if err := verifyCryptographicRPMSignature(ctx, signedPath, signKeyring); err != nil {
+				return scanResult{}, &Error{Kind: KindIntegrity, Op: "verify signed rpm", Path: representative.base, Err: err}
+			}
 		}
 		neutralAfter, err := signatureNeutralDigest(ctx, signedPath)
 		if err != nil {
@@ -196,7 +218,7 @@ func preserveStageRPMMetadata(target, original string) error {
 		return &Error{Kind: KindRuntime, Op: "inspect rpm signing ownership", Path: target, Err: err}
 	}
 	if gotOwner != wantOwner {
-		if err := os.Chown(target, wantOwner.uid, wantOwner.gid); err != nil {
+		if err := os.Chown(target, wantOwner.uid, wantOwner.gid); err != nil && !errors.Is(err, syscall.EPERM) {
 			return &Error{Kind: KindRuntime, Op: "preserve rpm signing ownership", Path: target, Err: err}
 		}
 	}
@@ -224,12 +246,63 @@ func preserveStageRPMMetadata(target, original string) error {
 	return nil
 }
 
-func hasEmbeddedRPMSignature(ctx context.Context, path string) (bool, error) {
+func embeddedRPMSignaturesAllowUnsigned(ctx context.Context, path string) ([]yumrepo.EmbeddedRPMSignature, error) {
 	signatures, err := embeddedRPMSignatures(ctx, path)
 	if errors.Is(err, yumrepo.ErrUnsignedRPMPackage) {
-		return false, nil
+		return nil, nil
 	}
-	return len(signatures) != 0, err
+	return signatures, err
+}
+
+func exportCommandSignKeyring(ctx context.Context, key string) (openpgp.KeyRing, error) {
+	gpg, err := exec.LookPath("gpg")
+	if err != nil {
+		return nil, errors.New("gpg executable is required for --sign-with")
+	}
+	command := exec.CommandContext(ctx, gpg, "--batch", "--no-tty", "--export", "0x"+key)
+	command.WaitDelay = 5 * time.Second
+	command.Stderr = io.Discard
+	publicKey, err := command.Output()
+	if err != nil || len(publicKey) == 0 {
+		return nil, errors.New("cannot export configured OpenPGP public key from gpg")
+	}
+	return yumrepo.ParseRPMPackageKeyring(publicKey)
+}
+
+func verifyExistingSignedRPM(ctx context.Context, path string, signatures []yumrepo.EmbeddedRPMSignature, signKeyring openpgp.KeyRing) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if err := yumrepo.VerifyPackageDigests(ctx, file); err != nil {
+		return err
+	}
+	claimsSignKey := false
+	for _, sig := range signatures {
+		if id, parseErr := strconv.ParseUint(sig.IssuerKeyID, 16, 64); parseErr == nil && len(signKeyring.KeysById(id)) != 0 {
+			claimsSignKey = true
+			break
+		}
+	}
+	if !claimsSignKey {
+		return nil
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err = yumrepo.VerifyEmbeddedRPMSignatures(ctx, file, signKeyring, time.Now().UTC())
+	return err
+}
+
+func verifyCryptographicRPMSignature(ctx context.Context, path string, signKeyring openpgp.KeyRing) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = yumrepo.VerifyEmbeddedRPMSignatures(ctx, file, signKeyring, time.Now().UTC())
+	return err
 }
 
 func embeddedRPMSignatures(ctx context.Context, path string) ([]yumrepo.EmbeddedRPMSignature, error) {
@@ -314,7 +387,7 @@ func copyStageRPM(ctx context.Context, source, target, expectedSHA string) (_ er
 	return nil
 }
 
-func signRPMWithCommand(ctx context.Context, path, key string, overwrite bool) error {
+func signRPMWithCommand(ctx context.Context, root, path, key string, overwrite bool) error {
 	rpm, err := exec.LookPath("rpm")
 	if err != nil {
 		return errors.New("rpm executable is required for --sign-with")
@@ -323,7 +396,7 @@ func signRPMWithCommand(ctx context.Context, path, key string, overwrite bool) e
 	if overwrite {
 		operation = "--resign"
 	}
-	source, err := signing.Select(ctx, "", "", "")
+	source, err := signing.Select(ctx, root, "", "")
 	if err != nil {
 		return err
 	}
@@ -337,9 +410,13 @@ func signRPMWithCommand(ctx context.Context, path, key string, overwrite bool) e
 		"--define", "_gpg_name " + key,
 		"--define", "_gpg_digest_algo sha256",
 	}
+	if gnupgHome := os.Getenv("GNUPGHOME"); gnupgHome != "" && !strings.ContainsAny(gnupgHome, " \t\r\n%\x00\"'\\") {
+		args = append(args, "--define", "_gpg_path "+gnupgHome)
+	}
 	args = append(args, signing.RPMArgs(passfile)...)
-	args = append(args, operation, path)
+	args = append(args, operation, "--", path)
 	command := exec.CommandContext(ctx, rpm, args...)
+	command.WaitDelay = 5 * time.Second
 	// The RPM/GPG environment may contain secret-bearing pinentry or macro
 	// diagnostics. Suppress child output rather than reflecting it through the
 	// CLI/JSON error surface; the operation and exit status remain actionable.

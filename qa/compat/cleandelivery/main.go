@@ -41,8 +41,8 @@ var (
 	productRoots           = []string{".github", "cmd", "internal", "qa", "third_party"}
 	deliveryRoots          = append([]string{}, productRoots...)
 	ignoredRootDirectories = []string{
-		".agents", ".bmad-loop", ".claude", ".codex", ".git", ".idea", ".pool", ".sow", ".tmp",
-		"_bmad", "_bmad-output", "bin", "dist", "tmp",
+		".agents", ".bmad-loop", ".claude", ".codex", ".git", ".idea", ".pool", ".sow", ".tmp", ".vscode",
+		"_bmad", "_bmad-output", "bin", "dist", "outputs", "tmp",
 	}
 	ignoredRootFileNames    = map[string]struct{}{".DS_Store": {}, "AGENTS.md": {}, "coverage.out": {}, "sow": {}}
 	ignoredRootFileSuffixes = []string{".iml", ".test"}
@@ -308,6 +308,12 @@ func build(root, out string) (buildResult, error) {
 		}
 		if err := verifyExtract(); err != nil {
 			return buildResult{}, fmt.Errorf("verify delivery %d: %w", index+1, err)
+		}
+		if index > 0 {
+			// Both archives were already proven byte-for-byte identical by
+			// compareFilesExact and verified after extraction above; skip running
+			// the identical clean-room Go compile and test suite a second time.
+			continue
 		}
 
 		binary := filepath.Join(work, fmt.Sprintf("sow-%d", index+1))

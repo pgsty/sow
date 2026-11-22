@@ -95,6 +95,32 @@ func TestNegativePackageSizesNeverWrapToUint64(t *testing.T) {
 	}
 }
 
+func TestReadHeaderRejectsDuplicateTagsAndMisalignedParallelSlicesDoNotPanic(t *testing.T) {
+	duplicate := encodeSyntheticHeader([]syntheticHeaderIndex{
+		{tag: 1000, kind: uint32(TagTypeString), offset: 0, count: 1},
+		{tag: 1000, kind: uint32(TagTypeString), offset: 2, count: 1},
+	}, []byte{'a', 0, 'b', 0})
+	if _, err := readHeader(bytes.NewReader(duplicate), false); err == nil || !strings.Contains(err.Error(), "duplicate header tag") {
+		t.Fatalf("duplicate main header tag was not rejected: %v", err)
+	}
+
+	pkg := &Package{
+		Header: Header{Tags: map[int]*Tag{
+			1049: {ID: 1049, Type: TagTypeStringArray, Value: []string{"dep-a", "dep-b"}},
+			1048: {ID: 1048, Type: TagTypeInt32, Value: []int64{8}},
+			1117: {ID: 1117, Type: TagTypeStringArray, Value: []string{"foo", "bar"}},
+			1116: {ID: 1116, Type: TagTypeInt32, Value: []int64{99, -1}},
+			1118: {ID: 1118, Type: TagTypeStringArray, Value: []string{"/etc/"}},
+		}},
+	}
+	if got := pkg.Requires(); len(got) != 2 || got[1].Name() != "dep-b" {
+		t.Fatalf("Requires() with misaligned slices = %+v", got)
+	}
+	if got := pkg.Files(); len(got) != 2 || got[0].Name() != "foo" || got[1].Name() != "bar" {
+		t.Fatalf("Files() with out-of-range dir index = %+v", got)
+	}
+}
+
 func FuzzReadHeaderDoesNotPanic(f *testing.F) {
 	f.Add(encodeSyntheticHeader([]syntheticHeaderIndex{{tag: 1000, kind: uint32(TagTypeString), count: 1}}, []byte{'x', 0}))
 	f.Add([]byte{0x8e, 0xad, 0xe8, 1})

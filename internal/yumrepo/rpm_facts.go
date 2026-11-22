@@ -197,8 +197,8 @@ func ProjectManagedPackageFacts(facts *PackageFacts, input PackageInput) (*Parse
 	if err != nil || hrefErr != nil || view != input.ViewPath || wantHref.String() != input.Location {
 		return nil, fmt.Errorf("%w: managed package href is not canonical for ViewPath %q", ErrUnsafeLocation, input.ViewPath.String())
 	}
-	source := sourceNameFromRPM(facts.metadata.SourceRPM, facts.metadata.Name, facts.metadata.Version, facts.metadata.Release)
-	if pool.Source() != source {
+	if !matchesManagedRPMSource(pool.Source(), facts.metadata.SourceRPM, facts.metadata.Name, facts.metadata.Version, facts.metadata.Release) {
+		source := sourceNameFromRPM(facts.metadata.SourceRPM, facts.metadata.Name, facts.metadata.Version, facts.metadata.Release)
 		return nil, fmt.Errorf("%w: managed Pool source %q differs from RPM source %q", ErrUnsafeLocation, pool.Source(), source)
 	}
 	metadata := *facts.metadata

@@ -85,7 +85,7 @@ func GenerateRPMLeaf(ctx context.Context, dest string, revision uint64, packages
 			bodies.closeDiscard()
 			return nil, readErr
 		}
-		if sourceNameFromRPM(metadata.SourceRPM, metadata.Name, metadata.Version, metadata.Release) != pool.Source() {
+		if !matchesManagedRPMSource(pool.Source(), metadata.SourceRPM, metadata.Name, metadata.Version, metadata.Release) {
 			bodies.closeDiscard()
 			return nil, fmt.Errorf("%w: RPM leaf Pool source differs from RPM source", ErrUnsafeLocation)
 		}

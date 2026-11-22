@@ -117,9 +117,8 @@ func decodeManagedPackageFact(source ManagedPackageSource, fact state.PackageFac
 		if err != nil {
 			return ManagedPackageSource{}, err
 		}
-		actual, err := rpmObjectFromInfo(info, source.Object.Filename, source.Object.PayloadSHA256)
-		if err != nil || !sameManagedPackageFacts(source.Object, actual) {
-			return ManagedPackageSource{}, errors.Join(errors.New("RPM package facts differ from object"), err)
+		if !matchesPersistedManagedRPMObject(source.Object, info, source.Object.PayloadSHA256) {
+			return ManagedPackageSource{}, errors.New("RPM package facts differ from object")
 		}
 		source.RPMFacts = parsed
 		source.DEBFacts = nil

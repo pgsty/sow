@@ -4,9 +4,10 @@ SHELL := /bin/bash
 
 GO ?= go
 GORELEASER ?= goreleaser
+STATICCHECK_VERSION ?= v0.8.2
 DEADCODE_VERSION ?= v0.52.0
 GOVULNCHECK_VERSION ?= v1.9.0
-VERSION ?= 0.7.1
+VERSION ?= 0.8.0
 TEST_TIMEOUT ?= 60m
 CORE_TEST_TIMEOUT ?= 20m
 RACE_TIMEOUT ?= 45m
@@ -21,7 +22,7 @@ LDFLAGS := -s -w -X github.com/pgsty/sow/internal/v2cli.Version=$(VERSION)
 CORE_PACKAGES := ./internal/v2/... ./internal/v2cli ./internal/aptrepo ./internal/openpgpkey ./internal/r2 ./internal/workmetrics ./internal/yumrepo
 
 .PHONY: all help version deadcode-version govulncheck-version build run install fmt fmt-check tidy tidy-check notices-check vet lint deadcode vuln verify-rpm-upstream \
-	test test-go test-rpm test-core test-v2 test-perf-contract race check clean-delivery \
+	test test-go test-rpm test-core test-v2 test-perf-contract test-perf race check clean-delivery \
 	test-r2-live goreleaser-check release-local release clean clean-bin clean-dist
 
 all: build
@@ -64,12 +65,10 @@ install:
 	CGO_ENABLED=0 $(GO) install -trimpath -ldflags '$(LDFLAGS)' ./cmd/sow
 
 fmt:
-	@files="$$(find cmd internal qa -type f -name '*.go' -print)"; \
-		test -z "$$files" || gofmt -w $$files
+	@find cmd internal qa -type f -name '*.go' -exec gofmt -w {} +
 
 fmt-check:
-	@files="$$(find cmd internal qa -type f -name '*.go' -print)"; \
-		unformatted="$$(test -z "$$files" || gofmt -l $$files)"; \
+	@unformatted="$$(find cmd internal qa -type f -name '*.go' -exec gofmt -l {} +)"; \
 		test -z "$$unformatted" || { printf 'gofmt required:\n%s\n' "$$unformatted" >&2; exit 1; }
 
 tidy:
@@ -83,36 +82,41 @@ notices-check:
 
 vet:
 	$(GO) vet ./...
+	cd third_party/cavaliergopher-rpm && $(GO) vet ./...
 
 lint:
-	@command -v staticcheck >/dev/null 2>&1 || { \
-		printf '%s\n' 'staticcheck is required: go install honnef.co/go/tools/cmd/staticcheck@v0.8.2' >&2; \
-		exit 1; \
-	}
-	staticcheck ./...
+	@if command -v staticcheck >/dev/null 2>&1; then \
+		staticcheck ./...; \
+	else \
+		$(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...; \
+	fi
 
 deadcode:
-	@command -v deadcode >/dev/null 2>&1 || { \
-		printf '%s\n' 'deadcode is required: go install golang.org/x/tools/cmd/deadcode@$(DEADCODE_VERSION)' >&2; \
-		exit 1; \
-	}
-	@deadcode_path="$$(command -v deadcode)"; \
+	@deadcode_cmd=""; tmp_dir=""; \
+	cleanup() { test -z "$$tmp_dir" || rm -rf "$$tmp_dir"; }; trap cleanup EXIT; \
+	if command -v deadcode >/dev/null 2>&1; then \
+		deadcode_path="$$(command -v deadcode)"; \
 		actual="$$( $(GO) version -m "$$deadcode_path" | awk '$$1 == "mod" && $$2 == "golang.org/x/tools" { print $$3 }')"; \
-		test "$$actual" = '$(DEADCODE_VERSION)' || { \
-			printf 'deadcode %s is required, found %s: go install golang.org/x/tools/cmd/deadcode@%s\n' '$(DEADCODE_VERSION)' "$${actual:-unknown}" '$(DEADCODE_VERSION)' >&2; \
-			exit 1; \
-		}
-	@output="$$(deadcode -test ./...)" || { status=$$?; printf '%s\n' "$$output" >&2; exit $$status; }; \
-		test -z "$$output" || { printf 'unreachable declarations:\n%s\n' "$$output" >&2; exit 1; }
-	bash qa/compat/check-deadcode-binary.sh
+		if test "$$actual" = '$(DEADCODE_VERSION)'; then \
+			deadcode_cmd="$$deadcode_path"; \
+		fi; \
+	fi; \
+	if test -z "$$deadcode_cmd"; then \
+		tmp_dir="$$(mktemp -d)"; \
+		GOBIN="$$tmp_dir" $(GO) install golang.org/x/tools/cmd/deadcode@$(DEADCODE_VERSION); \
+		deadcode_cmd="$$tmp_dir/deadcode"; \
+	fi; \
+	output="$$($$deadcode_cmd -test ./...)" || { status=$$?; printf '%s\n' "$$output" >&2; exit $$status; }; \
+	test -z "$$output" || { printf 'unreachable declarations:\n%s\n' "$$output" >&2; exit 1; }; \
+	DEADCODE_CMD="$$deadcode_cmd" bash qa/compat/check-deadcode-binary.sh
 
 vuln:
-	@command -v govulncheck >/dev/null 2>&1 || { \
-		printf '%s\n' 'govulncheck is required: go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION)' >&2; \
-		exit 1; \
-	}
-	govulncheck ./...
-	cd third_party/cavaliergopher-rpm && govulncheck ./...
+	@if command -v govulncheck >/dev/null 2>&1; then \
+		govulncheck ./... && (cd third_party/cavaliergopher-rpm && govulncheck ./...); \
+	else \
+		$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./... && \
+		(cd third_party/cavaliergopher-rpm && $(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...); \
+	fi
 
 verify-rpm-upstream:
 	third_party/cavaliergopher-rpm/verify-upstream.sh
@@ -132,6 +136,9 @@ test-v2: test-core
 
 test-perf-contract:
 	$(GO) test -tags perf -count=1 ./qa/perf -run '^TestYUMPerformanceFixtureAvailable$$'
+
+test-perf:
+	$(GO) test -tags perf -timeout '15m' -count=1 ./qa/perf
 
 test-r2-live:
 	SOW_REAL_R2_TEST=1 $(GO) test -timeout '10m' -count=1 -v ./internal/r2 -run '^TestCloudflareR2ReadOnlyCompatibility$$'

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pgsty/sow/internal/v2/signing"
 	"github.com/pgsty/sow/internal/yumrepo"
 )
 
@@ -132,8 +133,8 @@ func TestCreateSignWithFillsOnlyUnsignedRPMs(t *testing.T) {
 		t.Fatal("already-signed RPM was changed by fill mode")
 	}
 	for _, path := range []string{unsigned, signed} {
-		if present, err := hasEmbeddedRPMSignature(context.Background(), path); err != nil || !present {
-			t.Fatalf("signature %s: present=%t err=%v", path, present, err)
+		if signatures, err := embeddedRPMSignaturesAllowUnsigned(context.Background(), path); err != nil || len(signatures) == 0 {
+			t.Fatalf("signature %s: count=%d err=%v", path, len(signatures), err)
 		}
 	}
 	primary := readPrimaryXML(t, filepath.Join(dir, "repodata"))
@@ -314,6 +315,42 @@ func TestCreateRejectsMarkerBeforeMetadataChange(t *testing.T) {
 	}
 	if got := mustRead(t, filepath.Join(dir, "Packages")); !bytes.Equal(got, old) {
 		t.Fatalf("marker rejection changed old metadata: %q", got)
+	}
+
+	if err := os.Rename(filepath.Join(dir, "repo_complete"), filepath.Join(dir, pruneMarkerName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(context.Background(), Options{Dir: dir}); err == nil || KindOf(err) != KindRejected {
+		t.Fatalf("pending prune marker gate error = %v, kind = %s", err, KindOf(err))
+	}
+	if _, err := Create(context.Background(), Options{Dir: dir, Pigsty: true}); err != nil {
+		t.Fatalf("Create --pigsty over pending prune marker: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, pruneMarkerName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Create --pigsty left pending prune marker: %v", err)
+	}
+}
+
+func TestCreateRejectsManagedAncestorThroughAliasAndPigstyFiltersBeforeConflict(t *testing.T) {
+	workspace := t.TempDir()
+	mustMkdir(t, filepath.Join(workspace, ".sow"))
+	leaf := mustMkdir(t, filepath.Join(workspace, "pool", "pkg"))
+	writeDEBFixture(t, leaf, "alpha.deb", debControl("alpha", "1.0-1", "amd64"), "alpha")
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(filepath.Join(workspace, "pool"), alias); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Create(context.Background(), Options{Dir: filepath.Join(alias, "pkg")}); KindOf(err) != KindRejected {
+		t.Fatalf("managed workspace alias error = %v", err)
+	}
+
+	dir := t.TempDir()
+	writeDEBFixture(t, dir, "good.deb", debControl("alpha", "1.0-1", "amd64"), "good")
+	writeDEBFixture(t, dir, "drop1.deb", debControl("drop", "1.0-1", "i386"), "one")
+	writeDEBFixture(t, dir, "drop2.deb", debControl("drop", "1.0-1", "i386"), "two")
+	res, err := Create(context.Background(), Options{Dir: dir, Pigsty: true})
+	if err != nil || len(res.Removed) != 2 || res.DEB != 1 {
+		t.Fatalf("Create --pigsty with conflicting filtered packages: res=%+v err=%v", res, err)
 	}
 }
 
@@ -677,4 +714,80 @@ func fileSHA(path string) string {
 	body, _ := os.ReadFile(path)
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
+}
+
+func TestSignRPMWithCommandEnforcesFlatRepoRootPassfileBoundary(t *testing.T) {
+	binDir := t.TempDir()
+	calledFile := filepath.Join(binDir, "rpm-called")
+	fakeRPM := filepath.Join(binDir, "rpm")
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'called' > %q\nexit 0\n", calledFile)
+	if err := os.WriteFile(fakeRPM, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	repoRoot := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(repoRoot); err == nil {
+		repoRoot = resolved
+	}
+	stagedDir := filepath.Join(repoRoot, ".sow-plain-stage-test", "packages")
+	if err := os.MkdirAll(stagedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stagedRPM := filepath.Join(stagedDir, "pkg.rpm")
+	if err := os.WriteFile(stagedRPM, []byte("rpm"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	outsideDir := t.TempDir()
+	outsidePass := filepath.Join(outsideDir, "real.pass")
+	if err := os.WriteFile(outsidePass, []byte("secret-value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inRepoReal := filepath.Join(repoRoot, "real.pass")
+	if err := os.WriteFile(inRepoReal, []byte("secret-value\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Symlinks anywhere inside the flat repository root (not just under the
+	// private stage directory) must be rejected before rpm is invoked.
+	inRepoToOutside := filepath.Join(repoRoot, "link-out.pass")
+	if err := os.Symlink(outsidePass, inRepoToOutside); err != nil {
+		t.Fatal(err)
+	}
+	inRepoToInside := filepath.Join(repoRoot, "link-in.pass")
+	if err := os.Symlink(inRepoReal, inRepoToInside); err != nil {
+		t.Fatal(err)
+	}
+	outsideBounce := filepath.Join(outsideDir, "bounce.pass")
+	if err := os.Symlink(inRepoReal, outsideBounce); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, unsafe := range []string{inRepoToOutside, inRepoToInside, outsideBounce} {
+		_ = os.Remove(calledFile)
+		ctx := signing.WithPassFile(context.Background(), unsafe)
+		err := signRPMWithCommand(ctx, repoRoot, stagedRPM, "0123456789ABCDEF", false)
+		if !errors.Is(err, signing.ErrCredential) {
+			t.Fatalf("signRPMWithCommand(%s) error=%v, want signing.ErrCredential", unsafe, err)
+		}
+		if _, statErr := os.Stat(calledFile); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("rpm was invoked despite rejected passfile %s", unsafe)
+		}
+	}
+
+	// External symlink outside the flat repository root (such as a Kubernetes
+	// Secret mount) must still be accepted.
+	outsideLink := filepath.Join(outsideDir, "k8s-secret.pass")
+	if err := os.Symlink(outsidePass, outsideLink); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(calledFile)
+	ctx := signing.WithPassFile(context.Background(), outsideLink)
+	if err := signRPMWithCommand(ctx, repoRoot, stagedRPM, "0123456789ABCDEF", false); err != nil {
+		t.Fatalf("signRPMWithCommand external symlink error=%v", err)
+	}
+	if _, statErr := os.Stat(calledFile); statErr != nil {
+		t.Fatalf("rpm was not invoked for valid external symlink passfile: %v", statErr)
+	}
 }

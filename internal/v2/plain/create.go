@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/pgsty/sow/internal/v2/signing"
+	"golang.org/x/sys/unix"
 )
 
 // Create builds flat RPM and/or DEB metadata for one directory. It does not
@@ -29,6 +30,10 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return Result{}, &Error{Kind: KindRejected, Op: "inspect directory", Path: root, Err: errors.New("target is not a real directory")}
 	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return Result{}, &Error{Kind: KindRuntime, Op: "resolve directory", Path: root, Err: err}
+	}
 	lock, err := acquireDirectoryLock(ctx, root, opts.Timeout, opts.NoWait)
 	if err != nil {
 		return Result{}, err
@@ -41,19 +46,24 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 	if err := lock.Validate(); err != nil {
 		return Result{}, err
 	}
+	if err := rejectManagedWorkspaceAncestors(root, "create", "managed workspaces cannot be rebuilt as flat repositories"); err != nil {
+		return Result{}, err
+	}
 	result.Dir = root
 	result.Kept = []string{}
 	result.Removed = []string{}
 	if err := cleanupStalePlainState(root); err != nil {
 		return Result{}, err
 	}
-	markerPath := filepath.Join(root, "repo_complete")
 
 	if !opts.Pigsty {
-		if _, err := os.Lstat(markerPath); err == nil {
-			return Result{}, &Error{Kind: KindRejected, Op: "marker gate", Path: markerPath, Err: errors.New("repo_complete exists; use --pigsty or remove it explicitly before rebuilding")}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return Result{}, &Error{Kind: KindRuntime, Op: "marker gate", Path: markerPath, Err: err}
+		for _, markerName := range []string{"repo_complete", pruneMarkerName} {
+			markerPath := filepath.Join(root, markerName)
+			if _, err := os.Lstat(markerPath); err == nil {
+				return Result{}, &Error{Kind: KindRejected, Op: "marker gate", Path: markerPath, Err: errors.New("repo_complete exists; use --pigsty or remove it explicitly before rebuilding")}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return Result{}, &Error{Kind: KindRuntime, Op: "marker gate", Path: markerPath, Err: err}
+			}
 		}
 	}
 
@@ -148,6 +158,18 @@ func verifyStableInputs(ctx context.Context, root string, scan scanResult) error
 		before, after := fact.sourceInfo, candidate.info
 		if before == nil || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || before.Mode() != after.Mode() {
 			return &Error{Kind: KindIntegrity, Op: "verify input stats", Path: fact.originalPath, Err: errors.New("package stat changed after inspection")}
+		}
+		if fact.hasSourceStat {
+			var afterStat unix.Stat_t
+			if err := unix.Lstat(candidate.path, &afterStat); err != nil {
+				return &Error{Kind: KindIntegrity, Op: "verify input stats", Path: fact.originalPath, Err: err}
+			}
+			if afterStat.Ctim != fact.sourceStat.Ctim {
+				digest, err := hashFile(ctx, candidate.path)
+				if err != nil || digest != fact.originalSHA256 {
+					return &Error{Kind: KindIntegrity, Op: "verify input stats", Path: fact.originalPath, Err: errors.Join(err, errors.New("package content changed after inspection"))}
+				}
+			}
 		}
 	}
 	return nil

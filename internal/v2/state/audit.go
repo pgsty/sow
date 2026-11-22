@@ -60,6 +60,7 @@ func (s *Store) RecordOperationMembershipOutcomes(ctx context.Context, operation
 		return err
 	}
 	previousPackage := ""
+	needDigests := make(map[string]struct{}, len(canonical))
 	for _, outcome := range canonical {
 		if outcome.DistName == "" || !validSHA256Text(outcome.PackageSHA256) || (outcome.Action != "keep" && outcome.Action != "exclude" && outcome.Action != "limit") {
 			return errors.New("invalid operation membership outcome")
@@ -69,24 +70,103 @@ func (s *Store) RecordOperationMembershipOutcomes(ctx context.Context, operation
 			return errors.New("conflicting or duplicate operation membership outcome")
 		}
 		previousPackage = packageIdentity
-		var distExists, packageEvidence int
-		if err := tx.QueryRowContext(ctx, `SELECT
-EXISTS(SELECT 1 FROM dists WHERE name = ?),
-EXISTS(SELECT 1 FROM package_objects WHERE sha256 = ?)
-	OR EXISTS(SELECT 1 FROM operation_packages WHERE operation_id = ? AND package_sha256 = ?)
-	OR EXISTS(SELECT 1 FROM operation_memberships WHERE operation_id = ? AND package_sha256 = ? AND action IN ('add', 'remove'))`, outcome.DistName, outcome.PackageSHA256, operationID, outcome.PackageSHA256, operationID, outcome.PackageSHA256).Scan(&distExists, &packageEvidence); err != nil {
+		needDigests[outcome.PackageSHA256] = struct{}{}
+	}
+	if len(canonical) != 0 {
+		knownDists := map[string]struct{}{}
+		distRows, err := tx.QueryContext(ctx, `SELECT name FROM dists`)
+		if err != nil {
 			return err
 		}
-		if distExists == 0 {
-			return fmt.Errorf("%w: outcome Dist %q", ErrNotFound, outcome.DistName)
+		for distRows.Next() {
+			var name string
+			if err := distRows.Scan(&name); err != nil {
+				distRows.Close()
+				return err
+			}
+			knownDists[name] = struct{}{}
 		}
-		if packageEvidence == 0 {
-			return fmt.Errorf("%w: outcome package %s has no Operation evidence", ErrNotFound, outcome.PackageSHA256)
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO operation_memberships(operation_id, sequence, dist_name, package_sha256, action) VALUES (?, ?, ?, ?, ?)`, operationID, sequence, outcome.DistName, outcome.PackageSHA256, outcome.Action); err != nil {
+		if err := errors.Join(distRows.Err(), distRows.Close()); err != nil {
 			return err
 		}
-		sequence++
+		evidenceDigests := make(map[string]struct{}, len(needDigests))
+		evRows, err := tx.QueryContext(ctx, `SELECT DISTINCT package_sha256 FROM operation_packages WHERE operation_id = ? AND package_sha256 IS NOT NULL
+UNION
+SELECT DISTINCT package_sha256 FROM operation_memberships WHERE operation_id = ? AND action IN ('add', 'remove')`, operationID, operationID)
+		if err != nil {
+			return err
+		}
+		for evRows.Next() {
+			var digest string
+			if err := evRows.Scan(&digest); err != nil {
+				evRows.Close()
+				return err
+			}
+			evidenceDigests[digest] = struct{}{}
+		}
+		if err := errors.Join(evRows.Err(), evRows.Close()); err != nil {
+			return err
+		}
+		var remaining []string
+		for digest := range needDigests {
+			if _, ok := evidenceDigests[digest]; !ok {
+				remaining = append(remaining, digest)
+			}
+		}
+		sort.Strings(remaining)
+		for start := 0; start < len(remaining); start += 256 {
+			end := min(start+256, len(remaining))
+			var query strings.Builder
+			query.WriteString(`SELECT sha256 FROM package_objects WHERE sha256 IN (`)
+			args := make([]any, 0, end-start)
+			for index, digest := range remaining[start:end] {
+				if index != 0 {
+					query.WriteByte(',')
+				}
+				query.WriteByte('?')
+				args = append(args, digest)
+			}
+			query.WriteByte(')')
+			pkgRows, err := tx.QueryContext(ctx, query.String(), args...)
+			if err != nil {
+				return err
+			}
+			for pkgRows.Next() {
+				var digest string
+				if err := pkgRows.Scan(&digest); err != nil {
+					pkgRows.Close()
+					return err
+				}
+				evidenceDigests[digest] = struct{}{}
+			}
+			if err := errors.Join(pkgRows.Err(), pkgRows.Close()); err != nil {
+				return err
+			}
+		}
+		for _, outcome := range canonical {
+			if _, ok := knownDists[outcome.DistName]; !ok {
+				return fmt.Errorf("%w: outcome Dist %q", ErrNotFound, outcome.DistName)
+			}
+			if _, ok := evidenceDigests[outcome.PackageSHA256]; !ok {
+				return fmt.Errorf("%w: outcome package %s has no Operation evidence", ErrNotFound, outcome.PackageSHA256)
+			}
+		}
+		for start := 0; start < len(canonical); start += sqliteManifestInsertBatchSize {
+			end := min(start+sqliteManifestInsertBatchSize, len(canonical))
+			var query strings.Builder
+			query.WriteString(`INSERT INTO operation_memberships(operation_id, sequence, dist_name, package_sha256, action) VALUES `)
+			args := make([]any, 0, (end-start)*5)
+			for offset, outcome := range canonical[start:end] {
+				if offset != 0 {
+					query.WriteByte(',')
+				}
+				query.WriteString(`(?, ?, ?, ?, ?)`)
+				args = append(args, operationID, sequence+start+offset, outcome.DistName, outcome.PackageSHA256, outcome.Action)
+			}
+			if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
+				return err
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return err
@@ -148,6 +228,16 @@ func (s *Store) RecordOperationPackages(ctx context.Context, operationID string,
 	if _, err := tx.ExecContext(ctx, `DELETE FROM operation_packages WHERE operation_id = ?`, operationID); err != nil {
 		return err
 	}
+	type encodedOpPackage struct {
+		sequence   int
+		inputPath  string
+		digest     any
+		coordinate any
+		disp       string
+		errorClass any
+		message    any
+	}
+	encodedRows := make([]encodedOpPackage, 0, len(packages))
 	for sequence, item := range packages {
 		if item.InputPath == "" || (item.Disposition != "accepted" && item.Disposition != "reused" && item.Disposition != "excluded" && item.Disposition != "failed" && item.Disposition != "removed") {
 			return errors.New("invalid operation package record")
@@ -180,7 +270,24 @@ func (s *Store) RecordOperationPackages(ctx context.Context, operationID string,
 			}
 			message = string(encoded)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO operation_packages(operation_id, sequence, input_path, package_sha256, coordinate, disposition, error_class, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, operationID, sequence, item.InputPath, digest, coordinate, item.Disposition, errorClass, message); err != nil {
+		encodedRows = append(encodedRows, encodedOpPackage{
+			sequence: sequence, inputPath: item.InputPath, digest: digest, coordinate: coordinate,
+			disp: item.Disposition, errorClass: errorClass, message: message,
+		})
+	}
+	for start := 0; start < len(encodedRows); start += 100 {
+		end := min(start+100, len(encodedRows))
+		var query strings.Builder
+		query.WriteString(`INSERT INTO operation_packages(operation_id, sequence, input_path, package_sha256, coordinate, disposition, error_class, message) VALUES `)
+		args := make([]any, 0, (end-start)*8)
+		for index, row := range encodedRows[start:end] {
+			if index != 0 {
+				query.WriteByte(',')
+			}
+			query.WriteString(`(?, ?, ?, ?, ?, ?, ?, ?)`)
+			args = append(args, operationID, row.sequence, row.inputPath, row.digest, row.coordinate, row.disp, row.errorClass, row.message)
+		}
+		if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
 			return err
 		}
 	}

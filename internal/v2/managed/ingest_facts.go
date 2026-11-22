@@ -446,20 +446,6 @@ func verifyIngestReuse(ctx context.Context, source ManagedPackageSource, evidenc
 	return false, fmt.Errorf("%w: unstable backing package", ErrIntegrity)
 }
 
-func inspectSnapshotReader(ctx context.Context, file *os.File, originalBasename string) (state.PackageObject, error) {
-	if file == nil {
-		return state.PackageObject{}, errors.New("managed: nil package snapshot")
-	}
-	switch {
-	case strings.HasSuffix(originalBasename, ".rpm"):
-		return inspectRPMSnapshotReader(ctx, file, originalBasename)
-	case strings.HasSuffix(originalBasename, ".deb"):
-		return inspectDEBSnapshotReader(ctx, file, originalBasename)
-	default:
-		return state.PackageObject{}, errors.New("managed: unsupported package suffix")
-	}
-}
-
 func inspectRPMSnapshot(ctx context.Context, filename, originalBasename string) (state.PackageObject, error) {
 	opened, err := openRootedRegular(filepath.Dir(filename), filepath.Base(filename))
 	if err != nil {
@@ -485,6 +471,35 @@ func inspectRPMSnapshotReader(ctx context.Context, file *os.File, originalBasena
 		return state.PackageObject{}, err
 	}
 	return rpmObjectFromInfo(info, originalBasename, payloadSHA)
+}
+
+func matchesPersistedSnapshotReader(ctx context.Context, file *os.File, expected state.PackageObject) (bool, error) {
+	switch expected.Format {
+	case "rpm":
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return false, err
+		}
+		info, err := yumrepo.InspectPackageReader(ctx, file, expected.Filename)
+		if err != nil {
+			return false, err
+		}
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return false, err
+		}
+		payloadSHA, err := yumrepo.RPMSignatureNeutralDigest(ctx, file)
+		if err != nil {
+			return false, err
+		}
+		return matchesPersistedManagedRPMObject(expected, info, payloadSHA), nil
+	case "deb":
+		facts, err := inspectDEBSnapshotReader(ctx, file, expected.Filename)
+		if err != nil {
+			return false, err
+		}
+		return sameManagedPackageFacts(expected, facts), nil
+	default:
+		return false, fmt.Errorf("unsupported package format %q", expected.Format)
+	}
 }
 
 func rpmObjectFromInfo(info yumrepo.PackageInfo, originalBasename, payloadSHA string) (state.PackageObject, error) {

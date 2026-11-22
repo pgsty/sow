@@ -34,7 +34,7 @@ func renderStage(ctx context.Context, dir string, scan scanResult, opts Options)
 			resultErr = errors.Join(resultErr, os.RemoveAll(stage))
 		}
 	}()
-	scan, err = stageSignedRPMs(ctx, stage, scan, opts)
+	scan, err = stageSignedRPMs(ctx, dir, stage, scan, opts)
 	if err != nil {
 		return stagedBuild{}, scanResult{}, err
 	}

@@ -22,7 +22,14 @@ SOURCE_NOTICES = {
 
 
 def go(*args, env=None):
-    return subprocess.check_output([os.environ.get("GO", "go"), *args], cwd=ROOT, env=env, text=True)
+    merged_env = dict(os.environ if env is None else env, GOWORK="off", GOENV="off")
+    return subprocess.check_output(
+        [os.environ.get("GO", "go"), *args],
+        cwd=ROOT,
+        env=merged_env,
+        text=True,
+        encoding="utf-8",
+    )
 
 
 def packages(target):
@@ -48,9 +55,14 @@ def generate():
     modules = {}
     source_files = set()
     goroot = Path(go("env", "GOROOT").strip())
-    go_license_root = goroot if (goroot / "LICENSE").is_file() else goroot.parent
+    if (goroot / "LICENSE").is_file():
+        go_license_root = goroot
+    elif goroot.name == "libexec" and (goroot.parent / "LICENSE").is_file():
+        go_license_root = goroot.parent
+    else:
+        raise RuntimeError("No Go standard library LICENSE found under GOROOT=" + str(goroot))
     for path in license_files(go_license_root):
-        sections["Go " + go("env", "GOVERSION").strip() + "/" + path.name] = path.read_text().rstrip()
+        sections["Go standard library/" + path.name] = path.read_text(encoding="utf-8").rstrip()
     for target in TARGETS:
         for package in packages(target):
             directory = Path(package["Dir"])
@@ -71,7 +83,7 @@ def generate():
             found = False
             while directory.is_relative_to(boundary):
                 for path in license_files(directory):
-                    sections[label + "/" + str(path.relative_to(boundary))] = path.read_text().rstrip()
+                    sections[label + "/" + str(path.relative_to(boundary))] = path.read_text(encoding="utf-8").rstrip()
                     found = True
                 if directory == boundary:
                     break
@@ -85,7 +97,7 @@ def generate():
         path = directory / relative
         if path not in source_files:
             raise RuntimeError("Embedded-notice source changed; review " + str(path))
-        header, separator, _ = path.read_text().partition("\npackage ")
+        header, separator, _ = path.read_text(encoding="utf-8").partition("\npackage ")
         if not separator or author not in header:
             raise RuntimeError("Embedded-notice header changed; review " + str(path))
         sections[label + "/" + relative + " (source header)"] = header.rstrip()
@@ -110,11 +122,11 @@ def main():
     generated = generate()
     destination = ROOT / "THIRD_PARTY_NOTICES"
     if args.check:
-        if not destination.is_file() or destination.read_text() != generated:
+        if not destination.is_file() or destination.read_text(encoding="utf-8") != generated:
             parser.exit(1, "THIRD_PARTY_NOTICES is stale; run python3 qa/licensing/generate_notices.py\n")
         print("THIRD_PARTY_NOTICES matches all four release package graphs")
     else:
-        destination.write_text(generated)
+        destination.write_text(generated, encoding="utf-8")
         print("Wrote THIRD_PARTY_NOTICES for all four release package graphs")
 
 

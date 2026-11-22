@@ -157,4 +157,14 @@ func TestOpenPGPVerifierSelectsExactAggregateCertificate(t *testing.T) {
 	if _, err := NewOpenPGPVerifierForFingerprint(bytes.NewReader(aggregate.Bytes()), "00", at); err == nil || !strings.Contains(err.Error(), "invalid lowercase") {
 		t.Fatalf("short aggregate fingerprint error=%v", err)
 	}
+	if err := verifier.VerifyForPublication(context.Background(), bytes.NewReader(message), bytes.NewReader(signature.Bytes())); err != nil {
+		t.Fatalf("VerifyForPublication SHA-256 rejected: %v", err)
+	}
+	prefixed := append([]byte("untrusted preamble\n"), signature.Bytes()...)
+	if err := verifier.Verify(context.Background(), bytes.NewReader(message), bytes.NewReader(prefixed)); err == nil {
+		t.Fatal("leading preamble before detached signature armor was accepted")
+	}
+	if _, err := DetachedSignatureCreationTime(bytes.NewReader(prefixed)); err == nil {
+		t.Fatal("DetachedSignatureCreationTime accepted leading preamble")
+	}
 }

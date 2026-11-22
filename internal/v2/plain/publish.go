@@ -56,7 +56,11 @@ func preparePublication(ctx context.Context, root string, staged stagedBuild, sc
 		if err != nil {
 			return publicationPlan{}, err
 		}
-		plan.changed = plan.changed || !equal
+		pendingMarker, err := pruneMarkerExists(filepath.Join(root, pruneMarkerName))
+		if err != nil {
+			return publicationPlan{}, err
+		}
+		plan.changed = plan.changed || !equal || pendingMarker
 	}
 	return plan, nil
 }
@@ -464,7 +468,7 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 			if !ok {
 				return &Error{Kind: KindIntegrity, Op: "remove package", Path: path, Err: errors.New("verified replacement is missing")}
 			}
-			if err := replacement.verify(); err != nil {
+			if err := replacement.verify(ctx); err != nil {
 				return err
 			}
 			current, err := os.Lstat(path)
@@ -498,6 +502,14 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 	if opts.Pigsty {
 		if err := installStagedFile(filepath.Join(staged.dir, "repo_complete"), filepath.Join(root, "repo_complete")); err != nil {
 			return err
+		}
+		if !plan.prune {
+			if err := removeRegularFile(filepath.Join(root, pruneMarkerName), true); err != nil {
+				return err
+			}
+			if err := syncDir(root); err != nil {
+				return &Error{Kind: KindRuntime, Op: "sync pending prune marker cleanup", Path: root, Err: err}
+			}
 		}
 		if err := inject(opts.Fault, FaultAfterMarker, "", -1); err != nil {
 			return err

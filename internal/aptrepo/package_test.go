@@ -197,6 +197,7 @@ func TestBinaryControlRequiresOneStrictParagraph(t *testing.T) {
 		{"orphan continuation", " continuation\n", "orphan continuation"},
 		{"nul", "Package: good\x00bad\n", "forbidden control byte"},
 		{"control", "Package: good\x1bbad\n", "forbidden control byte"},
+		{"non-utf8", "Package: good\nMaintainer: \xff\xfe\n", "not valid UTF-8"},
 		{"leading empty paragraph", "\nPackage: good\n", "empty paragraph"},
 	}
 	for _, tt := range tests {
@@ -214,6 +215,21 @@ func TestBinaryControlRequiresOneStrictParagraph(t *testing.T) {
 	duplicateDeb := writeMinimalDeb(t, t.TempDir(), "libfoo-bin_1.2.3-1_amd64.deb", fixtureControl+"Package: duplicate\n")
 	if _, err := InspectPackage(context.Background(), duplicateDeb, "main"); err == nil || !strings.Contains(err.Error(), "repeats field") {
 		t.Fatalf("InspectPackage duplicate-field error = %v", err)
+	}
+
+	var lzmaDeb bytes.Buffer
+	lzmaDeb.WriteString("!<arch>\n")
+	writeArMember(t, &lzmaDeb, "debian-binary", []byte("2.0\n"))
+	lzmaPayload := []byte("lzma-payload")
+	lzmaDeb.WriteString(fmt.Sprintf("%-16s%-12d%-6d%-6d%-8o%-10d`\n", "control.tar.lzma", 0, 0, 0, 0o644, len(lzmaPayload)))
+	lzmaDeb.Write(lzmaPayload)
+	writeArMember(t, &lzmaDeb, "data.tar.gz", []byte("data"))
+	lzmaPath := filepath.Join(t.TempDir(), "legacy_1.0-1_amd64.deb")
+	if err := os.WriteFile(lzmaPath, lzmaDeb.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectPackage(context.Background(), lzmaPath, "main"); err == nil || !strings.Contains(err.Error(), "unsupported control archive compression") {
+		t.Fatalf("InspectPackage control.tar.lzma error = %v, want unsupported compression", err)
 	}
 }
 

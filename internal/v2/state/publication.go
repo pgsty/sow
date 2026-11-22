@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"time"
 )
@@ -412,8 +413,8 @@ func (s *Store) RebindPublicationTarget(ctx context.Context, input PublicationTa
 	if stored.MaxCacheTTL != binding.MaxCacheTTL && (pendingMaintenance || conditionalDelete) {
 		return fmt.Errorf("%w: max_cache_ttl cannot change while target maintenance is pending", ErrConflict)
 	}
-	if stored.Provider == "filesystem" && stored.PublicEndpoint != binding.PublicEndpoint && conditionalDelete {
-		return fmt.Errorf("%w: filesystem public_endpoint cannot change during conditional-delete maintenance", ErrConflict)
+	if stored.PublicEndpoint != binding.PublicEndpoint && conditionalDelete {
+		return fmt.Errorf("%w: public_endpoint cannot change during conditional-delete maintenance", ErrConflict)
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE publication_target_bindings
 SET target_name = ?, public_endpoint = ?, max_cache_ttl_ns = ?, config_identity = ?
@@ -625,20 +626,12 @@ func (s *Store) AbandonPublicationAttempt(ctx context.Context, attemptIdentity s
 	}
 	basePaths := map[string]struct{}{}
 	if base.Valid {
-		rows, err := tx.QueryContext(ctx, `SELECT i.path FROM publication_inventory AS i WHERE i.checkpoint_identity = ?`, base.String)
+		liveBase, err := publicationLiveInventoryTx(ctx, tx, base.String)
 		if err != nil {
 			return err
 		}
-		for rows.Next() {
-			var objectPath string
-			if err := rows.Scan(&objectPath); err != nil {
-				rows.Close()
-				return err
-			}
-			basePaths[objectPath] = struct{}{}
-		}
-		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
-			return err
+		for _, object := range liveBase {
+			basePaths[object.Path] = struct{}{}
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM publication_abandoned_objects WHERE attempt_identity = ?`, attemptIdentity); err != nil {
@@ -872,8 +865,19 @@ func (s *Store) PutAppliedCheckpoint(ctx context.Context, checkpoint *AppliedChe
 			return err
 		}
 	}
-	for _, object := range checkpoint.Inventory {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO publication_inventory(checkpoint_identity, path, phase, size, sha256, remote_identity) VALUES (?, ?, ?, ?, ?, ?)`, checkpoint.CheckpointIdentity, object.Path, object.Phase, object.Size, object.SHA256, object.RemoteIdentity); err != nil {
+	for start := 0; start < len(checkpoint.Inventory); start += sqliteManifestInsertBatchSize {
+		end := min(start+sqliteManifestInsertBatchSize, len(checkpoint.Inventory))
+		var query strings.Builder
+		query.WriteString(`INSERT INTO publication_inventory(checkpoint_identity, path, phase, size, sha256, remote_identity) VALUES `)
+		args := make([]any, 0, (end-start)*6)
+		for index, object := range checkpoint.Inventory[start:end] {
+			if index != 0 {
+				query.WriteByte(',')
+			}
+			query.WriteString(`(?, ?, ?, ?, ?, ?)`)
+			args = append(args, checkpoint.CheckpointIdentity, object.Path, object.Phase, object.Size, object.SHA256, object.RemoteIdentity)
+		}
+		if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
 			return err
 		}
 	}
@@ -898,6 +902,34 @@ func (s *Store) PutAppliedCheckpoint(ctx context.Context, checkpoint *AppliedChe
 		return fmt.Errorf("%w: verified attempt changed while applying checkpoint", ErrConflict)
 	}
 	return tx.Commit()
+}
+
+func (s *Store) MaxGraceNotBefore(ctx context.Context, targetIdentity string) (time.Time, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT g.not_before, c.applied_at, b.max_cache_ttl_ns
+FROM publication_grace_records AS g
+JOIN publication_checkpoints AS c ON c.checkpoint_identity = g.checkpoint_identity
+JOIN publication_target_bindings AS b ON b.target_identity = g.target_identity
+WHERE g.target_identity = ? AND g.state = 'grace'`, targetIdentity)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer rows.Close()
+	var latest time.Time
+	for rows.Next() {
+		var notBefore, appliedAt string
+		var ttlNS int64
+		if err := rows.Scan(&notBefore, &appliedAt, &ttlNS); err != nil {
+			return time.Time{}, err
+		}
+		deadline, err := effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if deadline.After(latest) {
+			latest = deadline.UTC()
+		}
+	}
+	return latest, rows.Err()
 }
 
 func (s *Store) PutGraceRecord(ctx context.Context, record *GraceRecord) error {
@@ -1000,22 +1032,34 @@ func (s *Store) PutPublicationCandidateReport(ctx context.Context, report *Publi
 		}
 		return tx.Commit()
 	}
-	var provider, inventory, attemptPhase, graceState, notBefore, appliedAt string
-	var ttlNS int64
-	if err := tx.QueryRowContext(ctx, `SELECT b.provider, c.inventory_identity, a.phase, g.state, g.not_before, c.applied_at, b.max_cache_ttl_ns
+	var provider, inventory, attemptPhase, graceState string
+	if err := tx.QueryRowContext(ctx, `SELECT b.provider, c.inventory_identity, a.phase, g.state
 	FROM publication_target_bindings AS b
 JOIN publication_checkpoints AS c ON c.target_identity = b.target_identity
 JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
 JOIN publication_grace_records AS g ON g.target_identity = c.target_identity AND g.checkpoint_identity = c.checkpoint_identity
-	WHERE b.target_identity = ? AND c.checkpoint_identity = ?`, report.TargetIdentity, report.CheckpointIdentity).Scan(&provider, &inventory, &attemptPhase, &graceState, &notBefore, &appliedAt, &ttlNS); err != nil {
+	WHERE b.target_identity = ? AND c.checkpoint_identity = ?`, report.TargetIdentity, report.CheckpointIdentity).Scan(&provider, &inventory, &attemptPhase, &graceState); err != nil {
 		return err
 	}
-	deadline, err := effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
+	deadline, err := effectiveCausalGraceDeadlineTx(ctx, tx, report.TargetIdentity, report.CheckpointIdentity)
 	if err != nil {
 		return err
 	}
-	if inventory != report.InventoryIdentity || provider == "r2" && report.Mode != "report_only" || provider == "filesystem" && report.Mode != "conditional_delete" || attemptPhase != "grace" || graceState != "grace" || report.CreatedAt.Before(deadline) {
+	if inventory != report.InventoryIdentity || provider == "filesystem" && report.Mode != "conditional_delete" || provider != "filesystem" && provider != "r2" || attemptPhase != "grace" || graceState != "grace" || report.CreatedAt.Before(deadline) {
 		return fmt.Errorf("%w: candidate report capability or inventory mismatch", ErrConflict)
+	}
+	var existingReport string
+	if err := tx.QueryRowContext(ctx, `SELECT report_identity FROM publication_candidate_reports WHERE target_identity = ? AND checkpoint_identity = ? AND inventory_identity = ?`, report.TargetIdentity, report.CheckpointIdentity, report.InventoryIdentity).Scan(&existingReport); err == nil {
+		return fmt.Errorf("%w: checkpoint already has candidate report %s", ErrConflict, existingReport)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	activeConditionalDelete, err := hasActiveConditionalDeleteWorkflowTx(ctx, tx, report.TargetIdentity)
+	if err != nil {
+		return err
+	}
+	if activeConditionalDelete {
+		return fmt.Errorf("%w: target has an unfinished conditional-delete report", ErrTransition)
 	}
 	var writeActive int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM publication_attempts WHERE target_identity = ? AND phase IN (
@@ -1037,12 +1081,122 @@ JOIN publication_grace_records AS g ON g.target_identity = c.target_identity AND
 	if _, err := tx.ExecContext(ctx, `INSERT INTO publication_candidate_reports(report_identity, schema_version, target_identity, checkpoint_identity, inventory_identity, mode, created_at) VALUES (?, 1, ?, ?, ?, ?, ?)`, report.ReportIdentity, report.TargetIdentity, report.CheckpointIdentity, report.InventoryIdentity, report.Mode, formatTimestamp(report.CreatedAt)); err != nil {
 		return err
 	}
-	for sequence, candidate := range report.Candidates {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO publication_candidates(report_identity, sequence, path, phase, size, sha256, remote_identity) VALUES (?, ?, ?, ?, ?, ?, ?)`, report.ReportIdentity, sequence, candidate.Path, candidate.Phase, candidate.Size, candidate.SHA256, candidate.RemoteIdentity); err != nil {
+	for start := 0; start < len(report.Candidates); start += sqliteManifestInsertBatchSize {
+		end := min(start+sqliteManifestInsertBatchSize, len(report.Candidates))
+		var query strings.Builder
+		query.WriteString(`INSERT INTO publication_candidates(report_identity, sequence, path, phase, size, sha256, remote_identity) VALUES `)
+		args := make([]any, 0, (end-start)*7)
+		for offset, candidate := range report.Candidates[start:end] {
+			if offset != 0 {
+				query.WriteByte(',')
+			}
+			query.WriteString(`(?, ?, ?, ?, ?, ?, ?)`)
+			args = append(args, report.ReportIdentity, start+offset, candidate.Path, candidate.Phase, candidate.Size, candidate.SHA256, candidate.RemoteIdentity)
+		}
+		if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// PromoteRetainedReportToConditionalDelete re-opens an already retained-reported
+// R2 checkpoint into an active conditional-delete report after re-computing the
+// live candidate set against the target's current head and grace protection set.
+func (s *Store) PromoteRetainedReportToConditionalDelete(ctx context.Context, checkpointIdentity string, observedAt time.Time) (PublicationCandidateReport, error) {
+	if !validSHA256Text(checkpointIdentity) {
+		return PublicationCandidateReport{}, errors.New("invalid publication checkpoint identity")
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	defer tx.Rollback()
+	var provider, targetIdentity, inventoryIdentity, attemptIdentity, attemptPhase, graceState, oldReportIdentity, oldMode string
+	if err := tx.QueryRowContext(ctx, `SELECT b.provider, c.target_identity, c.inventory_identity, a.attempt_identity, a.phase, g.state, r.report_identity, r.mode
+FROM publication_checkpoints AS c
+JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
+JOIN publication_target_bindings AS b ON b.target_identity = c.target_identity
+JOIN publication_grace_records AS g ON g.target_identity = c.target_identity AND g.checkpoint_identity = c.checkpoint_identity
+JOIN publication_candidate_reports AS r ON r.target_identity = c.target_identity AND r.checkpoint_identity = c.checkpoint_identity AND r.inventory_identity = c.inventory_identity
+WHERE c.checkpoint_identity = ?`, checkpointIdentity).Scan(
+		&provider, &targetIdentity, &inventoryIdentity, &attemptIdentity, &attemptPhase, &graceState, &oldReportIdentity, &oldMode,
+	); err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	deadline, err := effectiveCausalGraceDeadlineTx(ctx, tx, targetIdentity, checkpointIdentity)
+	if err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	if provider != "r2" || oldMode != "report_only" || graceState != "retained_reported" || attemptPhase != "done" && attemptPhase != "retained_reported" || observedAt.Before(deadline) {
+		return PublicationCandidateReport{}, fmt.Errorf("%w: checkpoint cannot be promoted from report-only to conditional-delete", ErrTransition)
+	}
+	activeConditionalDelete, err := hasActiveConditionalDeleteWorkflowTx(ctx, tx, targetIdentity)
+	if err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	if activeConditionalDelete {
+		return PublicationCandidateReport{}, fmt.Errorf("%w: target has an unfinished conditional-delete report", ErrTransition)
+	}
+	var writeActive int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM publication_attempts WHERE target_identity = ? AND phase IN (
+ 'planned', 'payload', 'immutable_metadata', 'pointer_prepared',
+ 'commit_intent', 'pointer_rollforward', 'verified', 'applied'
+)`, targetIdentity).Scan(&writeActive); err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	if writeActive != 0 {
+		return PublicationCandidateReport{}, fmt.Errorf("%w: target has a write-active publication attempt", ErrTransition)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM publication_candidate_reports WHERE report_identity = ? AND mode = 'report_only'`, oldReportIdentity); err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE publication_grace_records SET state = 'grace' WHERE checkpoint_identity = ? AND state = 'retained_reported'`, checkpointIdentity); err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE publication_attempts SET phase = 'grace', updated_at = ? WHERE attempt_identity = ? AND commit_intent = 1`, nowText(), attemptIdentity); err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	candidates, err := exactPublicationCandidatesTx(ctx, tx, checkpointIdentity)
+	if err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	report := PublicationCandidateReport{
+		SchemaVersion:      1,
+		TargetIdentity:     targetIdentity,
+		CheckpointIdentity: checkpointIdentity,
+		InventoryIdentity:  inventoryIdentity,
+		Mode:               "conditional_delete",
+		Candidates:         candidates,
+		CreatedAt:          observedAt,
+	}
+	report.ReportIdentity = candidateReportSemanticIdentity(report)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO publication_candidate_reports(report_identity, schema_version, target_identity, checkpoint_identity, inventory_identity, mode, created_at) VALUES (?, 1, ?, ?, ?, 'conditional_delete', ?)`, report.ReportIdentity, report.TargetIdentity, report.CheckpointIdentity, report.InventoryIdentity, formatTimestamp(report.CreatedAt)); err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	for start := 0; start < len(report.Candidates); start += sqliteManifestInsertBatchSize {
+		end := min(start+sqliteManifestInsertBatchSize, len(report.Candidates))
+		var query strings.Builder
+		query.WriteString(`INSERT INTO publication_candidates(report_identity, sequence, path, phase, size, sha256, remote_identity) VALUES `)
+		args := make([]any, 0, (end-start)*7)
+		for offset, candidate := range report.Candidates[start:end] {
+			if offset != 0 {
+				query.WriteByte(',')
+			}
+			query.WriteString(`(?, ?, ?, ?, ?, ?, ?)`)
+			args = append(args, report.ReportIdentity, start+offset, candidate.Path, candidate.Phase, candidate.Size, candidate.SHA256, candidate.RemoteIdentity)
+		}
+		if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
+			return PublicationCandidateReport{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return PublicationCandidateReport{}, err
+	}
+	return report, nil
 }
 
 // PutPublicationDeletionReceipt records one exact filesystem conditional
@@ -1093,7 +1247,7 @@ JOIN publication_grace_records AS g ON g.target_identity = r.target_identity AND
 	if err != nil {
 		return err
 	}
-	if provider != "filesystem" || mode != "conditional_delete" || attemptPhase != "grace" || graceState != "grace" || receipt.ObservedAt.Before(deadline) || candidate.Path != receipt.Path || candidate.Phase != receipt.Phase || candidate.Size != receipt.Size || candidate.SHA256 != receipt.SHA256 || candidate.RemoteIdentity != receipt.RemoteIdentity {
+	if provider != "filesystem" && provider != "r2" || mode != "conditional_delete" || attemptPhase != "grace" || graceState != "grace" || receipt.ObservedAt.Before(deadline) || candidate.Path != receipt.Path || candidate.Phase != receipt.Phase || candidate.Size != receipt.Size || candidate.SHA256 != receipt.SHA256 || candidate.RemoteIdentity != receipt.RemoteIdentity {
 		return fmt.Errorf("%w: deletion receipt is not exact conditional-delete evidence", ErrTransition)
 	}
 	receipt.ReceiptIdentity, err = acceptSemanticIdentity(receipt.ReceiptIdentity, deletionReceiptSemanticIdentity(*receipt), "publication deletion receipt identity")
@@ -1135,8 +1289,8 @@ JOIN publication_candidate_reports AS r ON r.target_identity = a.target_identity
 	WHERE a.attempt_identity = ? AND r.report_identity = ?`, attemptIdentity, reportIdentity).Scan(&provider, &mode, &phase, &graceState, &notBefore, &appliedAt, &ttlNS, &checkpointIdentity); err != nil {
 		return err
 	}
-	if provider != "filesystem" || mode != "conditional_delete" {
-		return fmt.Errorf("%w: deletion verification requires filesystem conditional-delete evidence", ErrTransition)
+	if provider != "filesystem" && provider != "r2" || mode != "conditional_delete" {
+		return fmt.Errorf("%w: deletion verification requires conditional-delete evidence", ErrTransition)
 	}
 	if (phase == "deletion_verified" || phase == "done") && graceState == "deletion_verified" {
 		if err := requireExactDeletionReceiptClosureTx(ctx, tx, reportIdentity); err != nil {
@@ -1188,15 +1342,15 @@ func (s *Store) MarkPublicationRetainedReported(ctx context.Context, attemptIden
 		return err
 	}
 	defer tx.Rollback()
-	var provider, phase, graceState, notBefore, appliedAt, mode, checkpointIdentity string
+	var provider, targetIdentity, phase, graceState, mode, checkpointIdentity, notBefore, appliedAt string
 	var ttlNS int64
-	if err := tx.QueryRowContext(ctx, `SELECT b.provider, a.phase, g.state, g.not_before, c.applied_at, b.max_cache_ttl_ns, r.mode, c.checkpoint_identity
+	if err := tx.QueryRowContext(ctx, `SELECT b.provider, a.target_identity, a.phase, g.state, r.mode, c.checkpoint_identity, g.not_before, c.applied_at, b.max_cache_ttl_ns
 FROM publication_attempts AS a
 JOIN publication_checkpoints AS c ON c.attempt_identity = a.attempt_identity
 JOIN publication_target_bindings AS b ON b.target_identity = a.target_identity
 JOIN publication_grace_records AS g ON g.target_identity = a.target_identity AND g.checkpoint_identity = c.checkpoint_identity
 JOIN publication_candidate_reports AS r ON r.target_identity = a.target_identity AND r.checkpoint_identity = c.checkpoint_identity AND r.inventory_identity = c.inventory_identity
-	WHERE a.attempt_identity = ? AND r.report_identity = ?`, attemptIdentity, reportIdentity).Scan(&provider, &phase, &graceState, &notBefore, &appliedAt, &ttlNS, &mode, &checkpointIdentity); err != nil {
+	WHERE a.attempt_identity = ? AND r.report_identity = ?`, attemptIdentity, reportIdentity).Scan(&provider, &targetIdentity, &phase, &graceState, &mode, &checkpointIdentity, &notBefore, &appliedAt, &ttlNS); err != nil {
 		return err
 	}
 	if provider != "r2" || mode != "report_only" {
@@ -1205,10 +1359,14 @@ JOIN publication_candidate_reports AS r ON r.target_identity = a.target_identity
 	if (phase == "retained_reported" || phase == "done") && graceState == "retained_reported" {
 		return tx.Commit()
 	}
+	// The report_only report is already persisted and immutable; use this
+	// checkpoint's own deadline so an interrupted legacy v0.7.1 report with
+	// inverted deadlines can still finish and unblock Publish.
 	deadline, err := effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
 	if err != nil {
 		return err
 	}
+	_ = targetIdentity
 	if phase != "grace" || graceState != "grace" || observedAt.Before(deadline) {
 		return fmt.Errorf("%w: grace is not expired or retention evidence is not pending", ErrTransition)
 	}
@@ -1254,7 +1412,7 @@ WHERE a.attempt_identity = ? AND r.report_identity = ?`, attemptIdentity, eviden
 		return err
 	}
 	if phase == "done" {
-		if provider == "filesystem" && mode == "conditional_delete" && graceState == "deletion_verified" {
+		if (provider == "filesystem" || provider == "r2") && mode == "conditional_delete" && graceState == "deletion_verified" {
 			if err := requireExactDeletionReceiptClosureTx(ctx, tx, evidenceIdentity); err != nil {
 				return err
 			}
@@ -1269,7 +1427,7 @@ WHERE a.attempt_identity = ? AND r.report_identity = ?`, attemptIdentity, eviden
 	switch {
 	case provider == "r2" && mode == "report_only" && graceState == "retained_reported" && phase == "retained_reported":
 		terminal = "retained_reported"
-	case provider == "filesystem" && mode == "conditional_delete" && graceState == "deletion_verified" && phase == "deletion_verified":
+	case (provider == "filesystem" || provider == "r2") && mode == "conditional_delete" && graceState == "deletion_verified" && phase == "deletion_verified":
 		if err := requireExactDeletionReceiptClosureTx(ctx, tx, evidenceIdentity); err != nil {
 			return err
 		}
@@ -1630,8 +1788,47 @@ ORDER BY i.path`, targetIdentity)
 	if err != nil {
 		return nil, err
 	}
-	deleted := make(map[string]PublicationCandidate)
-	deletedRows, err := tx.QueryContext(ctx, `SELECT d.path, d.phase, d.size, d.sha256, d.remote_identity
+	rawCandidates := make([]PublicationCandidate, 0)
+	rawPaths := make([]string, 0)
+	for _, object := range inventory {
+		if file, ok := checkpointClosure[object.Path]; ok && file.Phase == object.Phase && file.Size == object.Size && file.SHA256 == object.SHA256 {
+			continue
+		}
+		if object.Phase == "pointer" {
+			return nil, fmt.Errorf("%w: pointer %q cannot be a retention candidate", ErrConflict, object.Path)
+		}
+		if _, protected := protectedPaths[object.Path]; protected {
+			continue
+		}
+		rawCandidates = append(rawCandidates, PublicationCandidate(object))
+		rawPaths = append(rawPaths, object.Path)
+	}
+	if len(rawCandidates) == 0 {
+		return []PublicationCandidate{}, nil
+	}
+	causalOrder, orderedNodes, err := checkpointCausalChainTx(ctx, tx, targetIdentity)
+	if err != nil {
+		return nil, err
+	}
+	targetSeq, hasTargetSeq := causalOrder[checkpointIdentity]
+	if !hasTargetSeq {
+		return nil, fmt.Errorf("%w: publication checkpoint %s missing from target chain", ErrConflict, checkpointIdentity)
+	}
+	targetEpoch := checkpointCausalEpoch(targetSeq)
+	maxChainEpoch := abandonedCausalEpoch(len(orderedNodes) - 1)
+	// Check object appearances across the entire target causal chain up to and
+	// including any post-head abandoned uploads. Checkpoints sit at even epochs
+	// (2*seq) and post-checkpoint abandoned uploads sit at odd epochs (2*base+1).
+	// If an object was re-introduced strictly after checkpointIdentity (either by
+	// a later checkpoint or by an abandoned upload based on checkpointIdentity or
+	// later), this checkpoint no longer owns retiring it.
+	lastAppearanceEpoch, err := lastObjectAppearanceOrderForPathsTx(ctx, tx, targetIdentity, causalOrder, orderedNodes, maxChainEpoch, rawPaths)
+	if err != nil {
+		return nil, err
+	}
+	deletedMaxEpoch := make(map[string]int)
+	deletedPaths := make(map[string]struct{})
+	deletedRows, err := tx.QueryContext(ctx, `SELECT d.path, d.phase, d.size, d.sha256, d.remote_identity, r.checkpoint_identity
 FROM publication_deletion_receipts AS d
 JOIN publication_candidate_reports AS r ON r.report_identity = d.report_identity
 JOIN publication_checkpoints AS c ON c.checkpoint_identity = r.checkpoint_identity
@@ -1645,34 +1842,327 @@ ORDER BY d.path`, targetIdentity)
 	}
 	for deletedRows.Next() {
 		var object PublicationCandidate
-		if err := deletedRows.Scan(&object.Path, &object.Phase, &object.Size, &object.SHA256, &object.RemoteIdentity); err != nil {
+		var reportCheckpoint string
+		if err := deletedRows.Scan(&object.Path, &object.Phase, &object.Size, &object.SHA256, &object.RemoteIdentity, &reportCheckpoint); err != nil {
 			deletedRows.Close()
 			return nil, err
 		}
+		reportSeq, ok := causalOrder[reportCheckpoint]
+		if !ok {
+			continue
+		}
+		reportEpoch := checkpointCausalEpoch(reportSeq)
+		deletedPaths[object.Path] = struct{}{}
 		key := publicationObjectEvidenceKey(object.Path, object.Phase, object.Size, object.SHA256, object.RemoteIdentity)
-		deleted[key] = object
+		if prev, exists := deletedMaxEpoch[key]; !exists || reportEpoch > prev {
+			deletedMaxEpoch[key] = reportEpoch
+		}
 	}
 	if err := errors.Join(deletedRows.Err(), deletedRows.Close()); err != nil {
 		return nil, err
 	}
-	candidates := []PublicationCandidate{}
-	for _, object := range inventory {
-		if file, ok := checkpointClosure[object.Path]; ok && file.Phase == object.Phase && file.Size == object.Size && file.SHA256 == object.SHA256 {
+	candidates := make([]PublicationCandidate, 0, len(rawCandidates))
+	for _, candidate := range rawCandidates {
+		lastEpoch := -1
+		if epoch, ok := lastAppearanceEpoch[publicationManifestKey(candidate.Path, candidate.Phase, candidate.Size, candidate.SHA256)]; ok {
+			lastEpoch = epoch
+		}
+		if lastEpoch > targetEpoch {
 			continue
 		}
-		if object.Phase == "pointer" {
-			return nil, fmt.Errorf("%w: pointer %q cannot be a retention candidate", ErrConflict, object.Path)
-		}
-		candidate := PublicationCandidate(object)
-		if _, protected := protectedPaths[object.Path]; protected {
-			continue
-		}
-		if _, alreadyAbsent := deleted[publicationObjectEvidenceKey(candidate.Path, candidate.Phase, candidate.Size, candidate.SHA256, candidate.RemoteIdentity)]; alreadyAbsent {
-			continue
+		if _, hasPath := deletedPaths[candidate.Path]; hasPath {
+			if reportEpoch, hasReceipt := deletedMaxEpoch[publicationObjectEvidenceKey(candidate.Path, candidate.Phase, candidate.Size, candidate.SHA256, candidate.RemoteIdentity)]; hasReceipt && reportEpoch > lastEpoch {
+				continue
+			}
 		}
 		candidates = append(candidates, candidate)
 	}
 	return candidates, nil
+}
+
+type checkpointChainNode struct {
+	checkpoint string
+	base       string
+	generation GenerationID
+	appliedAt  string
+	seq        int
+}
+
+func checkpointCausalChainTx(ctx context.Context, tx *sql.Tx, targetIdentity string) (map[string]int, []checkpointChainNode, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT c.checkpoint_identity, COALESCE(a.base_checkpoint, ''), c.generation, c.applied_at
+FROM publication_checkpoints AS c
+JOIN publication_attempts AS a ON a.attempt_identity = c.attempt_identity
+WHERE c.target_identity = ? AND c.inventory_complete = 1`, targetIdentity)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	byID := map[string]checkpointChainNode{}
+	for rows.Next() {
+		var node checkpointChainNode
+		if err := rows.Scan(&node.checkpoint, &node.base, &node.generation, &node.appliedAt); err != nil {
+			return nil, nil, err
+		}
+		byID[node.checkpoint] = node
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	lessNode := func(a, b checkpointChainNode) bool {
+		if a.appliedAt != b.appliedAt {
+			return a.appliedAt < b.appliedAt
+		}
+		if a.generation != b.generation {
+			return a.generation < b.generation
+		}
+		return a.checkpoint < b.checkpoint
+	}
+	children := map[string][]checkpointChainNode{}
+	roots := []checkpointChainNode{}
+	for _, node := range byID {
+		if node.base == "" {
+			roots = append(roots, node)
+			continue
+		}
+		if _, parentExists := byID[node.base]; !parentExists {
+			roots = append(roots, node)
+			continue
+		}
+		children[node.base] = append(children[node.base], node)
+	}
+	sort.Slice(roots, func(i, j int) bool { return lessNode(roots[i], roots[j]) })
+	for parent := range children {
+		list := children[parent]
+		sort.Slice(list, func(i, j int) bool { return lessNode(list[i], list[j]) })
+		children[parent] = list
+	}
+	order := make(map[string]int, len(byID))
+	ordered := make([]checkpointChainNode, 0, len(byID))
+	visited := make(map[string]bool, len(byID))
+	var visit func(checkpointChainNode)
+	visit = func(node checkpointChainNode) {
+		if visited[node.checkpoint] {
+			return
+		}
+		visited[node.checkpoint] = true
+		node.seq = len(ordered)
+		order[node.checkpoint] = node.seq
+		ordered = append(ordered, node)
+		for _, child := range children[node.checkpoint] {
+			visit(child)
+		}
+	}
+	for _, root := range roots {
+		visit(root)
+	}
+	if len(ordered) < len(byID) {
+		remaining := make([]checkpointChainNode, 0, len(byID)-len(ordered))
+		for _, node := range byID {
+			if !visited[node.checkpoint] {
+				remaining = append(remaining, node)
+			}
+		}
+		sort.Slice(remaining, func(i, j int) bool { return lessNode(remaining[i], remaining[j]) })
+		for _, node := range remaining {
+			visit(node)
+		}
+	}
+	return order, ordered, nil
+}
+
+// effectiveCausalGraceDeadlinesTx computes effective grace deadlines along the
+// target's causal checkpoint chain. Legacy databases (such as v0.7.1 after
+// lowering max_cache_ttl via --rebind) can store a newer checkpoint whose
+// not_before precedes an older still-active grace checkpoint. Lifting each
+// active-grace and retained-reported checkpoint to at least the maximum
+// effective deadline of all earlier active-grace checkpoints preserves causal
+// expiry order so newer checkpoints never complete prematurely with zero
+// candidates while an older grace still protects superseded metadata.
+func effectiveCausalGraceDeadlinesTx(ctx context.Context, tx *sql.Tx, targetIdentity string, ordered []checkpointChainNode) (map[string]time.Time, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT g.checkpoint_identity, g.state, g.not_before, c.applied_at, b.max_cache_ttl_ns
+FROM publication_grace_records AS g
+JOIN publication_checkpoints AS c ON c.checkpoint_identity = g.checkpoint_identity
+JOIN publication_target_bindings AS b ON b.target_identity = g.target_identity
+WHERE g.target_identity = ?`, targetIdentity)
+	if err != nil {
+		return nil, err
+	}
+	type rawGrace struct {
+		state    string
+		deadline time.Time
+	}
+	byCheckpoint := map[string]rawGrace{}
+	for rows.Next() {
+		var checkpointID, graceState, notBefore, appliedAt string
+		var ttlNS int64
+		if err := rows.Scan(&checkpointID, &graceState, &notBefore, &appliedAt, &ttlNS); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		deadline, err := effectivePublicationGraceDeadline(notBefore, appliedAt, ttlNS)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		byCheckpoint[checkpointID] = rawGrace{state: graceState, deadline: deadline}
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	result := make(map[string]time.Time, len(byCheckpoint))
+	var causalFloor time.Time
+	for _, node := range ordered {
+		entry, ok := byCheckpoint[node.checkpoint]
+		if !ok {
+			continue
+		}
+		effective := entry.deadline
+		if entry.state == "grace" || entry.state == "retained_reported" {
+			if causalFloor.After(effective) {
+				effective = causalFloor
+			}
+			if effective.After(causalFloor) {
+				causalFloor = effective
+			}
+		}
+		result[node.checkpoint] = effective
+	}
+	for checkpointID, entry := range byCheckpoint {
+		if _, ok := result[checkpointID]; !ok {
+			result[checkpointID] = entry.deadline
+		}
+	}
+	return result, nil
+}
+
+func effectiveCausalGraceDeadlineTx(ctx context.Context, tx *sql.Tx, targetIdentity, checkpointIdentity string) (time.Time, error) {
+	_, ordered, err := checkpointCausalChainTx(ctx, tx, targetIdentity)
+	if err != nil {
+		return time.Time{}, err
+	}
+	deadlines, err := effectiveCausalGraceDeadlinesTx(ctx, tx, targetIdentity, ordered)
+	if err != nil {
+		return time.Time{}, err
+	}
+	deadline, ok := deadlines[checkpointIdentity]
+	if !ok {
+		return time.Time{}, fmt.Errorf("%w: publication grace", ErrNotFound)
+	}
+	return deadline, nil
+}
+
+func checkpointCausalEpoch(seq int) int {
+	return seq * 2
+}
+
+func abandonedCausalEpoch(baseSeq int) int {
+	return baseSeq*2 + 1
+}
+
+func lastObjectAppearanceOrderForPathsTx(ctx context.Context, tx *sql.Tx, targetIdentity string, causalOrder map[string]int, ordered []checkpointChainNode, uptoEpoch int, paths []string) (map[string]int, error) {
+	lastEpoch := map[string]int{}
+	if len(paths) == 0 || len(ordered) == 0 {
+		return lastEpoch, nil
+	}
+	genMaxEpoch := make(map[GenerationID]int, len(ordered))
+	for _, node := range ordered {
+		epoch := checkpointCausalEpoch(node.seq)
+		if epoch > uptoEpoch {
+			break
+		}
+		if prev, ok := genMaxEpoch[node.generation]; !ok || epoch > prev {
+			genMaxEpoch[node.generation] = epoch
+		}
+	}
+	if len(genMaxEpoch) == 0 {
+		return lastEpoch, nil
+	}
+	const pathBatchSize = 256
+	for start := 0; start < len(paths); start += pathBatchSize {
+		end := min(start+pathBatchSize, len(paths))
+		var query strings.Builder
+		query.WriteString(`SELECT generation, path, phase, size, sha256 FROM generation_files WHERE path IN (`)
+		args := make([]any, 0, end-start)
+		for index, objectPath := range paths[start:end] {
+			if index != 0 {
+				query.WriteByte(',')
+			}
+			query.WriteByte('?')
+			args = append(args, objectPath)
+		}
+		query.WriteByte(')')
+		rows, err := tx.QueryContext(ctx, query.String(), args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var gen GenerationID
+			var filePath, phase, sha string
+			var size int64
+			if err := rows.Scan(&gen, &filePath, &phase, &size, &sha); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			epoch, published := genMaxEpoch[gen]
+			if !published {
+				continue
+			}
+			key := publicationManifestKey(filePath, phase, size, sha)
+			if prev, ok := lastEpoch[key]; !ok || epoch > prev {
+				lastEpoch[key] = epoch
+			}
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			return nil, err
+		}
+	}
+	// Abandoned add-only uploads based on checkpoint C_k happened strictly after
+	// C_k (epoch 2*k+1) and before any successor checkpoint C_{k+1} (epoch 2*k+2).
+	// Placing them at half-step odd epochs prevents them from colliding with C_k's
+	// own checkpoint epoch (2*k) while preserving causal ordering against earlier
+	// deletion receipts (<= 2*k) and later successor checkpoints (>= 2*k+2).
+	abandonedRows, err := tx.QueryContext(ctx, `SELECT o.path, o.phase, o.size, o.sha256, COALESCE(a.base_checkpoint, '')
+FROM publication_abandoned_objects AS o
+JOIN publication_attempts AS a ON a.attempt_identity = o.attempt_identity
+WHERE a.target_identity = ? AND a.phase = 'abandoned'`, targetIdentity)
+	if err != nil {
+		return nil, err
+	}
+	wantPath := make(map[string]struct{}, len(paths))
+	for _, objectPath := range paths {
+		wantPath[objectPath] = struct{}{}
+	}
+	for abandonedRows.Next() {
+		var filePath, phase, sha, baseCheckpoint string
+		var size int64
+		if err := abandonedRows.Scan(&filePath, &phase, &size, &sha, &baseCheckpoint); err != nil {
+			abandonedRows.Close()
+			return nil, err
+		}
+		if _, wanted := wantPath[filePath]; !wanted || baseCheckpoint == "" {
+			continue
+		}
+		baseSeq, ok := causalOrder[baseCheckpoint]
+		if !ok {
+			continue
+		}
+		epoch := abandonedCausalEpoch(baseSeq)
+		if epoch > uptoEpoch {
+			continue
+		}
+		key := publicationManifestKey(filePath, phase, size, sha)
+		if prev, exists := lastEpoch[key]; !exists || epoch > prev {
+			lastEpoch[key] = epoch
+		}
+	}
+	if err := errors.Join(abandonedRows.Err(), abandonedRows.Close()); err != nil {
+		return nil, err
+	}
+	return lastEpoch, nil
+}
+
+func publicationManifestKey(path, phase string, size int64, sha string) string {
+	return fmt.Sprintf("%s\x00%s\x00%d\x00%s", path, phase, size, sha)
 }
 
 func publicationObjectEvidenceKey(path, phase string, size int64, sha, remoteIdentity string) string {

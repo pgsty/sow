@@ -65,7 +65,7 @@ func runRPMSigningChild(args []string) error {
 	if !managedFingerprint.MatchString(keyID) {
 		return errors.New("invalid RPM signing identity")
 	}
-	if name == "" || name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
+	if name == "" || name == "." || name == ".." || strings.HasPrefix(name, "-") || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
 		return errors.New("invalid RPM signing basename")
 	}
 	var directory unix.Stat_t
@@ -81,7 +81,7 @@ func runRPMSigningChild(args []string) error {
 	passfile := ""
 	if len(args) == 5 {
 		passfile = args[4]
-		if !strings.HasPrefix(passfile, "/tmp/sow-gpg-pass-") || filepath.Base(passfile) != "pass" || strings.ContainsAny(passfile, " \t\r\n%\x00") {
+		if filepath.Clean(passfile) != passfile || filepath.Dir(filepath.Dir(passfile)) != "/tmp" || !strings.HasPrefix(passfile, "/tmp/sow-gpg-pass-") || filepath.Base(passfile) != "pass" || strings.ContainsAny(passfile, " \t\r\n%\x00\"'\\") {
 			return errors.New("invalid RPM signing passfile")
 		}
 	}
@@ -90,6 +90,9 @@ func runRPMSigningChild(args []string) error {
 		"--define", "_signature gpg",
 		"--define", "_gpg_name " + strings.ToUpper(keyID),
 		"--define", "_gpg_digest_algo sha256",
+	}
+	if gnupgHome := os.Getenv("GNUPGHOME"); gnupgHome != "" && !strings.ContainsAny(gnupgHome, " \t\r\n%\x00\"'\\") {
+		rpmArgs = append(rpmArgs, "--define", "_gpg_path "+gnupgHome)
 	}
 	rpmArgs = append(rpmArgs, signing.RPMArgs(passfile)...)
 	rpmArgs = append(rpmArgs, operation, name)
@@ -443,6 +446,11 @@ func verifiedRPMSignerReader(ctx context.Context, reader io.ReadSeeker, keyring 
 	if err != nil || len(results) != 1 || results[0].Err != nil || len(results[0].Proofs) == 0 {
 		return "", false
 	}
+	for _, proof := range results[0].Proofs {
+		if proof.Coverage == yumrepo.RPMSignatureCoverageHeaderPayloadDigest || proof.Coverage == yumrepo.RPMSignatureCoverageHeaderPayload {
+			return strings.ToUpper(proof.SignerPrimaryFingerprint), true
+		}
+	}
 	return strings.ToUpper(results[0].Proofs[0].SignerPrimaryFingerprint), true
 }
 
@@ -509,7 +517,7 @@ func signManagedRPM(ctx context.Context, filename, keyID string, resign bool, cr
 		operation = "--resign"
 	}
 	name := filepath.Base(filename)
-	if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+	if name == "" || name == "." || name == ".." || strings.HasPrefix(name, "-") || strings.ContainsAny(name, `/\`) {
 		return errors.New("managed: unsafe RPM signing target")
 	}
 	parent, err := openPhysicalDirectoryChain(filepath.Dir(filename))
@@ -521,7 +529,7 @@ func signManagedRPM(ctx context.Context, filename, keyID string, resign bool, cr
 	if err := unix.Fstatat(int(parent.directory().Fd()), name, &before, unix.AT_SYMLINK_NOFOLLOW); err != nil || uint32(before.Mode)&unix.S_IFMT != unix.S_IFREG {
 		return finishParent(errors.Join(errors.New("managed: RPM signing target is not a regular file"), err))
 	}
-	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return finishParent(err)
 	}
@@ -535,12 +543,14 @@ func signManagedRPM(ctx context.Context, filename, keyID string, resign bool, cr
 	if err != nil {
 		return finish(errors.New("managed: current executable is unavailable for RPM signing"))
 	}
-	source, err := signing.Select(ctx, "", "", "")
+	var source signing.Source
 	if len(credentials) != 0 {
-		source, err = credentials[0], nil
-	}
-	if err != nil {
-		return finish(err)
+		source = credentials[0]
+	} else {
+		source, err = signing.Select(ctx, "", "", "")
+		if err != nil {
+			return finish(err)
+		}
 	}
 	passfile, cleanup, err := signing.RPMFile(source)
 	if err != nil {
@@ -552,6 +562,7 @@ func signManagedRPM(ctx context.Context, filename, keyID string, resign bool, cr
 		childArgs = append(childArgs, passfile)
 	}
 	command := exec.CommandContext(ctx, executable, childArgs...)
+	command.WaitDelay = 5 * time.Second
 	command.ExtraFiles = []*os.File{parent.directory()}
 	command.Stdout = io.Discard
 	command.Stderr = io.Discard
@@ -563,7 +574,7 @@ func signManagedRPM(ctx context.Context, filename, keyID string, resign bool, cr
 	if entryErr != nil || uint32(entry.Mode)&unix.S_IFMT != unix.S_IFREG {
 		return finish(errors.Join(errors.New("managed: RPM signing output is missing or unsafe"), entryErr))
 	}
-	signedFD, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	signedFD, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return finish(err)
 	}
@@ -770,10 +781,14 @@ func resolveKeyReference(root, reference string) ([]byte, string, error) {
 		return []byte(value), "", nil
 	}
 	filename := value
-	if !filepath.IsAbs(filename) {
+	if !filepath.IsAbs(filename) && root != "" {
 		filename = filepath.Join(root, filename)
 	}
-	data, err := readBoundedRegularNoFollow(filename, maxManagedKeyBytes)
+	absFilename, absErr := filepath.Abs(filename)
+	if absErr != nil {
+		return nil, "", errors.New("key reference path cannot be resolved")
+	}
+	data, err := readManagedKeyFile(root, absFilename, maxManagedKeyBytes)
 	if err != nil {
 		if secretOrigin {
 			return nil, "", errors.New("environment key reference does not resolve to a bounded regular file or OpenPGP key")
@@ -783,12 +798,24 @@ func resolveKeyReference(root, reference string) ([]byte, string, error) {
 	return data, "", nil
 }
 
+// readManagedKeyFile enforces strict O_NOFOLLOW inside the workspace root while
+// resolving symlinks (such as Kubernetes Secret ..data mounts) for key files
+// located outside the workspace root.
+func readManagedKeyFile(root, absFilename string, maximum int64) ([]byte, error) {
+	resolved, err := signing.ResolveSourcePath(root, absFilename)
+	if err != nil {
+		return nil, err
+	}
+	return readBoundedRegularNoFollow(resolved, maximum)
+}
+
 func exportPublicKey(ctx context.Context, identity string) ([]byte, error) {
 	gpg, err := exec.LookPath("gpg")
 	if err != nil {
 		return nil, errors.New("gpg executable is required to export a configured agent key")
 	}
 	command := exec.CommandContext(ctx, gpg, "--batch", "--no-tty", "--armor", "--export", identity)
+	command.WaitDelay = 5 * time.Second
 	var stdout bytes.Buffer
 	command.Stdout = &stdout
 	command.Stderr = io.Discard

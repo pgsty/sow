@@ -82,6 +82,55 @@ func TestWritePackagesPreservesExplicitZeroEpoch(t *testing.T) {
 	if len(entries) != 1 || entries[0].Paragraph.Values["Version"] != "0:1.2.3-1" {
 		t.Fatalf("generated Version = %q, want explicit zero epoch", entries[0].Paragraph.Values["Version"])
 	}
+
+	flatDir := t.TempDir()
+	flatDeb := writeMinimalDeb(t, flatDir, "libfoo-bin_1.2.3-1_amd64.deb", controlText)
+	flatPkg, err := InspectFlatPackage(context.Background(), flatDeb, "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	packagesPath := filepath.Join(flatDir, "Packages")
+	gzipPath := filepath.Join(flatDir, "Packages.gz")
+	var flatBuf bytes.Buffer
+	if err := WriteFlatPackages(context.Background(), &flatBuf, []Package{flatPkg}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(packagesPath, flatBuf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var gzBuf bytes.Buffer
+	zw := gzip.NewWriter(&gzBuf)
+	_, _ = zw.Write(flatBuf.Bytes())
+	_ = zw.Close()
+	if err := os.WriteFile(gzipPath, gzBuf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateFlatPackages(context.Background(), packagesPath, gzipPath, []Package{flatPkg}); err != nil {
+		t.Fatalf("ValidateFlatPackages explicit zero epoch: %v", err)
+	}
+}
+
+func TestWritePackagesConsecutiveBlankDescriptionLinesAndFoldedFields(t *testing.T) {
+	custom := "Package: multi\nVersion: 1.0-1\nArchitecture: amd64\nMaintainer: SOW Test <sow@example.invalid>\nDepends: libc6 (>= 2.31),\n libssl3\nDescription: summary\n para one\n .\n .\n para two\n"
+	pkg, err := InspectPackage(context.Background(), writeMinimalDeb(t, t.TempDir(), "multi_1.0-1_amd64.deb", custom), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := WritePackages(&output, []Package{pkg}); err != nil {
+		t.Fatal(err)
+	}
+	text := output.String()
+	if !strings.Contains(text, "Depends: libc6 (>= 2.31),\n libssl3\nDescription:") {
+		t.Fatalf("unexpected folded Depends output:\n%s", text)
+	}
+	if !strings.Contains(text, "Description: summary\n para one\n .\n .\n para two\n") {
+		t.Fatalf("consecutive blank lines in Description were corrupted:\n%s", text)
+	}
+	entries, err := control.ParseBinaryIndex(bufio.NewReader(bytes.NewReader(output.Bytes())))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("ParseBinaryIndex len=%d err=%v\n%s", len(entries), err, text)
+	}
 }
 
 func TestPackagesWriterRejectsOutOfOrderStream(t *testing.T) {

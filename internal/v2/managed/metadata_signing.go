@@ -20,6 +20,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"github.com/pgsty/sow/internal/aptrepo"
+	"github.com/pgsty/sow/internal/openpgpkey"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/signing"
 	"github.com/pgsty/sow/internal/v2/state"
@@ -118,12 +119,15 @@ func newGPGSignerCoreWithPublic(ctx context.Context, identity string, at time.Ti
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	credential, err := signing.Select(ctx, "", "", "")
+	var credential signing.Source
 	if len(credentials) != 0 {
-		credential, err = credentials[0], nil
-	}
-	if err != nil {
-		return nil, nil, err
+		credential = credentials[0]
+	} else {
+		var err error
+		credential, err = signing.Select(ctx, "", "", "")
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	cache, _ := ctx.Value(metadataSignerCacheKey{}).(*metadataSignerCache)
 	cacheKey := identity + "/" + strconv.FormatInt(at.Unix(), 10) + "/" + credential.ID()
@@ -186,6 +190,7 @@ func (signer *gpgSignerCore) runSign(ctx context.Context, operation []string, me
 	args := []string{"--batch", "--no-tty", "--yes", "--pinentry-mode", "error", "--digest-algo", "SHA256", "--faked-system-time", strconv.FormatInt(at.UTC().Unix(), 10) + "!", "--local-user", signer.signingFingerprint + "!", "--output", "-"}
 	args = append(args, operation...)
 	command := exec.CommandContext(ctx, gpg, args...)
+	command.WaitDelay = 5 * time.Second
 	command.Stdin, command.Stdout, command.Stderr = message, output, io.Discard
 	if err := signing.RunGPG(command, signer.credential); err != nil {
 		if ctx.Err() != nil {
@@ -217,25 +222,44 @@ func waitForFrozenGPGTime(ctx context.Context, at time.Time) error {
 }
 
 func (signer *gpgYUMMetadataSigner) Verify(ctx context.Context, message io.Reader, signature io.Reader) error {
-	messageBytes, err := io.ReadAll(io.LimitReader(message, 64<<20))
+	const maxMetadataMessageBytes = 64 << 20
+	messageBytes, err := io.ReadAll(io.LimitReader(message, maxMetadataMessageBytes+1))
 	if err != nil {
 		return err
 	}
+	if len(messageBytes) > maxMetadataMessageBytes {
+		return errors.New("managed: metadata message is unbounded")
+	}
 	signatureBytes, err := io.ReadAll(io.LimitReader(signature, maxManagedKeyBytes+1))
-	if err != nil || len(signatureBytes) > maxManagedKeyBytes {
+	if err != nil || len(signatureBytes) == 0 || len(signatureBytes) > maxManagedKeyBytes {
 		return errors.New("managed: detached metadata signature is unbounded")
 	}
-	return verifyGPGDetached(ctx, messageBytes, signatureBytes, signer.fingerprint)
+	blocks, err := openpgpkey.SplitArmor(signatureBytes, openpgp.SignatureType)
+	if err != nil || len(blocks) != 1 {
+		return errors.New("managed: detached metadata signature must be one complete armor block")
+	}
+	return verifyGPGDetached(ctx, messageBytes, blocks[0], signer.fingerprint)
 }
 
 // Verify satisfies APTMetadataSigner. gpg --decrypt both authenticates the
 // clear signature and returns the exact Release plaintext for byte comparison.
 func (signer *gpgAPTMetadataSigner) Verify(ctx context.Context, release, inRelease, detached []byte, _ time.Time) error {
+	if !bytes.HasPrefix(bytes.TrimLeft(inRelease, "\r\n"), []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
+		return errors.New("managed: InRelease verification failed")
+	}
+	if block, rest := clearsign.Decode(inRelease); block == nil || len(bytes.TrimSpace(rest)) != 0 {
+		return errors.New("managed: InRelease verification failed")
+	}
+	detachedBlocks, err := openpgpkey.SplitArmor(detached, openpgp.SignatureType)
+	if err != nil || len(detachedBlocks) != 1 {
+		return errors.New("managed: Release.gpg verification failed")
+	}
 	gpg, err := exec.LookPath("gpg")
 	if err != nil {
 		return err
 	}
 	command := exec.CommandContext(ctx, gpg, "--batch", "--no-tty", "--status-fd", "2", "--decrypt")
+	command.WaitDelay = 5 * time.Second
 	command.Stdin = bytes.NewReader(inRelease)
 	var plaintext bytes.Buffer
 	var status bytes.Buffer
@@ -243,7 +267,7 @@ func (signer *gpgAPTMetadataSigner) Verify(ctx context.Context, release, inRelea
 	if err := command.Run(); err != nil || !bytes.Equal(plaintext.Bytes(), release) || !gpgStatusMatchesFingerprint(status.String(), signer.fingerprint) {
 		return errors.New("managed: InRelease verification failed")
 	}
-	return verifyGPGDetached(ctx, release, detached, signer.fingerprint)
+	return verifyGPGDetached(ctx, release, detachedBlocks[0], signer.fingerprint)
 }
 
 func (signer *inProcessAPTMetadataSigner) Validate(ctx context.Context, at time.Time) error {
@@ -309,6 +333,7 @@ func verifyGPGDetached(ctx context.Context, message, signature []byte, fingerpri
 		return err
 	}
 	command := exec.CommandContext(ctx, gpg, "--batch", "--no-tty", "--status-fd", "2", "--verify", signaturePath, messagePath)
+	command.WaitDelay = 5 * time.Second
 	var status bytes.Buffer
 	command.Stdout, command.Stderr = io.Discard, &status
 	if err := command.Run(); err != nil || !gpgStatusMatchesFingerprint(status.String(), fingerprint) {
@@ -662,7 +687,13 @@ func metadataPublicationFloor(ctx context.Context, root string, repository confi
 			}
 		}
 		for _, subkey := range entity.Subkeys {
-			if subkey.PublicKey != nil && subkey.PublicKey.CreationTime.After(activation) {
+			if subkey.PublicKey == nil || !subkey.PublicKey.PubKeyAlgo.CanSign() {
+				continue
+			}
+			if subkey.Sig != nil && subkey.Sig.FlagsValid && !subkey.Sig.FlagSign {
+				continue
+			}
+			if subkey.PublicKey.CreationTime.After(activation) {
 				activation = subkey.PublicKey.CreationTime.UTC()
 			}
 			if subkey.Sig != nil && subkey.Sig.CreationTime.After(activation) {

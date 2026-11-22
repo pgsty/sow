@@ -76,31 +76,17 @@ func MigrateRepositoryLayout(ctx context.Context, opts RepositoryMigrationOption
 	if now.IsZero() {
 		return result, fmt.Errorf("%w: migration clock is unavailable", ErrRejected)
 	}
-	ws, cfg, _, rootGuard, err := migrationWorkspace(opts.WorkspaceOptions)
+	ws, _, _, rootGuard, err := migrationWorkspace(opts.WorkspaceOptions)
 	if err != nil {
 		return result, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, rootGuard.Close()) }()
-	repoName, err := selectMigrationRepository(ws, cfg, opts.Repository)
+	cfg, legacyConfig, repoName, workspaceLock, repoLock, err := acquireSelectedMigrationLocks(ctx, ws, opts.Repository, opts.LockOptions)
 	if err != nil {
 		return result, err
 	}
 	result.Repository = repoName
-	workspaceLock, repoLock, err := acquireLifecycleLocks(ctx, ws.Root, repoName, opts.LockOptions)
-	if err != nil {
-		return result, err
-	}
 	defer func() { resultErr = errors.Join(resultErr, workspaceLock.Close(), repoLock.Close()) }()
-	// Reload inside the exclusive Workspace lock.  The pre-lock compatibility
-	// parse was discovery only and never authorizes a stale config snapshot.
-	var legacyConfig bool
-	cfg, _, _, legacyConfig, err = config.LoadWorkspaceDocumentForMigration(ws)
-	if err != nil {
-		return result, err
-	}
-	if _, exists := cfg.Repositories[repoName]; !exists {
-		return result, fmt.Errorf("%w: repository %q disappeared from configuration", ErrRejected, repoName)
-	}
 	store, err := openExistingStateForMigration(filepath.Join(ws.Root, ".sow", repoName+".db"))
 	if err != nil {
 		if errors.Is(err, state.ErrLegacyLayout) {
@@ -497,6 +483,41 @@ func selectMigrationRepository(ws config.Workspace, cfg config.Config, explicit 
 	return selection.Name, nil
 }
 
+func acquireSelectedMigrationLocks(ctx context.Context, ws config.Workspace, explicit string, opts LockOptions) (config.Config, bool, string, *fileLock, *fileLock, error) {
+	started := time.Now()
+	workspaceLock, err := acquireFileLock(ctx, filepath.Join(ws.Root, ".sow", "workspace.lock"), opts.Timeout, opts.NoWait)
+	if err != nil {
+		return config.Config{}, false, "", nil, nil, err
+	}
+	fail := func(cause error) (config.Config, bool, string, *fileLock, *fileLock, error) {
+		return config.Config{}, false, "", nil, nil, errors.Join(cause, workspaceLock.Close())
+	}
+	remaining, err := remainingLockTimeout(opts.Timeout, started)
+	if err != nil {
+		return fail(err)
+	}
+	if err := recoverWorkspaceOperation(ctx, ws.Root, LockOptions{Timeout: remaining, NoWait: opts.NoWait}); err != nil {
+		return fail(err)
+	}
+	cfg, _, _, legacyConfig, err := config.LoadWorkspaceDocumentForMigration(ws)
+	if err != nil {
+		return fail(fmt.Errorf("%w: %v", ErrConfigInput, err))
+	}
+	repoName, err := selectMigrationRepository(ws, cfg, explicit)
+	if err != nil {
+		return fail(err)
+	}
+	remaining, err = remainingLockTimeout(opts.Timeout, started)
+	if err != nil {
+		return fail(err)
+	}
+	repoLock, err := acquireFileLock(ctx, filepath.Join(ws.Root, ".sow", "repo-locks", repoName+".lock"), remaining, opts.NoWait)
+	if err != nil {
+		return fail(err)
+	}
+	return cfg, legacyConfig, repoName, workspaceLock, repoLock, nil
+}
+
 func transitionJournalPath(root, repoName string) string {
 	return filepath.Join(root, ".sow", repoName, "transitions", transitionJournalName)
 }
@@ -609,6 +630,11 @@ func planC2Transition(ctx context.Context, root, repoName string, cfg config.Con
 			}
 		}
 	}
+	if len(rpmDists) != 0 {
+		if err := probeRootedDirectoryExchange(root, filepath.Join(repoName, "dists"), filepath.Join(".sow", repoName, "stage")); err != nil {
+			return nil, fmt.Errorf("%w: atomic Dist exchange is unavailable: %w", ErrRejected, err)
+		}
+	}
 	if err := loadManagedPackageFacts(ctx, allRPMSources, store, jobs, nil); err != nil {
 		return nil, err
 	}
@@ -714,9 +740,9 @@ func validateC2MigrationSource(ctx context.Context, root, repoName string, store
 		if err != nil {
 			return err
 		}
-		facts, inspectErr := inspectSnapshotReader(ctx, opened.file, object.Filename)
+		matched, inspectErr := matchesPersistedSnapshotReader(ctx, opened.file, object)
 		closeErr := opened.CloseVerified()
-		if inspectErr != nil || closeErr != nil || !sameManagedPackageFacts(object, facts) {
+		if inspectErr != nil || closeErr != nil || !matched {
 			return fmt.Errorf("package %s facts differ from SQLite: %v", object.SHA256, errors.Join(inspectErr, closeErr))
 		}
 	}
@@ -1430,6 +1456,7 @@ func (counter *copyCounter) copy(ctx context.Context, source *os.File) (int64, e
 func deleteLegacyAliases(ctx context.Context, root, repoName string, journal *C2ToSingleTransition, fault func(string) error) error {
 	repositoryRoot := filepath.Join(root, repoName)
 	poolRoots := map[string]struct{}{}
+	unflushed := 0
 	for index := range journal.LegacyAliases {
 		alias := &journal.LegacyAliases[index]
 		parts := strings.Split(alias.Path, "/")
@@ -1462,10 +1489,19 @@ func deleteLegacyAliases(ctx context.Context, root, repoName string, journal *C2
 			return receiptErr
 		}
 		alias.State, alias.ReceiptSHA256 = "deleted", &receipt
-		if err := persistTransitionJournal(root, repoName, *journal); err != nil {
-			return err
+		unflushed++
+		if fault != nil || unflushed >= 256 {
+			if err := persistTransitionJournal(root, repoName, *journal); err != nil {
+				return err
+			}
+			unflushed = 0
 		}
 		if err := callFault(fault, "migrate.alias."+alias.Path); err != nil {
+			return err
+		}
+	}
+	if unflushed != 0 {
+		if err := persistTransitionJournal(root, repoName, *journal); err != nil {
 			return err
 		}
 	}
@@ -1486,20 +1522,16 @@ func AbandonRepositoryMigration(ctx context.Context, opts RepositoryMigrationOpt
 	if ctx == nil {
 		return result, errors.New("managed: nil migration context")
 	}
-	ws, cfg, _, rootGuard, err := migrationWorkspace(opts.WorkspaceOptions)
+	ws, _, _, rootGuard, err := migrationWorkspace(opts.WorkspaceOptions)
 	if err != nil {
 		return result, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, rootGuard.Close()) }()
-	repoName, err := selectMigrationRepository(ws, cfg, opts.Repository)
+	_, _, repoName, workspaceLock, repoLock, err := acquireSelectedMigrationLocks(ctx, ws, opts.Repository, opts.LockOptions)
 	if err != nil {
 		return result, err
 	}
 	result.Repository = repoName
-	workspaceLock, repoLock, err := acquireLifecycleLocks(ctx, ws.Root, repoName, opts.LockOptions)
-	if err != nil {
-		return result, err
-	}
 	defer func() { resultErr = errors.Join(resultErr, workspaceLock.Close(), repoLock.Close()) }()
 	store, err := openExistingState(filepath.Join(ws.Root, ".sow", repoName+".db"))
 	if err != nil {

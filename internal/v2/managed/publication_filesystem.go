@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pgsty/sow/internal/v2/config"
@@ -46,6 +47,46 @@ type filesystemPublicationBackend struct {
 	publicReadIdleTimeout time.Duration
 	verificationSleep     func(context.Context, time.Duration) error
 	verificationNow       func() time.Time
+	hashMu                sync.Mutex
+	hashCache             map[rootedRegularIdentity]string
+}
+
+func (b *filesystemPublicationBackend) lookupCachedHash(identity rootedRegularIdentity) (string, bool) {
+	b.hashMu.Lock()
+	defer b.hashMu.Unlock()
+	if b.hashCache == nil {
+		return "", false
+	}
+	digest, ok := b.hashCache[identity]
+	return digest, ok
+}
+
+func (b *filesystemPublicationBackend) storeCachedHash(identity rootedRegularIdentity, digest string) {
+	b.hashMu.Lock()
+	defer b.hashMu.Unlock()
+	if b.hashCache == nil {
+		b.hashCache = map[rootedRegularIdentity]string{}
+	}
+	b.hashCache[identity] = digest
+}
+
+func (b *filesystemPublicationBackend) evictCachedPath(path string) {
+	opened, err := openRootedRegular(b.root, filepath.FromSlash(path))
+	if err != nil {
+		return
+	}
+	identity, identityErr := snapshotRegularDescriptorIdentity(opened.file)
+	_ = opened.CloseVerified()
+	if identityErr != nil {
+		return
+	}
+	b.hashMu.Lock()
+	defer b.hashMu.Unlock()
+	for key := range b.hashCache {
+		if key.sameInode(identity) {
+			delete(b.hashCache, key)
+		}
+	}
 }
 
 func newFilesystemPublicationBackend(target config.TargetConfig) (*filesystemPublicationBackend, error) {
@@ -287,12 +328,24 @@ func (b *filesystemPublicationBackend) List(ctx context.Context, ignored map[str
 		if !strings.HasPrefix(path, "pool/") && !strings.HasPrefix(path, "dists/") || publicFilePhase(path) == "" {
 			return fmt.Errorf("%w: filesystem target contains foreign public object %q", ErrIntegrity, path)
 		}
+		beforeIdentity, beforeErr := snapshotRegularDescriptorIdentity(file)
+		if beforeErr == nil {
+			if cached, ok := b.lookupCachedHash(beforeIdentity); ok {
+				objects = append(objects, publicationRemoteObject{Path: path, Size: info.Size(), SHA256: cached, RemoteIdentity: cached})
+				return nil
+			}
+		}
 		hash := sha256.New()
 		count, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
 		if err != nil || count != info.Size() {
 			return errors.Join(fmt.Errorf("%w: hash filesystem target object %q", ErrIntegrity, path), err)
 		}
 		digest := hex.EncodeToString(hash.Sum(nil))
+		if beforeErr == nil {
+			if afterIdentity, afterErr := snapshotRegularDescriptorIdentity(file); afterErr == nil && afterIdentity == beforeIdentity {
+				b.storeCachedHash(beforeIdentity, digest)
+			}
+		}
 		objects = append(objects, publicationRemoteObject{Path: path, Size: info.Size(), SHA256: digest, RemoteIdentity: digest})
 		return nil
 	}, func(relative string, _ *os.File, _ os.FileInfo) error {
@@ -310,6 +363,10 @@ func (b *filesystemPublicationBackend) List(ctx context.Context, ignored map[str
 }
 
 func (b *filesystemPublicationBackend) Head(ctx context.Context, path string) (publicationRemoteObject, bool, error) {
+	return b.headObject(ctx, path, true)
+}
+
+func (b *filesystemPublicationBackend) headObject(ctx context.Context, path string, useCache bool) (publicationRemoteObject, bool, error) {
 	opened, err := openRootedRegular(b.root, filepath.FromSlash(path))
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOENT) {
 		return publicationRemoteObject{}, false, nil
@@ -318,10 +375,24 @@ func (b *filesystemPublicationBackend) Head(ctx context.Context, path string) (p
 		return publicationRemoteObject{}, false, fmt.Errorf("%w: unsafe filesystem target object %q: %v", ErrIntegrity, path, err)
 	}
 	info, statErr := opened.file.Stat()
+	beforeIdentity, beforeErr := snapshotRegularDescriptorIdentity(opened.file)
+	if useCache && statErr == nil && beforeErr == nil {
+		if cached, ok := b.lookupCachedHash(beforeIdentity); ok {
+			if closeErr := opened.CloseVerified(); closeErr == nil {
+				return publicationRemoteObject{Path: path, Size: info.Size(), SHA256: cached, RemoteIdentity: cached}, true, nil
+			} else {
+				return publicationRemoteObject{}, false, fmt.Errorf("%w: read filesystem target object %q: %v", ErrIntegrity, path, closeErr)
+			}
+		}
+	}
 	digest, hashErr := hashOpenedFileContext(ctx, opened.file)
+	afterIdentity, afterErr := snapshotRegularDescriptorIdentity(opened.file)
 	closeErr := opened.CloseVerified()
 	if err := errors.Join(statErr, hashErr, closeErr); err != nil {
 		return publicationRemoteObject{}, false, fmt.Errorf("%w: read filesystem target object %q: %v", ErrIntegrity, path, err)
+	}
+	if beforeErr == nil && afterErr == nil && afterIdentity == beforeIdentity {
+		b.storeCachedHash(beforeIdentity, digest)
 	}
 	return publicationRemoteObject{Path: path, Size: info.Size(), SHA256: digest, RemoteIdentity: digest}, true, nil
 }
@@ -468,12 +539,13 @@ func (b *filesystemPublicationBackend) removeStageIfPresent(ctx context.Context,
 	if err != nil || !ok {
 		return err
 	}
+	b.evictCachedPath(stage)
 	return removeRootedRegularExact(ctx, b.root, filepath.FromSlash(stage), object.Size, object.SHA256)
 }
 
 func (b *filesystemPublicationBackend) VerifyPublic(ctx context.Context, expected state.GenerationFile) error {
 	if b.publicBase.Scheme == "file" {
-		object, ok, err := b.Head(ctx, expected.Path)
+		object, ok, err := b.headObject(ctx, expected.Path, false)
 		if err != nil || !ok || object.Size != expected.Size || object.SHA256 != expected.SHA256 {
 			return errors.Join(fmt.Errorf("%w: file public endpoint differs for %q", ErrIntegrity, expected.Path), err)
 		}
@@ -494,14 +566,24 @@ func (b *filesystemPublicationBackend) DeleteConditional(ctx context.Context, ca
 		if current.Size != candidate.Size || current.SHA256 != candidate.SHA256 || current.RemoteIdentity != candidate.RemoteIdentity {
 			return fmt.Errorf("%w: filesystem conditional-delete identity changed for %q", ErrIntegrity, candidate.Path)
 		}
+		b.evictCachedPath(candidate.Path)
 		if err := removeRootedRegularExact(ctx, b.root, filepath.FromSlash(candidate.Path), candidate.Size, candidate.SHA256); err != nil {
 			return fmt.Errorf("%w: conditional delete %q: %v", ErrIntegrity, candidate.Path, err)
 		}
+		pruneEmptyPublicationParents(b.root, candidate.Path)
 	}
 	if _, exists, err = b.Head(ctx, candidate.Path); err != nil || exists {
 		return errors.Join(fmt.Errorf("%w: filesystem object %q is not absent after conditional delete", ErrIntegrity, candidate.Path), err)
 	}
 	return nil
+}
+
+func pruneEmptyPublicationParents(root, objectPath string) {
+	for parent := filepath.ToSlash(filepath.Dir(filepath.FromSlash(objectPath))); parent != "." && parent != "pool" && parent != "dists"; parent = filepath.ToSlash(filepath.Dir(filepath.FromSlash(parent))) {
+		if err := removeRootedEmptyDirectory(root, filepath.FromSlash(parent)); err != nil {
+			break
+		}
+	}
 }
 
 func (b *filesystemPublicationBackend) VerifyPublicAbsent(ctx context.Context, objectPath string) error {

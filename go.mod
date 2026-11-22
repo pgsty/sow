@@ -8,7 +8,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.10
 	github.com/aws/smithy-go v1.28.9
 	github.com/cavaliergopher/rpm v1.3.0
-	github.com/kjk/lzma v0.0.0-20161016003348-3fd93898850d
 	github.com/klauspost/compress v1.20.4
 	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8
 	go.yaml.in/yaml/v4 v4.0.0

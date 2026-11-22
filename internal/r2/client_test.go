@@ -795,3 +795,42 @@ func TestS3HTTPStatusMultipart404AbortAndListErrorCap(t *testing.T) {
 		t.Fatalf("oversized non-2xx list response was not capped at maxErrorResponseSize: %v", err)
 	}
 }
+
+func TestDeleteHandles204Idempotent404ErrorAndInvalidKey(t *testing.T) {
+	ctx := context.Background()
+	var calls int
+	status := http.StatusNoContent
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodDelete {
+			t.Fatalf("unexpected method %s", request.Method)
+		}
+		calls++
+		writer.WriteHeader(status)
+		if status >= 400 && status != http.StatusNotFound {
+			_, _ = io.WriteString(writer, `<Error><Code>InternalError</Code></Error>`)
+		}
+	}))
+	defer server.Close()
+	httpClient := server.Client()
+	client, err := NewClient(Config{
+		Bucket: "bucket", ObjectBaseURL: server.URL + "/bucket", Client: httpClient, AllowInsecure: true,
+		Credentials: S3Credentials{AccessKeyID: "access", SecretAccessKey: "secret", Region: "auto"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Delete(ctx, "../escape"); err == nil || calls != 0 {
+		t.Fatalf("unsafe key delete err=%v calls=%d", err, calls)
+	}
+	if err := client.Delete(ctx, "repos/prod/package.rpm"); err != nil || calls != 1 {
+		t.Fatalf("204 delete err=%v calls=%d", err, calls)
+	}
+	status = http.StatusNotFound
+	if err := client.Delete(ctx, "repos/prod/package.rpm"); err != nil || calls != 2 {
+		t.Fatalf("404 idempotent delete err=%v calls=%d", err, calls)
+	}
+	status = http.StatusForbidden
+	if err := client.Delete(ctx, "repos/prod/package.rpm"); err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("403 delete error=%v, want HTTP 403 failure", err)
+	}
+}

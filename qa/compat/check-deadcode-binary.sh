@@ -8,7 +8,7 @@ cd "$root"
 diff -u "$allowlist" <(
   # Pin the release analysis platform so the exact allowlist is identical on
   # Darwin developer hosts and Linux CI runners.
-  GOOS=linux GOARCH=amd64 CGO_ENABLED=0 deadcode ./... |
+  GOOS=linux GOARCH=amd64 CGO_ENABLED=0 "${DEADCODE_CMD:-deadcode}" ./... |
     sed -E 's/^([^:]+):[0-9]+:[0-9]+: unreachable func: /\1: /' |
     LC_ALL=C sort
 )

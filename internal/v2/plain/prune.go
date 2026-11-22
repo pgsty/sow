@@ -69,12 +69,15 @@ func Prune(ctx context.Context, opts PruneOptions) (result PruneResult, resultEr
 		return result, err
 	}
 	info, err := os.Lstat(root)
-	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return result, &Error{Kind: KindRejected, Op: "prune directory", Path: root, Err: errors.Join(err, errors.New("target is not a real directory"))}
+	if err != nil {
+		return result, &Error{Kind: KindRuntime, Op: "prune directory", Path: root, Err: err}
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return result, &Error{Kind: KindRejected, Op: "prune directory", Path: root, Err: errors.New("target is not a real directory")}
 	}
 	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
-		return result, err
+		return result, &Error{Kind: KindRuntime, Op: "prune directory", Path: root, Err: err}
 	}
 	lock, err := acquireDirectoryLock(ctx, root, base.Timeout, base.NoWait)
 	if err != nil {
@@ -188,16 +191,23 @@ func Prune(ctx context.Context, opts PruneOptions) (result PruneResult, resultEr
 	return result, nil
 }
 
-func validatePruneDirectory(root string) error {
+func rejectManagedWorkspaceAncestors(root, op, message string) error {
 	for dir := root; ; dir = filepath.Dir(dir) {
 		if _, err := os.Lstat(filepath.Join(dir, ".sow")); err == nil {
-			return &Error{Kind: KindRejected, Op: "prune", Path: root, Err: errors.New("managed workspaces cannot be pruned as flat repositories")}
+			return &Error{Kind: KindRejected, Op: op, Path: root, Err: errors.New(message)}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
+			return &Error{Kind: KindRuntime, Op: op, Path: root, Err: err}
 		}
 		if filepath.Dir(dir) == dir {
 			break
 		}
+	}
+	return nil
+}
+
+func validatePruneDirectory(root string) error {
+	if err := rejectManagedWorkspaceAncestors(root, "prune", "managed workspaces cannot be pruned as flat repositories"); err != nil {
+		return err
 	}
 	for _, name := range []string{"repodata/repomd.xml.asc", "Packages", "Packages.gz"} {
 		if _, err := os.Lstat(filepath.Join(root, name)); err == nil {
@@ -297,22 +307,53 @@ func selectPrunePackages(scan scanResult, protect []string) (scanResult, []Prune
 // reads of every replacement for every old package.
 type pruneReplacement struct {
 	path     string
+	sha256   string
 	identity unix.Stat_t
 }
 
-func samePruneIdentity(a, b unix.Stat_t) bool {
+func samePruneCoreIdentity(a, b unix.Stat_t) bool {
 	return a.Dev == b.Dev && a.Ino == b.Ino && a.Mode == b.Mode &&
-		a.Nlink == b.Nlink && a.Size == b.Size && a.Mtim == b.Mtim && a.Ctim == b.Ctim
+		a.Size == b.Size && a.Mtim == b.Mtim
 }
 
-func (replacement pruneReplacement) verify() error {
+func samePruneIdentity(a, b unix.Stat_t) bool {
+	return samePruneCoreIdentity(a, b) && a.Nlink == b.Nlink && a.Ctim == b.Ctim
+}
+
+func (replacement pruneReplacement) verify(ctx context.Context) error {
 	var current unix.Stat_t
 	err := unix.Lstat(replacement.path, &current)
-	if err == nil && !samePruneIdentity(replacement.identity, current) {
-		err = errors.New("replacement RPM changed after verification")
-	}
 	if err != nil {
 		return &Error{Kind: KindIntegrity, Op: "verify replacement RPM", Path: replacement.path, Err: err}
+	}
+	if samePruneIdentity(replacement.identity, current) {
+		return nil
+	}
+	if !samePruneCoreIdentity(replacement.identity, current) || replacement.sha256 == "" {
+		return &Error{Kind: KindIntegrity, Op: "verify replacement RPM", Path: replacement.path, Err: errors.New("replacement RPM changed after verification")}
+	}
+	// Nlink/Ctim can change when an external hardlink to the same immutable inode
+	// is created or removed; re-verify SHA-256 on the bound descriptor before
+	// rejecting so hardlinked RPMs succeed while mtime-restored rewrites fail.
+	file, err := os.OpenFile(replacement.path, os.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return &Error{Kind: KindIntegrity, Op: "verify replacement RPM", Path: replacement.path, Err: err}
+	}
+	var opened unix.Stat_t
+	statErr := unix.Fstat(int(file.Fd()), &opened)
+	if statErr == nil && !samePruneCoreIdentity(replacement.identity, opened) {
+		statErr = errors.New("replacement RPM changed while reopening")
+	}
+	hash := sha256.New()
+	var copyErr error
+	if statErr == nil {
+		_, copyErr = io.Copy(hash, &contextReader{ctx: ctx, reader: file})
+	}
+	if err := errors.Join(statErr, copyErr, file.Close()); err != nil {
+		return &Error{Kind: KindIntegrity, Op: "verify replacement RPM", Path: replacement.path, Err: err}
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != replacement.sha256 {
+		return &Error{Kind: KindIntegrity, Op: "verify replacement RPM", Path: replacement.path, Err: errors.New("replacement RPM changed after verification")}
 	}
 	return nil
 }
@@ -322,7 +363,7 @@ func verifyPruneReplacementIdentities(ctx context.Context, replacements map[stri
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := replacement.verify(); err != nil {
+		if err := replacement.verify(ctx); err != nil {
 			return err
 		}
 	}
@@ -343,7 +384,7 @@ func verifyPruneReplacements(ctx context.Context, scan scanResult, candidates []
 		if err != nil {
 			return nil, &Error{Kind: KindIntegrity, Op: "verify replacement RPM", Path: fact.path, Err: err}
 		}
-		replacement := pruneReplacement{path: fact.path}
+		replacement := pruneReplacement{path: fact.path, sha256: fact.sha256}
 		err = unix.Fstat(int(file.Fd()), &replacement.identity)
 		if err == nil {
 			var before os.FileInfo
@@ -373,7 +414,7 @@ func verifyPruneReplacements(ctx context.Context, scan scanResult, candidates []
 		if err = errors.Join(err, statErr, file.Close()); err != nil {
 			return nil, &Error{Kind: KindIntegrity, Op: "verify replacement RPM", Path: fact.path, Err: err}
 		}
-		if err := replacement.verify(); err != nil {
+		if err := replacement.verify(ctx); err != nil {
 			return nil, err
 		}
 		replacements[fact.name+"\x00"+fact.arch] = replacement

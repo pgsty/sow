@@ -31,6 +31,7 @@ func WithPassFile(ctx context.Context, path string) context.Context {
 // Source contains only a file path or a legacy environment variable name.
 // Its zero value delegates unlocking to the existing GPG/RPM environment.
 type Source struct {
+	root   string
 	path   string
 	env    string
 	legacy bool
@@ -76,35 +77,51 @@ func Select(ctx context.Context, root, passfile, legacy string) (Source, error) 
 		return Source{}, errors.New("passfile and passphrase are mutually exclusive")
 	}
 	if override, _ := ctx.Value(overrideKey{}).(string); override != "" {
-		return fileSource("", override, false)
+		return fileSource("", root, override, false)
 	}
 	if passfile != "" {
-		return fileSource(root, passfile, false)
+		return fileSource(root, root, passfile, false)
 	}
 	if legacy != "" {
 		if strings.HasPrefix(legacy, "env://") {
 			return Source{env: strings.TrimPrefix(legacy, "env://"), legacy: true}, nil
 		}
-		return fileSource(root, strings.TrimPrefix(legacy, "file://"), true)
+		return fileSource(root, root, strings.TrimPrefix(legacy, "file://"), true)
 	}
 	if path, set := os.LookupEnv(Environment); set {
-		return fileSource("", path, false)
+		return fileSource("", root, path, false)
 	}
 	return Source{}, nil
 }
 
-func fileSource(root, path string, legacy bool) (Source, error) {
+func fileSource(baseDir, guardRoot, path string, legacy bool) (Source, error) {
 	if err := ValidatePath(path); err != nil {
 		return Source{}, err
 	}
-	if !filepath.IsAbs(path) && root != "" {
-		path = filepath.Join(root, path)
+	absBase := ""
+	if baseDir != "" {
+		resolvedBase, err := filepath.Abs(baseDir)
+		if err != nil {
+			return Source{}, errors.Join(ErrCredential, errors.New("cannot resolve workspace root"))
+		}
+		absBase = resolvedBase
+	}
+	absGuardRoot := ""
+	if guardRoot != "" {
+		resolvedGuard, err := filepath.Abs(guardRoot)
+		if err != nil {
+			return Source{}, errors.Join(ErrCredential, errors.New("cannot resolve workspace root"))
+		}
+		absGuardRoot = resolvedGuard
+	}
+	if !filepath.IsAbs(path) && absBase != "" {
+		path = filepath.Join(absBase, path)
 	}
 	path, err := filepath.Abs(path)
 	if err != nil {
 		return Source{}, errors.Join(ErrCredential, errors.New("cannot resolve passfile path"))
 	}
-	return Source{path: path, legacy: legacy}, nil
+	return Source{root: absGuardRoot, path: path, legacy: legacy}, nil
 }
 
 // Read returns caller-owned bytes. Clear them after use. New passfiles are
@@ -124,7 +141,7 @@ func (source Source) Read() ([]byte, error) {
 		data = []byte(value)
 	} else {
 		var err error
-		data, err = readFile(source.path)
+		data, err = readSourceFile(source.root, source.path)
 		if err != nil {
 			return nil, errors.Join(ErrCredential, err)
 		}

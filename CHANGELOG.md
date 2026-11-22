@@ -2,6 +2,86 @@
 
 All notable changes to SOW are recorded here.
 
+## 0.8.0 - 2026-11-22
+
+- Add opt-in `sow gc TARGET --delete` for R2 publication targets. Default
+  `sow gc TARGET` on R2 remains report-only; `--delete` (either directly or
+  after a prior report-only review) re-verifies live protection roots, verifies
+  each candidate's remote size and ETag before issuing `DeleteObject`, verifies
+  storage and public HTTP 404 absence, and records durable deletion receipts
+  scoped to the object's causal publication epoch so re-publishing identical
+  package bytes keeps subsequent publications idempotent. An unfinished
+  conditional-delete report requires `--delete` to resume.
+- Allow external secret and keyring symlinks outside the workspace root (such as
+  Kubernetes `Secret` mounts and `/var/run/secrets` paths) for `--passfile`,
+  `SOW_GPG_PASSFILE`, `passfile`, `key: file://`, and `trusted_keys`, while
+  keeping strict component-by-component `O_NOFOLLOW` traversal inside the
+  workspace and rejecting symlinks that resolve back into the workspace.
+- Drop `.deb` `control.tar.lzma` decompression support and remove the unmaintained
+  `github.com/kjk/lzma` and `pault.ag/go/debian/deb` package dependencies. Binary
+  `.deb` control archives using `.tar`, `.gz`, `.bz2`, `.xz`, and `.zst` remain
+  supported, and `ar` member headers are validated directly with 64-bit bounds.
+- Release the parent directory lock in `sow create` and `sow prune` before waiting
+  on a busy target directory and immediately after target binding, so neither
+  active nor queued runs on one flat repository block sibling repositories. Guard
+  `sow create` against running inside a managed `.sow` workspace ancestor or over
+  an interrupted `.sow-prune-repo-complete` marker, apply `--pigsty` filtering
+  before duplicate-filename checks, re-verify replacement SHA-256 digests on
+  `ctime`/`nlink` changes during `sow prune`, and cryptographically verify
+  exported OpenPGP signatures after `sow create --sign-with`.
+- Harden DEB and RPM metadata parsing and signature verification: enforce valid
+  UTF-8 in binary DEB `control` documents, accept explicit `0:` zero epochs in
+  flat APT self-validation, encode deb822 paragraphs without corrupting folded
+  leading-whitespace lines, enforce strict `InRelease` clearsign framing and
+  single-packet `Release.gpg` / `repomd.xml.asc` signatures, sanitize XML-illegal
+  control bytes from RPM display strings at parse time, extract `SourceRPM` names
+  by stripping the trailing `-version-release.arch.rpm` suffix for newly admitted
+  packages while preserving existing `Source` / `PoolPath` compatibility for
+  previously admitted subpackages, normalize empty RPM epochs, deduplicate
+  non-adjacent RPM `Requires`, parse RPM keyrings entity by entity, enforce
+  SHA-256+ hashes on published `repomd.xml.asc`, reject unsupported RPM signature
+  tag `278`, prefer payload-authenticating RPM signatures over header-only
+  signatures when attributing signers, and reject duplicate tags in main RPM
+  headers.
+- Unify managed `workspace.lock` -> `repo.lock` acquisition and recovery ordering
+  across `dist new`, `dist rm`, and `repo migrate` so an interrupted `repo.rm`
+  journal recovers without self-deadlock. Use descriptor-anchored directory
+  exchanges with preflight capability probes (recovering interrupted empty probe
+  directories automatically) and a `linkat`+`unlinkat` fallback when
+  `RENAME_NOREPLACE` is unsupported, replay and surface `retain-remove-*`
+  tombstones in `sow gc` and `sow check`, clamp `GraceRecord.NotBefore`
+  monotonically across `--rebind` TTL reductions while processing equal-deadline
+  checkpoints in causal publication order, and prune empty `pool/` and `dists/`
+  parent directories after filesystem target conditional deletes.
+- Ensure every SQLite writer (including `OpenExisting` after staged WAL schema
+  validation) reconnects through a connector that applies
+  `SQLITE_FCNTL_PERSIST_WAL` and `BEGIN IMMEDIATE` transactions, stage
+  `OpenExistingForMigration` safely before inspecting legacy schemas and
+  checkpoint WAL after migration commit, make `UpdateOperationPayload` a single
+  atomic statement, pass `--define "_gpg_path $GNUPGHOME"` to `rpmsign` when
+  `GNUPGHOME` is set, bound signing subprocess teardown with `WaitDelay`, and
+  zero-overwrite temporary passfile scratch files before removal.
+- Accelerate large-repository publication, GC, and SQLite state updates without
+  changing schema v13: validate local publication sources via fast stat/evidence
+  checks, reuse R2 checkpoint `(Path, Size, ETag)` identities to skip redundant
+  `HEAD` calls on unchanged `pool/` payloads while raising per-host idle HTTP
+  connections, cache descriptor hashes within filesystem target sessions while
+  re-reading freshly installed public files, hoist target maintenance inventory
+  verification outside per-attempt loops, omit surviving manifests from
+  `localGCPlan` and execute large unreachable backlogs in bounded batches below
+  the 64 MiB plan limit, and batch SQLite `memberships`, checkpoint, audit, and
+  legacy-alias updates.
+- Allow read-only inspection commands (`config check`, `repo ls`, `repo show`,
+  `dist ls`, `dist show`) on frozen `sow/v2` workspaces, populate `operation` in
+  `sow log prune --json` and `repository` in `sow where -r --json`, handle local
+  valued options cleanly before global flags, surface a clear hint when `sow.yaml`
+  is present without `sow.yml`, pin reproducible GoReleaser build and package
+  timestamps, add macOS CI coverage and signed Managed APT/DNF container tests,
+  and refresh `THIRD_PARTY_NOTICES`.
+
+This release keeps schema v13 and the existing public repository layout.
+Workspaces already on v0.5.0 through v0.7.1 do not require a schema migration.
+
 ## 0.7.1 - 2026-11-11
 
 - Require Go 1.27.4 and refresh runtime and test dependencies to their latest

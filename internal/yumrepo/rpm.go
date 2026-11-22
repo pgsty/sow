@@ -410,8 +410,8 @@ func packageMetadataFromParsedRPM(pkg *crpm.Package, in PackageInput, basename, 
 		if err != nil || hrefErr != nil || view != in.ViewPath || wantHref.String() != in.Location {
 			return nil, fmt.Errorf("%w: managed package href is not canonical for ViewPath %q", ErrUnsafeLocation, in.ViewPath.String())
 		}
-		source := sourceNameFromRPM(tagString(&pkg.Header, tagSourceRPM), name, tagString(&pkg.Header, tagVersion), tagString(&pkg.Header, tagRelease))
-		if pool.Source() != source {
+		if !matchesManagedRPMSource(pool.Source(), tagString(&pkg.Header, tagSourceRPM), name, tagString(&pkg.Header, tagVersion), tagString(&pkg.Header, tagRelease)) {
+			source := sourceNameFromRPM(tagString(&pkg.Header, tagSourceRPM), name, tagString(&pkg.Header, tagVersion), tagString(&pkg.Header, tagRelease))
 			return nil, fmt.Errorf("%w: managed Pool source %q differs from RPM source %q", ErrUnsafeLocation, pool.Source(), source)
 		}
 		location = in.Location
@@ -428,20 +428,20 @@ func packageMetadataFromParsedRPM(pkg *crpm.Package, in PackageInput, basename, 
 		Epoch:         tagInt(&pkg.Header, tagEpoch),
 		Checksum:      checksum,
 		Location:      location,
-		Summary:       joinTag(&pkg.Header, tagSummary),
-		Description:   joinTag(&pkg.Header, tagDescription),
-		Packager:      tagString(&pkg.Header, tagPackager),
-		URL:           tagString(&pkg.Header, tagURL),
+		Summary:       cleanXMLString(joinTag(&pkg.Header, tagSummary)),
+		Description:   cleanXMLString(joinTag(&pkg.Header, tagDescription)),
+		Packager:      cleanXMLString(tagString(&pkg.Header, tagPackager)),
+		URL:           cleanXMLString(tagString(&pkg.Header, tagURL)),
 		FileTime:      fileTime,
 		BuildTime:     tagInt(&pkg.Header, tagBuildTime),
 		PackageSize:   packageSize,
 		InstalledSize: pkg.Size(),
 		ArchiveSize:   pkg.ArchiveSize(),
-		License:       tagString(&pkg.Header, tagLicense),
-		Vendor:        tagString(&pkg.Header, tagVendor),
-		Group:         tagString(&pkg.Header, tagGroup),
-		BuildHost:     tagString(&pkg.Header, tagBuildHost),
-		SourceRPM:     tagString(&pkg.Header, tagSourceRPM),
+		License:       cleanXMLString(tagString(&pkg.Header, tagLicense)),
+		Vendor:        cleanXMLString(tagString(&pkg.Header, tagVendor)),
+		Group:         cleanXMLString(tagString(&pkg.Header, tagGroup)),
+		BuildHost:     cleanXMLString(tagString(&pkg.Header, tagBuildHost)),
+		SourceRPM:     cleanXMLString(tagString(&pkg.Header, tagSourceRPM)),
 	}
 	if m.Provides, err = readDependencies(&pkg.Header, tagProvideNames, tagProvideFlags, tagProvideEVRs, false); err != nil {
 		return nil, fmt.Errorf("%w: %q provides: %v", ErrInvalidPackage, in.Path, err)
@@ -514,6 +514,35 @@ func CompareEVR(leftEpoch int64, leftVersion, leftRelease string, rightEpoch int
 
 func sourceNameFromRPM(sourceRPM, fallback, version, release string) string {
 	base := strings.TrimSpace(sourceRPM)
+	hadSrcSuffix := false
+	for _, suffix := range []string{".src.rpm", ".nosrc.rpm"} {
+		if strings.HasSuffix(base, suffix) {
+			base = strings.TrimSuffix(base, suffix)
+			hadSrcSuffix = true
+			break
+		}
+	}
+	if tail := "-" + version + "-" + release; version != "" && release != "" && strings.HasSuffix(base, tail) {
+		base = strings.TrimSuffix(base, tail)
+	} else if hadSrcSuffix {
+		if last := strings.LastIndexByte(base, '-'); last > 0 && last < len(base)-1 {
+			if prev := strings.LastIndexByte(base[:last], '-'); prev > 0 && last > prev+1 {
+				base = base[:prev]
+			}
+		}
+	}
+	if base == "" || !safeManagedPackageComponent(base) {
+		return fallback
+	}
+	return base
+}
+
+// LegacySourceNameFromRPM reproduces the v0.5.0-v0.7.1 source-name derivation
+// so already-admitted RPM subpackages whose binary version differed from their
+// SRPM version remain valid at their persisted Source and PoolPath across
+// binary-only upgrades.
+func LegacySourceNameFromRPM(sourceRPM, fallback, version, release string) string {
+	base := strings.TrimSpace(sourceRPM)
 	for _, suffix := range []string{".src.rpm", ".nosrc.rpm"} {
 		if strings.HasSuffix(base, suffix) {
 			base = strings.TrimSuffix(base, suffix)
@@ -527,6 +556,13 @@ func sourceNameFromRPM(sourceRPM, fallback, version, release string) string {
 		return fallback
 	}
 	return base
+}
+
+func matchesManagedRPMSource(poolSource, sourceRPM, fallback, version, release string) bool {
+	if poolSource == sourceNameFromRPM(sourceRPM, fallback, version, release) {
+		return true
+	}
+	return poolSource == LegacySourceNameFromRPM(sourceRPM, fallback, version, release)
 }
 
 func safeManagedPackageComponent(value string) bool {
@@ -703,7 +739,7 @@ func normalizeRPMRequires(requires, provides []dependency, files []rpmFile) []de
 		}
 	}
 
-	lastByName := make(map[string]dependencyIdentity)
+	seen := make(map[dependencyIdentity]struct{}, len(requires))
 	result := make([]dependency, 0, len(requires))
 	var highestLibc *dependency
 	for _, dep := range requires {
@@ -719,7 +755,7 @@ func normalizeRPMRequires(requires, provides []dependency, files []rpmFile) []de
 			continue
 		}
 		identity := identityOfDependency(dep, true)
-		if previous, seen := lastByName[dep.Name]; seen && previous == identity {
+		if _, duplicate := seen[identity]; duplicate {
 			continue
 		}
 		if strings.HasPrefix(dep.Name, "libc.so.6") {
@@ -730,7 +766,7 @@ func normalizeRPMRequires(requires, provides []dependency, files []rpmFile) []de
 			continue
 		}
 		result = append(result, dep)
-		lastByName[dep.Name] = identity
+		seen[identity] = struct{}{}
 	}
 	if highestLibc != nil {
 		result = append(result, *highestLibc)
@@ -782,6 +818,14 @@ func splitEVR(evr string) (epoch, version, release string) {
 	}
 	if i := strings.IndexByte(evr, ':'); i >= 0 {
 		epoch, evr = evr[:i], evr[i+1:]
+		if epoch == "" {
+			epoch = "0"
+		} else if isASCIIDigits(epoch) {
+			epoch = strings.TrimLeft(epoch, "0")
+			if epoch == "" {
+				epoch = "0"
+			}
+		}
 	} else {
 		epoch = "0"
 	}
@@ -791,6 +835,18 @@ func splitEVR(evr string) (epoch, version, release string) {
 		version = evr
 	}
 	return epoch, version, release
+}
+
+func isASCIIDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func readFiles(h *crpm.Header) ([]rpmFile, error) {
@@ -848,7 +904,7 @@ func readChangelogs(h *crpm.Header) ([]changelog, error) {
 		if len(out) != 0 && date <= out[len(out)-1].Date {
 			date = out[len(out)-1].Date + 1
 		}
-		out = append(out, changelog{Author: names[i], Date: date, Text: texts[i]})
+		out = append(out, changelog{Author: cleanXMLString(names[i]), Date: date, Text: cleanXMLString(texts[i])})
 	}
 	return out, nil
 }

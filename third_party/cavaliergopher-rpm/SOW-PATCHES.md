@@ -31,15 +31,17 @@ tag semantics:
 - index count, per-tag ranges, aggregate decoded bytes and aggregate element
   counts are checked in a complete preflight before tag allocation;
 - strings must be NUL terminated even at non-zero offsets;
+- duplicate tag IDs are rejected in both signature and main headers instead of
+  silently using last-value-wins map projection;
+- legacy parallel-tag helpers (`dependencies`, `Files`) guard slice and
+  directory-index bounds instead of panicking on misaligned tags;
 - negative installed/archive sizes never wrap into `uint64`.
 
 `ReadSignatureHeader` stops before the main RPM header and payload and applies
 a separate 2 MiB raw signature-header, 256-index and bounded decoded-value
 budget. Provenance inspection uses this entry point so a large untrusted main
 header is never materialized once per concurrent sync worker merely to inspect
-embedded signature evidence. This strict signature-only path also rejects
-duplicate tag IDs instead of inheriting the general parser's historical
-last-value-wins map projection.
+embedded signature evidence.
 
 `version.go` recognizes RPM's `^` post-release snapshot operator instead of
 discarding it as punctuation. A snapshot sorts after its base version and before

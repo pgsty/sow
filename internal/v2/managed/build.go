@@ -59,6 +59,9 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 	if len(distNames) == 0 {
 		return nil, nil
 	}
+	if err := probeRootedDirectoryExchange(root, filepath.Join(repoName, "dists"), filepath.Join(".sow", repoName, "stage")); err != nil {
+		return nil, fmt.Errorf("%w: atomic Dist exchange is unavailable: %w", ErrRejected, err)
+	}
 	summary, err := store.Summary(ctx)
 	if err != nil {
 		return nil, err
@@ -221,8 +224,8 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 		return 0, fmt.Errorf("%w: build mutation from %s", ErrIntegrity, operation.State)
 	}
 	buildRoot := filepath.Join(mutationStageRoot(root, repoName, operationID), "build")
-	if err := (yumrepo.NativeDirectoryExchanger{}).Probe(filepath.Join(root, repoName, "dists")); err != nil {
-		return 0, fmt.Errorf("%w: atomic Dist exchange is unavailable: %v", ErrRejected, err)
+	if err := probeRootedDirectoryExchange(root, filepath.Join(repoName, "dists"), filepath.Join(".sow", repoName, "stage")); err != nil {
+		return 0, fmt.Errorf("%w: atomic Dist exchange is unavailable: %w", ErrRejected, err)
 	}
 	var generation state.GenerationID
 	var baseManifest []state.GenerationFile
@@ -315,7 +318,6 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 	if err := recordBuildProgress(ctx, store, operationID, "promoting_payload", len(pooled), len(pooled), 1); err != nil {
 		return 0, err
 	}
-	exchanger := yumrepo.NativeDirectoryExchanger{}
 	if err := recordBuildProgress(ctx, store, operationID, "publishing_dists", 0, len(buildDists), jobs); err != nil {
 		return 0, err
 	}
@@ -339,17 +341,10 @@ func buildAppliedMutation(ctx context.Context, root, repoName string, cfg config
 		if err := validateDistPublicationTime(staged, cfg.Repositories[repoName].Dists[dist.Name].Format, dist.Architectures, dist.MetadataSignerFingerprint != "", payload.PublicationTime.identity()); err != nil {
 			return 0, err
 		}
-		if err := requireSameDevice(live, staged); err != nil {
-			return 0, err
-		}
-		if err := exchanger.Exchange(live, staged); err != nil {
+		liveRelative := filepath.Join(repoName, "dists", dist.Name)
+		stagedRelative := filepath.Join(".sow", repoName, "stage", operationID, "build", "dists", dist.Name)
+		if err := exchangeRootedDirectories(root, liveRelative, stagedRelative); err != nil {
 			return 0, fmt.Errorf("managed: atomically publish Dist %q: %w", dist.Name, err)
-		}
-		if err := syncDir(filepath.Dir(live)); err != nil {
-			return 0, err
-		}
-		if err := syncDir(filepath.Dir(staged)); err != nil {
-			return 0, err
 		}
 		if err := callFault(fault, "build.pointer."+dist.Name); err != nil {
 			return 0, err

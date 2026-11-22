@@ -172,7 +172,11 @@ func clearWorkspaceJournal(root string) error {
 	return removeRootedRegular(filepath.Join(root, ".sow", "workspace-ops"), "active.json", -1)
 }
 
-func recoverWorkspaceOperation(ctx context.Context, root string) error {
+func recoverWorkspaceOperation(ctx context.Context, root string, lockOpts ...LockOptions) error {
+	var opts LockOptions
+	if len(lockOpts) > 0 {
+		opts = lockOpts[0]
+	}
 	if err := validateWorkspaceOpsLayout(root); err != nil {
 		return err
 	}
@@ -226,7 +230,7 @@ func recoverWorkspaceOperation(ctx context.Context, root string) error {
 		lockPath := filepath.Join(root, ".sow", "repo-locks", journal.Repository+".lock")
 		var repoLock *fileLock
 		if _, statErr := os.Lstat(lockPath); statErr == nil {
-			repoLock, err = acquireFileLock(ctx, lockPath, 0, false)
+			repoLock, err = acquireFileLock(ctx, lockPath, opts.Timeout, opts.NoWait)
 			if err != nil {
 				return err
 			}

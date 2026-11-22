@@ -15,6 +15,7 @@ import (
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
 	"github.com/pgsty/sow/internal/workmetrics"
+	"github.com/pgsty/sow/internal/yumrepo"
 )
 
 // Version 2 binds the exact affected Build Dist set. A pre-release v1 pending
@@ -1399,6 +1400,9 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 			preflight, err = prepareMutationBuildPreflight(ctx, root, repoName, cfg, payload.BuildDists, manifest, store, payload.PublicationTime.identity(), nil, nil, payload.Jobs)
 			if errors.Is(err, errImmutableRPMSigningPolicy) || errors.Is(err, errMetadataSigningPolicy) {
 				return finishUnbuiltMutation(ctx, root, repoName, store, operation, manifest, "signing policy rejected the operation before public build; Desired changes preserved if already applied")
+			}
+			if errors.Is(err, yumrepo.ErrAtomicUnsupported) {
+				return finishUnbuiltMutation(ctx, root, repoName, store, operation, manifest, "atomic directory exchange is unavailable before public build; Desired changes preserved if already applied")
 			}
 			if err != nil {
 				return err

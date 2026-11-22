@@ -370,6 +370,19 @@ func TestPruneDetectsInPlaceReplacementRewrite(t *testing.T) {
 			t.Fatalf("completion marker restored: %v", err)
 		}
 	})
+	t.Run("external hardlink Nlink drift succeeds", func(t *testing.T) {
+		dir := pruneFixture(t, true)
+		externalLink := filepath.Join(t.TempDir(), "hardlink.rpm")
+		result, err := Prune(context.Background(), PruneOptions{Dir: dir, Fault: func(event Fault) error {
+			if event.Point == FaultAfterRPMPointer {
+				return os.Link(filepath.Join(dir, "new.rpm"), externalLink)
+			}
+			return nil
+		}})
+		if err != nil || len(result.Removed) != 2 {
+			t.Fatalf("prune with external hardlink Nlink drift: result=%+v err=%v", result, err)
+		}
+	})
 }
 
 func TestPruneRejectsProtectionThatMatchesNoPackage(t *testing.T) {

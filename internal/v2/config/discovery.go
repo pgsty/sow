@@ -140,7 +140,25 @@ func Discover(opts DiscoverOptions) (Workspace, error) {
 			rootDevice: uint64(rootStat.Dev), rootInode: uint64(rootStat.Ino),
 		}, nil
 	}
-	return Workspace{}, fmt.Errorf("workspace not found (searched %s); run sow init or set --workdir/SOW_DIR", strings.Join(misses, ", "))
+	hint := ""
+	for _, candidate := range candidates {
+		if start, err := absoluteClean(candidate.path); err == nil {
+			for dir := start; ; dir = filepath.Dir(dir) {
+				if info, statErr := os.Lstat(filepath.Join(dir, "sow.yaml")); statErr == nil && info.Mode().IsRegular() {
+					hint = "; found sow.yaml (SOW uses sow.yml)"
+					break
+				}
+				parent := filepath.Dir(dir)
+				if parent == dir {
+					break
+				}
+			}
+		}
+		if hint != "" {
+			break
+		}
+	}
+	return Workspace{}, fmt.Errorf("workspace not found (searched %s)%s; run sow init or set --workdir/SOW_DIR", strings.Join(misses, ", "), hint)
 }
 
 func findWorkspaceRoot(start string) (string, bool, error) {

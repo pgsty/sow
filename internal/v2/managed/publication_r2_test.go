@@ -8,15 +8,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,9 +37,23 @@ type fakeR2PublicationObject struct {
 }
 
 type fakeR2PublicationClient struct {
+	mu         sync.Mutex
 	objects    map[string]fakeR2PublicationObject
 	conditions map[string]r2.PutCondition
 	next       int
+	headCounts map[string]int
+}
+
+func (f *fakeR2PublicationClient) resetHeadCounts() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.headCounts = map[string]int{}
+}
+
+func (f *fakeR2PublicationClient) headCount(key string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.headCounts[key]
 }
 
 type managedRoundTripFunc func(*http.Request) (*http.Response, error)
@@ -49,6 +66,8 @@ func (f *fakeR2PublicationClient) ListObjectsV2Prefix(_ context.Context, prefix,
 	if continuation != "" {
 		return r2.ObjectListPage{}, errors.New("unexpected continuation")
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	keys := []string{}
 	for key := range f.objects {
 		if strings.HasPrefix(key, prefix) {
@@ -65,6 +84,12 @@ func (f *fakeR2PublicationClient) ListObjectsV2Prefix(_ context.Context, prefix,
 }
 
 func (f *fakeR2PublicationClient) Head(_ context.Context, key string) (r2.ObjectInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.headCounts == nil {
+		f.headCounts = map[string]int{}
+	}
+	f.headCounts[key]++
 	object, ok := f.objects[key]
 	if !ok {
 		return r2.ObjectInfo{}, nil
@@ -73,21 +98,19 @@ func (f *fakeR2PublicationClient) Head(_ context.Context, key string) (r2.Object
 }
 
 func (f *fakeR2PublicationClient) OpenObject(_ context.Context, key string) (r2.ObjectContent, error) {
-	info, _ := f.Head(context.Background(), key)
-	if !info.Exists {
+	f.mu.Lock()
+	object, ok := f.objects[key]
+	f.mu.Unlock()
+	if !ok {
 		return r2.ObjectContent{}, r2.ErrNotFound
 	}
-	return r2.ObjectContent{Info: info, Body: io.NopCloser(bytes.NewReader(f.objects[key].body))}, nil
+	return r2.ObjectContent{
+		Info: r2.ObjectInfo{Exists: true, Size: int64(len(object.body)), SHA256: object.sha, ETag: object.etag},
+		Body: io.NopCloser(bytes.NewReader(object.body)),
+	}, nil
 }
 
 func (f *fakeR2PublicationClient) Put(_ context.Context, key string, body r2.ReadSeekReaderAt, size int64, sha string, condition r2.PutCondition) (string, error) {
-	current, exists := f.objects[key]
-	if condition.IfNoneMatch && exists {
-		return "", r2.ErrAlreadyExists
-	}
-	if condition.IfMatch != "" && (!exists || current.etag != condition.IfMatch) {
-		return "", r2.ErrConflict
-	}
 	data, err := io.ReadAll(io.LimitReader(body, size+1))
 	if err != nil || int64(len(data)) != size {
 		return "", errors.Join(errors.New("bad upload body"), err)
@@ -96,14 +119,30 @@ func (f *fakeR2PublicationClient) Put(_ context.Context, key string, body r2.Rea
 	if hex.EncodeToString(digest[:]) != sha {
 		return "", errors.New("bad upload digest")
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	current, exists := f.objects[key]
+	if condition.IfNoneMatch && exists {
+		return "", r2.ErrAlreadyExists
+	}
+	if condition.IfMatch != "" && (!exists || current.etag != condition.IfMatch) {
+		return "", r2.ErrConflict
+	}
 	f.next++
-	etag := fmt.Sprintf("\"etag-%d\"", f.next)
+	etag := fmt.Sprintf("\"etag-%s\"", sha[:32])
 	f.objects[key] = fakeR2PublicationObject{body: data, sha: sha, etag: etag}
 	if f.conditions == nil {
 		f.conditions = map[string]r2.PutCondition{}
 	}
 	f.conditions[key] = condition
 	return etag, nil
+}
+
+func (f *fakeR2PublicationClient) Delete(_ context.Context, key string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.objects, key)
+	return nil
 }
 
 func TestR2PublicationBackendMapsOneCanonicalKeyAndUsesConditionalPut(t *testing.T) {
@@ -392,6 +431,914 @@ func TestR2PublishAndTargetGCRemainReportOnly(t *testing.T) {
 	noop, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: secondMaintenanceClock})
 	if err != nil || !noop.Noop {
 		t.Fatalf("R2 noop after retained report=%#v err=%v", noop, err)
+	}
+}
+
+func TestR2PublishAndTargetGCDeleteWithExplicitFlag(t *testing.T) {
+	ctx := context.Background()
+	fixture := newLocalGCFixture(t, false)
+	fake := &fakeR2PublicationClient{objects: map[string]fakeR2PublicationObject{}}
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		relative := strings.TrimPrefix(request.URL.Path, "/repo/")
+		object, ok := fake.objects["repos/prod/"+relative]
+		if !ok {
+			http.NotFound(response, request)
+			return
+		}
+		_, _ = response.Write(object.body)
+	}))
+	defer server.Close()
+	publicBase, err := url.Parse(server.URL + "/repo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &r2PublicationBackend{objects: fake, prefix: "repos/prod", publicBase: publicBase}
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Targets = map[string]config.TargetConfig{"prod": {
+		Repository: "repo", Provider: "r2", Endpoint: "https://acct.r2.cloudflarestorage.com",
+		Region: "auto", Bucket: "sow-repo", Prefix: "repos/prod", Credential: "env://SOW_TEST_UNUSED_R2",
+		PublicEndpoint: server.URL + "/repo/", MaxCacheTTL: "0s",
+		AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}}
+	writeManagedConfig(t, fixture.root, cfg)
+	first, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstMaintenanceAt := time.Now().UTC().Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return firstMaintenanceAt }}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	secondPublishAt := firstMaintenanceAt.Add(time.Second)
+	second, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return secondPublishAt }})
+	if err != nil || second.Generation == first.Generation {
+		t.Fatalf("second R2 publish=%#v err=%v", second, err)
+	}
+	oldKey := "repos/prod/" + fixture.object.PoolPath
+	if _, ok := fake.objects[oldKey]; !ok {
+		t.Fatalf("old R2 payload missing before conditional-delete GC: %s", oldKey)
+	}
+	secondMaintenanceAt := secondPublishAt.Add(31 * 24 * time.Hour)
+	maintenance, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return secondMaintenanceAt }})
+	if err != nil || maintenance.DeletedObjects != 1 || maintenance.RetainedObjects != 0 || maintenance.DeletedBytes != fixture.object.Size {
+		t.Fatalf("R2 conditional-delete maintenance=%#v err=%v", maintenance, err)
+	}
+	if _, ok := fake.objects[oldKey]; ok {
+		t.Fatalf("R2 conditional-delete left deleted object in bucket: %s", oldKey)
+	}
+	store, err := state.OpenReadOnly(filepath.Join(fixture.root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, reportErr := store.GetPublicationCandidateReport(ctx, second.Checkpoint)
+	var receipt state.PublicationDeletionReceipt
+	var receiptErr error
+	if reportErr == nil && len(report.Candidates) == 1 {
+		receipt, receiptErr = store.GetPublicationDeletionReceipt(ctx, report.ReportIdentity, fixture.object.PoolPath)
+	}
+	closeErr := store.Close()
+	if err := errors.Join(reportErr, receiptErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if report.Mode != "conditional_delete" || !receipt.StorageAbsent || !receipt.PublicAbsent {
+		t.Fatalf("unexpected R2 deletion report/receipt: report=%#v receipt=%#v", report, receipt)
+	}
+	noop, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return secondMaintenanceAt }})
+	if err != nil || !noop.Noop {
+		t.Fatalf("R2 noop after conditional delete=%#v err=%v", noop, err)
+	}
+}
+
+func TestR2KnownImmutableSkipsPayloadHEADsAndDetectsETagDrift(t *testing.T) {
+	ctx := context.Background()
+	fixture := newLocalGCFixture(t, false)
+	fake := &fakeR2PublicationClient{objects: map[string]fakeR2PublicationObject{}}
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		relative := strings.TrimPrefix(request.URL.Path, "/repo/")
+		object, ok := fake.objects["repos/prod/"+relative]
+		if !ok {
+			http.NotFound(response, request)
+			return
+		}
+		_, _ = response.Write(object.body)
+	}))
+	defer server.Close()
+	publicBase, err := url.Parse(server.URL + "/repo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &r2PublicationBackend{objects: fake, prefix: "repos/prod", publicBase: publicBase}
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Targets = map[string]config.TargetConfig{"prod": {
+		Repository: "repo", Provider: "r2", Endpoint: "https://acct.r2.cloudflarestorage.com",
+		Region: "auto", Bucket: "sow-repo", Prefix: "repos/prod", Credential: "env://SOW_TEST_UNUSED_R2",
+		PublicEndpoint: server.URL + "/repo/", MaxCacheTTL: "0s",
+		AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}}
+	writeManagedConfig(t, fixture.root, cfg)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend}); err != nil {
+		t.Fatal(err)
+	}
+	payloadKey := "repos/prod/" + fixture.object.PoolPath
+	pointerKey := "repos/prod/dists/el9/x86_64/repodata/repomd.xml"
+	fake.resetHeadCounts()
+	noop, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend})
+	if err != nil || !noop.Noop {
+		t.Fatalf("second R2 publish=%#v err=%v", noop, err)
+	}
+	if got := fake.headCount(payloadKey); got != 0 {
+		t.Fatalf("unchanged R2 payload incurred %d HEADs on second publish, want 0", got)
+	}
+	if got := fake.headCount(pointerKey); got == 0 {
+		t.Fatal("mutable R2 pointer skipped HEAD check")
+	}
+	original := fake.objects[payloadKey]
+	fake.objects[payloadKey] = fakeR2PublicationObject{body: original.body, sha: strings.Repeat("f", 64), etag: `"drifted-etag"`}
+	fake.resetHeadCounts()
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend}); !errors.Is(err, ErrIntegrity) || fake.headCount(payloadKey) == 0 {
+		t.Fatalf("ETag drift err=%v payloadHEADs=%d, want ErrIntegrity after HEAD recheck", err, fake.headCount(payloadKey))
+	}
+}
+
+func TestR2TargetGCDeleteCrashRecoveryAndModeGuard(t *testing.T) {
+	ctx := context.Background()
+	fixture := newLocalGCFixture(t, false)
+	fake := &fakeR2PublicationClient{objects: map[string]fakeR2PublicationObject{}}
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		relative := strings.TrimPrefix(request.URL.Path, "/repo/")
+		object, ok := fake.objects["repos/prod/"+relative]
+		if !ok {
+			http.NotFound(response, request)
+			return
+		}
+		_, _ = response.Write(object.body)
+	}))
+	defer server.Close()
+	publicBase, err := url.Parse(server.URL + "/repo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &r2PublicationBackend{objects: fake, prefix: "repos/prod", publicBase: publicBase}
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Targets = map[string]config.TargetConfig{"prod": {
+		Repository: "repo", Provider: "r2", Endpoint: "https://acct.r2.cloudflarestorage.com",
+		Region: "auto", Bucket: "sow-repo", Prefix: "repos/prod", Credential: "env://SOW_TEST_UNUSED_R2",
+		PublicEndpoint: server.URL + "/repo/", MaxCacheTTL: "0s",
+		AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}}
+	writeManagedConfig(t, fixture.root, cfg)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend}); err != nil {
+		t.Fatal(err)
+	}
+	firstGCAt := time.Now().UTC().Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return firstGCAt }}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	secondPublishAt := firstGCAt.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return secondPublishAt }}); err != nil {
+		t.Fatal(err)
+	}
+	gcAt := secondPublishAt.Add(31 * 24 * time.Hour)
+	reportFault := errors.New("crash after report")
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return gcAt }, Fault: func(point string) error {
+		if point == "target_gc.report" {
+			return reportFault
+		}
+		return nil
+	}}); !errors.Is(err, reportFault) {
+		t.Fatalf("report fault=%v", err)
+	}
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: false, backend: backend, now: func() time.Time { return gcAt }}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("resuming conditional_delete without --delete returned %v, want ErrNotReady", err)
+	}
+	deleteFault := errors.New("crash after delete")
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return gcAt }, Fault: func(point string) error {
+		if point == "target_gc.deleted."+fixture.object.PoolPath {
+			return deleteFault
+		}
+		return nil
+	}}); !errors.Is(err, deleteFault) {
+		t.Fatalf("delete fault=%v", err)
+	}
+	resumed, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return gcAt }})
+	if err != nil || resumed.DeletedObjects != 1 || resumed.CompletedAttempts != 1 {
+		t.Fatalf("resumed R2 conditional delete=%#v err=%v", resumed, err)
+	}
+}
+
+func TestR2ReviewThenDeleteAndRepublishIdenticalPackage(t *testing.T) {
+	ctx := context.Background()
+	fixture := newLocalGCFixture(t, false)
+	fake := &fakeR2PublicationClient{objects: map[string]fakeR2PublicationObject{}}
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		relative := strings.TrimPrefix(request.URL.Path, "/repo/")
+		fake.mu.Lock()
+		object, ok := fake.objects["repos/prod/"+relative]
+		fake.mu.Unlock()
+		if !ok {
+			http.NotFound(response, request)
+			return
+		}
+		_, _ = response.Write(object.body)
+	}))
+	defer server.Close()
+	publicBase, err := url.Parse(server.URL + "/repo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &r2PublicationBackend{objects: fake, prefix: "repos/prod", publicBase: publicBase}
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Targets = map[string]config.TargetConfig{"prod": {
+		Repository: "repo", Provider: "r2", Endpoint: "https://acct.r2.cloudflarestorage.com",
+		Region: "auto", Bucket: "sow-repo", Prefix: "repos/prod", Credential: "env://SOW_TEST_UNUSED_R2",
+		PublicEndpoint: server.URL + "/repo/", MaxCacheTTL: "0s",
+		AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}}
+	writeManagedConfig(t, fixture.root, cfg)
+
+	rpmCopy := filepath.Join(t.TempDir(), filepath.Base(fixture.object.Filename))
+	rawRPM, err := os.ReadFile(filepath.Join(fixture.root, "repo", filepath.FromSlash(fixture.object.PoolPath)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rpmCopy, rawRPM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Report-first (`sow gc prod`), then `--delete` (`sow gc prod --delete`).
+	now = now.Add(31 * 24 * time.Hour)
+	reviewed, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: false, backend: backend, now: func() time.Time { return now }})
+	if err != nil || reviewed.RetainedObjects != 1 || reviewed.DeletedObjects != 0 {
+		t.Fatalf("review-first R2 GC=%#v err=%v", reviewed, err)
+	}
+	now = now.Add(time.Second)
+	deleted, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return now }})
+	if err != nil || deleted.DeletedObjects != 1 {
+		t.Fatalf("delete-after-review R2 GC=%#v err=%v", deleted, err)
+	}
+	now = now.Add(time.Second)
+	noopGC, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return now }})
+	if err != nil || !noopGC.Noop || noopGC.DeletedObjects != 0 {
+		t.Fatalf("repeat R2 GC --delete=%#v err=%v", noopGC, err)
+	}
+
+	// 2. Re-add identical RPM bytes (producing the exact same ETag!), publish, and
+	// verify the next no-op publish succeeds without subtracting stale receipts.
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpmCopy}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	republished, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }})
+	if err != nil || republished.Noop {
+		t.Fatalf("re-publish identical RPM=%#v err=%v", republished, err)
+	}
+	now = now.Add(time.Second)
+	noopPub, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }})
+	if err != nil || !noopPub.Noop {
+		t.Fatalf("no-op publish after identical RPM re-upload failed: %#v err=%v", noopPub, err)
+	}
+
+	// 3. Remove again -> add a second RPM (rotating prior_built_memberships) ->
+	// publish -> expire -> LocalGC -> publish -> expire -> report-only ->
+	// re-add & publish BEFORE --delete -> verify --delete re-checks live protection
+	// roots and does NOT delete the active payload!
+	otherRPM, err := filepath.Abs(filepath.Join("..", "..", "..", "third_party", "cavaliergopher-rpm", "testdata", "epel-release-7-5.noarch.rpm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Remove(ctx, RemoveOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Packages: []string{fixture.object.Name}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{otherRPM}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: false, backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	if collected, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); err != nil || collected.Objects != 1 {
+		t.Fatalf("second LocalGC=%#v err=%v", collected, err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if rev2, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: false, backend: backend, now: func() time.Time { return now }}); err != nil || rev2.RetainedObjects < 1 {
+		t.Fatalf("second review-first R2 GC=%#v err=%v", rev2, err)
+	}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpmCopy}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if safeDelete, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatalf("TargetGC --delete after re-protecting payload failed: %#v err=%v", safeDelete, err)
+	}
+	fake.mu.Lock()
+	_, payloadAlive := fake.objects["repos/prod/"+fixture.object.PoolPath]
+	fake.mu.Unlock()
+	if !payloadAlive {
+		t.Fatal("TargetGC --delete deleted a payload that was re-protected before --delete ran")
+	}
+}
+
+// TestR2DelayedDeleteAfterReaddAndGraceProtection covers two critical multi-
+// generation R2 maintenance contracts:
+//  1. Promoting an older report-only checkpoint after the same RPM was re-added
+//     and removed again must not delete the object while the newer removal's
+//     grace period is still active.
+//  2. Once the newer removal's grace expires, promoting all retained reports
+//     must attribute the deletion receipt to the newer removing checkpoint so
+//     subsequent GC retries, normal Publish, and identical-ETag re-uploads all
+//     converge cleanly.
+func TestR2DelayedDeleteAfterReaddAndGraceProtection(t *testing.T) {
+	runScenario := func(t *testing.T, checkActiveGraceBeforeExpiry bool) {
+		t.Helper()
+		ctx := context.Background()
+		fixture := newLocalGCFixture(t, false)
+		fake := &fakeR2PublicationClient{objects: map[string]fakeR2PublicationObject{}}
+		server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+			relative := strings.TrimPrefix(request.URL.Path, "/repo/")
+			fake.mu.Lock()
+			object, ok := fake.objects["repos/prod/"+relative]
+			fake.mu.Unlock()
+			if !ok {
+				http.NotFound(response, request)
+				return
+			}
+			_, _ = response.Write(object.body)
+		}))
+		defer server.Close()
+		publicBase, err := url.Parse(server.URL + "/repo/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		newBackend := func() *r2PublicationBackend {
+			return &r2PublicationBackend{objects: fake, prefix: "repos/prod", publicBase: publicBase}
+		}
+		cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.Targets = map[string]config.TargetConfig{"prod": {
+			Repository: "repo", Provider: "r2", Endpoint: "https://acct.r2.cloudflarestorage.com",
+			Region: "auto", Bucket: "sow-repo", Prefix: "repos/prod", Credential: "env://SOW_TEST_UNUSED_R2",
+			PublicEndpoint: server.URL + "/repo/", MaxCacheTTL: "0s",
+			AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+		}}
+		writeManagedConfig(t, fixture.root, cfg)
+
+		rpmCopy := filepath.Join(t.TempDir(), filepath.Base(fixture.object.Filename))
+		rawRPM, err := os.ReadFile(filepath.Join(fixture.root, "repo", filepath.FromSlash(fixture.object.PoolPath)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(rpmCopy, rawRPM, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		thirdRPM, err := filepath.Abs(filepath.Join("..", "..", "..", "third_party", "cavaliergopher-rpm", "testdata", "centos-release-7-2.1511.el7.centos.2.10.x86_64.rpm"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		now := time.Now().UTC().Truncate(time.Second)
+		clock := func() time.Time { return now }
+		publish := func() PublishResult {
+			t.Helper()
+			res, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: newBackend(), now: clock})
+			if err != nil {
+				t.Fatalf("publish: %+v %v", res, err)
+			}
+			return res
+		}
+		gc := func(del bool) TargetGCResult {
+			t.Helper()
+			res, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: del, backend: newBackend(), now: clock})
+			if err != nil {
+				t.Fatalf("target GC (delete=%t): %+v %v", del, res, err)
+			}
+			return res
+		}
+		payloadKey := "repos/prod/" + fixture.object.PoolPath
+		existsOnR2 := func() bool {
+			fake.mu.Lock()
+			defer fake.mu.Unlock()
+			_, ok := fake.objects[payloadKey]
+			return ok
+		}
+
+		// C1 (has retained pkg1) -> report-only -> LocalGC -> C2 (pkg1 absent
+		// from manifest, retained on R2) -> report-only (lists pkg1).
+		publish()
+		now = now.Add(31 * 24 * time.Hour)
+		gc(false)
+		if collected, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); err != nil || collected.Objects != 1 {
+			t.Fatalf("first LocalGC=%#v err=%v", collected, err)
+		}
+		now = now.Add(time.Second)
+		publish()
+		now = now.Add(31 * 24 * time.Hour)
+		if rev := gc(false); rev.RetainedObjects != 1 {
+			t.Fatalf("expected 1 retained candidate in C2, got %#v", rev)
+		}
+
+		// Re-add identical pkg1 -> publish (C3) -> remove pkg1, add pkg3 ->
+		// publish (C4) -> report-only -> LocalGC -> publish (C5, pkg1 absent).
+		if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpmCopy}, Jobs: 1}); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Second)
+		if restored := publish(); restored.Noop {
+			t.Fatal("re-adding pkg1 must publish a new generation")
+		}
+		if _, err := Remove(ctx, RemoveOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Packages: []string{fixture.object.Name}, Jobs: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{thirdRPM}, Jobs: 1}); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Second)
+		publish()
+		now = now.Add(31 * 24 * time.Hour)
+		gc(false)
+		if collected, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); err != nil || collected.Objects != 1 {
+			t.Fatalf("second LocalGC=%#v err=%v", collected, err)
+		}
+		now = now.Add(time.Second)
+		publish()
+
+		if checkActiveGraceBeforeExpiry {
+			// C5 is STILL in its 30-day cache grace period! Promoting old C2 with
+			// --delete MUST NOT delete pkg1 prematurely (even if unrelated expired
+			// metadata from C3->C4 is collected).
+			now = now.Add(time.Minute)
+			early := gc(true)
+			if early.PendingGrace == 0 {
+				t.Fatalf("early --delete during C5 active grace=%#v, want pending>0", early)
+			}
+			if !existsOnR2() {
+				t.Fatal("early --delete violated C5 active grace and deleted pkg1 from R2")
+			}
+			if pub := publish(); !pub.Noop {
+				t.Fatalf("publish after early --delete=%#v, want noop", pub)
+			}
+			now = now.Add(31 * 24 * time.Hour)
+		} else {
+			// Expire C5 and run report-only so BOTH C2 and C5 are retained_reported
+			// when --delete runs for the first time.
+			now = now.Add(31 * 24 * time.Hour)
+			gc(false)
+		}
+
+		deleted := gc(true)
+		if deleted.DeletedObjects < 1 {
+			t.Fatalf("delayed --delete=%#v, want deleted>=1", deleted)
+		}
+		if existsOnR2() {
+			t.Fatal("pkg1 remained on R2 after delayed --delete")
+		}
+		if retry := gc(true); !retry.Noop || retry.DeletedObjects != 0 {
+			t.Fatalf("retry --delete=%#v, want noop", retry)
+		}
+		if pub := publish(); !pub.Noop {
+			t.Fatalf("follow-up publish=%#v, want noop", pub)
+		}
+
+		// Re-add identical pkg1 again (same ETag) and confirm republish + noop converge.
+		if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpmCopy}, Jobs: 1}); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Second)
+		if repub := publish(); repub.Noop {
+			t.Fatal("re-adding pkg1 after delayed delete must publish")
+		}
+		if !existsOnR2() {
+			t.Fatal("re-added pkg1 missing on R2")
+		}
+		now = now.Add(time.Second)
+		if pub := publish(); !pub.Noop {
+			t.Fatalf("follow-up publish after second re-add=%#v, want noop", pub)
+		}
+	}
+
+	t.Run("delayed delete after re-add and re-remove", func(t *testing.T) {
+		runScenario(t, false)
+	})
+	t.Run("delayed delete respects newer removal grace", func(t *testing.T) {
+		runScenario(t, true)
+	})
+}
+
+// TestR2InterruptedConditionalDeleteResumesBeforeEarlierMaintenanceAndAllowsLocalGC
+// verifies two recovery invariants:
+//  1. When a promoted historical R2 checkpoint is interrupted mid-delete (leaving
+//     attempt.phase='grace' even though its target_generation payloads were
+//     already legally collected by LocalGC while it was done), LocalGC must not
+//     report a false ErrIntegrity on those remote-only historical payloads.
+//  2. If another maintenance item precedes an interrupted conditional-delete
+//     report in causal order, TargetGC must resume the unfinished conditional-
+//     delete report FIRST (with allowCandidateAbsence=true) rather than failing
+//     inventory verification on the earlier checkpoint with ErrIntegrity.
+func TestR2InterruptedConditionalDeleteResumesBeforeEarlierMaintenanceAndAllowsLocalGC(t *testing.T) {
+	ctx := context.Background()
+	fixture := newLocalGCFixture(t, false)
+	fake := &fakeR2PublicationClient{objects: map[string]fakeR2PublicationObject{}}
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		relative := strings.TrimPrefix(request.URL.Path, "/repo/")
+		fake.mu.Lock()
+		object, ok := fake.objects["repos/prod/"+relative]
+		fake.mu.Unlock()
+		if !ok {
+			http.NotFound(response, request)
+			return
+		}
+		_, _ = response.Write(object.body)
+	}))
+	defer server.Close()
+	publicBase, err := url.Parse(server.URL + "/repo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	newBackend := func() *r2PublicationBackend {
+		return &r2PublicationBackend{objects: fake, prefix: "repos/prod", publicBase: publicBase}
+	}
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Targets = map[string]config.TargetConfig{"prod": {
+		Repository: "repo", Provider: "r2", Endpoint: "https://acct.r2.cloudflarestorage.com",
+		Region: "auto", Bucket: "sow-repo", Prefix: "repos/prod", Credential: "env://SOW_TEST_UNUSED_R2",
+		PublicEndpoint: server.URL + "/repo/", MaxCacheTTL: "0s",
+		AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}}
+	writeManagedConfig(t, fixture.root, cfg)
+
+	secondRPM, err := filepath.Abs(filepath.Join("..", "..", "..", "third_party", "cavaliergopher-rpm", "testdata", "epel-release-7-5.noarch.rpm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdRPM, err := filepath.Abs(filepath.Join("..", "..", "..", "third_party", "cavaliergopher-rpm", "testdata", "centos-release-7-2.1511.el7.centos.2.10.x86_64.rpm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := func() time.Time { return now }
+
+	// Add pkg2 (epel-release) while pkg1 is retained in pool -> publish C1
+	// (has pkg1 + pkg2) -> report-only -> LocalGC deletes pkg1 -> publish C2
+	// (has pkg2; pkg1 retained on R2).
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{secondRPM}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	c1, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: newBackend(), now: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: newBackend(), now: clock}); err != nil {
+		t.Fatal(err)
+	}
+	if collected, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); err != nil || collected.Objects != 1 {
+		t.Fatalf("first LocalGC=%#v err=%v", collected, err)
+	}
+	now = now.Add(time.Second)
+	c2, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: newBackend(), now: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Remove pkg2, add pkg3, expire C2, run report-only on C2, then LocalGC deletes pkg2
+	// (so C2's target_generation payload pkg2 is now absent locally!).
+	if _, err := Remove(ctx, RemoveOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Packages: []string{"epel-release"}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{thirdRPM}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: newBackend(), now: clock}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: newBackend(), now: clock}); err != nil {
+		t.Fatal(err)
+	}
+	if collected, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); err != nil || collected.Objects != 1 {
+		t.Fatalf("second LocalGC=%#v err=%v", collected, err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: newBackend(), now: clock}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: newBackend(), now: clock}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Interrupt right after C2 physically deletes pkg1 on R2 (before receipt).
+	interruptErr := errors.New("interrupted after physical delete")
+	if _, err := TargetGC(ctx, TargetGCOptions{
+		WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: newBackend(), now: clock,
+		Fault: func(point string) error {
+			if point == "target_gc.deleted."+fixture.object.PoolPath {
+				return interruptErr
+			}
+			return nil
+		},
+	}); !errors.Is(err, interruptErr) {
+		t.Fatalf("expected delete interrupt, got %v", err)
+	}
+
+	// 1. LocalGC while C2 (whose target_generation payload pkg2 was already
+	// collected) is paused in phase='grace' must succeed as a noop, not fail
+	// with ErrIntegrity.
+	localAfterInterrupt, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"})
+	if err != nil || !localAfterInterrupt.Noop {
+		t.Fatalf("LocalGC during interrupted promoted R2 delete=%#v err=%v, want noop without ErrIntegrity", localAfterInterrupt, err)
+	}
+
+	// 2. Also simulate an earlier checkpoint (C1) still being retained_reported
+	// ahead of the unfinished C2 conditional_delete report: TargetGC must still
+	// prioritize resuming C2 first instead of failing exact inventory check on C1.
+	store, err := state.OpenExisting(filepath.Join(fixture.root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE publication_grace_records SET state = 'retained_reported' WHERE checkpoint_identity = ?`, c1.Checkpoint); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `UPDATE publication_candidate_reports SET mode = 'report_only' WHERE checkpoint_identity = ?`, c1.Checkpoint); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = c2
+
+	// Without --delete, TargetGC must immediately report ErrNotReady (not ErrIntegrity).
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: false, backend: newBackend(), now: clock}); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("TargetGC without --delete while earlier item precedes unfinished delete: err=%v, want ErrNotReady", err)
+	}
+
+	// With --delete, TargetGC must resume C2 first, then finish C1 and all later
+	// checkpoints cleanly.
+	resumed, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: newBackend(), now: clock})
+	if err != nil || resumed.DeletedObjects == 0 {
+		t.Fatalf("resumed TargetGC --delete=%#v err=%v", resumed, err)
+	}
+	if retry, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: newBackend(), now: clock}); err != nil || !retry.Noop {
+		t.Fatalf("repeat TargetGC --delete=%#v err=%v, want noop", retry, err)
+	}
+	if pub, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: newBackend(), now: clock}); err != nil || !pub.Noop {
+		t.Fatalf("follow-up publish=%#v err=%v, want noop", pub, err)
+	}
+}
+
+func TestSiloManagedR2DeleteRepublishAndNoop(t *testing.T) {
+	if os.Getenv("SOW_SILO_TEST") != "1" {
+		t.Skip("set SOW_SILO_TEST=1 to run the pinned Silo managed R2 end-to-end test")
+	}
+	docker, err := exec.LookPath("docker")
+	if err != nil {
+		t.Fatalf("SOW_SILO_TEST=1 requires docker: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	const siloImage = "pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46"
+	container := fmt.Sprintf("sow-managed-silo-%d", time.Now().UnixNano())
+	cmd := exec.CommandContext(ctx, docker,
+		"run", "-d", "--rm", "--name", container,
+		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
+		"-e", "MINIO_ROOT_USER=sowtest",
+		"-e", "MINIO_ROOT_PASSWORD=sowtest-secret-key",
+		"-e", "MINIO_BROWSER=off",
+		"-p", "127.0.0.1::9000",
+		"--tmpfs", "/data:rw,size=256m,mode=1777",
+		siloImage,
+		"sh", "-ec", "mkdir -p /data/repo && exec docker-entrypoint.sh server /data --address :9000 --console-address :9001",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("start Silo: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer stopCancel()
+		_ = exec.CommandContext(stopCtx, docker, "rm", "-f", container).Run()
+	})
+	portOut, err := exec.CommandContext(ctx, docker, "port", container, "9000/tcp").CombinedOutput()
+	if err != nil {
+		t.Fatalf("discover Silo port: %v: %s", err, strings.TrimSpace(string(portOut)))
+	}
+	_, port, err := net.SplitHostPort(strings.TrimSpace(string(portOut)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r2Client, err := r2.NewClient(r2.Config{
+		Bucket: "repo", ObjectBaseURL: "http://127.0.0.1:" + port + "/repo", AllowInsecure: true,
+		Credentials: r2.S3Credentials{AccessKeyID: "sowtest", SecretAccessKey: "sowtest-secret-key", Region: "us-east-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := r2Client.ListObjectsV2Prefix(ctx, "", ""); err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	publicServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		key := "repos/prod/" + strings.TrimPrefix(req.URL.Path, "/repo/")
+		obj, openErr := r2Client.OpenObject(req.Context(), key)
+		if errors.Is(openErr, r2.ErrNotFound) {
+			http.NotFound(w, req)
+			return
+		}
+		if openErr != nil {
+			http.Error(w, openErr.Error(), http.StatusBadGateway)
+			return
+		}
+		defer obj.Body.Close()
+		_, _ = io.Copy(w, obj.Body)
+	}))
+	defer publicServer.Close()
+	publicBase, err := url.Parse(publicServer.URL + "/repo/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &r2PublicationBackend{objects: r2Client, prefix: "repos/prod", publicBase: publicBase}
+
+	fixture := newLocalGCFixture(t, false)
+	rpmCopy := filepath.Join(t.TempDir(), filepath.Base(fixture.object.Filename))
+	rawRPM, err := os.ReadFile(filepath.Join(fixture.root, "repo", filepath.FromSlash(fixture.object.PoolPath)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rpmCopy, rawRPM, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Targets = map[string]config.TargetConfig{"prod": {
+		Repository: "repo", Provider: "r2", Endpoint: "https://acct.r2.cloudflarestorage.com",
+		Region: "auto", Bucket: "repo", Prefix: "repos/prod", Credential: "env://SOW_TEST_UNUSED_R2",
+		PublicEndpoint: publicServer.URL + "/repo/", MaxCacheTTL: "0s",
+		AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}}
+	writeManagedConfig(t, fixture.root, cfg)
+
+	now := time.Now().UTC().Truncate(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if gcRes, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return now }}); err != nil || gcRes.DeletedObjects < 1 {
+		t.Fatalf("Silo R2 gc --delete=%#v err=%v", gcRes, err)
+	}
+
+	// Re-add the exact same RPM bytes -> Silo assigns the exact same MD5 ETag ->
+	// publish -> next publish MUST return Noop=true!
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpmCopy}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if repub, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil || repub.Noop {
+		t.Fatalf("Silo R2 republish identical RPM=%#v err=%v", repub, err)
+	}
+	now = now.Add(time.Second)
+	if noop, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil || !noop.Noop {
+		t.Fatalf("Silo R2 follow-up publish after identical ETag re-upload=%#v err=%v", noop, err)
+	}
+
+	// Multi-generation delayed delete: remove -> report-only -> re-add -> remove
+	// -> report-only -> --delete must converge on real Silo and allow subsequent
+	// GC retries and Publish calls.
+	thirdRPM, err := filepath.Abs(filepath.Join("..", "..", "..", "third_party", "cavaliergopher-rpm", "testdata", "centos-release-7-2.1511.el7.centos.2.10.x86_64.rpm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Remove(ctx, RemoveOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Packages: []string{fixture.object.Name}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{thirdRPM}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: false, backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: false, backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpmCopy}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Remove(ctx, RemoveOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Packages: []string{fixture.object.Name}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: false, backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: fixture.options, Repository: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(31 * 24 * time.Hour)
+	if _, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: false, backend: backend, now: func() time.Time { return now }}); err != nil {
+		t.Fatal(err)
+	}
+	if delRes, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return now }}); err != nil || delRes.DeletedObjects < 1 {
+		t.Fatalf("Silo R2 delayed multi-generation --delete=%#v err=%v", delRes, err)
+	}
+	if retryRes, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "prod", Delete: true, backend: backend, now: func() time.Time { return now }}); err != nil || !retryRes.Noop {
+		t.Fatalf("Silo R2 delayed delete retry=%#v err=%v, want noop", retryRes, err)
+	}
+	if finalPub, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil || !finalPub.Noop {
+		t.Fatalf("Silo R2 follow-up publish after delayed delete=%#v err=%v, want noop", finalPub, err)
 	}
 }
 

@@ -337,8 +337,22 @@ func (c *signedObjectHTTP) putMultipart(ctx context.Context, key string, body Re
 	return etag, nil
 }
 
+func (c *signedObjectHTTP) deleteObject(ctx context.Context, key string) error {
+	if err := validateRemoteKey(key); err != nil {
+		return err
+	}
+	_, err := c.sdk.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil && s3HTTPStatus(err) != http.StatusNotFound {
+		return err
+	}
+	return nil
+}
+
 func (c *signedObjectHTTP) abortMultipart(key, uploadID string) error {
-	if uploadID == "" {
+	if uploadID == "" || len(uploadID) > 16<<10 || strings.ContainsAny(uploadID, "\x00\r\n") {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -735,6 +749,8 @@ func cloneNoRedirectClient(client *http.Client) *http.Client {
 	if client == nil {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
 		transport.ResponseHeaderTimeout = responseHeaderLimit
+		transport.MaxIdleConns = max(transport.MaxIdleConns, 100)
+		transport.MaxIdleConnsPerHost = max(transport.MaxIdleConnsPerHost, 32)
 		client = &http.Client{Transport: transport}
 	}
 	copyClient := *client

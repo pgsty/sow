@@ -105,6 +105,12 @@ func inspectEmbeddedRPMSignaturePackets(ctx context.Context, r io.Reader) ([]emb
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse RPM signature header: %w", ErrEmbeddedSignature, err)
 	}
+	// RPM 4.19+/6.0 multi-signature tag RPMSIGTAG_OPENPGP (278) is not supported
+	// yet; fail closed rather than silently misclassifying a tag-278-only RPM as
+	// unsigned or skipping unverified signatures.
+	if signatureHeader.GetTag(278) != nil {
+		return nil, fmt.Errorf("%w: RPMSIGTAG_OPENPGP (tag 278) is not supported", ErrEmbeddedSignature)
+	}
 	signatures := make([]embeddedRPMSignaturePacket, 0, len(embeddedRPMSignatureTags))
 	for _, known := range embeddedRPMSignatureTags {
 		tag := signatureHeader.GetTag(known.id)
@@ -935,6 +941,18 @@ func validateOpenPGPSigningKeyAt(key openpgp.Key, at time.Time) error {
 	if key.Entity.PrimaryKey.KeyExpired(primarySignature, at) || primarySignature.SigExpired(at) {
 		return errors.New("trusted OpenPGP primary key was not valid at signature creation time")
 	}
+	directSignature, err := latestDirectKeySelfSignatureAt(key.Entity, at)
+	if err != nil {
+		return err
+	}
+	if directSignature != nil && directSignature != primarySignature {
+		if directSignature.CreationTime.After(at) || key.Entity.PrimaryKey.KeyExpired(directSignature, at) || directSignature.SigExpired(at) {
+			return errors.New("trusted OpenPGP primary key direct signature was not valid at signature creation time")
+		}
+		if key.PublicKey == key.Entity.PrimaryKey && directSignature.FlagsValid && !directSignature.FlagSign && directSignature.CreationTime.After(primarySignature.CreationTime) {
+			return errors.New("trusted OpenPGP direct-key flags do not permit signing")
+		}
+	}
 	if key.PublicKey != key.Entity.PrimaryKey {
 		// Historical package keyrings may expose an older binding packet that
 		// the legacy parser normally discards. Authenticate the binding here on
@@ -951,7 +969,7 @@ func validateOpenPGPSigningKeyAt(key openpgp.Key, at time.Time) error {
 			return errors.New("trusted OpenPGP signing subkey was not valid at signature creation time")
 		}
 	}
-	signatures := []*packet.Signature{primarySignature, bindingSignature}
+	signatures := []*packet.Signature{primarySignature, bindingSignature, directSignature}
 	if bindingSignature != nil && bindingSignature.EmbeddedSignature != nil {
 		signatures = append(signatures, bindingSignature.EmbeddedSignature)
 	}
@@ -979,34 +997,45 @@ func openPGPKeysByIDAt(keyring openpgp.KeyRing, id uint64, at time.Time) []openp
 	return keyring.KeysById(id)
 }
 
+func latestDirectKeySelfSignatureAt(entity *openpgp.Entity, at time.Time) (*packet.Signature, error) {
+	if entity == nil || entity.PrimaryKey == nil {
+		return nil, errors.New("trusted OpenPGP signer evidence is incomplete")
+	}
+	var selected *packet.Signature
+	ambiguous := false
+	for _, signature := range entity.Signatures {
+		if signature == nil || signature.SigType != packet.SigTypeDirectSignature || signature.CreationTime.After(at) {
+			continue
+		}
+		if err := entity.PrimaryKey.VerifyDirectKeySignature(signature); err != nil {
+			continue
+		}
+		if selected == nil || signature.CreationTime.After(selected.CreationTime) {
+			selected = signature
+			ambiguous = false
+			continue
+		}
+		if signature.CreationTime.Equal(selected.CreationTime) && signature != selected {
+			ambiguous = true
+		}
+	}
+	if ambiguous {
+		return nil, errors.New("trusted OpenPGP signer has ambiguous direct-key self-signatures at signature creation time")
+	}
+	return selected, nil
+}
+
 func primarySelfSignatureAt(entity *openpgp.Entity, at time.Time) (*packet.Signature, *openpgp.Identity, error) {
 	if entity == nil || entity.PrimaryKey == nil {
 		return nil, nil, errors.New("trusted OpenPGP signer evidence is incomplete")
 	}
 	if entity.PrimaryKey.Version == 6 {
-		var selected *packet.Signature
-		ambiguous := false
-		for _, signature := range entity.Signatures {
-			if signature == nil || signature.SigType != packet.SigTypeDirectSignature || signature.CreationTime.After(at) {
-				continue
-			}
-			if err := entity.PrimaryKey.VerifyDirectKeySignature(signature); err != nil {
-				continue
-			}
-			if selected == nil || signature.CreationTime.After(selected.CreationTime) {
-				selected = signature
-				ambiguous = false
-				continue
-			}
-			if signature.CreationTime.Equal(selected.CreationTime) && signature != selected {
-				ambiguous = true
-			}
+		selected, err := latestDirectKeySelfSignatureAt(entity, at)
+		if err != nil {
+			return nil, nil, err
 		}
 		if selected == nil {
 			return nil, nil, errors.New("trusted OpenPGP signer has no primary self-signature valid at signature creation time")
-		}
-		if ambiguous {
-			return nil, nil, errors.New("trusted OpenPGP signer has ambiguous direct-key self-signatures at signature creation time")
 		}
 		return selected, nil, nil
 	}
@@ -1055,6 +1084,13 @@ func primarySelfSignatureAt(entity *openpgp.Entity, at time.Time) (*packet.Signa
 		}
 	}
 	if selected == nil {
+		direct, err := latestDirectKeySelfSignatureAt(entity, at)
+		if err != nil {
+			return nil, nil, err
+		}
+		if direct != nil {
+			return direct, nil, nil
+		}
 		return nil, nil, errors.New("trusted OpenPGP signer has no primary self-signature valid at signature creation time")
 	}
 	if selectedAmbiguous {

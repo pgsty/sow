@@ -923,3 +923,177 @@ func TestPublicationAttemptsAndCheckpointsAreTargetScoped(t *testing.T) {
 		t.Fatalf("target manifests differ: alpha=%#v beta=%#v err=%v", alphaManifest, betaManifest, err)
 	}
 }
+
+// TestTargetGCLegacyInvertedGraceDeadlinesConverge verifies that a repository
+// upgraded from v0.7.1 (where lowering max_cache_ttl via --rebind could leave a
+// newer checkpoint with an earlier stored not_before than an older active grace)
+// neither completes the newer checkpoint prematurely nor leaks superseded
+// metadata once both deadlines pass.
+func TestTargetGCLegacyInvertedGraceDeadlinesConverge(t *testing.T) {
+	ctx := context.Background()
+	root, err := realDirectory(t.TempDir(), false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetRoot, err := realDirectory(t.TempDir(), false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}
+	target := config.TargetConfig{
+		Repository: "repo", Provider: "filesystem",
+		Endpoint:               (&url.URL{Scheme: "file", Path: targetRoot}).String(),
+		Prefix:                 "repo",
+		PublicEndpoint:         (&url.URL{Scheme: "file", Path: filepath.Join(targetRoot, "repo") + string(filepath.Separator)}).String(),
+		MaxCacheTTL:            "1440h0m0s",
+		AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}
+	cfg.Targets = map[string]config.TargetConfig{"local": target}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	ws := WorkspaceOptions{Workdir: root, CWD: root}
+	firstRPM := decodeManagedFixture(t, "../../testdata/pgdg-redhat-nonfree-repo.rpm.b64", filepath.Join(t.TempDir(), "first.rpm"))
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"el9"}, Paths: []string{firstRPM}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	baseNow := time.Now().UTC().Truncate(time.Second)
+	clockNow := baseNow
+	clock := func() time.Time { return clockNow }
+
+	firstPub, err := Publish(ctx, PublishOptions{WorkspaceOptions: ws, Target: "local", now: clock})
+	if err != nil || firstPub.Checkpoint == "" {
+		t.Fatalf("first publish=%#v err=%v", firstPub, err)
+	}
+
+	secondRPM, err := filepath.Abs(filepath.Join("..", "..", "..", "third_party", "cavaliergopher-rpm", "testdata", "epel-release-7-5.noarch.rpm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"el9"}, Paths: []string{secondRPM}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	target.MaxCacheTTL = "1h0m0s"
+	cfg.Targets["local"] = target
+	writeManagedConfig(t, root, cfg)
+
+	// Reproduce a genuine v0.7.1 inverted grace record: stop right after
+	// PutAppliedCheckpoint and record C2's unclamped 30-day not_before (earlier
+	// than C1's 61-day not_before).
+	clockNow = clockNow.Add(time.Second)
+	stopAfterCheckpoint := errors.New("inject legacy unclamped grace")
+	if _, err := Publish(ctx, PublishOptions{
+		WorkspaceOptions: ws, Target: "local", Rebind: true, now: clock,
+		Fault: func(point string) error {
+			if point == "publish.checkpoint" {
+				return stopAfterCheckpoint
+			}
+			return nil
+		},
+	}); !errors.Is(err, stopAfterCheckpoint) {
+		t.Fatalf("expected checkpoint fault, got %v", err)
+	}
+	store, err := state.OpenExisting(filepath.Join(root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := store.RepositoryIdentity(ctx)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	binding, err := publicationTargetBinding(cfg, "local", identity.RepositoryID)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	targetSnap, err := store.GetPublicationTarget(ctx, binding.TargetIdentity)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	secondCheckpoint, err := store.GetAppliedCheckpoint(ctx, targetSnap.Head.CheckpointIdentity)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	oldGrace, err := store.GetGraceRecord(ctx, firstPub.Checkpoint)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	legacySecondGrace := state.GraceRecord{
+		TargetIdentity:      binding.TargetIdentity,
+		CheckpointIdentity:  secondCheckpoint.CheckpointIdentity,
+		VerifiedAt:          secondCheckpoint.AppliedAt.UTC(),
+		NotBefore:           secondCheckpoint.AppliedAt.UTC().Add(30 * 24 * time.Hour),
+		CachePolicyIdentity: oldGrace.CachePolicyIdentity,
+		State:               "grace",
+	}
+	if !legacySecondGrace.NotBefore.Before(oldGrace.NotBefore) {
+		store.Close()
+		t.Fatalf("fixture did not invert deadlines: old=%s new=%s", oldGrace.NotBefore, legacySecondGrace.NotBefore)
+	}
+	if err := store.PutGraceRecord(ctx, &legacySecondGrace); err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	beforeManifest, err := store.GenerationManifest(ctx, firstPub.Generation)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	afterManifest, err := store.GenerationManifest(ctx, secondCheckpoint.Generation)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	livePaths := map[string]bool{}
+	for _, f := range afterManifest {
+		livePaths[f.Path] = true
+	}
+	var superseded []string
+	for _, f := range beforeManifest {
+		if f.Phase == "metadata" && !livePaths[f.Path] {
+			superseded = append(superseded, f.Path)
+		}
+	}
+	if len(superseded) == 0 {
+		t.Fatal("expected superseded metadata files between generations")
+	}
+
+	// 1. In the intermediate window (past C2's stored deadline, before C1's
+	// deadline), C2 must NOT complete prematurely; both checkpoints stay pending.
+	clockNow = legacySecondGrace.NotBefore.Add(time.Minute)
+	midGC, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: ws, Target: "local", now: clock})
+	if err != nil || !midGC.Noop || midGC.PendingGrace != 2 || midGC.DeletedObjects != 0 {
+		t.Fatalf("intermediate TargetGC=%#v err=%v, want pending_grace=2 noop=true", midGC, err)
+	}
+
+	// 2. Past both deadlines, C1 completes first and C2 collects every superseded
+	// metadata file, then repeated GC and Publish converge to noop.
+	clockNow = oldGrace.NotBefore.Add(time.Minute)
+	collected, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: ws, Target: "local", now: clock})
+	if err != nil || collected.DeletedObjects != len(superseded) || collected.CompletedAttempts != 2 {
+		t.Fatalf("final TargetGC=%#v err=%v, want deleted=%d completed=2", collected, err, len(superseded))
+	}
+	for _, rel := range superseded {
+		if _, statErr := os.Stat(filepath.Join(targetRoot, "repo", filepath.FromSlash(rel))); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("superseded metadata survived GC: %s (err=%v)", rel, statErr)
+		}
+	}
+	again, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: ws, Target: "local", now: clock})
+	if err != nil || !again.Noop {
+		t.Fatalf("repeat TargetGC=%#v err=%v, want noop", again, err)
+	}
+	noopPub, err := Publish(ctx, PublishOptions{WorkspaceOptions: ws, Target: "local", now: clock})
+	if err != nil || !noopPub.Noop {
+		t.Fatalf("follow-up publish=%#v err=%v, want noop", noopPub, err)
+	}
+}

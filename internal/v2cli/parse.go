@@ -53,6 +53,7 @@ type Invocation struct {
 	Hardlink    bool
 	Abort       bool
 	Rebind      bool
+	Delete      bool
 	DryRun      bool
 	Protect     []string
 
@@ -88,6 +89,7 @@ type commandSpec struct {
 	hardlink  bool
 	abort     bool
 	rebind    bool
+	deleteOpt bool
 	prune     bool
 
 	metadataTimestamp bool
@@ -121,7 +123,7 @@ var commandSpecs = map[string]commandSpec{
 	"retain add":      {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
 	"retain ls":       {globals: useWorkdir | useRepo | useJSON},
 	"retain rm":       {globals: useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1},
-	"gc":              {globals: usePassFile | useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1},
+	"gc":              {globals: usePassFile | useWorkdir | useRepo | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, deleteOpt: true},
 	"export rpm-leaf": {globals: usePassFile | useWorkdir | useRepo | useJSON, minArgs: 3, maxArgs: 3, hardlink: true},
 	"log":             {globals: useWorkdir | useRepo | useDist | useJSON, minArgs: 0, maxArgs: 1},
 	"log export":      {globals: useWorkdir | useRepo | useDist, minArgs: 0, maxArgs: 1},
@@ -263,6 +265,9 @@ func Parse(args []string) (Invocation, error) {
 	if key == "gc" && len(positionals) == 1 && global.repoSet {
 		return Invocation{}, usageError("gc TARGET selects its repository from the target and does not accept --repo")
 	}
+	if key == "gc" && inv.Delete && len(positionals) == 0 {
+		return Invocation{}, usageError("gc --delete requires TARGET")
+	}
 	if key == "log" && len(positionals) == 1 {
 		if _, err := parseNonnegativeInt64(positionals[0], "operation"); err != nil {
 			return Invocation{}, err
@@ -361,6 +366,12 @@ func extractGlobal(args []string) ([]string, GlobalOptions, bool, bool, error) {
 				}
 				out.Timeout, out.timeoutSet = duration, true
 			}
+		case "--protect", "-j", "--jobs", "--metadata-timestamp", "-S", "--sign-with", "--format":
+			remaining = append(remaining, token)
+			if !hasInline && i+1 < len(args) {
+				i++
+				remaining = append(remaining, args[i])
+			}
 		default:
 			remaining = append(remaining, token)
 		}
@@ -373,7 +384,7 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 	stopped := false
 	metadataTimestampSet := false
 	jobsSet, pigstySet, signWithSet, overwriteSet, allSet, forceSet, formatSet := false, false, false, false, false, false, false
-	recursiveSet, skipSet, checkSet, hardlinkSet, abortSet, rebindSet := false, false, false, false, false, false
+	recursiveSet, skipSet, checkSet, hardlinkSet, abortSet, rebindSet, deleteSet := false, false, false, false, false, false, false
 	for i := 0; i < len(args); i++ {
 		token := args[i]
 		if token == "--" && !stopped {
@@ -509,6 +520,11 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 				return nil, usageError("option --rebind is not allowed, duplicated, or has a value")
 			}
 			inv.Rebind, rebindSet = true, true
+		case "--delete":
+			if !spec.deleteOpt || deleteSet || hasInline {
+				return nil, usageError("option --delete is not allowed, duplicated, or has a value")
+			}
+			inv.Delete, deleteSet = true, true
 		default:
 			return nil, usageError("unknown option %q", token)
 		}

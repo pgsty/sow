@@ -30,28 +30,22 @@ var derivedIndexFields = map[string]struct{}{
 	"filename": {}, "size": {}, "md5sum": {}, "sha1": {}, "sha256": {},
 }
 
-type encodedParagraph struct {
-	control.Paragraph
-}
-
-// PackagesWriter emits one Debian Packages paragraph at a time through
-// pault.ag/go/debian/control.Encoder. Callers that already have an externally
-// sorted stream can keep memory bounded to one Package; an out-of-order entry
-// is rejected rather than silently producing non-deterministic output.
+// PackagesWriter emits one Debian Packages paragraph at a time with
+// deterministic deb822 continuation folding. Callers that already have an
+// externally sorted stream can keep memory bounded to one Package; an
+// out-of-order entry is rejected rather than silently producing
+// non-deterministic output.
 type PackagesWriter struct {
-	encoder *control.Encoder
-	last    *Package
+	writer io.Writer
+	wrote  bool
+	last   *Package
 }
 
 func NewPackagesWriter(w io.Writer) (*PackagesWriter, error) {
 	if w == nil {
 		return nil, errors.New("aptrepo: nil Packages writer")
 	}
-	encoder, err := control.NewEncoder(w)
-	if err != nil {
-		return nil, fmt.Errorf("aptrepo: create control encoder: %w", err)
-	}
-	return &PackagesWriter{encoder: encoder}, nil
+	return &PackagesWriter{writer: w}, nil
 }
 
 func (w *PackagesWriter) Write(pkg Package) error {
@@ -81,9 +75,10 @@ func (w *PackagesWriter) writeAt(pkg Package, filename string) error {
 	}
 	paragraph := packageParagraph(pkg)
 	paragraph.Values["Filename"] = filename
-	if err := w.encoder.Encode(encodedParagraph{Paragraph: paragraph}); err != nil {
+	if err := writeControlParagraph(w.writer, paragraph, w.wrote); err != nil {
 		return fmt.Errorf("aptrepo: encode Packages paragraph: %w", err)
 	}
+	w.wrote = true
 	copyForOrder := pkg
 	w.last = &copyForOrder
 	return nil
@@ -147,12 +142,8 @@ func writeFlatPackages(ctx context.Context, w io.Writer, packages []Package, ver
 	}
 	sorted := append([]Package(nil), packages...)
 	SortPackages(sorted)
-	encoder, err := control.NewEncoder(w)
-	if err != nil {
-		return fmt.Errorf("aptrepo: create flat control encoder: %w", err)
-	}
 	var previous *Package
-	for _, pkg := range sorted {
+	for index, pkg := range sorted {
 		if verifySource {
 			if err := verifyPackageSource(ctx, pkg); err != nil {
 				return err
@@ -173,7 +164,7 @@ func writeFlatPackages(ctx context.Context, w io.Writer, packages []Package, ver
 		}
 		paragraph := packageParagraph(pkg)
 		paragraph.Values["Filename"] = "./" + base
-		if err := encoder.Encode(encodedParagraph{Paragraph: paragraph}); err != nil {
+		if err := writeControlParagraph(w, paragraph, index > 0); err != nil {
 			return fmt.Errorf("aptrepo: encode flat Packages paragraph: %w", err)
 		}
 		copyForOrder := pkg
@@ -293,14 +284,12 @@ func packageParagraph(pkg Package) control.Paragraph {
 		if _, derived := derivedIndexFields[strings.ToLower(key)]; derived {
 			continue
 		}
+		// The control decoder retains a trailing newline on multiline values.
+		// Canonical dpkg-scanpackages paragraphs do not emit synthetic trailing
+		// blank continuation lines on Description or folded dependency fields.
+		value = strings.TrimRight(value, "\n")
 		if value == "" {
 			continue
-		}
-		if strings.EqualFold(key, "Description") {
-			// The control decoder retains its final continuation newline. The
-			// canonical dpkg-scanpackages paragraph does not emit a synthetic
-			// trailing blank continuation line.
-			value = strings.TrimRight(value, "\n")
 		}
 		values[key] = value
 	}
@@ -327,4 +316,31 @@ func packageParagraph(pkg Package) control.Paragraph {
 	values["SHA256"] = pkg.SHA256
 	order = append(order, "Filename", "Size", "SHA256")
 	return control.Paragraph{Order: order, Values: values}
+}
+
+func writeControlParagraph(w io.Writer, paragraph control.Paragraph, separate bool) error {
+	if separate {
+		if _, err := io.WriteString(w, "\n"); err != nil {
+			return err
+		}
+	}
+	for _, key := range paragraph.Order {
+		value := paragraph.Values[key]
+		lines := strings.Split(value, "\n")
+		if _, err := io.WriteString(w, key+": "+lines[0]+"\n"); err != nil {
+			return err
+		}
+		for _, line := range lines[1:] {
+			if line == "" {
+				if _, err := io.WriteString(w, " .\n"); err != nil {
+					return err
+				}
+				continue
+			}
+			if _, err := io.WriteString(w, " "+line+"\n"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

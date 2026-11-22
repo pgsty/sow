@@ -54,9 +54,6 @@ func ListDists(ctx context.Context, opts DistListOptions) (result []DistInfo, re
 		return nil, classifyReadLockError(fmt.Sprintf("acquire repository %q read lock", repoName), err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, repoLock.Close()) }()
-	if err := validateRepositoryLayout(ws.Root, repoName); err != nil {
-		return nil, err
-	}
 	if _, err := validateReadOnlyStateRoot(ws.Root, false); err != nil {
 		return nil, err
 	}
@@ -65,6 +62,9 @@ func ListDists(ctx context.Context, opts DistListOptions) (result []DistInfo, re
 		return nil, fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
+	if err := validateRepositoryLayoutForRead(ws.Root, repoName, store.SchemaVersion()); err != nil {
+		return nil, err
+	}
 	dists, err := store.ListDists(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%w: list repository Dist state: %v", ErrIntegrity, err)
@@ -120,9 +120,6 @@ func ShowDist(ctx context.Context, opts DistShowOptions) (result DistInfo, resul
 		return DistInfo{}, classifyReadLockError(fmt.Sprintf("acquire repository %q read lock", repoName), err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, repoLock.Close()) }()
-	if err := validateRepositoryLayout(ws.Root, repoName); err != nil {
-		return DistInfo{}, err
-	}
 	if _, err := validateReadOnlyStateRoot(ws.Root, false); err != nil {
 		return DistInfo{}, err
 	}
@@ -131,6 +128,9 @@ func ShowDist(ctx context.Context, opts DistShowOptions) (result DistInfo, resul
 		return DistInfo{}, fmt.Errorf("%w: %v", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
+	if err := validateRepositoryLayoutForRead(ws.Root, repoName, store.SchemaVersion()); err != nil {
+		return DistInfo{}, err
+	}
 	dist, err := store.GetDist(ctx, opts.Name)
 	if errors.Is(err, state.ErrNotFound) {
 		configured, ok := cfg.Repositories[repoName].Dists[opts.Name]
@@ -460,24 +460,17 @@ func NewDist(ctx context.Context, opts DistNewOptions) (result DistInfo, resultE
 	if opts.Format != "rpm" && opts.Format != "deb" {
 		return DistInfo{}, fmt.Errorf("%w: dist format must be rpm or deb", ErrRejected)
 	}
-	ws, cfg, rootGuard, err := workspace(opts.WorkspaceOptions)
+	ws, _, rootGuard, err := workspace(opts.WorkspaceOptions)
 	if err != nil {
 		return DistInfo{}, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, rootGuard.Close()) }()
-	repoName, err := selectRepo(ws, cfg, opts.Repository)
-	if err != nil {
-		return DistInfo{}, err
-	}
-	workspaceLock, repoLock, err := acquireLifecycleLocks(ctx, ws.Root, repoName, opts.LockOptions)
+	cfg, oldData, repoName, workspaceLock, repoLock, err := acquireSelectedLifecycleLocks(ctx, ws, opts.Repository, opts.LockOptions)
 	if err != nil {
 		return DistInfo{}, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, workspaceLock.Close()) }()
 	defer func() { resultErr = errors.Join(resultErr, repoLock.Close()) }()
-	if err := recoverWorkspaceOperation(ctx, ws.Root); err != nil {
-		return DistInfo{}, err
-	}
 	if err := validateRepositoryLayout(ws.Root, repoName); err != nil {
 		return DistInfo{}, err
 	}
@@ -494,11 +487,6 @@ func NewDist(ctx context.Context, opts DistNewOptions) (result DistInfo, resultE
 	}
 	if err := store.Checkpoint(ctx); err != nil {
 		return DistInfo{}, fmt.Errorf("%w: %v", ErrIntegrity, err)
-	}
-	var oldData []byte
-	cfg, oldData, _, err = config.LoadWorkspaceDocument(ws)
-	if err != nil {
-		return DistInfo{}, err
 	}
 	if _, err := checkConfigAtRootWithLockedRepositories(ctx, ws.Root, cfg, map[string]struct{}{repoName: {}}); err != nil {
 		return DistInfo{}, err
@@ -560,24 +548,17 @@ func removeDist(ctx context.Context, opts DistRemoveOptions, result *RemovalResu
 	if err := config.ValidateName(opts.Name); err != nil {
 		return fmt.Errorf("%w: %v", ErrRejected, err)
 	}
-	ws, cfg, rootGuard, err := workspace(opts.WorkspaceOptions)
+	ws, _, rootGuard, err := workspace(opts.WorkspaceOptions)
 	if err != nil {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, rootGuard.Close()) }()
-	repoName, err := selectRepo(ws, cfg, opts.Repository)
-	if err != nil {
-		return err
-	}
-	workspaceLock, repoLock, err := acquireLifecycleLocks(ctx, ws.Root, repoName, opts.LockOptions)
+	cfg, oldData, repoName, workspaceLock, repoLock, err := acquireSelectedLifecycleLocks(ctx, ws, opts.Repository, opts.LockOptions)
 	if err != nil {
 		return err
 	}
 	defer func() { resultErr = errors.Join(resultErr, workspaceLock.Close()) }()
 	defer func() { resultErr = errors.Join(resultErr, repoLock.Close()) }()
-	if err := recoverWorkspaceOperation(ctx, ws.Root); err != nil {
-		return err
-	}
 	if err := validateRepositoryLayout(ws.Root, repoName); err != nil {
 		return err
 	}
@@ -594,11 +575,6 @@ func removeDist(ctx context.Context, opts DistRemoveOptions, result *RemovalResu
 	}
 	if err := store.Checkpoint(ctx); err != nil {
 		return fmt.Errorf("%w: %v", ErrIntegrity, err)
-	}
-	var oldData []byte
-	cfg, oldData, _, err = config.LoadWorkspaceDocument(ws)
-	if err != nil {
-		return err
 	}
 	check := checkConfigAtRootWithLockedRepositories
 	if opts.Force {
@@ -640,7 +616,11 @@ func initializeDeclaredDists(ctx context.Context, root, repoName string, fault f
 		return 0, err
 	}
 	defer func() { resultErr = errors.Join(resultErr, workspaceLock.Close()) }()
-	if err := recoverWorkspaceOperation(ctx, root); err != nil {
+	remaining, err := remainingLockTimeout(lockOptions.Timeout, started)
+	if err != nil {
+		return 0, err
+	}
+	if err := recoverWorkspaceOperation(ctx, root, LockOptions{Timeout: remaining, NoWait: lockOptions.NoWait}); err != nil {
 		return 0, err
 	}
 	currentCfg, currentData, _, err := config.LoadDocument(filepath.Join(root, config.ConfigFilename))
@@ -655,7 +635,7 @@ func initializeDeclaredDists(ctx context.Context, root, repoName string, fault f
 	if _, configured := currentCfg.Repositories[repoName]; !configured {
 		return 0, nil
 	}
-	remaining, err := remainingLockTimeout(lockOptions.Timeout, started)
+	remaining, err = remainingLockTimeout(lockOptions.Timeout, started)
 	if err != nil {
 		return 0, err
 	}
@@ -1256,6 +1236,9 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 	if err := recoverDoneDistCleanup(ctx, root, repoName, store); err != nil {
 		return err
 	}
+	if err := cleanupExchangeProbeDirectories(root, repoName); err != nil {
+		return err
+	}
 	if err := bootstrapLegacyGeneration(ctx, root, repoName, store); err != nil {
 		return err
 	}
@@ -1754,23 +1737,39 @@ func sameArchitectureProjectionList(left, right []state.Architecture) bool {
 	return true
 }
 
-func acquireLifecycleLocks(ctx context.Context, root, repoName string, opts LockOptions) (*fileLock, *fileLock, error) {
+func acquireSelectedLifecycleLocks(ctx context.Context, ws config.Workspace, explicitRepository string, opts LockOptions) (config.Config, []byte, string, *fileLock, *fileLock, error) {
 	started := time.Now()
-	workspaceLock, err := acquireFileLock(ctx, filepath.Join(root, ".sow", "workspace.lock"), opts.Timeout, opts.NoWait)
+	workspaceLock, err := acquireFileLock(ctx, filepath.Join(ws.Root, ".sow", "workspace.lock"), opts.Timeout, opts.NoWait)
 	if err != nil {
-		return nil, nil, err
+		return config.Config{}, nil, "", nil, nil, err
+	}
+	fail := func(cause error) (config.Config, []byte, string, *fileLock, *fileLock, error) {
+		return config.Config{}, nil, "", nil, nil, errors.Join(cause, workspaceLock.Close())
 	}
 	remaining, err := remainingLockTimeout(opts.Timeout, started)
 	if err != nil {
-		workspaceLock.Close()
-		return nil, nil, err
+		return fail(err)
 	}
-	repoLock, err := acquireFileLock(ctx, filepath.Join(root, ".sow", "repo-locks", repoName+".lock"), remaining, opts.NoWait)
+	if err := recoverWorkspaceOperation(ctx, ws.Root, LockOptions{Timeout: remaining, NoWait: opts.NoWait}); err != nil {
+		return fail(err)
+	}
+	cfg, oldData, _, err := config.LoadWorkspaceDocument(ws)
 	if err != nil {
-		workspaceLock.Close()
-		return nil, nil, err
+		return fail(err)
 	}
-	return workspaceLock, repoLock, nil
+	repoName, err := selectRepo(ws, cfg, explicitRepository)
+	if err != nil {
+		return fail(err)
+	}
+	remaining, err = remainingLockTimeout(opts.Timeout, started)
+	if err != nil {
+		return fail(err)
+	}
+	repoLock, err := acquireFileLock(ctx, filepath.Join(ws.Root, ".sow", "repo-locks", repoName+".lock"), remaining, opts.NoWait)
+	if err != nil {
+		return fail(err)
+	}
+	return cfg, oldData, repoName, workspaceLock, repoLock, nil
 }
 
 // acquireRepositoryLocks freezes Workspace lifecycle/configuration with a
@@ -1812,7 +1811,13 @@ func acquireSelectedRepositoryLocks(ctx context.Context, ws config.Workspace, ex
 			if err != nil {
 				return config.Config{}, "", "", nil, nil, err
 			}
-			recoveryErr := recoverWorkspaceOperation(ctx, ws.Root)
+			remAfterLock, remErr := remainingLockTimeout(opts.Timeout, started)
+			var recoveryErr error
+			if remErr != nil {
+				recoveryErr = remErr
+			} else {
+				recoveryErr = recoverWorkspaceOperation(ctx, ws.Root, LockOptions{Timeout: remAfterLock, NoWait: opts.NoWait})
+			}
 			if err := errors.Join(recoveryErr, recoveryLock.Close()); err != nil {
 				return config.Config{}, "", "", nil, nil, err
 			}

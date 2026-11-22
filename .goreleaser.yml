@@ -19,6 +19,7 @@ builds:
       - v1
     flags:
       - -trimpath
+    mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
       - >-
         -s -w
@@ -45,11 +46,11 @@ nfpms:
     package_name: sow
     file_name_template: >-
       {{ .PackageName }}
-      {{- if eq .Format "deb" }}_{{ .Version }}-1PGSTY_
+      {{- if eq .Format "deb" }}_{{ .Version }}-{{ .Release }}_
         {{- if eq .Arch "amd64" }}amd64
         {{- else if eq .Arch "arm64" }}arm64
         {{- else }}{{ .Arch }}{{ end }}
-      {{- else if eq .Format "rpm" }}-{{ .Version }}-1PGSTY.
+      {{- else if eq .Format "rpm" }}-{{ .Version }}-{{ .Release }}.
         {{- if eq .Arch "amd64" }}x86_64
         {{- else if eq .Arch "arm64" }}aarch64
         {{- else }}{{ .Arch }}{{ end }}
@@ -86,9 +87,10 @@ nfpms:
         file_info:
           mode: 0644
     release: "1PGSTY"
+    mtime: "{{ .CommitDate }}"
     rpm:
       summary: Local RPM and DEB repository manager
-      group: Applications/Databases
+      group: Development/Tools
 
 checksum:
   name_template: SHA256SUMS

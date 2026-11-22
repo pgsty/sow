@@ -9,7 +9,7 @@ import (
 )
 
 func isNativeExchangeUnsupported(err error) bool {
-	return errors.Is(err, unix.ENOTSUP)
+	return errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EINVAL)
 }
 
 func nativeExchange(first, second string) error {

@@ -102,6 +102,10 @@ func (c *Client) Put(ctx context.Context, key string, body ReadSeekReaderAt, siz
 	return c.objects.put(ctx, key, body, size, sha256, condition.IfMatch, condition.IfNoneMatch, condition.CacheControl)
 }
 
+func (c *Client) Delete(ctx context.Context, key string) error {
+	return c.objects.deleteObject(ctx, key)
+}
+
 func validateRemoteKey(value string) error {
 	if value == "" || strings.HasPrefix(value, "/") || strings.ContainsAny(value, "\\\x00\r\n\t") {
 		return fmt.Errorf("unsafe remote key %q", value)

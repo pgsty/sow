@@ -48,6 +48,8 @@ type httpPublicationVerifier struct {
 func newPublicVerificationClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = publicResponseTimeout
+	transport.MaxIdleConns = max(transport.MaxIdleConns, 100)
+	transport.MaxIdleConnsPerHost = max(transport.MaxIdleConnsPerHost, 32)
 	return &http.Client{
 		Transport: transport,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {

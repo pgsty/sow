@@ -522,3 +522,47 @@ func TestRetainedGenerationCopiesMetadataButReferencesPayload(t *testing.T) {
 		t.Fatalf("idempotent retained removal=%#v err=%v", noop, err)
 	}
 }
+
+func TestRetainedTombstoneFlaggedByCheckAndReplayedByLocalGC(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Repositories["repo"] = config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}
+	writeManagedConfig(t, root, cfg)
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	rpm := decodeManagedFixture(t, filepath.Join("..", "..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(root, "package.rpm"))
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	added, err := Add(ctx, AddOptions{WorkspaceOptions: options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm}, Jobs: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RetainAdd(ctx, RetainAddOptions{WorkspaceOptions: options, Repository: "repo", Generation: added.Generation}); err != nil {
+		t.Fatal(err)
+	}
+	crash := errors.New("crash after tombstone rename")
+	if _, err := RetainRemove(ctx, RetainRemoveOptions{WorkspaceOptions: options, Repository: "repo", Generation: added.Generation, Fault: func(point string) error {
+		if point == "retain.remove.tombstoned" {
+			return crash
+		}
+		return nil
+	}}); !errors.Is(err, crash) {
+		t.Fatalf("tombstone rename fault=%v", err)
+	}
+	checked, checkErr := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})
+	if checkErr == nil || checked.ReadyToCopy {
+		t.Fatalf("Check accepted unfinished retain-remove tombstone: checked=%#v err=%v", checked, checkErr)
+	}
+	if _, err := LocalGC(ctx, LocalGCOptions{WorkspaceOptions: options, Repository: "repo"}); err != nil {
+		t.Fatalf("LocalGC failed to replay retain-remove tombstone: %v", err)
+	}
+	tombstone := filepath.Join(root, ".sow", "repo", "stage", "retain-remove-"+added.Generation.String())
+	if _, err := os.Lstat(tombstone); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tombstone remained after LocalGC replay: %v", err)
+	}
+	clean, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})
+	if err != nil || !clean.ReadyToCopy {
+		t.Fatalf("Check after LocalGC replay=%#v err=%v", clean, err)
+	}
+}

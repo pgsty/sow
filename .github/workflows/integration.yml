@@ -12,7 +12,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   rpm-passfile:
@@ -77,7 +77,7 @@ jobs:
           SOW_COMPAT_EL8_IMAGE: almalinux:8
         run: >-
           go test -timeout 20m -count=1 -v ./qa/compat
-          -run '^(TestShippedExampleSupportsCleanRoomLocalMVP|TestV2APTClientCompatibility|TestYUMDetachedSignatureBridgeCompatibility)$'
+          -run '^(TestShippedExampleSupportsCleanRoomLocalMVP|TestV2APTClientCompatibility|TestV2SignedManagedClientCompatibility|TestYUMDetachedSignatureBridgeCompatibility)$'
 
   s3-compatible:
     name: S3-Compatible Publication
@@ -96,7 +96,9 @@ jobs:
       - name: Pull pinned Silo fixture
         run: docker pull pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46
 
-      - name: Run R2 transport integration test
+      - name: Run R2 transport and managed publication integration tests
         env:
           SOW_SILO_TEST: "1"
-        run: go test -timeout 10m -count=1 -v ./internal/r2 -run '^TestSiloS3Compatibility$'
+        run: |
+          go test -timeout 10m -count=1 -v ./internal/r2 -run '^TestSiloS3Compatibility$'
+          go test -timeout 10m -count=1 -v ./internal/v2/managed -run '^TestSiloManagedR2DeleteRepublishAndNoop$'

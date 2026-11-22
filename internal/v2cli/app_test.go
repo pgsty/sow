@@ -1104,6 +1104,72 @@ func TestMainOutputFailureIsRuntime(t *testing.T) {
 	}
 }
 
+func TestV080CLISurfacesFrozenV2ReadOnlySymlinkInitAndMetadataEnvelopes(t *testing.T) {
+	base := t.TempDir()
+	realParent := filepath.Join(base, "real-parent")
+	realWorkdir := filepath.Join(realParent, "workspace")
+	if err := os.MkdirAll(realWorkdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkParent := filepath.Join(base, "link-parent")
+	if err := os.Symlink(realParent, linkParent); err != nil {
+		t.Fatal(err)
+	}
+	leafLink := filepath.Join(base, "leaf-link")
+	if err := os.Symlink(realWorkdir, leafLink); err != nil {
+		t.Fatal(err)
+	}
+
+	assertCLIFailureNull(t, []string{"init", leafLink, "--json"}, ExitRejected, "rejected")
+	assertCLISuccess(t, []string{"init", filepath.Join(linkParent, "workspace"), "--json"}, `"command":"init"`)
+	assertCLISuccess(t, []string{"repo", "new", "repo", "-C", realWorkdir, "--json"}, `"name":"repo"`)
+	assertCLISuccess(t, []string{"dist", "new", "el9", "--format", "rpm", "-C", realWorkdir, "-r", "repo", "--json"}, `"name":"el9"`)
+
+	whereMiss, stderr, code := runCLI([]string{"where", "missing-pkg", "-C", realWorkdir, "-r", "repo", "--json"})
+	if code != ExitRejected || stderr == "" || !strings.Contains(whereMiss, `"repository":"repo"`) {
+		t.Fatalf("where missing-pkg -r repo code=%d stdout=%q stderr=%q", code, whereMiss, stderr)
+	}
+	rpm := decodeCLIFixture(t, filepath.Join("..", "testdata", "pgdg-redhat-nonfree-repo.rpm.b64"), filepath.Join(base, "package.rpm"))
+	assertCLISuccess(t, []string{"add", rpm, "-C", realWorkdir, "-r", "repo", "-d", "el9", "--json"}, `"command":"add"`)
+	whereHit, stderr, code := runCLI([]string{"where", "pgdg-redhat-nonfree-repo", "-C", realWorkdir, "-r", "repo", "--json"})
+	if code != ExitOK || stderr != "" || !strings.Contains(whereHit, `"repository":"repo"`) {
+		t.Fatalf("where pgdg-redhat-nonfree-repo -r repo code=%d stdout=%q stderr=%q", code, whereHit, stderr)
+	}
+
+	pruneOut, stderr, code := runCLI([]string{"log", "prune", "2099-01-01", "-C", realWorkdir, "-r", "repo", "--json"})
+	if code != ExitOK || stderr != "" {
+		t.Fatalf("log prune --json code=%d stdout=%q stderr=%q", code, pruneOut, stderr)
+	}
+	var pruneEnvelope struct {
+		Operation string `json:"operation"`
+		Result    struct {
+			Operation string `json:"operation"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(pruneOut), &pruneEnvelope); err != nil || pruneEnvelope.Operation == "" || pruneEnvelope.Operation != pruneEnvelope.Result.Operation {
+		t.Fatalf("log prune envelope operation mismatch: %v %+v", err, pruneEnvelope)
+	}
+
+	assertCLIFailureNull(t, []string{"gc", "--delete", "-C", realWorkdir, "-r", "repo", "--json"}, ExitUsage, "usage")
+
+	configPath := filepath.Join(realWorkdir, "sow.yml")
+	rawConfig, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2Config := strings.Replace(string(rawConfig), "schema: sow/v3", "schema: sow/v2", 1)
+	if err := os.WriteFile(configPath, []byte(v2Config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	assertCLISuccess(t, []string{"config", "check", "-C", realWorkdir, "--json"}, `"repositories":1`)
+	assertCLIFailureNull(t, []string{"config", "show", "--all", "-C", realWorkdir, "--json"}, ExitUsage, "config")
+	assertCLISuccess(t, []string{"repo", "ls", "-C", realWorkdir, "--json"}, `"name":"repo"`)
+	assertCLISuccess(t, []string{"repo", "show", "repo", "-C", realWorkdir, "--json"}, `"name":"repo"`)
+	assertCLISuccess(t, []string{"dist", "ls", "-C", realWorkdir, "-r", "repo", "--json"}, `"name":"el9"`)
+	assertCLISuccess(t, []string{"dist", "show", "el9", "-C", realWorkdir, "-r", "repo", "--json"}, `"name":"el9"`)
+	assertCLIFailureNull(t, []string{"build", "-C", realWorkdir, "-r", "repo", "--json"}, ExitUsage, "config")
+}
+
 func runCLI(args []string) (string, string, int) {
 	var stdout, stderr bytes.Buffer
 	code := Main(args, &stdout, &stderr)

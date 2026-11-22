@@ -12,6 +12,7 @@ import (
 
 	"github.com/pgsty/sow/internal/aptrepo"
 	"github.com/pgsty/sow/internal/yumrepo"
+	"golang.org/x/sys/unix"
 )
 
 type packageFormat string
@@ -37,6 +38,8 @@ type packageFact struct {
 	parsedRPM      *yumrepo.FlatPackage
 	deb            aptrepo.Package
 	sourceInfo     os.FileInfo
+	sourceStat     unix.Stat_t
+	hasSourceStat  bool
 }
 
 type scanResult struct {
@@ -170,6 +173,10 @@ func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanR
 	result := scanResult{all: facts}
 	coordinates := make(map[string]packageFact, len(facts))
 	for _, fact := range facts {
+		if pigsty && shouldRemove(fact) {
+			result.removed = append(result.removed, fact)
+			continue
+		}
 		if previous, exists := coordinates[fact.coordinate]; exists {
 			if previous.sha256 != fact.sha256 {
 				return scanResult{}, &Error{Kind: KindRejected, Op: "coordinate conflict", Path: fact.base, Err: fmt.Errorf("%s and %s have the same logical coordinate but different SHA-256", previous.base, fact.base)}
@@ -178,11 +185,7 @@ func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanR
 		} else {
 			coordinates[fact.coordinate] = fact
 		}
-		if pigsty && shouldRemove(fact) {
-			result.removed = append(result.removed, fact)
-		} else {
-			result.kept = append(result.kept, fact)
-		}
+		result.kept = append(result.kept, fact)
 	}
 	indexed := make(map[string]struct{}, len(result.kept))
 	for _, fact := range result.kept {
@@ -235,6 +238,11 @@ func inspectPackageFact(ctx context.Context, path, base string, format packageFo
 		return packageFact{}, errors.Join(err, errors.New("package changed after inspection"))
 	}
 	fact.sourceInfo = info
+	var st unix.Stat_t
+	if unix.Lstat(path, &st) == nil {
+		fact.sourceStat = st
+		fact.hasSourceStat = true
+	}
 	fact.originalSHA256 = fact.sha256
 	return fact, nil
 }

@@ -20,9 +20,10 @@ type PublicationRootRequirement struct {
 	StateComplete    bool
 	EvidenceIdentity string
 	MinimumRoots     []GenerationFile
-	// GenerationRootPaths are the payload roots taken from nonterminal attempt
-	// source Generations; their bytes must exist locally. Every other root is
-	// only observed checkpoint inventory and may already be remote-only.
+	// GenerationRootPaths are the payload roots taken from write-active attempt
+	// source Generations; their bytes must exist locally. Post-applied
+	// checkpoints and observed checkpoint inventory roots may already be
+	// remote-only once locally collected.
 	GenerationRootPaths map[string]struct{}
 }
 
@@ -107,24 +108,37 @@ func publicationRootRequirementTx(ctx context.Context, tx *sql.Tx) (PublicationR
 		return PublicationRootRequirement{}, err
 	}
 	roots := make(map[string]GenerationFile)
-	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT target_generation FROM publication_attempts WHERE phase NOT IN ('done', 'abandoned') ORDER BY target_generation`)
+	rows, err := tx.QueryContext(ctx, `SELECT target_generation, MAX(CASE WHEN phase IN (
+ 'planned', 'payload', 'immutable_metadata', 'pointer_prepared',
+ 'commit_intent', 'pointer_rollforward', 'verified', 'applied'
+) THEN 1 ELSE 0 END)
+FROM publication_attempts
+WHERE phase NOT IN ('done', 'abandoned')
+GROUP BY target_generation
+ORDER BY target_generation`)
 	if err != nil {
 		return PublicationRootRequirement{}, err
 	}
-	generations := []GenerationID{}
+	type generationRootEntry struct {
+		generation  GenerationID
+		writeActive bool
+	}
+	generations := []generationRootEntry{}
 	for rows.Next() {
-		var generation GenerationID
-		if err := rows.Scan(&generation); err != nil {
+		var entry generationRootEntry
+		var writeActive int
+		if err := rows.Scan(&entry.generation, &writeActive); err != nil {
 			rows.Close()
 			return PublicationRootRequirement{}, err
 		}
-		generations = append(generations, generation)
+		entry.writeActive = writeActive != 0
+		generations = append(generations, entry)
 	}
 	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
 		return PublicationRootRequirement{}, err
 	}
-	for _, generation := range generations {
-		manifest, err := generationManifestOn(ctx, tx, generation)
+	for _, entry := range generations {
+		manifest, err := generationManifestOn(ctx, tx, entry.generation)
 		if errors.Is(err, ErrNotFound) {
 			result.StateComplete = false
 			continue
@@ -137,7 +151,9 @@ func publicationRootRequirementTx(ctx context.Context, tx *sql.Tx) (PublicationR
 				if err := addPublicationRoot(roots, file); err != nil {
 					return PublicationRootRequirement{}, err
 				}
-				result.GenerationRootPaths[file.Path] = struct{}{}
+				if entry.writeActive {
+					result.GenerationRootPaths[file.Path] = struct{}{}
+				}
 			}
 		}
 	}

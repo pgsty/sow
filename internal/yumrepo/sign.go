@@ -26,7 +26,15 @@ func DetachedSignatureCreationTime(signature io.Reader) (time.Time, error) {
 	if signature == nil {
 		return time.Time{}, fmt.Errorf("yumrepo: nil detached signature")
 	}
-	block, err := armor.Decode(io.LimitReader(signature, maxOpenPGPKeyBytes+1))
+	raw, err := io.ReadAll(io.LimitReader(signature, maxOpenPGPKeyBytes+1))
+	if err != nil || len(raw) == 0 || len(raw) > maxOpenPGPKeyBytes {
+		return time.Time{}, fmt.Errorf("yumrepo: read detached signature: invalid or unbounded")
+	}
+	blocks, err := openpgpkey.SplitArmor(raw, openpgp.SignatureType)
+	if err != nil || len(blocks) != 1 {
+		return time.Time{}, fmt.Errorf("yumrepo: detached signature must be one complete armor block")
+	}
+	block, err := armor.Decode(bytes.NewReader(blocks[0]))
 	if err != nil {
 		return time.Time{}, fmt.Errorf("yumrepo: decode detached signature armor: %w", err)
 	}
@@ -238,6 +246,16 @@ func (k *OpenPGPKey) Sign(ctx context.Context, message io.Reader, signature io.W
 
 // Verify verifies an ASCII-armored detached signature with the same single key.
 func (k *OpenPGPKey) Verify(ctx context.Context, message io.Reader, signature io.Reader) error {
+	return k.verify(ctx, message, signature, false)
+}
+
+// VerifyForPublication also checks that the detached signature uses SHA-256 or
+// stronger for new metadata publication.
+func (k *OpenPGPKey) VerifyForPublication(ctx context.Context, message io.Reader, signature io.Reader) error {
+	return k.verify(ctx, message, signature, true)
+}
+
+func (k *OpenPGPKey) verify(ctx context.Context, message io.Reader, signature io.Reader, publication bool) error {
 	if k == nil || len(k.entities) != 1 {
 		return fmt.Errorf("yumrepo: no OpenPGP verification key")
 	}
@@ -250,8 +268,39 @@ func (k *OpenPGPKey) Verify(ctx context.Context, message io.Reader, signature io
 	if message == nil || signature == nil {
 		return fmt.Errorf("yumrepo: nil OpenPGP verify stream")
 	}
-	if _, err := openpgp.CheckArmoredDetachedSignature(k.entities, &contextReader{ctx: ctx, r: message}, signature, &k.config); err != nil {
+	rawSig, err := io.ReadAll(io.LimitReader(signature, maxOpenPGPKeyBytes+1))
+	if err != nil || len(rawSig) == 0 || len(rawSig) > maxOpenPGPKeyBytes {
+		return fmt.Errorf("yumrepo: verify OpenPGP detached signature: invalid or unbounded signature")
+	}
+	blocks, err := openpgpkey.SplitArmor(rawSig, openpgp.SignatureType)
+	if err != nil || len(blocks) != 1 {
+		return fmt.Errorf("yumrepo: verify OpenPGP detached signature: expected one complete signature armor block")
+	}
+	armored, err := armor.Decode(bytes.NewReader(blocks[0]))
+	if err != nil || armored.Type != openpgp.SignatureType {
+		return fmt.Errorf("yumrepo: verify OpenPGP detached signature: invalid armor")
+	}
+	packetBytes, err := io.ReadAll(io.LimitReader(armored.Body, maxOpenPGPKeyBytes+1))
+	if err != nil || len(packetBytes) == 0 || len(packetBytes) > maxOpenPGPKeyBytes {
+		return fmt.Errorf("yumrepo: verify OpenPGP detached signature: invalid signature body")
+	}
+	pktReader := packet.NewReader(bytes.NewReader(packetBytes))
+	firstPkt, err := pktReader.Next()
+	if err != nil {
 		return fmt.Errorf("yumrepo: verify OpenPGP detached signature: %w", err)
+	}
+	if _, ok := firstPkt.(*packet.Signature); !ok {
+		return fmt.Errorf("yumrepo: verify OpenPGP detached signature: expected signature packet")
+	}
+	if _, err := pktReader.Next(); err != io.EOF {
+		return fmt.Errorf("yumrepo: verify OpenPGP detached signature: trailing signature packets")
+	}
+	verified, _, err := openpgp.VerifyDetachedSignature(k.entities, &contextReader{ctx: ctx, r: message}, bytes.NewReader(packetBytes), &k.config)
+	if err != nil {
+		return fmt.Errorf("yumrepo: verify OpenPGP detached signature: %w", err)
+	}
+	if publication && verified.Hash != crypto.SHA256 && verified.Hash != crypto.SHA384 && verified.Hash != crypto.SHA512 {
+		return fmt.Errorf("yumrepo: new RPM publication requires SHA-256 or stronger metadata signatures; rebuild the Dist")
 	}
 	return nil
 }

@@ -61,6 +61,18 @@ func TestSignerProducesVerifiableInReleaseAndDetachedSignature(t *testing.T) {
 	if err := signer.Verify(tampered, inRelease.Bytes(), detached.Bytes(), signedAt); !errors.Is(err, ErrSigningFailed) {
 		t.Fatalf("tampered self-check error = %v", err)
 	}
+	prefixedInRelease := append([]byte("Origin: Evil\n\n"), inRelease.Bytes()...)
+	if err := signer.Verify(message, prefixedInRelease, detached.Bytes(), signedAt); !errors.Is(err, ErrSigningFailed) {
+		t.Fatalf("leading garbage InRelease error = %v", err)
+	}
+	prefixedDetached := append([]byte("untrusted preamble\n"), detached.Bytes()...)
+	if err := signer.Verify(message, inRelease.Bytes(), prefixedDetached, signedAt); !errors.Is(err, ErrSigningFailed) {
+		t.Fatalf("leading garbage Release.gpg error = %v", err)
+	}
+	suffixedDetached := append(append([]byte(nil), detached.Bytes()...), []byte("\ntrailing garbage\n")...)
+	if err := signer.Verify(message, inRelease.Bytes(), suffixedDetached, signedAt); !errors.Is(err, ErrSigningFailed) {
+		t.Fatalf("trailing garbage Release.gpg error = %v", err)
+	}
 }
 
 func TestSignerUnlockErrorsDoNotExposeSecrets(t *testing.T) {

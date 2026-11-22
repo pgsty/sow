@@ -105,9 +105,9 @@ func validateManagedAPTIndexWithEvidence(ctx context.Context, repositoryRoot, di
 			indexedRelative := filepath.ToSlash(filepath.Join("dists", distName, filepath.FromSlash(relative)))
 			byHashRelative := filepath.ToSlash(filepath.Join(filepath.Dir(indexedRelative), "by-hash", "SHA256", want.digest))
 			same, err := sameRootedRegularFile(repositoryRoot, indexedRelative, byHashRelative)
-			if errors.Is(err, os.ErrNotExist) && plainSize == 0 {
-				// Schema-v1/P1 empty Dists predate managed by-hash projection.
-				// The first non-empty build replaces them with the full shape.
+			if errors.Is(err, os.ErrNotExist) && plainSize == 0 && !present {
+				// Schema-v1/P1 empty Dists without X-SOW-Generation predate managed
+				// by-hash projection. Post-P1 Dists always project by-hash.
 				continue
 			}
 			if err != nil || !same {

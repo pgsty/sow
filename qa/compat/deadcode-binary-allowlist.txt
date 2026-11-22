@@ -28,6 +28,11 @@ internal/v2cli/help.go: RootHelp
 internal/yumrepo/exchange.go: ActivateInitialLocalGuarded
 internal/yumrepo/exchange.go: ActivateLocal
 internal/yumrepo/exchange.go: ActivateLocalGuarded
+internal/yumrepo/exchange.go: NativeDirectoryExchanger.Exchange
+internal/yumrepo/exchange.go: NativeDirectoryExchanger.Probe
+internal/yumrepo/exchange.go: exchangePaths
+internal/yumrepo/exchange_linux.go: isNativeExchangeUnsupported
+internal/yumrepo/exchange_linux.go: nativeExchange
 internal/yumrepo/generation.go: Generate
 internal/yumrepo/generation.go: directoryFiles
 internal/yumrepo/generation.go: equivalentGeneration
@@ -38,9 +43,6 @@ internal/yumrepo/managed.go: GenerateManagedParsed
 internal/yumrepo/plain.go: GenerateFlatUnsigned
 internal/yumrepo/rpm.go: InspectPackage
 internal/yumrepo/rpm_facts.go: InspectManagedPackageFacts
-internal/yumrepo/rpm_signature.go: VerifyEmbeddedRPMSignatures
-internal/yumrepo/rpm_signature.go: verifyOpenPGPV3DetachedSignature
-internal/yumrepo/rpm_signature.go: verifyOpenPGPV4DetachedSignature
 internal/yumrepo/sign.go: NewOpenPGPVerifierForFingerprint
 internal/yumrepo/types.go: CompressionForEL
 internal/yumrepo/types.go: CompressionForOptions

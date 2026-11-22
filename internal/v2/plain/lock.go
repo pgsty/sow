@@ -14,9 +14,7 @@ import (
 type directoryLock struct {
 	path       string
 	pathInfo   os.FileInfo
-	parentFile *os.File
 	targetFile *os.File
-	targetLock bool
 }
 
 func acquireDirectoryLock(ctx context.Context, dir string, timeout time.Duration, noWait bool) (*directoryLock, error) {
@@ -25,45 +23,82 @@ func acquireDirectoryLock(ctx context.Context, dir string, timeout time.Duration
 		deadline = time.Now().Add(timeout)
 	}
 	parent := filepath.Dir(dir)
-	parentFile, err := os.Open(parent)
-	if err != nil {
-		return nil, &Error{Kind: KindRuntime, Op: "open parent lock", Path: parent, Err: err}
+	var parentFile *os.File
+	if parent != dir {
+		openedParent, err := os.Open(parent)
+		if err != nil && !errors.Is(err, os.ErrPermission) {
+			return nil, &Error{Kind: KindRuntime, Op: "open parent lock", Path: parent, Err: err}
+		}
+		if err == nil {
+			parentFile = openedParent
+			if err := flockUntil(ctx, parentFile, deadline, timeout, noWait); err != nil {
+				_ = parentFile.Close()
+				return nil, &Error{Kind: KindLock, Op: "lock parent", Path: parent, Err: err}
+			}
+			parentInfo, statErr := parentFile.Stat()
+			if statErr != nil || !parentInfo.IsDir() {
+				_ = unlockAndClose(parentFile)
+				return nil, &Error{Kind: KindIntegrity, Op: "bind parent lock", Path: parent, Err: errors.Join(statErr, errors.New("parent lock is not a directory"))}
+			}
+		}
 	}
-	if err := flockUntil(ctx, parentFile, deadline, timeout, noWait); err != nil {
-		_ = parentFile.Close()
-		return nil, &Error{Kind: KindLock, Op: "lock parent", Path: parent, Err: err}
+	releaseParent := func() error {
+		if parentFile == nil {
+			return nil
+		}
+		f := parentFile
+		parentFile = nil
+		return unlockAndClose(f)
 	}
-	parentInfo, err := parentFile.Stat()
-	if err != nil || !parentInfo.IsDir() {
-		_ = unlockAndClose(parentFile)
-		return nil, &Error{Kind: KindIntegrity, Op: "bind parent lock", Path: parent, Err: errors.Join(err, errors.New("parent lock is not a directory"))}
-	}
+
 	pathInfo, err := os.Lstat(dir)
 	if err != nil || !pathInfo.IsDir() || pathInfo.Mode()&os.ModeSymlink != 0 {
-		_ = unlockAndClose(parentFile)
+		_ = releaseParent()
 		return nil, &Error{Kind: KindRuntime, Op: "bind lock target", Path: dir, Err: errors.Join(err, errors.New("target is not a real directory"))}
 	}
 	targetFile, err := os.Open(dir)
 	if err != nil {
-		_ = unlockAndClose(parentFile)
+		_ = releaseParent()
 		return nil, &Error{Kind: KindRuntime, Op: "open target lock", Path: dir, Err: err}
 	}
 	opened, openErr := targetFile.Stat()
 	current, pathErr := os.Lstat(dir)
 	if openErr != nil || pathErr != nil || !opened.IsDir() || current.Mode()&os.ModeSymlink != 0 || !current.IsDir() || !os.SameFile(pathInfo, opened) || !os.SameFile(pathInfo, current) {
 		_ = targetFile.Close()
-		_ = unlockAndClose(parentFile)
+		_ = releaseParent()
 		return nil, &Error{Kind: KindIntegrity, Op: "bind lock target", Path: dir, Err: errors.Join(openErr, pathErr, errors.New("target changed while locking"))}
 	}
-	targetLock := !os.SameFile(parentInfo, pathInfo)
-	if targetLock {
+	if err := unix.Flock(int(targetFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			_ = targetFile.Close()
+			_ = releaseParent()
+			return nil, &Error{Kind: KindLock, Op: "lock", Path: dir, Err: err}
+		}
+		// Release the parent lock before waiting on a busy target so queued
+		// operations on one flat repository never block sibling directories.
+		if releaseErr := releaseParent(); releaseErr != nil {
+			_ = targetFile.Close()
+			return nil, &Error{Kind: KindRuntime, Op: "release parent lock", Path: parent, Err: releaseErr}
+		}
 		if err := flockUntil(ctx, targetFile, deadline, timeout, noWait); err != nil {
 			_ = targetFile.Close()
-			_ = unlockAndClose(parentFile)
 			return nil, &Error{Kind: KindLock, Op: "lock", Path: dir, Err: err}
 		}
 	}
-	return &directoryLock{path: dir, pathInfo: pathInfo, parentFile: parentFile, targetFile: targetFile, targetLock: targetLock}, nil
+	openedAfter, openAfterErr := targetFile.Stat()
+	currentAfter, pathAfterErr := os.Lstat(dir)
+	if openAfterErr != nil || pathAfterErr != nil || !openedAfter.IsDir() || currentAfter.Mode()&os.ModeSymlink != 0 || !currentAfter.IsDir() || !os.SameFile(pathInfo, openedAfter) || !os.SameFile(pathInfo, currentAfter) {
+		_ = unlockAndClose(targetFile)
+		_ = releaseParent()
+		return nil, &Error{Kind: KindIntegrity, Op: "bind lock target", Path: dir, Err: errors.Join(openAfterErr, pathAfterErr, errors.New("target changed while locking"))}
+	}
+	// Release the parent lock immediately once targetFile is bound and locked so
+	// sibling flat repositories (e.g. el8/el9/el10) run concurrently.
+	if err := releaseParent(); err != nil {
+		_ = unlockAndClose(targetFile)
+		return nil, &Error{Kind: KindRuntime, Op: "release parent lock", Path: parent, Err: err}
+	}
+	return &directoryLock{path: dir, pathInfo: pathInfo, targetFile: targetFile}, nil
 }
 
 func flockUntil(ctx context.Context, file *os.File, deadline time.Time, timeout time.Duration, noWait bool) error {
@@ -116,16 +151,8 @@ func (lock *directoryLock) Close() error {
 	if lock == nil {
 		return nil
 	}
-	targetErr := error(nil)
-	if lock.targetLock {
-		targetErr = unlockAndClose(lock.targetFile)
-	} else if lock.targetFile != nil {
-		targetErr = lock.targetFile.Close()
-	}
-	err := errors.Join(targetErr, unlockAndClose(lock.parentFile))
+	err := unlockAndClose(lock.targetFile)
 	lock.targetFile = nil
-	lock.parentFile = nil
-	lock.targetLock = false
 	return err
 }
 

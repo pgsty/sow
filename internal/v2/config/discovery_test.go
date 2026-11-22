@@ -265,6 +265,23 @@ func TestWorkspaceConfigReadDetectsAncestorReplacementAfterParentBinding(t *test
 	}
 }
 
+func TestDiscoverHintsWhenSOWYAMLExistsWithoutSOWYML(t *testing.T) {
+	root := t.TempDir()
+	nested := filepath.Join(root, "sub", "dir")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sow.yaml"), []byte("schema: sow/v3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Discover(DiscoverOptions{Workdir: root}); err == nil || !strings.Contains(err.Error(), "found sow.yaml (SOW uses sow.yml)") {
+		t.Fatalf("explicit workdir error=%v, want sow.yaml hint", err)
+	}
+	if _, err := Discover(DiscoverOptions{CWD: nested}); err == nil || !strings.Contains(err.Error(), "found sow.yaml (SOW uses sow.yml)") {
+		t.Fatalf("upward walk error=%v, want sow.yaml hint", err)
+	}
+}
+
 func realPath(t *testing.T, path string) string {
 	t.Helper()
 	real, err := filepath.EvalSymlinks(path)

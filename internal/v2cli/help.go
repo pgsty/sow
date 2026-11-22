@@ -6,7 +6,7 @@ import (
 )
 
 // Version is a link-time replaceable binary version.
-var Version = "0.7.1"
+var Version = "0.8.0"
 
 func VersionString() string {
 	return "sow " + Version + " " + runtime.GOOS + "/" + runtime.GOARCH + " " + runtime.Version()
@@ -58,7 +58,7 @@ Config passfile paths are relative to the workspace root. No default file is sea
 Use one non-empty UTF-8 line without BOM, NUL or embedded CR/LF.
 The 64 KiB limit includes any final newline.
 An optional final LF or CRLF is removed; spaces and tabs are preserved literally.
-Keep the file outside the repository, normally mode 0600. Symlinks are rejected.
+Keep the file outside the repository, normally mode 0600; symlinks inside the workspace are rejected.
 Selected credentials never fall back to a prompt.
 Without a source, existing key/GPG/RPM behavior is unchanged.
 `
@@ -519,16 +519,19 @@ Options:
   -h, --help            Show help
 `,
 	"gc": `Usage:
-  sow gc [TARGET] [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json] [--passfile PATH]
+  sow gc [TARGET [--delete]] [-C|--workdir DIR] [-r|--repo NAME] [-T|--timeout DUR | -N|--no-wait] [--json] [--passfile PATH]
 
 Arguments:
   TARGET                Optional publication target; omitting it runs local GC
 
 Target behavior:
   Filesystem targets conditionally delete only after grace and absence receipts.
-  R2 targets persist exact retained-candidate reports and never delete objects.
+  R2 targets persist exact retained-candidate reports by default; running again
+  with --delete (or passing --delete directly) re-verifies live protection roots
+  and conditionally deletes after grace and absence receipts.
 
 Options:
+      --delete          Conditionally delete expired R2 target candidates
   -C, --workdir DIR     Workspace discovery start directory
   -r, --repo NAME       Select a repository for local GC
   -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely

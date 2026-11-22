@@ -5,10 +5,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	openpgpv2 "github.com/ProtonMail/go-crypto/openpgp/v2"
 	"github.com/pgsty/sow/internal/openpgpkey"
@@ -167,44 +169,59 @@ func parsePackageKeyringModels(data []byte) (openpgp.EntityList, openpgpv2.Entit
 
 func parseLegacyKeyring(data []byte) (openpgp.EntityList, error) {
 	trimmed := bytes.TrimSpace(data)
-	if !bytes.HasPrefix(trimmed, []byte("-----BEGIN PGP")) {
-		// Binary OpenPGP packets are arbitrary octets. In particular, a valid
-		// signature MPI can end in an ASCII whitespace byte. Trimming a binary
-		// keyring would silently truncate that packet and make acceptance depend
-		// on random key material.
-		return openpgp.ReadKeyRing(bytes.NewReader(data))
-	}
-	blocks, err := splitPublicKeyArmorBlocks(trimmed)
-	if err != nil {
-		return nil, err
-	}
-	var entities openpgp.EntityList
-	for _, block := range blocks {
-		current, err := openpgp.ReadArmoredKeyRing(bytes.NewReader(block))
-		if err != nil {
+	if bytes.HasPrefix(trimmed, []byte("-----BEGIN PGP")) {
+		if _, err := splitPublicKeyArmorBlocks(trimmed); err != nil {
 			return nil, err
 		}
-		entities = append(entities, current...)
 	}
-	return entities, nil
+	// openpgpkey.Read validates every packet boundary and parses entities one by
+	// one without silently skipping malformed certificates.
+	return openpgpkey.Read(data)
 }
 
 func parseHistoricalKeyring(data []byte) (openpgpv2.EntityList, error) {
 	trimmed := bytes.TrimSpace(data)
-	if !bytes.HasPrefix(trimmed, []byte("-----BEGIN PGP")) {
-		return openpgpv2.ReadKeyRing(bytes.NewReader(data))
-	}
-	blocks, err := splitPublicKeyArmorBlocks(trimmed)
-	if err != nil {
-		return nil, err
-	}
-	var entities openpgpv2.EntityList
-	for _, block := range blocks {
-		current, err := openpgpv2.ReadArmoredKeyRing(bytes.NewReader(block))
+	blocks := [][]byte{data}
+	armored := bytes.HasPrefix(trimmed, []byte("-----BEGIN PGP"))
+	if armored {
+		var err error
+		blocks, err = splitPublicKeyArmorBlocks(trimmed)
 		if err != nil {
 			return nil, err
 		}
-		entities = append(entities, current...)
+	}
+	var entities openpgpv2.EntityList
+	for _, block := range blocks {
+		material := block
+		if armored {
+			decoded, err := armor.Decode(bytes.NewReader(block))
+			if err != nil {
+				return nil, err
+			}
+			material, err = io.ReadAll(decoded.Body)
+			if err != nil {
+				return nil, err
+			}
+		}
+		packets := packet.NewReader(bytes.NewReader(material))
+		count := 0
+		for {
+			entity, err := openpgpv2.ReadEntity(packets)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			if entity == nil || entity.PrimaryKey == nil {
+				return nil, errors.New("yumrepo: incomplete OpenPGP certificate")
+			}
+			entities = append(entities, entity)
+			count++
+		}
+		if count == 0 {
+			return nil, errors.New("yumrepo: empty OpenPGP key block")
+		}
 	}
 	return entities, nil
 }

@@ -315,6 +315,13 @@ func OpenExisting(path string) (_ *Store, err error) {
 				return nil, err
 			}
 			writerConn = nil
+			// Evict the staged validation connection (which lacked _txlock=immediate)
+			// so the pool reconnects through the promoted writer connector.
+			db.SetMaxIdleConns(0)
+			db.SetMaxIdleConns(1)
+			if err := db.PingContext(ctx); err != nil {
+				return nil, fmt.Errorf("open repository sqlite writer: %w", err)
+			}
 			if err := closeProbe(); err != nil {
 				return nil, err
 			}
@@ -351,7 +358,7 @@ func OpenExistingForMigration(path string, requireExistingLayout bool) (*Store, 
 	if err != nil {
 		return nil, err
 	}
-	probe, err := openDatabaseMode(absolute, "ro", false, requireExistingLayout)
+	probe, err := openDatabaseMode(absolute, "ro", false, false)
 	if err != nil {
 		return nil, err
 	}
@@ -378,6 +385,10 @@ func OpenExistingForMigration(path string, requireExistingLayout bool) (*Store, 
 	}
 	store := &Store{path: absolute, db: db, schemaVersion: SchemaVersion, openedSchema: probeStore.schemaVersion}
 	if err := store.migrate(context.Background()); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := store.Checkpoint(context.Background()); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -430,21 +441,33 @@ func OpenReadOnly(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	ctx := context.Background()
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("%w: begin read-only schema check: %v", ErrSchema, err)
+	}
 	var version int
-	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+	if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		_ = tx.Rollback()
 		db.Close()
 		return nil, fmt.Errorf("%w: read user_version: %v", ErrSchema, err)
 	}
 	if version != 6 && version != 12 && version != SchemaVersion {
+		_ = tx.Rollback()
 		db.Close()
 		return nil, fmt.Errorf("%w: read-only database version %d is neither frozen v0.2, v0.4, nor current", ErrSchema, version)
 	}
-	store := &Store{path: absolute, db: db, schemaVersion: version, readOnly: true}
-	if err := store.validateSchemaVersion(context.Background(), version); err != nil {
+	if err := validateSchemaOn(ctx, tx, version); err != nil {
+		_ = tx.Rollback()
 		db.Close()
 		return nil, err
 	}
-	return store, nil
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		db.Close()
+		return nil, err
+	}
+	return &Store{path: absolute, db: db, schemaVersion: version, readOnly: true}, nil
 }
 
 // ReadOnlyRequiresLifecycleFence reports whether OpenReadOnly must use
@@ -479,6 +502,9 @@ func ReadOnlyRequiresLifecycleFence(path string) (bool, error) {
 	}
 	if shmInfo.Mode()&os.ModeSymlink != 0 || !shmInfo.Mode().IsRegular() {
 		return false, fmt.Errorf("database shared memory is not a regular file: %s", absolute+"-shm")
+	}
+	if shmInfo.Size() == 0 {
+		return true, nil
 	}
 	return false, nil
 }
@@ -652,7 +678,25 @@ func (c *validatedWriterConnector) Connect(ctx context.Context) (driver.Conn, er
 
 func (c *validatedWriterConnector) Driver() driver.Driver { return c.initial.Driver() }
 
+type persistentWALConnector struct {
+	base driver.Connector
+}
+
+func (c *persistentWALConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := c.base.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := persistDatabaseWAL(conn); err != nil {
+		return nil, errors.Join(err, conn.Close())
+	}
+	return conn, nil
+}
+
+func (c *persistentWALConnector) Driver() driver.Driver { return c.base.Driver() }
+
 func addDatabaseWriterPragmas(query url.Values) {
+	query.Set("_txlock", "immediate")
 	query.Add("_pragma", "journal_mode(WAL)")
 	query.Add("_pragma", "synchronous(FULL)")
 	if runtime.GOOS == "darwin" {
@@ -754,7 +798,7 @@ func openDatabaseModeDetailed(path, mode string, writable, physicallyReadOnly, s
 	// Repository writers hold an external lock, but read-only WAL recovery
 	// can still briefly hold SQLite locks. Bound that coordination wait.
 	query.Add("_pragma", "busy_timeout(5000)")
-	if writable {
+	if writable && !staged {
 		addDatabaseWriterPragmas(query)
 	}
 	u.RawQuery = query.Encode()
@@ -774,8 +818,14 @@ func openDatabaseModeDetailed(path, mode string, writable, physicallyReadOnly, s
 		if err != nil {
 			return nil, fmt.Errorf("open repository sqlite: %w", err)
 		}
-		opened.connector = &validatedWriterConnector{initial: initial, writer: writer}
+		opened.connector = &validatedWriterConnector{initial: initial, writer: &persistentWALConnector{base: writer}}
 		opened.db = sql.OpenDB(opened.connector)
+	} else if writable {
+		writer, err := sqlite.NewConnector(u.String())
+		if err != nil {
+			return nil, fmt.Errorf("open repository sqlite: %w", err)
+		}
+		opened.db = sql.OpenDB(&persistentWALConnector{base: writer})
 	} else {
 		opened.db, err = sql.Open("sqlite", u.String())
 		if err != nil {
@@ -2423,17 +2473,22 @@ func (s *Store) UpdateOperationPayload(ctx context.Context, id, payloadJSON stri
 	if err := validateOperationPayload(payloadJSON); err != nil {
 		return err
 	}
-	var current string
-	if err := s.db.QueryRowContext(ctx, `SELECT state FROM operations WHERE id = ?`, id).Scan(&current); errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%w: operation %q", ErrNotFound, id)
-	} else if err != nil {
-		return fmt.Errorf("read operation %q: %w", id, err)
-	}
-	if OperationState(current) != OperationPlanned && OperationState(current) != OperationStaged && OperationState(current) != OperationApplied {
-		return fmt.Errorf("%w: cannot update payload in state %s", ErrTransition, current)
-	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE operations SET payload_json = ?, updated_at = ? WHERE id = ?`, payloadJSON, nowText(), id); err != nil {
+	result, err := s.db.ExecContext(ctx, `UPDATE operations SET payload_json = ?, updated_at = ? WHERE id = ? AND state IN ('planned', 'staged', 'applied')`, payloadJSON, nowText(), id)
+	if err != nil {
 		return fmt.Errorf("update operation %q payload: %w", id, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("update operation %q payload: %w", id, err)
+	}
+	if count == 0 {
+		var current string
+		if err := s.db.QueryRowContext(context.WithoutCancel(ctx), `SELECT state FROM operations WHERE id = ?`, id).Scan(&current); errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: operation %q", ErrNotFound, id)
+		} else if err != nil {
+			return fmt.Errorf("read operation %q: %w", id, err)
+		}
+		return fmt.Errorf("%w: cannot update payload in state %s", ErrTransition, current)
 	}
 	return s.checkpointAfterCommit(ctx)
 }

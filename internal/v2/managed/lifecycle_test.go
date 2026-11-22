@@ -3169,3 +3169,153 @@ func TestUninitializedRepositoryOrphanSidecarIsRejectedReadOnly(t *testing.T) {
 		t.Fatalf("orphan sidecar changed: %q err=%v", data, err)
 	}
 }
+
+func TestNewDistRecoversInterruptedRepoRemoveWithoutDeadlock(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	options := WorkspaceOptions{Workdir: root, CWD: root}
+	if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewRepository(ctx, RepositoryNewOptions{WorkspaceOptions: options, Name: "repo"}); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("crash at planned repo.rm")
+	err := RemoveRepository(ctx, RepositoryRemoveOptions{WorkspaceOptions: options, Name: "repo", Force: true, Fault: func(point string) error {
+		if point == "repo.rm.journal" {
+			return injected
+		}
+		return nil
+	}})
+	if !errors.Is(err, injected) {
+		t.Fatalf("fault=%v", err)
+	}
+	created, err := NewDist(ctx, DistNewOptions{
+		WorkspaceOptions: options,
+		LockOptions:      LockOptions{Timeout: time.Second},
+		Repository:       "repo",
+		Name:             "el9",
+		Format:           "rpm",
+	})
+	if err != nil || created.Name != "el9" {
+		t.Fatalf("NewDist after interrupted repo.rm=%#v err=%v", created, err)
+	}
+}
+
+func TestPublicationGraceNotBeforeMonotonicAcrossRebindTTLReduction(t *testing.T) {
+	ctx := context.Background()
+	fixture := newLocalGCFixture(t, false)
+	targetDir := filepath.Join(t.TempDir(), "target")
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	physicalTarget := realPathForManagedTest(t, targetDir)
+	cfg, err := config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Targets = map[string]config.TargetConfig{"local": {
+		Repository: "repo", Provider: "filesystem",
+		Endpoint: "file://" + physicalTarget, PublicEndpoint: "file://" + physicalTarget + "/",
+		MaxCacheTTL: "1440h0m0s", AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}}
+	writeManagedConfig(t, fixture.root, cfg)
+	t0 := time.Now().UTC().Truncate(time.Second)
+	first, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", now: func() time.Time { return t0 }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.OpenReadOnly(filepath.Join(fixture.root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstManifest, err := store.GenerationManifest(ctx, first.Generation)
+	_ = store.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiredMetadata := []string{}
+	for _, file := range firstManifest {
+		if file.Phase == "metadata" && strings.HasPrefix(file.Path, "dists/el9/") {
+			expiredMetadata = append(expiredMetadata, file.Path)
+		}
+	}
+	if len(expiredMetadata) == 0 {
+		t.Fatal("expected immutable metadata files in first generation")
+	}
+	rpm2, err := filepath.Abs("../../../third_party/cavaliergopher-rpm/testdata/epel-release-7-5.noarch.rpm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Add(ctx, AddOptions{WorkspaceOptions: fixture.options, Repository: "repo", Dists: []string{"el9"}, Paths: []string{rpm2}, Jobs: 1}); err != nil {
+		t.Fatal(err)
+	}
+	store, err = state.OpenReadOnly(filepath.Join(fixture.root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaryAfterAdd, sumErr := store.Summary(ctx)
+	secondManifest, manErr := store.GenerationManifest(ctx, summaryAfterAdd.BuiltGeneration)
+	_ = store.Close()
+	if err := errors.Join(sumErr, manErr); err != nil {
+		t.Fatal(err)
+	}
+	secondSet := map[string]bool{}
+	for _, f := range secondManifest {
+		secondSet[f.Path] = true
+	}
+	retiredMetadata := []string{}
+	for _, rel := range expiredMetadata {
+		if !secondSet[rel] {
+			retiredMetadata = append(retiredMetadata, rel)
+		}
+	}
+	if len(retiredMetadata) != 6 {
+		t.Fatalf("expected 6 retired metadata files between Gen %d and Gen %d, got %d", first.Generation, summaryAfterAdd.BuiltGeneration, len(retiredMetadata))
+	}
+	cfg, err = config.Load(filepath.Join(fixture.root, config.ConfigFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Targets["local"] = config.TargetConfig{
+		Repository: "repo", Provider: "filesystem",
+		Endpoint: "file://" + physicalTarget, PublicEndpoint: "file://" + physicalTarget + "/",
+		MaxCacheTTL: "1h0m0s", AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}
+	writeManagedConfig(t, fixture.root, cfg)
+	t1 := t0.Add(time.Minute)
+	second, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", Rebind: true, now: func() time.Time { return t1 }})
+	if err != nil || second.Generation == first.Generation {
+		t.Fatalf("rebound publish=%#v err=%v", second, err)
+	}
+	store, err = state.OpenReadOnly(filepath.Join(fixture.root, ".sow", "repo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstGrace, err1 := store.GetGraceRecord(ctx, first.Checkpoint)
+	secondGrace, err2 := store.GetGraceRecord(ctx, second.Checkpoint)
+	closeErr := store.Close()
+	if err := errors.Join(err1, err2, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if !secondGrace.NotBefore.Equal(firstGrace.NotBefore) {
+		t.Fatalf("second GraceRecord.NotBefore (%s) was not clamped to 60d+24h horizon (%s)", secondGrace.NotBefore, firstGrace.NotBefore)
+	}
+	if early, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "local", now: func() time.Time { return t0.Add(45 * 24 * time.Hour) }}); err != nil || early.PendingGrace != 2 || early.DeletedObjects != 0 {
+		t.Fatalf("early TargetGC before clamped 61d horizon=%#v err=%v", early, err)
+	}
+	gcAt := firstGrace.NotBefore.Add(time.Second)
+	collected, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "local", now: func() time.Time { return gcAt }})
+	if err != nil || collected.DeletedObjects < len(retiredMetadata) {
+		t.Fatalf("TargetGC after clamped horizon=%#v want >=%d deleted metadata objects err=%v", collected, len(retiredMetadata), err)
+	}
+	for _, rel := range retiredMetadata {
+		if _, err := os.Lstat(filepath.Join(physicalTarget, filepath.FromSlash(rel))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expired metadata file %s survived equal-deadline TargetGC: %v", rel, err)
+		}
+	}
+	noop, err := TargetGC(ctx, TargetGCOptions{WorkspaceOptions: fixture.options, Target: "local", now: func() time.Time { return gcAt.Add(time.Second) }})
+	if err != nil || !noop.Noop || noop.DeletedObjects != 0 {
+		t.Fatalf("follow-up TargetGC=%#v err=%v", noop, err)
+	}
+}

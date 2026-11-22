@@ -993,6 +993,24 @@ func sameManagedPackageFacts(expected, actual state.PackageObject) bool {
 		expected.PayloadSHA256 == actual.PayloadSHA256
 }
 
+// matchesPersistedManagedRPMObject validates an already-persisted RPM object
+// against parsed RPM metadata, accepting both the canonical v0.8.0 Source/PoolPath
+// and the legacy v0.5.0-v0.7.1 subpackage Source/PoolPath derivation.
+func matchesPersistedManagedRPMObject(expected state.PackageObject, info yumrepo.PackageInfo, payloadSHA string) bool {
+	actual, err := rpmObjectFromInfo(info, expected.Filename, payloadSHA)
+	if err == nil && sameManagedPackageFacts(expected, actual) {
+		return true
+	}
+	legacySource := yumrepo.LegacySourceNameFromRPM(info.SourceRPM, info.Name, info.Version, info.Release)
+	if legacySource == info.Source {
+		return false
+	}
+	legacyInfo := info
+	legacyInfo.Source = legacySource
+	legacyActual, legacyErr := rpmObjectFromInfo(legacyInfo, expected.Filename, payloadSHA)
+	return legacyErr == nil && sameManagedPackageFacts(expected, legacyActual)
+}
+
 func sameGenerationManifest(left, right []state.GenerationFile) bool {
 	left = append([]state.GenerationFile(nil), left...)
 	right = append([]state.GenerationFile(nil), right...)

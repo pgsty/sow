@@ -2164,3 +2164,37 @@ func TestOpenExistingHotWALValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenExistingAcquiresImmediateWriteLockOnBeginTx(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "repo.db")
+	initial, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenExisting(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	tx, err := store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	contender, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?mode=rw&_pragma=busy_timeout(0)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer contender.Close()
+
+	if _, err := contender.ExecContext(ctx, `BEGIN IMMEDIATE`); err == nil {
+		t.Fatal("second connection acquired BEGIN IMMEDIATE while OpenExisting BeginTx was active")
+	}
+}

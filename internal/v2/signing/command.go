@@ -9,11 +9,15 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // RunGPG leaves stdin available for the signed message. Each process receives
 // a fresh, private descriptor and cannot fall back to interactive pinentry.
 func RunGPG(command *exec.Cmd, source Source) error {
+	if command.WaitDelay == 0 {
+		command.WaitDelay = 5 * time.Second
+	}
 	if !source.Explicit() {
 		return command.Run()
 	}
@@ -87,8 +91,16 @@ func RPMFile(source Source) (string, func(), error) {
 	if err != nil {
 		return "", noop, errors.New("cannot create private RPM passfile directory")
 	}
-	cleanup := func() { _ = os.RemoveAll(dir) }
 	path := filepath.Join(dir, "pass")
+	secretLen := len(secret)
+	cleanup := func() {
+		if f, openErr := os.OpenFile(path, os.O_WRONLY, 0); openErr == nil {
+			_, _ = f.Write(make([]byte, secretLen))
+			_ = f.Sync()
+			_ = f.Close()
+		}
+		_ = os.RemoveAll(dir)
+	}
 	if err := os.WriteFile(path, secret, 0o600); err != nil {
 		cleanup()
 		return "", noop, errors.New("cannot prepare private RPM passfile")
@@ -101,6 +113,12 @@ func RPMFile(source Source) (string, func(), error) {
 func RPMArgs(passfile string) []string {
 	if passfile == "" {
 		return nil
+	}
+	if strings.ContainsAny(passfile, " \t\r\n%\x00\"'\\") {
+		return []string{
+			"--define", "_openpgp_sign gpg",
+			"--define", "_gpg_sign_cmd_extra_args --batch --no-tty --pinentry-mode error",
+		}
 	}
 	return []string{
 		"--define", "_openpgp_sign gpg",

@@ -218,21 +218,36 @@ func verifyMetadataSignatures(entity *openpgp.Entity, release, inRelease, detach
 	if entity == nil || at.IsZero() {
 		return ErrSigningFailed
 	}
+	if !bytes.HasPrefix(bytes.TrimLeft(inRelease, "\r\n"), []byte("-----BEGIN PGP SIGNED MESSAGE-----")) {
+		return ErrSigningFailed
+	}
 	block, rest := clearsign.Decode(inRelease)
-	if block == nil || len(bytes.TrimSpace(rest)) != 0 || !sameClearsignedRelease(block.Plaintext, release) {
+	if block == nil || block.ArmoredSignature == nil || len(bytes.TrimSpace(rest)) != 0 || !sameClearsignedRelease(block.Plaintext, release) {
+		return ErrSigningFailed
+	}
+	clearPackets, err := io.ReadAll(io.LimitReader(block.ArmoredSignature.Body, maxSigningKeyBytes+1))
+	if err != nil || len(clearPackets) == 0 || len(clearPackets) > maxSigningKeyBytes || !singleSignaturePacket(clearPackets) {
 		return ErrSigningFailed
 	}
 	keyring := openpgp.EntityList{entity}
 	config := signingConfig(at)
-	clearSignature, _, err := openpgp.VerifyDetachedSignature(keyring, bytes.NewReader(block.Bytes), block.ArmoredSignature.Body, config)
+	clearSignature, _, err := openpgp.VerifyDetachedSignature(keyring, bytes.NewReader(block.Bytes), bytes.NewReader(clearPackets), config)
 	if err != nil {
 		return ErrSigningFailed
 	}
-	armored, err := armor.Decode(bytes.NewReader(detached))
+	detachedBlocks, err := openpgpkey.SplitArmor(detached, openpgp.SignatureType)
+	if err != nil || len(detachedBlocks) != 1 {
+		return ErrSigningFailed
+	}
+	armored, err := armor.Decode(bytes.NewReader(detachedBlocks[0]))
 	if err != nil || armored.Type != openpgp.SignatureType {
 		return ErrSigningFailed
 	}
-	detachedSignature, _, err := openpgp.VerifyDetachedSignature(keyring, bytes.NewReader(release), armored.Body, config)
+	detachedPackets, err := io.ReadAll(io.LimitReader(armored.Body, maxSigningKeyBytes+1))
+	if err != nil || len(detachedPackets) == 0 || len(detachedPackets) > maxSigningKeyBytes || !singleSignaturePacket(detachedPackets) {
+		return ErrSigningFailed
+	}
+	detachedSignature, _, err := openpgp.VerifyDetachedSignature(keyring, bytes.NewReader(release), bytes.NewReader(detachedPackets), config)
 	if err != nil {
 		return ErrSigningFailed
 	}
@@ -240,6 +255,19 @@ func verifyMetadataSignatures(entity *openpgp.Entity, release, inRelease, detach
 		return fmt.Errorf("%w: new APT publication requires SHA-256 or stronger metadata signatures; rebuild the Dist", ErrSigningFailed)
 	}
 	return nil
+}
+
+func singleSignaturePacket(data []byte) bool {
+	reader := packet.NewReader(bytes.NewReader(data))
+	first, err := reader.Next()
+	if err != nil {
+		return false
+	}
+	if _, ok := first.(*packet.Signature); !ok {
+		return false
+	}
+	_, err = reader.Next()
+	return err == io.EOF
 }
 
 func publicationSignatureHash(hash crypto.Hash) bool {

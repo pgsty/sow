@@ -28,6 +28,7 @@ var defaultHeaderLimits = headerLimits{
 	maxHeaderIndexCount: r_MaxHeaderIndexCount,
 	maxDecodedBytes:     r_MaxDecodedHeaderBytes,
 	maxDecodedElements:  r_MaxDecodedHeaderElements,
+	rejectDuplicateTags: true,
 }
 
 // A Header stores metadata about an rpm package.

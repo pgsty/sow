@@ -400,6 +400,18 @@ func TestPassfileProtectedGPGAndRPMSigning(t *testing.T) {
 						t.Fatalf("managed encrypted RPM signing: %v: %s", err, output)
 					}
 				} else {
+					if mode == "plain" {
+						inRepoLink := filepath.Join(filepath.Dir(path), "in-repo-pass.link")
+						if err := os.Symlink(passfile, inRepoLink); err != nil {
+							t.Fatal(err)
+						}
+						if _, err := plain.Create(context.Background(), plain.Options{Dir: filepath.Dir(path), SignWith: fingerprint, PassFile: inRepoLink, Overwrite: true, Jobs: 1}); !errors.Is(err, signing.ErrCredential) {
+							t.Fatalf("plain Create accepted in-repository passfile symlink: err=%v", err)
+						}
+						if err := os.Remove(inRepoLink); err != nil {
+							t.Fatal(err)
+						}
+					}
 					_, err := plain.Create(context.Background(), plain.Options{Dir: filepath.Dir(path), SignWith: fingerprint, PassFile: passfile, Overwrite: true, Jobs: 1})
 					if err != nil {
 						output, _ := os.ReadFile(rpmLog)

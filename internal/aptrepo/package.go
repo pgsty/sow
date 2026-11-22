@@ -2,13 +2,11 @@ package aptrepo
 
 import (
 	"archive/tar"
-	"bufio"
 	"bytes"
 	"compress/bzip2"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,13 +18,13 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
-	"github.com/kjk/lzma"
 	"github.com/klauspost/compress/zstd"
 	"github.com/pgsty/sow/internal/workmetrics"
 	"github.com/xi2/xz"
 	"pault.ag/go/debian/control"
-	"pault.ag/go/debian/deb"
+	"pault.ag/go/debian/dependency"
 	"pault.ag/go/debian/version"
 )
 
@@ -349,126 +347,155 @@ func PackageFromFacts(data []byte, sourcePath string) (Package, error) {
 	return pkg, nil
 }
 
-func loadDebControl(ctx context.Context, reader io.ReaderAt, size int64) (deb.Control, error) {
-	if err := validateDebArLayout(ctx, reader, size); err != nil {
-		return deb.Control{}, err
-	}
-	archive, err := deb.LoadAr(reader)
+type debBinaryControl struct {
+	control.Paragraph
+
+	Package       string `required:"true"`
+	Source        string
+	Version       version.Version `required:"true"`
+	Architecture  dependency.Arch `required:"true"`
+	Maintainer    string
+	InstalledSize int    `control:"Installed-Size"`
+	MultiArch     string `control:"Multi-Arch"`
+	Depends       dependency.Dependency
+	Recommends    dependency.Dependency
+	Suggests      dependency.Dependency
+	Breaks        dependency.Dependency
+	Replaces      dependency.Dependency
+	BuiltUsing    dependency.Dependency `control:"Built-Using"`
+	Section       string
+	Priority      string
+	Homepage      string
+	Description   string
+}
+
+type debArEntry struct {
+	Name string
+	Size int64
+	Data *io.SectionReader
+}
+
+func loadDebControl(ctx context.Context, reader io.ReaderAt, size int64) (debBinaryControl, error) {
+	controlMember, err := scanDebArMembers(ctx, reader, size)
 	if err != nil {
-		return deb.Control{}, err
-	}
-	var versionSeen bool
-	var dataSeen bool
-	var controlMember *deb.ArEntry
-	for {
-		if err := ctx.Err(); err != nil {
-			return deb.Control{}, err
-		}
-		member, err := archive.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return deb.Control{}, err
-		}
-		switch {
-		case member.Name == "debian-binary":
-			if versionSeen {
-				return deb.Control{}, errors.New("duplicate debian-binary member")
-			}
-			versionSeen = true
-			if member.Size != int64(len("2.0\n")) {
-				return deb.Control{}, fmt.Errorf("unexpected debian-binary size %d", member.Size)
-			}
-			versionBytes, err := io.ReadAll(member.Data)
-			if err != nil {
-				return deb.Control{}, err
-			}
-			if string(versionBytes) != "2.0\n" {
-				return deb.Control{}, fmt.Errorf("unsupported debian binary version %q", versionBytes)
-			}
-		case member.Name == "control.tar" || strings.HasPrefix(member.Name, "control.tar."):
-			if controlMember != nil {
-				return deb.Control{}, errors.New("duplicate control archive member")
-			}
-			if member.Size <= 0 || member.Size > maxDebControlCompressed {
-				return deb.Control{}, fmt.Errorf("control archive compressed size %d exceeds limit", member.Size)
-			}
-			controlMember = member
-		case member.Name == "data.tar" || strings.HasPrefix(member.Name, "data.tar."):
-			if dataSeen {
-				return deb.Control{}, errors.New("duplicate data archive member")
-			}
-			if member.Size == 0 {
-				return deb.Control{}, errors.New("empty data archive member")
-			}
-			dataSeen = true
-		}
-	}
-	if !versionSeen {
-		return deb.Control{}, errors.New("missing debian-binary member")
-	}
-	if controlMember == nil {
-		return deb.Control{}, errors.New("missing control archive member")
-	}
-	if !dataSeen {
-		return deb.Control{}, errors.New("missing data archive member")
+		return debBinaryControl{}, err
 	}
 	return loadDebControlArchive(ctx, controlMember)
 }
 
-func validateDebArLayout(ctx context.Context, reader io.ReaderAt, size int64) error {
+func scanDebArMembers(ctx context.Context, reader io.ReaderAt, size int64) (*debArEntry, error) {
 	if size < 8 {
-		return errors.New("truncated ar archive")
+		return nil, errors.New("truncated ar archive")
 	}
 	magic := make([]byte, 8)
 	if _, err := reader.ReadAt(magic, 0); err != nil || string(magic) != "!<arch>\n" {
-		return errors.Join(err, errors.New("invalid ar archive header"))
+		return nil, errors.Join(err, errors.New("invalid ar archive header"))
 	}
+	var versionSeen bool
+	var dataSeen bool
+	var controlMember *debArEntry
 	offset := int64(8)
 	for count := 0; offset < size; count++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		if count >= maxDebArMembers {
-			return fmt.Errorf("ar archive exceeds %d members", maxDebArMembers)
+			return nil, fmt.Errorf("ar archive exceeds %d members", maxDebArMembers)
 		}
 		if size-offset < 60 {
-			return errors.New("truncated ar member header")
+			return nil, errors.New("truncated ar member header")
 		}
 		header := make([]byte, 60)
 		if _, err := reader.ReadAt(header, offset); err != nil {
-			return err
+			return nil, err
 		}
 		if header[58] != '`' || header[59] != '\n' {
-			return errors.New("malformed ar member header terminator")
+			return nil, errors.New("malformed ar member header terminator")
+		}
+		for _, field := range []struct {
+			name string
+			raw  []byte
+		}{
+			{name: "Timestamp", raw: header[16:28]},
+			{name: "OwnerID", raw: header[28:34]},
+			{name: "GroupID", raw: header[34:40]},
+		} {
+			if trimmed := strings.TrimSpace(string(field.raw)); trimmed != "" {
+				if _, err := strconv.ParseInt(trimmed, 10, 64); err != nil {
+					return nil, fmt.Errorf("invalid ar member %s %q: %w", field.name, trimmed, err)
+				}
+			}
 		}
 		memberSize, err := strconv.ParseInt(strings.TrimSpace(string(header[48:58])), 10, 64)
 		if err != nil || memberSize < 0 {
-			return fmt.Errorf("invalid ar member size %q", strings.TrimSpace(string(header[48:58])))
+			return nil, fmt.Errorf("invalid ar member size %q", strings.TrimSpace(string(header[48:58])))
 		}
 		dataOffset := offset + 60
 		if memberSize > size-dataOffset {
-			return errors.New("ar member extends beyond package")
+			return nil, errors.New("ar member extends beyond package")
+		}
+		memberName := strings.TrimSuffix(strings.TrimSpace(string(header[0:16])), "/")
+		memberData := io.NewSectionReader(reader, dataOffset, memberSize)
+		switch {
+		case memberName == "debian-binary":
+			if versionSeen {
+				return nil, errors.New("duplicate debian-binary member")
+			}
+			versionSeen = true
+			if memberSize != int64(len("2.0\n")) {
+				return nil, fmt.Errorf("unexpected debian-binary size %d", memberSize)
+			}
+			versionBytes, err := io.ReadAll(memberData)
+			if err != nil {
+				return nil, err
+			}
+			if string(versionBytes) != "2.0\n" {
+				return nil, fmt.Errorf("unsupported debian binary version %q", versionBytes)
+			}
+		case memberName == "control.tar" || strings.HasPrefix(memberName, "control.tar."):
+			if controlMember != nil {
+				return nil, errors.New("duplicate control archive member")
+			}
+			if memberSize <= 0 || memberSize > maxDebControlCompressed {
+				return nil, fmt.Errorf("control archive compressed size %d exceeds limit", memberSize)
+			}
+			controlMember = &debArEntry{Name: memberName, Size: memberSize, Data: memberData}
+		case memberName == "data.tar" || strings.HasPrefix(memberName, "data.tar."):
+			if dataSeen {
+				return nil, errors.New("duplicate data archive member")
+			}
+			if memberSize == 0 {
+				return nil, errors.New("empty data archive member")
+			}
+			dataSeen = true
 		}
 		offset = dataOffset + memberSize
 		if memberSize&1 != 0 {
 			if offset >= size {
-				return errors.New("ar member is missing alignment padding")
+				return nil, errors.New("ar member is missing alignment padding")
 			}
 			offset++
 		}
 	}
 	if offset != size {
-		return errors.New("ar archive length is inconsistent")
+		return nil, errors.New("ar archive length is inconsistent")
 	}
-	return nil
+	if !versionSeen {
+		return nil, errors.New("missing debian-binary member")
+	}
+	if controlMember == nil {
+		return nil, errors.New("missing control archive member")
+	}
+	if !dataSeen {
+		return nil, errors.New("missing data archive member")
+	}
+	return controlMember, nil
 }
 
-func loadDebControlArchive(ctx context.Context, member *deb.ArEntry) (parsed deb.Control, resultErr error) {
+func loadDebControlArchive(ctx context.Context, member *debArEntry) (parsed debBinaryControl, resultErr error) {
 	stream, err := openDebControlStream(ctx, member)
 	if err != nil {
-		return deb.Control{}, err
+		return debBinaryControl{}, err
 	}
 	defer func() {
 		resultErr = errors.Join(resultErr, stream.Close())
@@ -480,58 +507,58 @@ func loadDebControlArchive(ctx context.Context, member *deb.ArEntry) (parsed deb
 	expanded := int64(0)
 	for members := 0; ; members++ {
 		if err := ctx.Err(); err != nil {
-			return deb.Control{}, err
+			return debBinaryControl{}, err
 		}
 		if members >= maxDebControlMembers {
-			return deb.Control{}, fmt.Errorf("control archive exceeds %d members", maxDebControlMembers)
+			return debBinaryControl{}, fmt.Errorf("control archive exceeds %d members", maxDebControlMembers)
 		}
 		header, err := archive.Next()
 		if limitedStream.N == 0 {
-			return deb.Control{}, fmt.Errorf("control archive expands beyond %d bytes", maxDebControlExpanded)
+			return debBinaryControl{}, fmt.Errorf("control archive expands beyond %d bytes", maxDebControlExpanded)
 		}
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			return deb.Control{}, err
+			return debBinaryControl{}, err
 		}
 		if header.Size < 0 || header.Size > maxDebControlExpanded-expanded {
-			return deb.Control{}, fmt.Errorf("control archive expands beyond %d bytes", maxDebControlExpanded)
+			return debBinaryControl{}, fmt.Errorf("control archive expands beyond %d bytes", maxDebControlExpanded)
 		}
 		expanded += header.Size
 		if path.Clean(header.Name) != "control" {
 			continue
 		}
 		if found {
-			return deb.Control{}, errors.New("duplicate control file in control archive")
+			return debBinaryControl{}, errors.New("duplicate control file in control archive")
 		}
 		// Some historical control archives encode a regular file with the
 		// original NUL typeflag. Keep accepting that wire value without relying
 		// on archive/tar's deprecated TypeRegA alias.
 		if header.Typeflag != tar.TypeReg && header.Typeflag != byte(0) {
-			return deb.Control{}, errors.New("control file in control archive is not regular")
+			return debBinaryControl{}, errors.New("control file in control archive is not regular")
 		}
 		if header.Size > maxDebControlFile {
-			return deb.Control{}, fmt.Errorf("control file exceeds %d bytes", maxDebControlFile)
+			return debBinaryControl{}, fmt.Errorf("control file exceeds %d bytes", maxDebControlFile)
 		}
 		limited := &io.LimitedReader{R: archive, N: maxDebControlFile + 1}
 		body, err := io.ReadAll(limited)
 		if err != nil {
-			return deb.Control{}, err
+			return debBinaryControl{}, err
 		}
 		if int64(len(body)) != header.Size || limited.N == 0 {
-			return deb.Control{}, fmt.Errorf("control file exceeds %d bytes or is truncated", maxDebControlFile)
+			return debBinaryControl{}, fmt.Errorf("control file exceeds %d bytes or is truncated", maxDebControlFile)
 		}
 		if err := validateBinaryControlDocument(body); err != nil {
-			return deb.Control{}, err
+			return debBinaryControl{}, err
 		}
 		if err := control.Unmarshal(&parsed, bytes.NewReader(body)); err != nil {
-			return deb.Control{}, err
+			return debBinaryControl{}, err
 		}
 		found = true
 	}
 	if !found {
-		return deb.Control{}, errors.New("missing control file in control archive")
+		return debBinaryControl{}, errors.New("missing control file in control archive")
 	}
 	return parsed, nil
 }
@@ -551,6 +578,9 @@ func validateBinaryControlDocument(body []byte) error {
 			if value == '\r' || value == 0 || value == 0x7f || (value < 0x20 && value != '\t') {
 				return fmt.Errorf("binary control line %d contains a forbidden control byte", index+1)
 			}
+		}
+		if !utf8.Valid(line) {
+			return fmt.Errorf("binary control line %d is not valid UTF-8", index+1)
 		}
 		if len(line) == 0 {
 			if !haveField {
@@ -600,7 +630,7 @@ func validBinaryControlFieldName(name []byte) bool {
 	return true
 }
 
-func openDebControlStream(ctx context.Context, member *deb.ArEntry) (io.ReadCloser, error) {
+func openDebControlStream(ctx context.Context, member *debArEntry) (io.ReadCloser, error) {
 	input := io.Reader(&contextReader{ctx: ctx, r: member.Data})
 	switch filepath.Ext(member.Name) {
 	case ".tar":
@@ -615,16 +645,6 @@ func openDebControlStream(ctx context.Context, member *deb.ArEntry) (io.ReadClos
 			return nil, err
 		}
 		return io.NopCloser(reader), nil
-	case ".lzma":
-		buffered := bufio.NewReader(input)
-		header, err := buffered.Peek(5)
-		if err != nil {
-			return nil, err
-		}
-		if dictionary := uint64(binary.LittleEndian.Uint32(header[1:5])); dictionary > maxDebDecoderMemory {
-			return nil, fmt.Errorf("lzma dictionary %d exceeds limit", dictionary)
-		}
-		return lzma.NewReader(buffered), nil
 	case ".zst":
 		reader, err := zstd.NewReader(input,
 			zstd.WithDecoderConcurrency(1),

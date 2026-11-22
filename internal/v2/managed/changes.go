@@ -78,9 +78,6 @@ func Changes(ctx context.Context, opts ChangesOptions) (result ChangesResult, re
 	if err != nil {
 		return result, err
 	}
-	if err := store.ValidateGenerationLedger(ctx); err != nil {
-		return result, fmt.Errorf("%w: generation ledger is invalid: %v", ErrIntegrity, err)
-	}
 	observedStatus, err := changesRepositoryStatus(ctx, ws.Root, repoName, cfg, store, summary)
 	if err != nil {
 		return result, err

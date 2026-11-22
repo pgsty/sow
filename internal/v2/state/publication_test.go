@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1117,5 +1118,715 @@ func TestListPackageObjectsBatchesManyDists(t *testing.T) {
 	listed, err := store.ListPackageObjects(ctx, append(distNames, distNames[0]), false)
 	if err != nil || len(listed) != 2 || listed[0].Name != "alpha" || listed[1].Name != "beta" || len(listed[0].Dists) != distCount || len(listed[1].Dists) != distCount/2 {
 		t.Fatalf("ListPackageObjects across %d dists: len=%d err=%v listed=%+v", distCount, len(listed), err, listed)
+	}
+}
+
+func TestPublicationLiveInventoryAvoidsFullHistoryScanAcrossGenerations(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(filepath.Join(t.TempDir(), "scale.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	identity, err := store.RepositoryIdentity(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := PublicationTargetBinding{
+		RepositoryID: identity.RepositoryID, TargetName: "prod", Provider: "r2",
+		Endpoint: "https://acct.r2.cloudflarestorage.com", Region: "auto", Bucket: "repo", Prefix: "p",
+		PublicEndpoint: "https://repo.example.test/p/", MaxCacheTTL: 0,
+		AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
+	}
+	if err := store.BindPublicationTarget(ctx, binding); err != nil {
+		t.Fatal(err)
+	}
+	binding, err = store.canonicalPublicationTargetBinding(ctx, binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		objectCount = 300
+		generations = 12
+	)
+	baseObjects := make([]GenerationFile, 0, objectCount)
+	baseObjects = append(baseObjects, GenerationFile{
+		Path: "dists/el9/x86_64/repodata/repomd.xml", Phase: "pointer", Size: 64, SHA256: strings.Repeat("a", 64),
+	})
+	for i := 1; i < objectCount; i++ {
+		sha := fmt.Sprintf("%064x", i)
+		baseObjects = append(baseObjects, GenerationFile{
+			Path: fmt.Sprintf("pool/p/pkg-%05d/pkg-%05d-1.0-1.el9.x86_64.rpm", i, i), Phase: "payload", Size: 1024, SHA256: sha,
+		})
+	}
+
+	var firstCheckpointID, lastCheckpointID string
+	baseCheckpoint := ""
+	at := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	for g := 1; g <= generations; g++ {
+		gen := GenerationID(g)
+		prevGen := GenerationID(g - 1)
+		manifest := make([]GenerationFile, len(baseObjects))
+		copy(manifest, baseObjects)
+		manifest[0].SHA256 = fmt.Sprintf("%064x", 1000000+g)
+		_, manifestSHA, err := ManifestBytes(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opID := fmt.Sprintf("%d", g)
+		tx, err := store.DB().BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO operations(id, kind, state, payload_json, result_json, created_at, updated_at) VALUES (?, 'fixture', 'done', '{}', '{}', ?, ?)`, opID, nowText(), nowText()); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES (?, ?, ?, ?, ?, ?)`, gen.String(), prevGen.String(), opID, manifestSHA, strings.Repeat("0", 64), nowText()); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+		for start := 0; start < len(manifest); start += sqliteManifestInsertBatchSize {
+			end := min(start+sqliteManifestInsertBatchSize, len(manifest))
+			var q strings.Builder
+			q.WriteString(`INSERT INTO generation_files(generation, path, phase, size, sha256) VALUES `)
+			args := make([]any, 0, (end-start)*5)
+			for idx, f := range manifest[start:end] {
+				if idx != 0 {
+					q.WriteByte(',')
+				}
+				q.WriteString(`(?, ?, ?, ?, ?)`)
+				args = append(args, gen.String(), f.Path, f.Phase, f.Size, f.SHA256)
+			}
+			if _, err := tx.ExecContext(ctx, q.String(), args...); err != nil {
+				_ = tx.Rollback()
+				t.Fatal(err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		views := []PublicationAttemptView{{
+			ViewID: "rpm:el9/x86_64", PointerPath: manifest[0].Path, NewIdentity: manifest[0].SHA256, State: "pending",
+		}}
+		if g > 1 {
+			views[0].OldIdentity = fmt.Sprintf("%064x", 1000000+g-1)
+		}
+		attempt := PublicationAttempt{
+			RepositoryID: identity.RepositoryID, TargetIdentity: binding.TargetIdentity, BaseCheckpoint: baseCheckpoint,
+			TargetGeneration: gen, ManifestSHA256: manifestSHA, PlanSHA256: fmt.Sprintf("%064x", 2000000+g),
+			Phase: "planned", Views: views,
+		}
+		if err := store.PutPublicationAttempt(ctx, &attempt); err != nil {
+			t.Fatal(err)
+		}
+		for _, phase := range []string{"payload", "immutable_metadata", "pointer_prepared"} {
+			if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.SetPublicationAttemptViewState(ctx, attempt.AttemptIdentity, views[0].ViewID, views[0].PointerPath, "prepared"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetPublicationCommitIntent(ctx, attempt.AttemptIdentity); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, "pointer_rollforward"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetPublicationAttemptViewState(ctx, attempt.AttemptIdentity, views[0].ViewID, views[0].PointerPath, "applied"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SetPublicationAttemptViewState(ctx, attempt.AttemptIdentity, views[0].ViewID, views[0].PointerPath, "verified"); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, "verified"); err != nil {
+			t.Fatal(err)
+		}
+		inventory := make([]PublicationInventoryObject, len(manifest))
+		for idx, f := range manifest {
+			inventory[idx] = PublicationInventoryObject{Path: f.Path, Phase: f.Phase, Size: f.Size, SHA256: f.SHA256, RemoteIdentity: "etag-" + f.SHA256[:12]}
+		}
+		cp := AppliedCheckpoint{
+			RepositoryID: identity.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: attempt.AttemptIdentity,
+			Generation: gen, ManifestSHA256: manifestSHA, InventoryComplete: true,
+			Views:     []PublicationCheckpointView{{ViewID: views[0].ViewID, PointerPath: views[0].PointerPath, RemoteIdentity: inventory[0].RemoteIdentity}},
+			Inventory: inventory, AppliedAt: at.Add(time.Duration(g) * time.Second),
+		}
+		if err := store.PutAppliedCheckpoint(ctx, &cp); err != nil {
+			t.Fatal(err)
+		}
+		grace := GraceRecord{
+			TargetIdentity: binding.TargetIdentity, CheckpointIdentity: cp.CheckpointIdentity,
+			VerifiedAt: cp.AppliedAt, NotBefore: cp.AppliedAt.Add(30 * 24 * time.Hour),
+			CachePolicyIdentity: strings.Repeat("c", 64), State: "grace",
+		}
+		if err := store.PutGraceRecord(ctx, &grace); err != nil {
+			t.Fatal(err)
+		}
+		baseCheckpoint = cp.CheckpointIdentity
+		if g == 1 {
+			firstCheckpointID = cp.CheckpointIdentity
+		}
+		lastCheckpointID = cp.CheckpointIdentity
+	}
+
+	measureAllocBytes := func(checkpointID string) uint64 {
+		// Run two GCs before measuring so sync.Pool victims (such as encoding/json
+		// encode buffers) are drained identically for every call.
+		runtime.GC()
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		inv, err := store.PublicationLiveInventory(ctx, checkpointID)
+		if err != nil || len(inv) != objectCount {
+			t.Fatalf("PublicationLiveInventory(%s) len=%d err=%v", checkpointID, len(inv), err)
+		}
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+
+	// Warm up prepared state / SQLite page cache for both checkpoints.
+	_ = measureAllocBytes(firstCheckpointID)
+	_ = measureAllocBytes(lastCheckpointID)
+	allocFirst := measureAllocBytes(firstCheckpointID)
+	allocLast := measureAllocBytes(lastCheckpointID)
+	// With zero receipts, reading the 12th generation must not scale linearly
+	// with generation count (previously ~6-12x because every historical manifest
+	// was scanned and keyed unconditionally).
+	if allocLast > allocFirst*2 {
+		t.Fatalf("PublicationLiveInventory scaled with history depth on 0 receipts: gen1=%d bytes, gen%d=%d bytes", allocFirst, generations, allocLast)
+	}
+}
+
+func TestPublicationLiveInventoryTracksReabandonedObjectAfterDeletion(t *testing.T) {
+	ctx := context.Background()
+	store, binding, firstManifest := publicationStoreFixture(t)
+	defer store.Close()
+
+	// Create generation 2 without the payload from generation 1.
+	payload := firstManifest[1]
+	secondManifest := []GenerationFile{firstManifest[0]}
+	_, firstSHA, _ := ManifestBytes(firstManifest)
+	_, secondSHA, _ := ManifestBytes(secondManifest)
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO operations(id, kind, state, payload_json, result_json, created_at, updated_at) VALUES ('2', 'fixture', 'done', '{}', '{}', ?, ?)`, nowText(), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES ('00000000000000000002', '00000000000000000001', '2', ?, ?, ?)`, secondSHA, strings.Repeat("0", 64), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO generation_files(generation, path, phase, size, sha256) VALUES ('00000000000000000002', ?, ?, ?, ?)`, secondManifest[0].Path, secondManifest[0].Phase, secondManifest[0].Size, secondManifest[0].SHA256); err != nil {
+		t.Fatal(err)
+	}
+	advanceToVerified := func(attempt *PublicationAttempt) {
+		t.Helper()
+		if err := store.PutPublicationAttempt(ctx, attempt); err != nil {
+			t.Fatal(err)
+		}
+		for _, phase := range []string{"payload", "immutable_metadata", "pointer_prepared"} {
+			if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.SetPublicationCommitIntent(ctx, attempt.AttemptIdentity); err != nil {
+			t.Fatal(err)
+		}
+		for _, phase := range []string{"pointer_rollforward", "verified"} {
+			if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	a1 := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, TargetGeneration: 1, ManifestSHA256: firstSHA, PlanSHA256: strings.Repeat("1", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	advanceToVerified(&a1)
+	inv1 := []PublicationInventoryObject{
+		{Path: firstManifest[0].Path, Phase: firstManifest[0].Phase, Size: firstManifest[0].Size, SHA256: firstManifest[0].SHA256, RemoteIdentity: "etag-ptr"},
+		{Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256, RemoteIdentity: "etag-payload"},
+	}
+	c1 := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: a1.AttemptIdentity, Generation: 1, ManifestSHA256: firstSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inv1, AppliedAt: at}
+	if err := store.PutAppliedCheckpoint(ctx, &c1); err != nil {
+		t.Fatal(err)
+	}
+	g1 := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c1.CheckpointIdentity, VerifiedAt: at, NotBefore: at.Add(30 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
+	if err := store.PutGraceRecord(ctx, &g1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Publish gen 2 (removing payload from manifest, retaining it in inventory),
+	// then delete payload via C2's conditional_delete report.
+	a2 := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, BaseCheckpoint: c1.CheckpointIdentity, TargetGeneration: 2, ManifestSHA256: secondSHA, PlanSHA256: strings.Repeat("2", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	advanceToVerified(&a2)
+	c2 := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: a2.AttemptIdentity, Generation: 2, ManifestSHA256: secondSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inv1, AppliedAt: at.Add(time.Hour)}
+	if err := store.PutAppliedCheckpoint(ctx, &c2); err != nil {
+		t.Fatal(err)
+	}
+	g2 := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c2.CheckpointIdentity, VerifiedAt: at.Add(time.Hour), NotBefore: at.Add(31 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
+	if err := store.PutGraceRecord(ctx, &g2); err != nil {
+		t.Fatal(err)
+	}
+	expired := at.Add(32 * 24 * time.Hour)
+	r1 := PublicationCandidateReport{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c1.CheckpointIdentity, InventoryIdentity: c1.InventoryIdentity, Mode: "conditional_delete", Candidates: []PublicationCandidate{}, CreatedAt: expired}
+	if err := store.PutPublicationCandidateReport(ctx, &r1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkPublicationDeletionVerified(ctx, a1.AttemptIdentity, r1.ReportIdentity, expired); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompletePublicationAttempt(ctx, a1.AttemptIdentity, r1.ReportIdentity); err != nil {
+		t.Fatal(err)
+	}
+	r2 := PublicationCandidateReport{
+		TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c2.CheckpointIdentity, InventoryIdentity: c2.InventoryIdentity, Mode: "conditional_delete", CreatedAt: expired,
+		Candidates: []PublicationCandidate{{Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256, RemoteIdentity: "etag-payload"}},
+	}
+	if err := store.PutPublicationCandidateReport(ctx, &r2); err != nil {
+		t.Fatal(err)
+	}
+	receipt := PublicationDeletionReceipt{
+		ReportIdentity: r2.ReportIdentity, Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256,
+		RemoteIdentity: "etag-payload", StorageAbsent: true, PublicAbsent: true, ObservedAt: expired,
+	}
+	if err := store.PutPublicationDeletionReceipt(ctx, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkPublicationDeletionVerified(ctx, a2.AttemptIdentity, r2.ReportIdentity, expired); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompletePublicationAttempt(ctx, a2.AttemptIdentity, r2.ReportIdentity); err != nil {
+		t.Fatal(err)
+	}
+	liveBeforeAbandon, err := store.PublicationLiveInventory(ctx, c2.CheckpointIdentity)
+	if err != nil || len(liveBeforeAbandon) != 1 {
+		t.Fatalf("live inventory after deletion = %+v err=%v, want 1 object", liveBeforeAbandon, err)
+	}
+
+	// Simulate an abandoned pre-commit publish based on C2 that re-uploaded the
+	// exact same payload (same path, sha256, remote_identity), followed by a new
+	// checkpoint C3 whose inventory includes that abandoned object.
+	abandoned := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, BaseCheckpoint: c2.CheckpointIdentity, TargetGeneration: 1, ManifestSHA256: firstSHA, PlanSHA256: strings.Repeat("3", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	if err := store.PutPublicationAttempt(ctx, &abandoned); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AbandonPublicationAttempt(ctx, abandoned.AttemptIdentity, []PublicationAbandonedObject{{
+		Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256, RemoteIdentity: "etag-payload",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	thirdManifest := []GenerationFile{{
+		Path: firstManifest[0].Path, Phase: firstManifest[0].Phase, Size: firstManifest[0].Size, SHA256: strings.Repeat("9", 64),
+	}}
+	_, thirdSHA, _ := ManifestBytes(thirdManifest)
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO operations(id, kind, state, payload_json, result_json, created_at, updated_at) VALUES ('3', 'fixture', 'done', '{}', '{}', ?, ?)`, nowText(), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES ('00000000000000000003', '00000000000000000002', '3', ?, ?, ?)`, thirdSHA, strings.Repeat("0", 64), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO generation_files(generation, path, phase, size, sha256) VALUES ('00000000000000000003', ?, ?, ?, ?)`, thirdManifest[0].Path, thirdManifest[0].Phase, thirdManifest[0].Size, thirdManifest[0].SHA256); err != nil {
+		t.Fatal(err)
+	}
+	a3 := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, BaseCheckpoint: c2.CheckpointIdentity, TargetGeneration: 3, ManifestSHA256: thirdSHA, PlanSHA256: strings.Repeat("4", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	advanceToVerified(&a3)
+	inv3 := []PublicationInventoryObject{
+		{Path: thirdManifest[0].Path, Phase: thirdManifest[0].Phase, Size: thirdManifest[0].Size, SHA256: thirdManifest[0].SHA256, RemoteIdentity: "etag-ptr-3"},
+		{Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256, RemoteIdentity: "etag-payload"},
+	}
+	c3 := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: a3.AttemptIdentity, Generation: 3, ManifestSHA256: thirdSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inv3, AppliedAt: expired.Add(time.Hour)}
+	if err := store.PutAppliedCheckpoint(ctx, &c3); err != nil {
+		t.Fatal(err)
+	}
+	g3 := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c3.CheckpointIdentity, VerifiedAt: expired.Add(time.Hour), NotBefore: expired.Add(31 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
+	if err := store.PutGraceRecord(ctx, &g3); err != nil {
+		t.Fatal(err)
+	}
+
+	liveAfterAbandon, err := store.PublicationLiveInventory(ctx, c3.CheckpointIdentity)
+	if err != nil || len(liveAfterAbandon) != 2 {
+		t.Fatalf("live inventory must keep re-abandoned identical object alive: len=%d err=%v", len(liveAfterAbandon), err)
+	}
+	// And once C3 expires, that re-abandoned payload must be eligible for collection again!
+	candidatesC3, err := store.ExactPublicationCandidates(ctx, c3.CheckpointIdentity, g3.NotBefore.Add(time.Minute))
+	if err != nil || len(candidatesC3) != 1 || candidatesC3[0].Path != payload.Path {
+		t.Fatalf("C3 candidates after re-abandon = %+v err=%v, want [%s]", candidatesC3, err, payload.Path)
+	}
+}
+
+func TestListPublicationMaintenancePreservesCausalOrderForInvertedRetainedReports(t *testing.T) {
+	ctx := context.Background()
+	store, binding, firstManifest := publicationStoreFixture(t)
+	defer store.Close()
+
+	secondManifest := []GenerationFile{firstManifest[0]}
+	_, firstSHA, _ := ManifestBytes(firstManifest)
+	_, secondSHA, _ := ManifestBytes(secondManifest)
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO operations(id, kind, state, payload_json, result_json, created_at, updated_at) VALUES ('2', 'fixture', 'done', '{}', '{}', ?, ?)`, nowText(), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES ('00000000000000000002', '00000000000000000001', '2', ?, ?, ?)`, secondSHA, strings.Repeat("0", 64), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO generation_files(generation, path, phase, size, sha256) VALUES ('00000000000000000002', ?, ?, ?, ?)`, secondManifest[0].Path, secondManifest[0].Phase, secondManifest[0].Size, secondManifest[0].SHA256); err != nil {
+		t.Fatal(err)
+	}
+	advanceToVerified := func(attempt *PublicationAttempt) {
+		t.Helper()
+		if err := store.PutPublicationAttempt(ctx, attempt); err != nil {
+			t.Fatal(err)
+		}
+		for _, phase := range []string{"payload", "immutable_metadata", "pointer_prepared"} {
+			if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.SetPublicationCommitIntent(ctx, attempt.AttemptIdentity); err != nil {
+			t.Fatal(err)
+		}
+		for _, phase := range []string{"pointer_rollforward", "verified"} {
+			if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	inv := []PublicationInventoryObject{
+		{Path: firstManifest[0].Path, Phase: firstManifest[0].Phase, Size: firstManifest[0].Size, SHA256: firstManifest[0].SHA256, RemoteIdentity: "etag-ptr"},
+		{Path: firstManifest[1].Path, Phase: firstManifest[1].Phase, Size: firstManifest[1].Size, SHA256: firstManifest[1].SHA256, RemoteIdentity: "etag-payload"},
+	}
+	a1 := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, TargetGeneration: 1, ManifestSHA256: firstSHA, PlanSHA256: strings.Repeat("5", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	advanceToVerified(&a1)
+	c1 := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: a1.AttemptIdentity, Generation: 1, ManifestSHA256: firstSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inv, AppliedAt: at}
+	if err := store.PutAppliedCheckpoint(ctx, &c1); err != nil {
+		t.Fatal(err)
+	}
+	// Legacy inverted deadlines: C1 expires at +61d, C2 expires at +30d.
+	g1 := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c1.CheckpointIdentity, VerifiedAt: at, NotBefore: at.Add(61 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
+	if err := store.PutGraceRecord(ctx, &g1); err != nil {
+		t.Fatal(err)
+	}
+	a2 := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, BaseCheckpoint: c1.CheckpointIdentity, TargetGeneration: 2, ManifestSHA256: secondSHA, PlanSHA256: strings.Repeat("6", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	advanceToVerified(&a2)
+	c2 := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: a2.AttemptIdentity, Generation: 2, ManifestSHA256: secondSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inv, AppliedAt: at.Add(time.Hour)}
+	if err := store.PutAppliedCheckpoint(ctx, &c2); err != nil {
+		t.Fatal(err)
+	}
+	g2 := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c2.CheckpointIdentity, VerifiedAt: at.Add(time.Hour), NotBefore: at.Add(30*24*time.Hour + time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
+	if err := store.PutGraceRecord(ctx, &g2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Report-only both checkpoints past C1's deadline so both enter retained_reported.
+	afterBoth := at.Add(62 * 24 * time.Hour)
+	for _, cp := range []struct {
+		id         string
+		attempt    string
+		invID      string
+		candidates []PublicationCandidate
+	}{
+		{c1.CheckpointIdentity, a1.AttemptIdentity, c1.InventoryIdentity, []PublicationCandidate{}},
+		{c2.CheckpointIdentity, a2.AttemptIdentity, c2.InventoryIdentity, []PublicationCandidate{{Path: firstManifest[1].Path, Phase: firstManifest[1].Phase, Size: firstManifest[1].Size, SHA256: firstManifest[1].SHA256, RemoteIdentity: "etag-payload"}}},
+	} {
+		rep := PublicationCandidateReport{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: cp.id, InventoryIdentity: cp.invID, Mode: "report_only", Candidates: cp.candidates, CreatedAt: afterBoth}
+		if err := store.PutPublicationCandidateReport(ctx, &rep); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.MarkPublicationRetainedReported(ctx, cp.attempt, rep.ReportIdentity, afterBoth); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.CompletePublicationAttempt(ctx, cp.attempt, rep.ReportIdentity); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	items, err := store.ListPublicationMaintenance(ctx, binding.TargetIdentity, true)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("ListPublicationMaintenance(includeRetained=true) = %+v err=%v", items, err)
+	}
+	if items[0].CheckpointIdentity != c1.CheckpointIdentity || items[1].CheckpointIdentity != c2.CheckpointIdentity {
+		t.Fatalf("inverted retained_reported order broke causal sequence: got [%s, %s], want [%s, %s]",
+			items[0].CheckpointIdentity, items[1].CheckpointIdentity, c1.CheckpointIdentity, c2.CheckpointIdentity)
+	}
+}
+
+func TestAbandonedUploadUsesHalfStepCausalEpochAndFiltersSupersededOrphans(t *testing.T) {
+	ctx := context.Background()
+	store, binding, firstManifest := publicationStoreFixture(t)
+	defer store.Close()
+
+	payload := firstManifest[1]
+	ptr := firstManifest[0]
+	extra := GenerationFile{Path: "pool/q/other/other.rpm", Phase: "payload", Size: 11, SHA256: strings.Repeat("d", 64)}
+	secondManifest := []GenerationFile{ptr, extra}
+	thirdManifest := []GenerationFile{{Path: ptr.Path, Phase: ptr.Phase, Size: ptr.Size, SHA256: strings.Repeat("8", 64)}, extra}
+	fourthManifest := []GenerationFile{{Path: ptr.Path, Phase: ptr.Phase, Size: ptr.Size, SHA256: strings.Repeat("7", 64)}, extra, payload}
+	_, firstSHA, _ := ManifestBytes(firstManifest)
+	_, secondSHA, _ := ManifestBytes(secondManifest)
+	_, thirdSHA, _ := ManifestBytes(thirdManifest)
+	_, fourthSHA, _ := ManifestBytes(fourthManifest)
+
+	insertGen := func(num int, manifest []GenerationFile, digest string) {
+		t.Helper()
+		gen := GenerationID(num)
+		prev := GenerationID(num - 1)
+		opID := fmt.Sprintf("%d", num)
+		if _, err := store.DB().ExecContext(ctx, `INSERT INTO operations(id, kind, state, payload_json, result_json, created_at, updated_at) VALUES (?, 'fixture', 'done', '{}', '{}', ?, ?)`, opID, nowText(), nowText()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.DB().ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES (?, ?, ?, ?, ?, ?)`, gen.String(), prev.String(), opID, digest, strings.Repeat("0", 64), nowText()); err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range manifest {
+			if _, err := store.DB().ExecContext(ctx, `INSERT INTO generation_files(generation, path, phase, size, sha256) VALUES (?, ?, ?, ?, ?)`, gen.String(), f.Path, f.Phase, f.Size, f.SHA256); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	insertGen(2, secondManifest, secondSHA)
+	insertGen(3, thirdManifest, thirdSHA)
+	insertGen(4, fourthManifest, fourthSHA)
+
+	advance := func(attempt *PublicationAttempt) {
+		t.Helper()
+		if err := store.PutPublicationAttempt(ctx, attempt); err != nil {
+			t.Fatal(err)
+		}
+		for _, phase := range []string{"payload", "immutable_metadata", "pointer_prepared"} {
+			if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.SetPublicationCommitIntent(ctx, attempt.AttemptIdentity); err != nil {
+			t.Fatal(err)
+		}
+		for _, phase := range []string{"pointer_rollforward", "verified"} {
+			if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	// First abandoned upload (pre-C0) with ETag1, later absorbed & deleted by C1.
+	aPre := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, TargetGeneration: 1, ManifestSHA256: firstSHA, PlanSHA256: strings.Repeat("a", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	if err := store.PutPublicationAttempt(ctx, &aPre); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AbandonPublicationAttempt(ctx, aPre.AttemptIdentity, []PublicationAbandonedObject{{
+		Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256, RemoteIdentity: "etag-old",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// C0: Gen 1 = [ptr, payload(etag-old)], expires T+30d.
+	a0 := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, TargetGeneration: 1, ManifestSHA256: firstSHA, PlanSHA256: strings.Repeat("1", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	advance(&a0)
+	inv0 := []PublicationInventoryObject{
+		{Path: ptr.Path, Phase: ptr.Phase, Size: ptr.Size, SHA256: ptr.SHA256, RemoteIdentity: "etag-ptr-0"},
+		{Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256, RemoteIdentity: "etag-old"},
+	}
+	c0 := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: a0.AttemptIdentity, Generation: 1, ManifestSHA256: firstSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inv0, AppliedAt: at}
+	if err := store.PutAppliedCheckpoint(ctx, &c0); err != nil {
+		t.Fatal(err)
+	}
+	g0 := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c0.CheckpointIdentity, VerifiedAt: at, NotBefore: at.Add(30 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
+	if err := store.PutGraceRecord(ctx, &g0); err != nil {
+		t.Fatal(err)
+	}
+
+	// C1: Gen 2 = [ptr, extra], carries payload(etag-old) in inventory, expires T+31d.
+	a1 := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, BaseCheckpoint: c0.CheckpointIdentity, TargetGeneration: 2, ManifestSHA256: secondSHA, PlanSHA256: strings.Repeat("2", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	advance(&a1)
+	inv1 := []PublicationInventoryObject{
+		{Path: ptr.Path, Phase: ptr.Phase, Size: ptr.Size, SHA256: ptr.SHA256, RemoteIdentity: "etag-ptr-1"},
+		{Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256, RemoteIdentity: "etag-old"},
+		{Path: extra.Path, Phase: extra.Phase, Size: extra.Size, SHA256: extra.SHA256, RemoteIdentity: "etag-extra"},
+	}
+	c1 := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: a1.AttemptIdentity, Generation: 2, ManifestSHA256: secondSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inv1, AppliedAt: at.Add(24 * time.Hour)}
+	if err := store.PutAppliedCheckpoint(ctx, &c1); err != nil {
+		t.Fatal(err)
+	}
+	g1 := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c1.CheckpointIdentity, VerifiedAt: at.Add(24 * time.Hour), NotBefore: at.Add(31 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
+	if err := store.PutGraceRecord(ctx, &g1); err != nil {
+		t.Fatal(err)
+	}
+
+	// C2: Gen 3 = [ptr3, extra], still carries payload(etag-old) in inventory, expires T+50d.
+	a2 := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, BaseCheckpoint: c1.CheckpointIdentity, TargetGeneration: 3, ManifestSHA256: thirdSHA, PlanSHA256: strings.Repeat("3", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	advance(&a2)
+	inv2 := []PublicationInventoryObject{
+		{Path: thirdManifest[0].Path, Phase: thirdManifest[0].Phase, Size: thirdManifest[0].Size, SHA256: thirdManifest[0].SHA256, RemoteIdentity: "etag-ptr-2"},
+		{Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256, RemoteIdentity: "etag-old"},
+		{Path: extra.Path, Phase: extra.Phase, Size: extra.Size, SHA256: extra.SHA256, RemoteIdentity: "etag-extra"},
+	}
+	c2 := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: a2.AttemptIdentity, Generation: 3, ManifestSHA256: thirdSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inv2, AppliedAt: at.Add(20 * 24 * time.Hour)}
+	if err := store.PutAppliedCheckpoint(ctx, &c2); err != nil {
+		t.Fatal(err)
+	}
+	g2 := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c2.CheckpointIdentity, VerifiedAt: at.Add(20 * 24 * time.Hour), NotBefore: at.Add(50 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
+	if err := store.PutGraceRecord(ctx, &g2); err != nil {
+		t.Fatal(err)
+	}
+
+	// At T+32d: C0 finishes (0 candidates), C1 deletes payload(etag-old) and finishes. C2 stays in grace.
+	at32 := at.Add(32 * 24 * time.Hour)
+	r0 := PublicationCandidateReport{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c0.CheckpointIdentity, InventoryIdentity: c0.InventoryIdentity, Mode: "conditional_delete", Candidates: []PublicationCandidate{}, CreatedAt: at32}
+	if err := store.PutPublicationCandidateReport(ctx, &r0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkPublicationDeletionVerified(ctx, a0.AttemptIdentity, r0.ReportIdentity, at32); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompletePublicationAttempt(ctx, a0.AttemptIdentity, r0.ReportIdentity); err != nil {
+		t.Fatal(err)
+	}
+	r1 := PublicationCandidateReport{
+		TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c1.CheckpointIdentity, InventoryIdentity: c1.InventoryIdentity, Mode: "conditional_delete", CreatedAt: at32,
+		Candidates: []PublicationCandidate{{Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256, RemoteIdentity: "etag-old"}},
+	}
+	if err := store.PutPublicationCandidateReport(ctx, &r1); err != nil {
+		t.Fatal(err)
+	}
+	rc1 := PublicationDeletionReceipt{
+		ReportIdentity: r1.ReportIdentity, Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256,
+		RemoteIdentity: "etag-old", StorageAbsent: true, PublicAbsent: true, ObservedAt: at32,
+	}
+	if err := store.PutPublicationDeletionReceipt(ctx, &rc1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkPublicationDeletionVerified(ctx, a1.AttemptIdentity, r1.ReportIdentity, at32); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompletePublicationAttempt(ctx, a1.AttemptIdentity, r1.ReportIdentity); err != nil {
+		t.Fatal(err)
+	}
+
+	// At T+33d: Abandoned attempt A4 based on C2 re-uploads payload with a NEW ETag ("etag-new").
+	a4 := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, BaseCheckpoint: c2.CheckpointIdentity, TargetGeneration: 4, ManifestSHA256: fourthSHA, PlanSHA256: strings.Repeat("4", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	if err := store.PutPublicationAttempt(ctx, &a4); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AbandonPublicationAttempt(ctx, a4.AttemptIdentity, []PublicationAbandonedObject{{
+		Path: payload.Path, Phase: payload.Phase, Size: payload.Size, SHA256: payload.SHA256, RemoteIdentity: "etag-new",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1) PublicationLiveInventory(C2) must NOT resurrect C2's deleted (payload, etag-old):
+	//    post-C2 abandoned upload sits at epoch 2*2+1=5 > C2's epoch 4.
+	liveC2, err := store.PublicationLiveInventory(ctx, c2.CheckpointIdentity)
+	if err != nil || len(liveC2) != 2 {
+		t.Fatalf("PublicationLiveInventory(C2) must stay at 2 objects without deleted etag-old: len=%d err=%v live=%+v", len(liveC2), err, liveC2)
+	}
+	// 2) ListPublicationAbandonedObjects must ignore the deleted pre-C0 (etag-old)
+	//    and return only the live (etag-new) without ErrConflict.
+	orphans, err := store.ListPublicationAbandonedObjects(ctx, binding.TargetIdentity)
+	if err != nil || len(orphans) != 1 || orphans[0].RemoteIdentity != "etag-new" {
+		t.Fatalf("ListPublicationAbandonedObjects = %+v err=%v, want [etag-new]", orphans, err)
+	}
+	// 3) When C2 expires at T+51d, ExactPublicationCandidates(C2) must NOT claim
+	//    payload (because A4 re-uploaded it at epoch 5 > C2's epoch 4).
+	candidatesC2, err := store.ExactPublicationCandidates(ctx, c2.CheckpointIdentity, at.Add(51*24*time.Hour))
+	if err != nil || len(candidatesC2) != 0 {
+		t.Fatalf("ExactPublicationCandidates(C2) claimed post-C2 abandoned upload: %+v err=%v", candidatesC2, err)
+	}
+}
+
+func TestInterruptedLegacyReportOnlyUnblocksDespiteInvertedDeadlines(t *testing.T) {
+	ctx := context.Background()
+	store, binding, firstManifest := publicationStoreFixture(t)
+	defer store.Close()
+
+	secondManifest := []GenerationFile{firstManifest[0]}
+	_, firstSHA, _ := ManifestBytes(firstManifest)
+	_, secondSHA, _ := ManifestBytes(secondManifest)
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO operations(id, kind, state, payload_json, result_json, created_at, updated_at) VALUES ('2', 'fixture', 'done', '{}', '{}', ?, ?)`, nowText(), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO generations(generation, previous_generation, operation_id, manifest_sha256, renderer_identity, created_at) VALUES ('00000000000000000002', '00000000000000000001', '2', ?, ?, ?)`, secondSHA, strings.Repeat("0", 64), nowText()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO generation_files(generation, path, phase, size, sha256) VALUES ('00000000000000000002', ?, ?, ?, ?)`, secondManifest[0].Path, secondManifest[0].Phase, secondManifest[0].Size, secondManifest[0].SHA256); err != nil {
+		t.Fatal(err)
+	}
+	advance := func(attempt *PublicationAttempt) {
+		t.Helper()
+		if err := store.PutPublicationAttempt(ctx, attempt); err != nil {
+			t.Fatal(err)
+		}
+		for _, phase := range []string{"payload", "immutable_metadata", "pointer_prepared"} {
+			if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.SetPublicationCommitIntent(ctx, attempt.AttemptIdentity); err != nil {
+			t.Fatal(err)
+		}
+		for _, phase := range []string{"pointer_rollforward", "verified"} {
+			if err := store.AdvancePublicationAttemptPhase(ctx, attempt.AttemptIdentity, phase); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	inv := []PublicationInventoryObject{
+		{Path: firstManifest[0].Path, Phase: firstManifest[0].Phase, Size: firstManifest[0].Size, SHA256: firstManifest[0].SHA256, RemoteIdentity: "etag-ptr"},
+		{Path: firstManifest[1].Path, Phase: firstManifest[1].Phase, Size: firstManifest[1].Size, SHA256: firstManifest[1].SHA256, RemoteIdentity: "etag-payload"},
+	}
+	a0 := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, TargetGeneration: 1, ManifestSHA256: firstSHA, PlanSHA256: strings.Repeat("7", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	advance(&a0)
+	c0 := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: a0.AttemptIdentity, Generation: 1, ManifestSHA256: firstSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inv, AppliedAt: at}
+	if err := store.PutAppliedCheckpoint(ctx, &c0); err != nil {
+		t.Fatal(err)
+	}
+	g0 := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c0.CheckpointIdentity, VerifiedAt: at, NotBefore: at.Add(60 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
+	if err := store.PutGraceRecord(ctx, &g0); err != nil {
+		t.Fatal(err)
+	}
+	a1 := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, BaseCheckpoint: c0.CheckpointIdentity, TargetGeneration: 2, ManifestSHA256: secondSHA, PlanSHA256: strings.Repeat("8", 64), Phase: "planned", Views: []PublicationAttemptView{}}
+	advance(&a1)
+	c1 := AppliedCheckpoint{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, AttemptIdentity: a1.AttemptIdentity, Generation: 2, ManifestSHA256: secondSHA, InventoryComplete: true, Views: []PublicationCheckpointView{}, Inventory: inv, AppliedAt: at.Add(time.Hour)}
+	if err := store.PutAppliedCheckpoint(ctx, &c1); err != nil {
+		t.Fatal(err)
+	}
+	g1 := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c1.CheckpointIdentity, VerifiedAt: at.Add(time.Hour), NotBefore: at.Add(31 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
+	if err := store.PutGraceRecord(ctx, &g1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate an interrupted v0.7.1 report_only candidate report persisted at T+32d
+	// before MarkPublicationRetainedReported could run.
+	at32 := at.Add(32 * 24 * time.Hour)
+	rep := PublicationCandidateReport{
+		SchemaVersion: 1, TargetIdentity: binding.TargetIdentity, CheckpointIdentity: c1.CheckpointIdentity,
+		InventoryIdentity: c1.InventoryIdentity, Mode: "report_only", Candidates: []PublicationCandidate{}, CreatedAt: at32,
+	}
+	rep.ReportIdentity = candidateReportSemanticIdentity(rep)
+	if _, err := store.DB().ExecContext(ctx, `INSERT INTO publication_candidate_reports(report_identity, schema_version, target_identity, checkpoint_identity, inventory_identity, mode, created_at) VALUES (?, 1, ?, ?, ?, 'report_only', ?)`,
+		rep.ReportIdentity, rep.TargetIdentity, rep.CheckpointIdentity, rep.InventoryIdentity, formatTimestamp(rep.CreatedAt)); err != nil {
+		t.Fatal(err)
+	}
+
+	at33 := at.Add(33 * 24 * time.Hour)
+	items, err := store.ListPublicationMaintenance(ctx, binding.TargetIdentity, false)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("ListPublicationMaintenance = %+v err=%v", items, err)
+	}
+	if items[0].CheckpointIdentity != c1.CheckpointIdentity || items[0].NotBefore.After(at33) {
+		t.Fatalf("interrupted legacy report_only must sort ready for completion at T+33d: got %+v", items)
+	}
+	if err := store.MarkPublicationRetainedReported(ctx, a1.AttemptIdentity, rep.ReportIdentity, at33); err != nil {
+		t.Fatalf("MarkPublicationRetainedReported blocked interrupted legacy report_only: %v", err)
+	}
+	if err := store.CompletePublicationAttempt(ctx, a1.AttemptIdentity, rep.ReportIdentity); err != nil {
+		t.Fatalf("CompletePublicationAttempt failed: %v", err)
+	}
+	pending, err := store.HasPendingPublicationMaintenance(ctx, binding.TargetIdentity)
+	if err != nil || pending {
+		t.Fatalf("HasPendingPublicationMaintenance remained %v (err=%v) after resuming legacy report_only", pending, err)
 	}
 }

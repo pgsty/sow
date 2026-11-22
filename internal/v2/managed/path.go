@@ -18,6 +18,7 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/workmetrics"
+	"github.com/pgsty/sow/internal/yumrepo"
 	"golang.org/x/sys/unix"
 )
 
@@ -322,7 +323,7 @@ func createRootedRegular(root, relative string, mode os.FileMode) (*rootedCreate
 		return nil, errors.Join(result, parent.close(true))
 	}
 	name := components[len(components)-1]
-	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, uint32(mode.Perm()))
+	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, uint32(mode.Perm()))
 	if err != nil {
 		return finishError(err)
 	}
@@ -664,7 +665,7 @@ func renameRootedRegularWithEvidence(ctx context.Context, root, sourceRelative, 
 	}
 	sourceName := sourceComponents[len(sourceComponents)-1]
 	targetName := targetComponents[len(targetComponents)-1]
-	fd, err := unix.Openat(int(sourceParent.directory().Fd()), sourceName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(sourceParent.directory().Fd()), sourceName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return finish(err)
 	}
@@ -859,7 +860,7 @@ func linkRootedRegularDeferredTargetSync(ctx context.Context, root, sourceRelati
 	}
 	sourceName := sourceComponents[len(sourceComponents)-1]
 	targetName := targetComponents[len(targetComponents)-1]
-	fd, err := unix.Openat(int(sourceParent.directory().Fd()), sourceName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(sourceParent.directory().Fd()), sourceName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return finish(err)
 	}
@@ -998,7 +999,7 @@ func linkRootedRegular(ctx context.Context, sourceRoot, sourceRelative, targetRo
 	}
 	sourceName := sourceComponents[len(sourceComponents)-1]
 	targetName := targetComponents[len(targetComponents)-1]
-	fd, err := unix.Openat(int(sourceParent.directory().Fd()), sourceName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(sourceParent.directory().Fd()), sourceName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return finish(err)
 	}
@@ -1181,7 +1182,7 @@ func removeRootedRegular(root, relative string, expectedSize int64) error {
 	}
 	finish := func(result error) error { return errors.Join(result, parent.close(true)) }
 	name := components[len(components)-1]
-	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if errors.Is(err, unix.ENOENT) {
 		return finish(nil)
 	}
@@ -1237,7 +1238,7 @@ func removeRootedRegularExactWithEvidence(ctx context.Context, root, relative st
 	}
 	finish := func(result error) error { return errors.Join(result, parent.close(true)) }
 	name := components[len(components)-1]
-	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if errors.Is(err, unix.ENOENT) {
 		return finish(nil)
 	}
@@ -2065,6 +2066,107 @@ func durableRenameWithHook(root, source, target string, afterSourceParent func()
 	return closeHeld(errors.Join(sourceParent.directory().Sync(), targetParent.directory().Sync()))
 }
 
+// linkUnlinkAtNoReplace is the POSIX fallback for filesystems where
+// renameat2(RENAME_NOREPLACE) or renameatx_np(RENAME_EXCL) is unsupported.
+// linkat without AT_SYMLINK_FOLLOW fails with EEXIST if target exists and never
+// dereferences a source symlink.
+func linkUnlinkAtNoReplace(sourceFD int, source string, targetFD int, target string) error {
+	var before unix.Stat_t
+	if err := unix.Fstatat(sourceFD, source, &before, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if uint32(before.Mode)&unix.S_IFMT != unix.S_IFREG {
+		return unix.EPERM
+	}
+	if err := unix.Linkat(sourceFD, source, targetFD, target, 0); err != nil {
+		return err
+	}
+	var linked unix.Stat_t
+	if err := unix.Fstatat(targetFD, target, &linked, unix.AT_SYMLINK_NOFOLLOW); err != nil || linked.Dev != before.Dev || linked.Ino != before.Ino {
+		_ = unix.Unlinkat(targetFD, target, 0)
+		if err != nil {
+			return err
+		}
+		return unix.EIO
+	}
+	return unix.Unlinkat(sourceFD, source, 0)
+}
+
+const (
+	exchangeProbeLeftPrefix  = ".sow-exchange-probe-a-"
+	exchangeProbeRightPrefix = ".sow-exchange-probe-b-"
+)
+
+func isExchangeProbeDirectoryName(name string) bool {
+	return strings.HasPrefix(name, exchangeProbeLeftPrefix) || strings.HasPrefix(name, exchangeProbeRightPrefix)
+}
+
+func cleanupExchangeProbeDirectories(root, repoName string) error {
+	stageRelative := filepath.Join(".sow", repoName, "stage")
+	entries, err := listRootedDirectory(filepath.Join(root, stageRelative))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !isExchangeProbeDirectoryName(entry.Name) {
+			continue
+		}
+		if err := removeRootedEmptyDirectory(root, filepath.Join(stageRelative, entry.Name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: exchange probe directory %q is not an empty directory: %v", ErrIntegrity, entry.Name, err)
+		}
+	}
+	return nil
+}
+
+func probeRootedDirectoryExchange(root, distsRelative, stageRelative string) error {
+	stageDir := filepath.Join(root, filepath.FromSlash(stageRelative))
+	if entries, listErr := listRootedDirectory(stageDir); listErr == nil {
+		for _, entry := range entries {
+			if isExchangeProbeDirectoryName(entry.Name) {
+				_ = removeRootedEmptyDirectory(root, filepath.Join(filepath.FromSlash(stageRelative), entry.Name))
+			}
+		}
+	}
+	leftPath, err := os.MkdirTemp(stageDir, exchangeProbeLeftPrefix)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(leftPath) }()
+	rightPath, err := os.MkdirTemp(stageDir, exchangeProbeRightPrefix)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(rightPath) }()
+	distsChain, err := openRootedDirectoryChain(root, distsRelative, false, 0)
+	if err != nil {
+		return err
+	}
+	var distsStat, stageStat unix.Stat_t
+	statErr := errors.Join(
+		unix.Fstat(int(distsChain.directory().Fd()), &distsStat),
+		unix.Lstat(leftPath, &stageStat),
+		distsChain.close(true),
+	)
+	if statErr != nil {
+		return statErr
+	}
+	if distsStat.Dev != stageStat.Dev {
+		return fmt.Errorf("%w: repository dists and stage are on different filesystems", yumrepo.ErrAtomicUnsupported)
+	}
+	leftRel := filepath.Join(stageRelative, filepath.Base(leftPath))
+	rightRel := filepath.Join(stageRelative, filepath.Base(rightPath))
+	if err := exchangeRootedDirectories(root, leftRel, rightRel); err != nil {
+		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EXDEV) {
+			return fmt.Errorf("%w: %v", yumrepo.ErrAtomicUnsupported, err)
+		}
+		return err
+	}
+	return nil
+}
+
 // exchangeRootedDirectories atomically swaps two directory entries reached
 // from one held owner descriptor.  Both parents and both leaf inodes are
 // rebound immediately before the kernel exchange and verified afterwards.
@@ -2168,7 +2270,7 @@ func readBoundedRegularNoFollowWithHook(filename string, maximum int64, afterOpe
 	if err := unix.Fstatat(int(parent.directory().Fd()), name, &before, unix.AT_SYMLINK_NOFOLLOW); err != nil || uint32(before.Mode)&unix.S_IFMT != unix.S_IFREG || before.Size < 1 || before.Size > maximum {
 		return nil, finishParent(errors.New("managed: bounded file is missing, unsafe, empty, or oversized"))
 	}
-	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(int(parent.directory().Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, finishParent(errors.New("managed: cannot bind bounded regular file"))
 	}

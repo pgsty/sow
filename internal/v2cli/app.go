@@ -133,7 +133,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		)}, err
 
 	case "config check":
-		if _, _, err := loadWorkspace(workspaceOptions); err != nil {
+		if _, _, err := loadWorkspaceForRead(workspaceOptions); err != nil {
 			return managedOutput{}, err
 		}
 		result, err := managed.CheckConfig(ctx, workspaceOptions)
@@ -151,7 +151,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		return managedOutput{repository: nullableString(repository), result: view, human: string(data)}, err
 
 	case "repo ls":
-		if _, _, err := loadWorkspace(workspaceOptions); err != nil {
+		if _, _, err := loadWorkspaceForRead(workspaceOptions); err != nil {
 			return managedOutput{}, err
 		}
 		result, err := managed.ListRepositories(ctx, workspaceOptions)
@@ -177,7 +177,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			}
 			name = inv.Positionals[0]
 		}
-		ws, cfg, err := loadWorkspace(workspaceOptions)
+		ws, cfg, err := loadWorkspaceForRead(workspaceOptions)
 		if err != nil {
 			return managedOutput{repository: nullableString(name)}, err
 		}
@@ -231,7 +231,25 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		}
 		return managedOutput{repository: name, result: map[string]any{"name": name, "removed": result.Removed, "noop": result.Noop}, preserveFailureResult: result.Removed || result.Noop, human: human}, err
 
-	case "dist ls", "dist new", "dist show", "dist rm":
+	case "dist ls", "dist show":
+		ws, cfg, err := loadWorkspaceForRead(workspaceOptions)
+		if err != nil {
+			return managedOutput{repository: nullableString(inv.Global.Repo)}, err
+		}
+		repository, err := selectedRepository(ws, cfg, inv.Global.Repo)
+		if err != nil {
+			return managedOutput{repository: nullableString(inv.Global.Repo)}, err
+		}
+		if invocationCommand(inv) == "dist ls" {
+			result, err := managed.ListDists(ctx, managed.DistListOptions{WorkspaceOptions: workspaceOptions, Repository: repository})
+			return managedOutput{repository: repository, result: map[string]any{"dists": result}, human: distsHuman(result)}, err
+		}
+		result, err := managed.ShowDist(ctx, managed.DistShowOptions{
+			WorkspaceOptions: workspaceOptions, Repository: repository, Name: inv.Positionals[0],
+		})
+		return managedOutput{repository: repository, result: result, human: distShowHuman(result)}, err
+
+	case "dist new", "dist rm":
 		ws, cfg, err := loadWorkspace(workspaceOptions)
 		if err != nil {
 			return managedOutput{repository: nullableString(inv.Global.Repo)}, err
@@ -240,33 +258,23 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 		if err != nil {
 			return managedOutput{repository: nullableString(inv.Global.Repo)}, err
 		}
-		switch invocationCommand(inv) {
-		case "dist ls":
-			result, err := managed.ListDists(ctx, managed.DistListOptions{WorkspaceOptions: workspaceOptions, Repository: repository})
-			return managedOutput{repository: repository, result: map[string]any{"dists": result}, human: distsHuman(result)}, err
-		case "dist new":
+		if invocationCommand(inv) == "dist new" {
 			result, err := managed.NewDist(ctx, managed.DistNewOptions{
 				WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: repository,
 				Name: inv.Positionals[0], Format: inv.Format,
 			})
 			return managedOutput{repository: repository, result: result, preserveFailureResult: result.Name != "", human: distHuman("created", result)}, err
-		case "dist show":
-			result, err := managed.ShowDist(ctx, managed.DistShowOptions{
-				WorkspaceOptions: workspaceOptions, Repository: repository, Name: inv.Positionals[0],
-			})
-			return managedOutput{repository: repository, result: result, human: distShowHuman(result)}, err
-		default:
-			name := inv.Positionals[0]
-			result, err := managed.RemoveDistResult(ctx, managed.DistRemoveOptions{
-				WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: repository,
-				Name: name, Force: inv.Force,
-			})
-			human := fmt.Sprintf("removed dist %s from %s\n", name, repository)
-			if result.Noop {
-				human = fmt.Sprintf("dist %s already absent from %s (noop)\n", name, repository)
-			}
-			return managedOutput{repository: repository, result: map[string]any{"name": name, "removed": result.Removed, "noop": result.Noop}, preserveFailureResult: result.Removed || result.Noop, human: human}, err
 		}
+		name := inv.Positionals[0]
+		result, err := managed.RemoveDistResult(ctx, managed.DistRemoveOptions{
+			WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: repository,
+			Name: name, Force: inv.Force,
+		})
+		human := fmt.Sprintf("removed dist %s from %s\n", name, repository)
+		if result.Noop {
+			human = fmt.Sprintf("dist %s already absent from %s (noop)\n", name, repository)
+		}
+		return managedOutput{repository: repository, result: map[string]any{"name": name, "removed": result.Removed, "noop": result.Noop}, preserveFailureResult: result.Removed || result.Noop, human: human}, err
 
 	case "add":
 		result, err := managed.Add(ctx, managed.AddOptions{
@@ -293,7 +301,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 
 	case "where":
 		result, err := managed.WherePackage(ctx, managed.PackageWhereOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo, Dists: inv.Global.Dists, Reference: inv.Positionals[0]})
-		return managedOutput{result: result, human: packageWhereHuman(result)}, err
+		return managedOutput{repository: nullableString(inv.Global.Repo), result: result, human: packageWhereHuman(result)}, err
 
 	case "status":
 		result, err := managed.Status(ctx, managed.StatusOptions{WorkspaceOptions: workspaceOptions, Repository: inv.Global.Repo, Dists: inv.Global.Dists})
@@ -368,7 +376,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 	case "gc":
 		if len(inv.Positionals) == 1 {
 			result, err := managed.TargetGC(ctx, managed.TargetGCOptions{
-				WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Target: inv.Positionals[0],
+				WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Target: inv.Positionals[0], Delete: inv.Delete,
 			})
 			human := fmt.Sprintf("target gc %s/%s (%s): phase=%s candidates=%d deleted=%d retained=%d pending=%d\n", result.Repository, result.Target, result.Provider, result.Phase, result.Candidates, result.DeletedObjects, result.RetainedObjects, result.PendingGrace)
 			if result.Noop {
@@ -409,7 +417,7 @@ func executeManaged(ctx context.Context, inv Invocation) (managedOutput, error) 
 			return managedOutput{}, err
 		}
 		result, err := managed.PruneLog(ctx, managed.LogPruneOptions{WorkspaceOptions: workspaceOptions, LockOptions: lockOptions, Repository: inv.Global.Repo, Before: before})
-		return managedOutput{repository: nullableString(result.Repository), result: result, preserveFailureResult: result.Operation != "", human: logPruneHuman(result)}, err
+		return managedOutput{repository: nullableString(result.Repository), operation: nullableString(result.Operation), result: result, preserveFailureResult: result.Operation != "", human: logPruneHuman(result)}, err
 	default:
 		return managedOutput{}, usageError("unknown command %q", invocationCommand(inv))
 	}
@@ -427,12 +435,28 @@ func loadWorkspace(opts managed.WorkspaceOptions) (config.Workspace, config.Conf
 	return ws, cfg, nil
 }
 
+func loadWorkspaceForRead(opts managed.WorkspaceOptions) (config.Workspace, config.Config, error) {
+	ws, err := config.Discover(config.DiscoverOptions{Workdir: opts.Workdir, CWD: opts.CWD, SOWDir: opts.SOWDir})
+	if err != nil {
+		return config.Workspace{}, config.Config{}, Errorf(ErrDiscovery, "%v", err)
+	}
+	cfg, _, _, _, err := config.LoadWorkspaceDocumentForMigration(ws)
+	if err != nil {
+		return config.Workspace{}, config.Config{}, Errorf(ErrConfig, "%v", err)
+	}
+	return ws, cfg, nil
+}
+
 func preflightInitConfig(directory string) error {
 	root, err := filepath.Abs(directory)
 	if err != nil {
 		return err
 	}
-	filename := filepath.Join(filepath.Clean(root), config.ConfigFilename)
+	cleanRoot := filepath.Clean(root)
+	if realRoot, evalErr := filepath.EvalSymlinks(cleanRoot); evalErr == nil {
+		cleanRoot = filepath.Clean(realRoot)
+	}
+	filename := filepath.Join(cleanRoot, config.ConfigFilename)
 	_, err = os.Lstat(filename)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -622,6 +646,12 @@ func failureInvocationContext(args []string) (string, bool) {
 		case "-h", "--help", "--version", "-N", "--no-wait":
 			// Recognized value-free global options do not participate in
 			// command discovery, even when their use is invalid.
+		case "--protect", "-j", "--jobs", "--metadata-timestamp", "-S", "--sign-with", "--format":
+			remaining = append(remaining, token)
+			if !inline && index+1 < len(args) {
+				index++
+				remaining = append(remaining, args[index])
+			}
 		default:
 			remaining = append(remaining, token)
 		}

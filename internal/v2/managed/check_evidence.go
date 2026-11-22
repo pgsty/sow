@@ -256,9 +256,8 @@ func inspectKnownPackageFacts(ctx context.Context, reader *os.File, source Manag
 	switch object.Format {
 	case "rpm":
 		facts, info, err := yumrepo.InspectManagedPackageFactsReaderKnown(ctx, reader, object.Filename, object.SHA256, object.Size)
-		actual, objectErr := rpmObjectFromInfo(info, object.Filename, object.PayloadSHA256)
-		if err != nil || objectErr != nil || !sameManagedPackageFacts(object, actual) {
-			return ManagedPackageSource{}, errors.Join(err, objectErr, errors.New("known RPM facts differ from immutable object"))
+		if err != nil || !matchesPersistedManagedRPMObject(object, info, object.PayloadSHA256) {
+			return ManagedPackageSource{}, errors.Join(err, errors.New("known RPM facts differ from immutable object"))
 		}
 		source.RPMFacts, source.DEBFacts = facts, nil
 		return source, nil

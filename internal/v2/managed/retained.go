@@ -398,6 +398,9 @@ func AddRetainedGeneration(ctx context.Context, opts RetainAddOptions) (result R
 	if err := cleanupRetainedAddStagesLocked(ctx, ws.Root, repoName, store); err != nil {
 		return result, err
 	}
+	if err := replayRetainedRemovalTombstonesLocked(ctx, ws.Root, repoName, store); err != nil {
+		return result, err
+	}
 	if opts.Generation != summary.BuiltGeneration {
 		return result, fmt.Errorf("%w: retained/v1 add requires the current Built Generation", ErrRejected)
 	}
@@ -889,7 +892,97 @@ func verifyAllRetainedGenerationsLockedWithEvidence(ctx context.Context, root, r
 			issues = append(issues, fmt.Sprintf("retained Generation %s is invalid: %v", generation, verifyErr))
 		}
 	}
+	if stageEntries, stageErr := listRootedDirectory(filepath.Join(root, ".sow", repoName, "stage")); stageErr == nil {
+		for _, entry := range stageEntries {
+			if strings.HasPrefix(entry.Name, "retain-remove-") {
+				issues = append(issues, fmt.Sprintf("unfinished retained removal stage %q requires recovery", entry.Name))
+			} else if isExchangeProbeDirectoryName(entry.Name) {
+				issues = append(issues, fmt.Sprintf("unfinished directory exchange probe %q requires recovery", entry.Name))
+			}
+		}
+	}
 	return int64(len(entries)), issues
+}
+
+func replayRetainedRemovalTombstonesLocked(ctx context.Context, root, repoName string, store *state.Store) error {
+	identity, err := store.RepositoryIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	stageRoot := filepath.Join(root, ".sow", repoName, "stage")
+	entries, err := listRootedDirectory(stageRoot)
+	if err != nil {
+		return err
+	}
+	generations := map[state.GenerationID]struct{}{}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name, "retain-remove-") {
+			continue
+		}
+		raw := strings.TrimPrefix(entry.Name, "retain-remove-")
+		raw = strings.TrimSuffix(raw, ".plan.json")
+		generation, parseErr := state.ParseGenerationID(raw)
+		if parseErr != nil || generation == 0 {
+			return fmt.Errorf("%w: non-canonical retained removal stage %q", ErrIntegrity, entry.Name)
+		}
+		generations[generation] = struct{}{}
+	}
+	if len(generations) == 0 {
+		return nil
+	}
+	sorted := make([]state.GenerationID, 0, len(generations))
+	for generation := range generations {
+		sorted = append(sorted, generation)
+	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	privateRoot := filepath.Join(root, ".sow", repoName)
+	for _, generation := range sorted {
+		targetRelative := filepath.Join("retained", generation.String())
+		tombstoneName := "retain-remove-" + generation.String()
+		tombstoneRelative := filepath.Join("stage", tombstoneName)
+		planName := tombstoneName + ".plan.json"
+		targetExists, err := rootedDirectoryExists(privateRoot, targetRelative)
+		if err != nil {
+			return err
+		}
+		tombstoneExists, err := rootedDirectoryExists(privateRoot, tombstoneRelative)
+		if err != nil {
+			return err
+		}
+		if targetExists && tombstoneExists {
+			return fmt.Errorf("%w: retained Generation and removal tombstone both exist", ErrIntegrity)
+		}
+		if targetExists && !tombstoneExists {
+			// The atomic rename to the tombstone never committed; the retained
+			// Generation remains intact, so discard only the pre-commit plan.
+			plan, planBytes, planExists, planErr := loadRetainedRemovalPlan(stageRoot, planName)
+			if errors.Is(planErr, errIncompleteRetainedRemovalPlan) {
+				if err := removeRootedRegularExact(ctx, stageRoot, planName, int64(len(planBytes)), bytesSHA(planBytes)); err != nil {
+					return err
+				}
+				continue
+			}
+			if planErr != nil {
+				return planErr
+			}
+			if planExists {
+				if plan.RepositoryID != identity.RepositoryID || plan.Generation != generation {
+					return fmt.Errorf("%w: retained removal plan belongs to another repository or Generation", ErrIntegrity)
+				}
+				if _, err := verifyRetainedGenerationLocked(ctx, root, repoName, generation, identity.RepositoryID); err != nil {
+					return err
+				}
+				if err := removeRootedRegularExact(ctx, stageRoot, planName, int64(len(planBytes)), bytesSHA(planBytes)); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if _, err := removeRetainedGenerationLocked(ctx, root, repoName, identity.RepositoryID, generation, nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func RetainList(ctx context.Context, opts RetainListOptions) (RetainListResult, error) {
@@ -923,12 +1016,17 @@ func RemoveRetainedGeneration(ctx context.Context, opts RetainRemoveOptions) (re
 	if err != nil {
 		return result, err
 	}
-	privateRoot := filepath.Join(ws.Root, ".sow", repoName)
+	return removeRetainedGenerationLocked(ctx, ws.Root, repoName, identity.RepositoryID, opts.Generation, opts.Fault)
+}
+
+func removeRetainedGenerationLocked(ctx context.Context, root, repoName, repositoryID string, generation state.GenerationID, fault func(string) error) (result RetainedGeneration, resultErr error) {
+	result.Repository = repoName
+	privateRoot := filepath.Join(root, ".sow", repoName)
 	retainedRoot := filepath.Join(privateRoot, "retained")
 	stageRoot := filepath.Join(privateRoot, "stage")
-	targetRelative := filepath.Join("retained", opts.Generation.String())
-	target := filepath.Join(retainedRoot, opts.Generation.String())
-	tombstoneName := "retain-remove-" + opts.Generation.String()
+	targetRelative := filepath.Join("retained", generation.String())
+	target := filepath.Join(retainedRoot, generation.String())
+	tombstoneName := "retain-remove-" + generation.String()
 	tombstoneRelative := filepath.Join("stage", tombstoneName)
 	tombstone := filepath.Join(stageRoot, tombstoneName)
 	planName := tombstoneName + ".plan.json"
@@ -955,11 +1053,11 @@ func RemoveRetainedGeneration(ctx context.Context, opts RetainRemoveOptions) (re
 	if err != nil {
 		return result, err
 	}
-	if planExists && (plan.RepositoryID != identity.RepositoryID || plan.Generation != opts.Generation) {
+	if planExists && (plan.RepositoryID != repositoryID || plan.Generation != generation) {
 		return result, fmt.Errorf("%w: retained removal plan belongs to another repository or Generation", ErrIntegrity)
 	}
 	if targetExists {
-		result, err = verifyRetainedGenerationLocked(ctx, ws.Root, repoName, opts.Generation, identity.RepositoryID)
+		result, err = verifyRetainedGenerationLocked(ctx, root, repoName, generation, repositoryID)
 		if err != nil {
 			return result, err
 		}
@@ -968,7 +1066,7 @@ func RemoveRetainedGeneration(ctx context.Context, opts RetainRemoveOptions) (re
 			return result, fmt.Errorf("%w: retained removal inventory is unsafe: %v", ErrIntegrity, err)
 		}
 		expectedPlan := retainedRemovalPlan{
-			Schema: retainedRemovalSchema, RepositoryID: identity.RepositoryID, Generation: opts.Generation,
+			Schema: retainedRemovalSchema, RepositoryID: repositoryID, Generation: generation,
 			RecordIdentity: result.RecordIdentity, Entries: entries,
 		}
 		expectedBytes, err := canonicalRetainedRemovalPlan(expectedPlan)
@@ -984,14 +1082,14 @@ func RemoveRetainedGeneration(ctx context.Context, opts RetainRemoveOptions) (re
 				return result, err
 			}
 			plan, planBytes, planExists = expectedPlan, expectedBytes, true
-			if err := callFault(opts.Fault, "retain.remove.planned"); err != nil {
+			if err := callFault(fault, "retain.remove.planned"); err != nil {
 				return result, err
 			}
 		}
 		if err := durableRename(privateRoot, target, tombstone); err != nil {
 			return result, err
 		}
-		if err := callFault(opts.Fault, "retain.remove.tombstoned"); err != nil {
+		if err := callFault(fault, "retain.remove.tombstoned"); err != nil {
 			return result, err
 		}
 	} else if tombstoneExists {
@@ -1012,7 +1110,7 @@ func RemoveRetainedGeneration(ctx context.Context, opts RetainRemoveOptions) (re
 		// A completed removal is an idempotent no-op.  The generation field
 		// keeps the result useful without inventing a record identity that no
 		// longer has persisted evidence.
-		return RetainedGeneration{Repository: repoName, Record: RetainedRecord{Generation: opts.Generation}, Path: target}, nil
+		return RetainedGeneration{Repository: repoName, Record: RetainedRecord{Generation: generation}, Path: target}, nil
 	}
 	if !planExists {
 		return result, fmt.Errorf("%w: retained removal has no durable sibling plan", ErrIntegrity)
@@ -1030,7 +1128,7 @@ func RemoveRetainedGeneration(ctx context.Context, opts RetainRemoveOptions) (re
 		if err := removeRootedRegularExact(ctx, tombstone, filepath.FromSlash(entry.Path), entry.Size, entry.SHA256); err != nil {
 			return result, fmt.Errorf("%w: remove planned retained file %q: %v", ErrIntegrity, entry.Path, err)
 		}
-		if err := callFault(opts.Fault, "retain.remove.entry."+entry.Path); err != nil {
+		if err := callFault(fault, "retain.remove.entry."+entry.Path); err != nil {
 			return result, err
 		}
 	}
@@ -1045,14 +1143,14 @@ func RemoveRetainedGeneration(ctx context.Context, opts RetainRemoveOptions) (re
 		if err := removeRootedEmptyDirectory(tombstone, filepath.FromSlash(entry.Path)); err != nil {
 			return result, fmt.Errorf("%w: remove planned retained directory %q: %v", ErrIntegrity, entry.Path, err)
 		}
-		if err := callFault(opts.Fault, "retain.remove.entry."+entry.Path); err != nil {
+		if err := callFault(fault, "retain.remove.entry."+entry.Path); err != nil {
 			return result, err
 		}
 	}
 	if err := removeRootedEmptyDirectory(stageRoot, tombstoneName); err != nil {
 		return result, fmt.Errorf("%w: remove retained tombstone root: %v", ErrIntegrity, err)
 	}
-	if err := callFault(opts.Fault, "retain.remove.cleaned"); err != nil {
+	if err := callFault(fault, "retain.remove.cleaned"); err != nil {
 		return result, err
 	}
 	if err := removeRootedRegularExact(ctx, stageRoot, planName, int64(len(planBytes)), bytesSHA(planBytes)); err != nil {

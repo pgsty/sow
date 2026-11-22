@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -35,10 +34,6 @@ func TestSiloS3Compatibility(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
-	dataRoot := filepath.Join(t.TempDir(), "silo-data")
-	if err := os.MkdirAll(filepath.Join(dataRoot, "repo"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	container := fmt.Sprintf("sow-silo-%d", time.Now().UnixNano())
 	command := exec.CommandContext(ctx, docker,
 		"run", "-d", "--rm", "--name", container,
@@ -47,8 +42,9 @@ func TestSiloS3Compatibility(t *testing.T) {
 		"-e", "MINIO_ROOT_PASSWORD=sowtest-secret-key",
 		"-e", "MINIO_BROWSER=off",
 		"-p", "127.0.0.1::9000",
-		"--mount", "type=bind,src="+dataRoot+",dst=/data",
-		siloCompatibilityImage, "server", "/data", "--address", ":9000", "--console-address", ":9001",
+		"--tmpfs", "/data:rw,size=256m,mode=1777",
+		siloCompatibilityImage,
+		"sh", "-ec", "mkdir -p /data/repo && exec docker-entrypoint.sh server /data --address :9000 --console-address :9001",
 	)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("start pinned Silo fixture: %v: %s", err, strings.TrimSpace(string(output)))
@@ -109,6 +105,16 @@ func TestSiloS3Compatibility(t *testing.T) {
 	page, err := client.ListObjectsV2Prefix(ctx, "repos/prod/", "")
 	if err != nil || len(page.Objects) != 1 || page.Objects[0].Key != "repos/prod/package.rpm" {
 		t.Fatalf("list=%#v err=%v", page, err)
+	}
+	if err := client.Delete(ctx, "repos/prod/package.rpm"); err != nil {
+		t.Fatalf("delete existing object: %v", err)
+	}
+	if err := client.Delete(ctx, "repos/prod/package.rpm"); err != nil {
+		t.Fatalf("idempotent delete missing object: %v", err)
+	}
+	deletedInfo, err := client.Head(ctx, "repos/prod/package.rpm")
+	if err != nil || deletedInfo.Exists {
+		t.Fatalf("head after delete=%#v err=%v", deletedInfo, err)
 	}
 }
 

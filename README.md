@@ -2,7 +2,7 @@
 
 [![Website: sow.pgsty.com](https://img.shields.io/badge/Website-sow.pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://sow.pgsty.com)
 [![Docs](https://img.shields.io/badge/Docs-sow.pgsty.com%2Fdocs-slategray?style=flat)](https://sow.pgsty.com/docs/)
-[![Version: 0.7.1](https://img.shields.io/badge/version-0.7.1-slategray?style=flat&logo=github&logoColor=white)](https://github.com/pgsty/sow/tree/v0.7.1)
+[![Version: 0.8.0](https://img.shields.io/badge/version-0.8.0-slategray?style=flat&logo=github&logoColor=white)](https://github.com/pgsty/sow/tree/v0.8.0)
 [![CI](https://img.shields.io/github/actions/workflow/status/pgsty/sow/ci.yml?style=flat&branch=main&label=CI&logo=githubactions&logoColor=white)](https://github.com/pgsty/sow/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/github/go-mod/go-version/pgsty/sow?style=flat&logo=go&logoColor=white&color=slategray)](go.mod)
 [![License: Apache-2.0](https://img.shields.io/github/license/pgsty/sow?logo=opensourceinitiative&logoColor=green&color=slategray)](LICENSE)
@@ -72,8 +72,9 @@ For a password-protected signing key, SOW 0.7.0 and later accept
 to that path or configure `passfile` next to a managed signing
 `key`. Priority is CLI, per-key config (including legacy `passphrase`), then environment.
 Use one nonempty UTF-8 line: one final LF or CRLF is removed, with no trimming of spaces
-or tabs. Keep the file outside the repository, normally mode `0600`. No default file
-is searched. For `create`, `--sign-with` still selects and enables signing.
+or tabs. Keep the file outside the repository, normally mode `0600` (external secret
+symlinks such as Kubernetes `Secret` mounts are accepted as long as they do not resolve
+into the workspace). No default file is searched. For `create`, `--sign-with` still selects and enables signing.
 Signing and recovery commands share this interface; check `sow help COMMAND` in
 your installed binary and see
 [password files](https://sow.pgsty.com/docs/reference/config/#passfile) for the full contract.
@@ -161,18 +162,20 @@ sow log --workdir ./lab --repo local
 
 `sow add` and `sow rm` converge the selected Dist to a new Built Generation by default.
 Configure a `filesystem` or `r2` target in `sow.yml`, then `sow publish TARGET` uploads the
-change set and `sow gc` collects unreachable local payloads. `sow help COMMAND` is the
+change set, `sow gc` collects unreachable local payloads, and `sow gc TARGET` runs target
+maintenance (filesystem targets delete expired candidates conditionally; R2 targets default
+to report-only and accept `--delete` for opt-in conditional deletion). `sow help COMMAND` is the
 authoritative CLI reference shipped with the binary; machine consumers can rely on the
 closed `--json` envelopes and the documented exit-code contract.
 
 Upgrading a workspace created by SOW v0.3 or v0.4? Stop writers, back up the workspace,
-and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Versions 0.5.0 through 0.7.1 use
+and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Versions 0.5.0 through 0.8.0 use
 schema v13 to index pool-path ownership without scanning unrelated publication history;
 configuration and public layout stay unchanged. Then run `sow build` and `sow check`:
 the updated RPM authentication and APT metadata contracts require one rebuild of affected
 Dists. Later unchanged RPMs reuse matching Built evidence instead of repeated payload
 verification. Do not reopen the migrated database with an older binary.
-Upgrading from v0.5.0 through v0.7.0 to v0.7.1 requires no schema migration or public-layout change.
+Upgrading from v0.5.0 through v0.7.1 to v0.8.0 requires no schema migration or public-layout change.
 If a Repository migrated by v0.5 or v0.6 reports an invalid transition control target
 after a later build, upgrade to v0.7.0 or newer; no manual repair is needed.
 A configuration using `passfile` cannot be loaded by v0.6.1 or older; remove those

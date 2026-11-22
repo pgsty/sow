@@ -211,30 +211,81 @@ func (s *Store) ApplyDesiredMutationWithSigningKeys(ctx context.Context, operati
 		for _, digest := range wantedByDist[distName] {
 			after[digest] = struct{}{}
 		}
+		type opMembershipRow struct {
+			sequence int
+			digest   string
+			action   string
+		}
+		var opRows []opMembershipRow
+		var removedDigests []string
 		for _, digest := range currentByDist[distName] {
 			if _, retained := after[digest]; retained {
 				continue
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO operation_memberships(operation_id, sequence, dist_name, package_sha256, action) VALUES (?, ?, ?, ?, 'remove')`, operationID, membershipSequence, distName, digest); err != nil {
-				return DesiredMutationResult{}, err
-			}
+			opRows = append(opRows, opMembershipRow{sequence: membershipSequence, digest: digest, action: "remove"})
+			removedDigests = append(removedDigests, digest)
 			membershipSequence++
 		}
+		var addedDigests []string
 		for _, digest := range wantedByDist[distName] {
 			if _, existed := before[digest]; existed {
 				continue
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO operation_memberships(operation_id, sequence, dist_name, package_sha256, action) VALUES (?, ?, ?, ?, 'add')`, operationID, membershipSequence, distName, digest); err != nil {
-				return DesiredMutationResult{}, err
-			}
+			opRows = append(opRows, opMembershipRow{sequence: membershipSequence, digest: digest, action: "add"})
+			addedDigests = append(addedDigests, digest)
 			membershipSequence++
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM memberships WHERE dist_name = ?`, distName); err != nil {
-			return DesiredMutationResult{}, fmt.Errorf("replace memberships for dist %q: %w", distName, err)
+		for start := 0; start < len(opRows); start += sqliteManifestInsertBatchSize {
+			end := min(start+sqliteManifestInsertBatchSize, len(opRows))
+			var query strings.Builder
+			query.WriteString(`INSERT INTO operation_memberships(operation_id, sequence, dist_name, package_sha256, action) VALUES `)
+			args := make([]any, 0, (end-start)*5)
+			for index, row := range opRows[start:end] {
+				if index != 0 {
+					query.WriteByte(',')
+				}
+				query.WriteString(`(?, ?, ?, ?, ?)`)
+				args = append(args, operationID, row.sequence, distName, row.digest, row.action)
+			}
+			if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
+				return DesiredMutationResult{}, err
+			}
 		}
-		for _, digest := range wantedByDist[distName] {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO memberships(dist_name, package_sha256, created_revision) VALUES (?, ?, ?)`, distName, digest, nextRevision); err != nil {
-				return DesiredMutationResult{}, fmt.Errorf("add membership %q/%s: %w", distName, digest, err)
+		for start := 0; start < len(removedDigests); start += 256 {
+			end := min(start+256, len(removedDigests))
+			var query strings.Builder
+			query.WriteString(`DELETE FROM memberships WHERE dist_name = ? AND package_sha256 IN (`)
+			args := make([]any, 0, (end-start)+1)
+			args = append(args, distName)
+			for index, digest := range removedDigests[start:end] {
+				if index != 0 {
+					query.WriteByte(',')
+				}
+				query.WriteByte('?')
+				args = append(args, digest)
+			}
+			query.WriteByte(')')
+			if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
+				return DesiredMutationResult{}, fmt.Errorf("replace memberships for dist %q: %w", distName, err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE memberships SET created_revision = ? WHERE dist_name = ?`, nextRevision, distName); err != nil {
+			return DesiredMutationResult{}, fmt.Errorf("advance surviving memberships for dist %q: %w", distName, err)
+		}
+		for start := 0; start < len(addedDigests); start += 256 {
+			end := min(start+256, len(addedDigests))
+			var query strings.Builder
+			query.WriteString(`INSERT INTO memberships(dist_name, package_sha256, created_revision) VALUES `)
+			args := make([]any, 0, (end-start)*3)
+			for index, digest := range addedDigests[start:end] {
+				if index != 0 {
+					query.WriteByte(',')
+				}
+				query.WriteString(`(?, ?, ?)`)
+				args = append(args, distName, digest, nextRevision)
+			}
+			if _, err := tx.ExecContext(ctx, query.String(), args...); err != nil {
+				return DesiredMutationResult{}, fmt.Errorf("add membership %q/%s: %w", distName, addedDigests[start], err)
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE dists SET desired_revision = ? WHERE name = ?`, nextRevision, distName); err != nil {

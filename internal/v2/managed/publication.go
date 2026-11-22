@@ -14,6 +14,7 @@ import (
 
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
+	"github.com/pgsty/sow/internal/workmetrics"
 )
 
 type PublishOptions struct {
@@ -58,6 +59,8 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 	if ctx == nil || opts.Target == "" {
 		return result, fmt.Errorf("%w: publish requires a context and target", ErrRejected)
 	}
+	var maintenanceErr error
+	defer func() { resultErr = errors.Join(maintenanceErr, resultErr) }()
 	ws, _, rootGuard, err := workspace(opts.WorkspaceOptions)
 	if err != nil {
 		return result, err
@@ -83,7 +86,13 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 	}
 	observedAt := publicationObservedTime(opts.now)
 	if err := store.ObserveRepositoryTime(ctx, observedAt); err != nil {
-		return result, fmt.Errorf("%w: publish clock preflight: %v", ErrIntegrity, err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return result, err
+		}
+		if !stateTransactionCommitted(err) {
+			return result, fmt.Errorf("%w: publish clock preflight: %w", ErrIntegrity, err)
+		}
+		maintenanceErr = errors.Join(maintenanceErr, err)
 	}
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
 		return result, err
@@ -189,11 +198,14 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 		return result, fmt.Errorf("%w: build target publication plan: %v", ErrIntegrity, err)
 	}
 	ignoredStages := publicationStagePaths(plan, active.AttemptIdentity, activeErr == nil)
-	remoteBefore, err := backend.List(ctx, ignoredStages)
+	orphans, err := store.ListPublicationAbandonedObjects(ctx, binding.TargetIdentity)
 	if err != nil {
 		return result, err
 	}
-	orphans, err := store.ListPublicationAbandonedObjects(ctx, binding.TargetIdentity)
+	if r2Backend, ok := backend.(*r2PublicationBackend); ok {
+		r2Backend.setKnownInventory(baseInventory, abandonedObjectsToInventory(orphans))
+	}
+	remoteBefore, err := backend.List(ctx, ignoredStages)
 	if err != nil {
 		return result, err
 	}
@@ -348,7 +360,13 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 	}
 	appliedAt := publicationObservedTime(opts.now)
 	if err := store.ObserveRepositoryTime(ctx, appliedAt); err != nil {
-		return result, fmt.Errorf("%w: publish checkpoint clock: %v", ErrIntegrity, err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return result, err
+		}
+		if !stateTransactionCommitted(err) {
+			return result, fmt.Errorf("%w: publish checkpoint clock: %w", ErrIntegrity, err)
+		}
+		maintenanceErr = errors.Join(maintenanceErr, err)
 	}
 	checkpoint := state.AppliedCheckpoint{
 		RepositoryID: identity.RepositoryID, TargetIdentity: binding.TargetIdentity,
@@ -470,11 +488,14 @@ func AbandonPublication(ctx context.Context, opts PublicationAbandonOptions) (re
 			}
 		}
 	}
-	remote, err := backend.List(ctx, nil)
+	orphans, err := store.ListPublicationAbandonedObjects(ctx, binding.TargetIdentity)
 	if err != nil {
 		return result, err
 	}
-	orphans, err := store.ListPublicationAbandonedObjects(ctx, binding.TargetIdentity)
+	if r2Backend, ok := backend.(*r2PublicationBackend); ok {
+		r2Backend.setKnownInventory(baseInventory, abandonedObjectsToInventory(orphans))
+	}
+	remote, err := backend.List(ctx, nil)
 	if err != nil {
 		return result, err
 	}
@@ -685,12 +706,35 @@ func publicationSourceGeneration(ctx context.Context, root, repoName string, sto
 	if err != nil {
 		return 0, nil, "", err
 	}
-	physical, err := scanPublicManifest(ctx, filepath.Join(root, repoName))
-	if err != nil || !sameGenerationManifest(manifest, physical) {
-		return 0, nil, "", errors.Join(fmt.Errorf("%w: publication source is not the exact target Generation", ErrIntegrity), err)
+	if generation == summary.BuiltGeneration {
+		snapshot, fingerprints, fastErr := scanCurrentPublicGenerationFast(workmetrics.WithPhase(ctx, "current_public_generation"), filepath.Join(root, repoName), manifest, store)
+		if fastErr != nil || !sameGenerationManifest(manifest, snapshot.Manifest) {
+			return 0, nil, "", errors.Join(fmt.Errorf("%w: publication source is not the exact target Generation", ErrIntegrity), fastErr)
+		}
+		if !store.ReadOnly() && len(fingerprints) != 0 {
+			if err := store.UpdatePackageFingerprints(ctx, fingerprints); err != nil {
+				return 0, nil, "", err
+			}
+		}
+	} else {
+		physical, scanErr := scanPublicManifest(ctx, filepath.Join(root, repoName))
+		if scanErr != nil || !sameGenerationManifest(manifest, physical) {
+			return 0, nil, "", errors.Join(fmt.Errorf("%w: publication source is not the exact target Generation", ErrIntegrity), scanErr)
+		}
 	}
 	_, digest, err := state.ManifestBytes(manifest)
 	return generation, manifest, digest, err
+}
+
+func abandonedObjectsToInventory(objects []state.PublicationAbandonedObject) []state.PublicationInventoryObject {
+	if len(objects) == 0 {
+		return nil
+	}
+	result := make([]state.PublicationInventoryObject, len(objects))
+	for index, object := range objects {
+		result[index] = state.PublicationInventoryObject(object)
+	}
+	return result
 }
 
 func rejectPublicationSourceTargetOverlap(source, private, target string) error {
@@ -1019,6 +1063,9 @@ func verifyAppliedCheckpointInventory(ctx context.Context, backend publicationBa
 	if err != nil {
 		return err
 	}
+	if r2Backend, ok := backend.(*r2PublicationBackend); ok {
+		r2Backend.setKnownInventory(expected)
+	}
 	remote, err := backend.List(ctx, nil)
 	if err != nil {
 		return err
@@ -1074,9 +1121,17 @@ func putPublicationGrace(ctx context.Context, store *state.Store, binding state.
 	cacheHash.Write([]byte(binding.PublicEndpoint))
 	cacheHash.Write([]byte{0})
 	cacheHash.Write([]byte(binding.MaxCacheTTL.String()))
+	notBefore := checkpoint.AppliedAt.UTC().Add(minimum)
+	maxExisting, err := store.MaxGraceNotBefore(ctx, binding.TargetIdentity)
+	if err != nil {
+		return err
+	}
+	if maxExisting.After(notBefore) {
+		notBefore = maxExisting
+	}
 	grace := state.GraceRecord{
 		TargetIdentity: binding.TargetIdentity, CheckpointIdentity: checkpoint.CheckpointIdentity,
-		VerifiedAt: checkpoint.AppliedAt.UTC(), NotBefore: checkpoint.AppliedAt.UTC().Add(minimum),
+		VerifiedAt: checkpoint.AppliedAt.UTC(), NotBefore: notBefore,
 		CachePolicyIdentity: hex.EncodeToString(cacheHash.Sum(nil)), State: "grace",
 	}
 	return store.PutGraceRecord(ctx, &grace)
