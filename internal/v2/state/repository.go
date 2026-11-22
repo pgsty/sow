@@ -291,7 +291,7 @@ func (s *Store) CompleteLayoutTransition(ctx context.Context, operationID string
 		return 0, err
 	}
 	signerRows, err := tx.QueryContext(ctx, `
-SELECT d.name, a.family, COALESCE(s.fingerprint, ''), COALESCE(s.public_key, X'')
+SELECT d.name, a.family, COALESCE(s.fingerprint, ''), s.public_key
 FROM dists AS d
 JOIN dist_architectures AS a ON a.dist_name = d.name
 LEFT JOIN dist_metadata_signers AS s ON s.dist_name = d.name

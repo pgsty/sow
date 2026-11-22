@@ -191,7 +191,7 @@ func validateGenerationViewSignerCoverage(ctx context.Context, queryer generatio
 		expected = append(expected, viewID)
 	}
 	sort.Strings(expected)
-	rows, err := queryer.QueryContext(ctx, `SELECT view_id, signer_identity, COALESCE(trusted_public_key, X'') FROM generation_view_signers WHERE generation = ? ORDER BY view_id`, generation)
+	rows, err := queryer.QueryContext(ctx, `SELECT view_id, signer_identity, trusted_public_key FROM generation_view_signers WHERE generation = ? ORDER BY view_id`, generation)
 	if err != nil {
 		return err
 	}
@@ -282,7 +282,7 @@ func insertGenerationDistViewSignersTx(ctx context.Context, tx *sql.Tx, generati
 // topology or signedness.
 func insertCurrentGenerationViewSignersTx(ctx context.Context, tx *sql.Tx, generation GenerationID) error {
 	rows, err := tx.QueryContext(ctx, `
-SELECT d.name, a.family, COALESCE(s.fingerprint, ''), COALESCE(s.public_key, X'')
+SELECT d.name, a.family, COALESCE(s.fingerprint, ''), s.public_key
 FROM dists AS d
 JOIN dist_architectures AS a ON a.dist_name = d.name
 LEFT JOIN dist_metadata_signers AS s ON s.dist_name = d.name
@@ -456,7 +456,7 @@ func repairGenerationViewSignersTx(ctx context.Context, tx *sql.Tx) error {
 				state.signers[viewID] = generationSignerEvidence{identity: "none"}
 			}
 		}
-		signerRows, err := tx.QueryContext(ctx, `SELECT view_id, signer_identity, COALESCE(trusted_public_key, X'') FROM generation_view_signers WHERE generation = ? ORDER BY view_id`, state.generation)
+		signerRows, err := tx.QueryContext(ctx, `SELECT view_id, signer_identity, trusted_public_key FROM generation_view_signers WHERE generation = ? ORDER BY view_id`, state.generation)
 		if err != nil {
 			return err
 		}
@@ -504,7 +504,7 @@ func repairGenerationViewSignersTx(ctx context.Context, tx *sql.Tx) error {
 		return fmt.Errorf("%w: signer repair head %s differs from current Generation %s", ErrConflict, head.generation, current)
 	}
 	anchorRows, err := tx.QueryContext(ctx, `
-SELECT d.name, a.family, COALESCE(s.fingerprint, ''), COALESCE(s.public_key, X'')
+SELECT d.name, a.family, COALESCE(s.fingerprint, ''), s.public_key
 FROM dists AS d
 JOIN dist_architectures AS a ON a.dist_name = d.name
 LEFT JOIN dist_metadata_signers AS s ON s.dist_name = d.name
@@ -613,7 +613,7 @@ func (s *Store) GenerationViewSigner(ctx context.Context, generation GenerationI
 	}
 	var record GenerationViewSigner
 	var trusted []byte
-	err := s.db.QueryRowContext(ctx, `SELECT generation, view_id, signer_identity, COALESCE(trusted_public_key, X'') FROM generation_view_signers WHERE generation = ? AND view_id = ?`, generation, viewID).Scan(
+	err := s.db.QueryRowContext(ctx, `SELECT generation, view_id, signer_identity, trusted_public_key FROM generation_view_signers WHERE generation = ? AND view_id = ?`, generation, viewID).Scan(
 		&record.Generation, &record.ViewID, &record.SignerIdentity, &trusted,
 	)
 	if errors.Is(err, sql.ErrNoRows) {

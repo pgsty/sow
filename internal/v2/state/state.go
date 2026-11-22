@@ -1780,7 +1780,7 @@ func (s *Store) ListDists(ctx context.Context) ([]Dist, error) {
 	defer tx.Rollback()
 	rows, err := tx.QueryContext(ctx, `
 SELECT d.name, d.format, d.effective_config_sha256, d.built_generation,
-       COALESCE(s.fingerprint, ''), COALESCE(s.public_key, X''), d.effective_signing_json
+       COALESCE(s.fingerprint, ''), s.public_key, d.effective_signing_json
 FROM dists AS d
 LEFT JOIN dist_metadata_signers AS s ON s.dist_name = d.name
 ORDER BY d.name`)
@@ -1824,7 +1824,7 @@ func (s *Store) GetDist(ctx context.Context, name string) (Dist, error) {
 	var out Dist
 	err = tx.QueryRowContext(ctx, `
 SELECT d.name, d.format, d.effective_config_sha256, d.built_generation,
-       COALESCE(s.fingerprint, ''), COALESCE(s.public_key, X''), d.effective_signing_json
+       COALESCE(s.fingerprint, ''), s.public_key, d.effective_signing_json
 FROM dists AS d
 LEFT JOIN dist_metadata_signers AS s ON s.dist_name = d.name
 WHERE d.name = ?`, name).Scan(

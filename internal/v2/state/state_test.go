@@ -1294,6 +1294,10 @@ func TestDistLifecycleAndArchitectureReferences(t *testing.T) {
 	if !reflect.DeepEqual(got, dist) {
 		t.Fatalf("GetDist()=%#v want=%#v", got, dist)
 	}
+	listed, err := store.ListDists(ctx)
+	if err != nil || !reflect.DeepEqual(listed, []Dist{dist}) {
+		t.Fatalf("ListDists()=%#v err=%v want=%#v", listed, err, []Dist{dist})
+	}
 	refs, err := store.ReferencedArchitectures(ctx)
 	if err != nil {
 		t.Fatal(err)
