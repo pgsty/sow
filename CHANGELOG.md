@@ -2,16 +2,17 @@
 
 All notable changes to SOW are recorded here.
 
-## 0.8.0 - 2026-11-22
+## 0.8.0 - 2026-11-23
 
 - Add opt-in `sow gc TARGET --delete` for R2 publication targets. Default
   `sow gc TARGET` on R2 remains report-only; `--delete` (either directly or
   after a prior report-only review) re-verifies live protection roots, verifies
-  each candidate's remote size and ETag before issuing `DeleteObject`, verifies
-  storage and public HTTP 404 absence, and records durable deletion receipts
-  scoped to the object's causal publication epoch so re-publishing identical
-  package bytes keeps subsequent publications idempotent. An unfinished
-  conditional-delete report requires `--delete` to resume.
+  each candidate's remote size, SHA-256 metadata, and ETag before issuing
+  `DeleteObject`, verifies storage and public HTTP 404/410 absence, and records
+  durable deletion receipts scoped to the object's causal publication epoch so
+  re-publishing identical package bytes keeps subsequent publications
+  idempotent. An unfinished conditional-delete report requires `--delete` to
+  resume.
 - Allow external secret and keyring symlinks outside the workspace root (such as
   Kubernetes `Secret` mounts and `/var/run/secrets` paths) for `--passfile`,
   `SOW_GPG_PASSFILE`, `passfile`, `key: file://`, and `trusted_keys`, while

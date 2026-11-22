@@ -96,9 +96,10 @@ It is a retention list, not a publication journal. Missing or corrupt history re
 window: a changed pointer retains its readable predecessor; an unchanged pointer can
 only retain its current indexes. Malformed old `repomd.xml` and corrupt historical indexes
 do not prevent rebuilding, but their old reader closure cannot be restored. Symlinks at
-SOW-owned metadata paths are rejected. Rebuilding with only DEB inputs, or an empty
-`--pigsty` result, removes SOW RPM metadata and the retention list. Package removal
-rules, including `--pigsty`, are unchanged.
+SOW-owned metadata paths are rejected, and `create` refuses to run inside a managed `.sow`
+workspace or over an interrupted `.sow-prune-repo-complete` marker without `--pigsty`.
+Rebuilding with only DEB inputs, or an empty `--pigsty` result, removes SOW RPM metadata
+and the retention list. Package removal rules, including `--pigsty`, are unchanged.
 
 To remove old versions from a flat RPM repository, use `sow prune`:
 
@@ -176,6 +177,11 @@ the updated RPM authentication and APT metadata contracts require one rebuild of
 Dists. Later unchanged RPMs reuse matching Built evidence instead of repeated payload
 verification. Do not reopen the migrated database with an older binary.
 Upgrading from v0.5.0 through v0.7.1 to v0.8.0 requires no schema migration or public-layout change.
+If local GC was interrupted under v0.7.1 or earlier, complete it with the previous binary
+(`sow gc -r REPOSITORY -C WORKSPACE`) before switching to v0.8.0: an old plan with an empty
+`manifest` array requires the previous binary to finish recovery. Binary `.deb` packages
+using `control.tar.lzma` are no longer supported in v0.8.0; repack them with `.tar`, `.gz`,
+`.bz2`, `.xz`, or `.zst` before importing.
 If a Repository migrated by v0.5 or v0.6 reports an invalid transition control target
 after a later build, upgrade to v0.7.0 or newer; no manual repair is needed.
 A configuration using `passfile` cannot be loaded by v0.6.1 or older; remove those
@@ -196,7 +202,7 @@ a usable GPG installation and key.
 make build          # write the binary to bin/sow
 make test-core      # focused repository-manager tests
 make test           # all Go packages plus the patched RPM module
-make check          # format, module, vet, staticcheck, deadcode, focused tests
+make check          # format, module, notices, vet, staticcheck, deadcode, vuln, focused tests
 make release-local  # GoReleaser snapshot archives and packages under dist/
 ```
 

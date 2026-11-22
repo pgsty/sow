@@ -44,7 +44,7 @@ targets: {}
 #     endpoint: file:///srv/www
 #     prefix: repos/pgsql
 #     public_endpoint: https://mirror.example.com/repos/pgsql/
-#     max_cache_ttl: 5m
+#     max_cache_ttl: 5m0s
 #     authoritative_workspace: true
 #     single_writer: true
 #     exclusive_write_authority: true
@@ -57,7 +57,7 @@ targets: {}
 #     prefix: repos/pgsql
 #     credential: env://SOW_R2_CREDENTIAL
 #     public_endpoint: https://dl.example.com/repos/pgsql/
-#     max_cache_ttl: 5m
+#     max_cache_ttl: 5m0s
 #     authoritative_workspace: true
 #     single_writer: true
 #     exclusive_write_authority: true
