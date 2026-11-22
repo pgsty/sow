@@ -683,7 +683,7 @@ func TestR2ReviewThenDeleteAndRepublishIdenticalPackage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Truncate(time.Second).Add(time.Second)
 	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
 		t.Fatal(err)
 	}
@@ -843,7 +843,7 @@ func TestR2DelayedDeleteAfterReaddAndGraceProtection(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		now := time.Now().UTC().Truncate(time.Second)
+		now := time.Now().UTC().Truncate(time.Second).Add(time.Second)
 		clock := func() time.Time { return now }
 		publish := func() PublishResult {
 			t.Helper()
@@ -1025,7 +1025,7 @@ func TestR2InterruptedConditionalDeleteResumesBeforeEarlierMaintenanceAndAllowsL
 		t.Fatal(err)
 	}
 
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Truncate(time.Second).Add(time.Second)
 	clock := func() time.Time { return now }
 
 	// Add pkg2 (epel-release) while pkg1 is retained in pool -> publish C1
@@ -1236,7 +1236,7 @@ func TestSiloManagedR2DeleteRepublishAndNoop(t *testing.T) {
 	}}
 	writeManagedConfig(t, fixture.root, cfg)
 
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Truncate(time.Second).Add(time.Second)
 	if _, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "prod", backend: backend, now: func() time.Time { return now }}); err != nil {
 		t.Fatal(err)
 	}

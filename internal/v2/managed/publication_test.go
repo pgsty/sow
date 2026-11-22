@@ -959,7 +959,7 @@ func TestTargetGCLegacyInvertedGraceDeadlinesConverge(t *testing.T) {
 	if _, err := Add(ctx, AddOptions{WorkspaceOptions: ws, Repository: "repo", Dists: []string{"el9"}, Paths: []string{firstRPM}, Jobs: 1}); err != nil {
 		t.Fatal(err)
 	}
-	baseNow := time.Now().UTC().Truncate(time.Second)
+	baseNow := time.Now().UTC().Truncate(time.Second).Add(time.Second)
 	clockNow := baseNow
 	clock := func() time.Time { return clockNow }
 

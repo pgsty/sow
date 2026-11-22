@@ -3220,7 +3220,7 @@ func TestPublicationGraceNotBeforeMonotonicAcrossRebindTTLReduction(t *testing.T
 		MaxCacheTTL: "1440h0m0s", AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
 	}}
 	writeManagedConfig(t, fixture.root, cfg)
-	t0 := time.Now().UTC().Truncate(time.Second)
+	t0 := time.Now().UTC().Truncate(time.Second).Add(time.Second)
 	first, err := Publish(ctx, PublishOptions{WorkspaceOptions: fixture.options, Target: "local", now: func() time.Time { return t0 }})
 	if err != nil {
 		t.Fatal(err)
