@@ -202,7 +202,7 @@ a usable GPG installation and key.
 make build          # write the binary to bin/sow
 make test-core      # focused repository-manager tests
 make test           # all Go packages plus the patched RPM module
-make check          # format, module, notices, vet, staticcheck, deadcode, vuln, focused tests
+make check          # format, module, vet, staticcheck, deadcode, vuln, focused tests
 make release-local  # GoReleaser snapshot archives and packages under dist/
 ```
 

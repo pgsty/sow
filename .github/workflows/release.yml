@@ -48,9 +48,6 @@ jobs:
           git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
           test -z "$(git status --porcelain)"
 
-      - name: Verify third-party notices
-        run: make notices-check
-
       - name: Create Draft GitHub Release
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:

@@ -7,9 +7,12 @@ _bmad-output/
 .agents/
 .claude/
 .codex/
+AGENTS.md
+CLAUDE.md
 
 # Editors and operating systems
 .idea/
+.vscode/
 *.iml
 .DS_Store
 
@@ -20,7 +23,13 @@ coverage.out
 bin/
 dist/
 /outputs/
+/*.tar.gz
+/*.rpm
+/*.deb
 
-# Runtime state
+# Local configuration and runtime state
+/sow.yml
+/.env
+/.env.*
 .sow/
 .pool/

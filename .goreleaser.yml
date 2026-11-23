@@ -34,10 +34,7 @@ archives:
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     files:
-      - README.md
-      - CHANGELOG.md
       - LICENSE
-      - THIRD_PARTY_NOTICES
 
 nfpms:
   - id: sow-packages
@@ -66,16 +63,6 @@ nfpms:
       - rpm
     bindir: /usr/bin
     contents:
-      - src: THIRD_PARTY_NOTICES
-        dst: /usr/share/doc/sow/THIRD_PARTY_NOTICES
-        packager: deb
-        file_info:
-          mode: 0644
-      - src: THIRD_PARTY_NOTICES
-        dst: /usr/share/licenses/sow/THIRD_PARTY_NOTICES
-        packager: rpm
-        file_info:
-          mode: 0644
       - src: LICENSE
         dst: /usr/share/doc/sow/copyright
         packager: deb

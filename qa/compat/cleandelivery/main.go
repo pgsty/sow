@@ -44,7 +44,7 @@ var (
 		".agents", ".bmad-loop", ".claude", ".codex", ".git", ".idea", ".pool", ".sow", ".tmp", ".vscode",
 		"_bmad", "_bmad-output", "bin", "dist", "outputs", "tmp",
 	}
-	ignoredRootFileNames    = map[string]struct{}{".DS_Store": {}, "AGENTS.md": {}, "coverage.out": {}, "sow": {}}
+	ignoredRootFileNames    = map[string]struct{}{".DS_Store": {}, "AGENTS.md": {}, "CLAUDE.md": {}, "coverage.out": {}, "sow": {}}
 	ignoredRootFileSuffixes = []string{".iml", ".test"}
 	markdownInlineLink      = regexp.MustCompile(`!?\[[^\]]*\]\(([^)]+)\)`)
 	markdownReference       = regexp.MustCompile(`(?m)^\s*\[[^\]]+\]:\s*(\S+)`)

@@ -1,8 +1,8 @@
 # SOW compatibility patch
 
 This directory is a source snapshot of
-`github.com/cavaliergopher/rpm@v1.3.0`, retained under its original MIT
-license.
+`github.com/cavaliergopher/rpm@v1.3.0`, retained under its original
+[BSD-3-Clause license](LICENSE).
 
 The local module uses SOW's Go 1.27.4 build baseline.
 
