@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"reflect"
 )
 
 const (
@@ -20,7 +21,6 @@ type headerLimits struct {
 	maxHeaderIndexCount uint64
 	maxDecodedBytes     uint64
 	maxDecodedElements  uint64
-	rejectDuplicateTags bool
 }
 
 var defaultHeaderLimits = headerLimits{
@@ -28,7 +28,6 @@ var defaultHeaderLimits = headerLimits{
 	maxHeaderIndexCount: r_MaxHeaderIndexCount,
 	maxDecodedBytes:     r_MaxDecodedHeaderBytes,
 	maxDecodedElements:  r_MaxDecodedHeaderElements,
-	rejectDuplicateTags: true,
 }
 
 // A Header stores metadata about an rpm package.
@@ -82,11 +81,11 @@ func (b *headerDecodeBudget) reserve(index int, materializedBytes, elements uint
 // readHeader reads an RPM package file header structure from r. The raw header,
 // index count, per-value range, and aggregate decoded allocations are all
 // bounded before any tag value is materialized.
-func readHeader(r io.Reader, pad bool) (*Header, error) {
-	return readHeaderWithLimits(r, pad, defaultHeaderLimits)
+func readHeader(r io.Reader, signature bool) (*Header, error) {
+	return readHeaderWithLimits(r, signature, defaultHeaderLimits)
 }
 
-func readHeaderWithLimits(r io.Reader, pad bool, limits headerLimits) (*Header, error) {
+func readHeaderWithLimits(r io.Reader, signature bool, limits headerLimits) (*Header, error) {
 	var hdrBytes rpmHeader
 	if _, err := io.ReadFull(r, hdrBytes[:]); err != nil {
 		return nil, err
@@ -126,9 +125,6 @@ func readHeaderWithLimits(r io.Reader, pad bool, limits headerLimits) (*Header, 
 
 	tags := make(map[int]*Tag, len(indexBytes))
 	for _, ix := range indexBytes {
-		if _, duplicate := tags[ix.Tag()]; duplicate && limits.rejectDuplicateTags {
-			return nil, errorf("duplicate header tag: %d", ix.Tag())
-		}
 		o := int(ix.Offset())
 		count := int(ix.ValueCount())
 		var value interface{}
@@ -170,11 +166,19 @@ func readHeaderWithLimits(r io.Reader, pad bool, limits headerLimits) (*Header, 
 		case TagTypeNull:
 			// No materialized value.
 		}
-		tags[ix.Tag()] = &Tag{ID: ix.Tag(), Type: ix.Type(), Value: value}
+		tag := &Tag{ID: ix.Tag(), Type: ix.Type(), Value: value}
+		if previous := tags[tag.ID]; previous != nil {
+			// EL10 RPMs can store the same SOURCERPM string at two offsets.
+			if signature || value == nil || !reflect.DeepEqual(previous, tag) {
+				return nil, errorf("duplicate header tag: %d", tag.ID)
+			}
+			continue
+		}
+		tags[tag.ID] = tag
 	}
 
 	var padding int64
-	if pad {
+	if signature {
 		padding = int64(8-(headerSize%8)) % 8
 		if padding != 0 {
 			if _, err := io.CopyN(io.Discard, r, padding); err != nil {

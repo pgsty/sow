@@ -68,6 +68,9 @@ func TestReadSignatureHeaderRejectsDuplicateTags(t *testing.T) {
 	if _, err := ReadSignatureHeader(bytes.NewReader(data)); err == nil || !strings.Contains(err.Error(), "duplicate header tag") {
 		t.Fatalf("duplicate signature tag error=%v", err)
 	}
+	if _, err := Read(bytes.NewReader(data)); err == nil || !strings.Contains(err.Error(), "duplicate header tag") {
+		t.Fatalf("full package reader duplicate signature tag error=%v", err)
+	}
 }
 
 func TestMD5Check(t *testing.T) {

@@ -33,8 +33,9 @@ tag semantics:
 - index count, per-tag ranges, aggregate decoded bytes and aggregate element
   counts are checked in a complete preflight before tag allocation;
 - strings must be NUL terminated even at non-zero offsets;
-- duplicate tag IDs are rejected in both signature and main headers instead of
-  silently using last-value-wins map projection;
+- main headers may repeat a tag with the same type and value, as EL10 packages
+  do with `SOURCERPM`. Conflicting entries, repeated valueless tags and all
+  duplicate signature-header tags are rejected.
 - legacy parallel-tag helpers (`dependencies`, `Files`) guard slice and
   directory-index bounds instead of panicking on misaligned tags;
 - negative installed/archive sizes never wrap into `uint64`.

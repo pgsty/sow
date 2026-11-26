@@ -2,6 +2,11 @@
 
 All notable changes to SOW are recorded here.
 
+## Unreleased
+
+- Fix RPM indexing for packages that repeat an identical main-header value,
+  including the duplicate `SOURCERPM` found in EL10 packages.
+
 ## 0.8.0 - 2026-11-23
 
 - Add opt-in `sow gc TARGET --delete` for R2 publication targets. Default

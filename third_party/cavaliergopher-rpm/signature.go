@@ -55,7 +55,6 @@ var signatureHeaderLimits = headerLimits{
 	maxHeaderIndexCount: r_MaxSignatureHeaderIndexCount,
 	maxDecodedBytes:     r_MaxSignatureDecodedHeaderBytes,
 	maxDecodedElements:  r_MaxSignatureDecodedHeaderElements,
-	rejectDuplicateTags: true,
 }
 
 // GPGSignature is the raw byte representation of a package's embedded

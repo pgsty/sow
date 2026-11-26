@@ -49,6 +49,26 @@ func TestCreateAcceptsBinaryRPMWithSourceLookingBasename(t *testing.T) {
 	}
 }
 
+func TestCreatePigstyIndexesRepeatedSourceRPM(t *testing.T) {
+	dir := t.TempDir()
+	const source = "pkg-1-1.src.rpm"
+	writeRPMFixture(t, filepath.Join(dir, "pkg-1-1.aarch64.rpm"), rpmFixture{
+		Name: "pkg", Version: "1", Release: "1", Arch: "aarch64",
+		ExtraTags: []rpmTag{rpmStringTag(1044, source)},
+	})
+	result, err := Create(context.Background(), Options{Dir: dir, Pigsty: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RPM != 1 || !result.Marker {
+		t.Fatalf("created repository with rpm=%d marker=%t", result.RPM, result.Marker)
+	}
+	primary := readPrimaryXML(t, filepath.Join(dir, "repodata"))
+	if got := bytes.Count(primary, []byte("<rpm:sourcerpm>"+source+"</rpm:sourcerpm>")); got != 1 {
+		t.Fatalf("primary metadata contains %d copies of SOURCERPM, want 1", got)
+	}
+}
+
 // Temporarily remove every package after the concurrent scan, then restore the
 // same inodes immediately before final stat validation. Rendering can succeed
 // only if neither RPM nor DEB payloads are reopened after the content pass.

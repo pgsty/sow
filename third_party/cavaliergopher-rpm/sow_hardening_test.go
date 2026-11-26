@@ -95,15 +95,39 @@ func TestNegativePackageSizesNeverWrapToUint64(t *testing.T) {
 	}
 }
 
-func TestReadHeaderRejectsDuplicateTagsAndMisalignedParallelSlicesDoNotPanic(t *testing.T) {
-	duplicate := encodeSyntheticHeader([]syntheticHeaderIndex{
-		{tag: 1000, kind: uint32(TagTypeString), offset: 0, count: 1},
-		{tag: 1000, kind: uint32(TagTypeString), offset: 2, count: 1},
-	}, []byte{'a', 0, 'b', 0})
-	if _, err := readHeader(bytes.NewReader(duplicate), false); err == nil || !strings.Contains(err.Error(), "duplicate header tag") {
-		t.Fatalf("duplicate main header tag was not rejected: %v", err)
+func TestReadHeaderRepeatedSourceRPM(t *testing.T) {
+	const source = "SFCGAL-2.3.0-5PGDG.rhel10.2.src.rpm"
+	store := []byte(source + "\x00" + source + "\x00")
+	first := syntheticHeaderIndex{tag: 1044, kind: uint32(TagTypeString), count: 1}
+	second := first
+	second.offset = uint32(len(source) + 1)
+	header := encodeSyntheticHeader([]syntheticHeaderIndex{first, second}, store)
+	hdr, err := readHeader(bytes.NewReader(header), false)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if got := hdr.GetTag(1044).String(); got != source {
+		t.Fatalf("SOURCERPM = %q, want %q", got, source)
+	}
+}
 
+func TestReadHeaderRejectsConflictingMainTags(t *testing.T) {
+	first := syntheticHeaderIndex{tag: 1000, kind: uint32(TagTypeString), count: 1}
+	for name, second := range map[string]syntheticHeaderIndex{
+		"value": {tag: 1000, kind: uint32(TagTypeString), offset: 2, count: 1},
+		"type":  {tag: 1000, kind: uint32(TagTypeStringArray), count: 1},
+		"count": {tag: 1000, kind: uint32(TagTypeString), count: 2},
+	} {
+		t.Run(name, func(t *testing.T) {
+			header := encodeSyntheticHeader([]syntheticHeaderIndex{first, second}, []byte{'a', 0, 'b', 0})
+			if _, err := readHeader(bytes.NewReader(header), false); err == nil || !strings.Contains(err.Error(), "duplicate header tag") {
+				t.Fatalf("conflicting main header tag error = %v", err)
+			}
+		})
+	}
+}
+
+func TestMisalignedParallelSlicesDoNotPanic(t *testing.T) {
 	pkg := &Package{
 		Header: Header{Tags: map[int]*Tag{
 			1049: {ID: 1049, Type: TagTypeStringArray, Value: []string{"dep-a", "dep-b"}},
