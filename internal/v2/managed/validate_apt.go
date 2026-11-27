@@ -110,8 +110,14 @@ func validateManagedAPTIndexWithEvidence(ctx context.Context, repositoryRoot, di
 				// by-hash projection. Post-P1 Dists always project by-hash.
 				continue
 			}
-			if err != nil || !same {
-				return fmt.Errorf("by-hash entry for %s is not its regular hardlink", relative)
+			if err != nil {
+				return fmt.Errorf("by-hash entry for %s is missing or unreadable: %v", relative, err)
+			}
+			if !same {
+				byHashDigest, byHashSize, hashErr := digestManagedIndex(ctx, repositoryRoot, byHashRelative, false, want.size)
+				if hashErr != nil || byHashDigest != want.digest || byHashSize != want.size {
+					return fmt.Errorf("by-hash entry for %s differs from Release", relative)
+				}
 			}
 		}
 		if err := validateManagedPackagesParagraphs(ctx, repositoryRoot, plainRelativeRoot, architecture.EcosystemArch, expectedPackages[architecture.EcosystemArch], evidence); err != nil {

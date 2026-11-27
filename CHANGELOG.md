@@ -2,10 +2,93 @@
 
 All notable changes to SOW are recorded here.
 
-## Unreleased
+## 0.9.0 - 2026-11-27
 
-- Fix RPM indexing for packages that repeat an identical main-header value,
-  including the duplicate `SOURCERPM` found in EL10 packages.
+- Make flat `sow create` and `sow prune` fault-tolerant by default and add
+  `--strict` to restore fail-fast rejection:
+  - Corrupt, unreadable, source (`src`/`nosrc`), and coordinate-conflicting
+    packages (including Debian version-equivalent conflicts such as `1.0-1` vs
+    `1.00-1`), as well as unmatched `--protect` names, are skipped with warnings
+    so remaining valid packages still index.
+  - Per-format failure isolation preserves a format's previous index, history,
+    and completion state when all its candidates fail, while still publishing
+    valid packages of the other format (including in fresh `--pigsty`
+    directories).
+  - In mixed RPM + DEB directories, `sow prune` updates the RPM index, preserves
+    the DEB index, and carries forward existing `repo_complete` digests for
+    still-present DEBs without prematurely hashing unindexed DEBs.
+  - Human output writes warnings to `stderr`; successful `--json` output carries
+    `warnings` and `skipped` in the `stdout` JSON envelope and leaves `stderr`
+    empty.
+  - Retain TOCTOU file-identity/size/mtime checks across scan, publication,
+    signing installation, and package deletion without repeating full
+    decompression read-backs.
+- Add full RPM format v6 support (lead major versions 3..6, `PAYLOADSHA256`
+  without `PAYLOADSHA256ALGO`, native `RPMSIGTAG_OPENPGP` tag `278` OpenPGP
+  v4/v6 signature arrays) across flat `create`/`prune`/`--sign-with` and managed
+  `add`/`build`/`check`, including dual- and multi-signed RPMs. When tag `278`
+  is present it is authoritative over legacy signature tags.
+- Fix RPM indexing for packages that repeat an identical main-header tag value
+  (such as duplicate `SOURCERPM` in EL10 packages), while continuing to reject
+  conflicting main tags and duplicate signature-header tags. Normalize legacy
+  Latin-1 bytes (`>=0x80`) in binary `.deb` `control` files to UTF-8, and accept
+  human-readable comments outside armor fences in `.asc` OpenPGP keyrings.
+- Accept both `sow.yml` and `sow.yaml` uniformly across workspace discovery,
+  `init`, recovery, and `config check` (while keeping support for a legacy
+  repository directory named `sow.yaml/` beside `sow.yml` and refusing explicit
+  `-C`/`--workdir` fallback to `CWD`/`SOW_DIR`). Resolve the physical SQLite
+  path before probing `-wal`/`-shm`/`-journal` sidecars and enforcing single
+  hardlink (`nlink == 1`) invariants, eliminating Darwin-specific C ABI code.
+- Harden managed workspace operations and ergonomics:
+  - Require offline recovery when a populated `.sow/` directory loses
+    `workspace.lock` instead of silently minting a competing lock inode, while
+    allowing `sow init` to repair missing per-repository lock files under
+    `workspace.lock`.
+  - Allow ECDSA and DSA metadata signing keys alongside RSA and EdDSA
+    (Ed25519/Ed448); `rm --check` is a read-only semantic preview that does not
+    touch `.sow/<repo>/stage`, while real writes still probe directory-exchange
+    capability before committing Desired.
+  - Support symlinks (including Kubernetes `Secret` mounts), optional UTF-8 BOM
+    stripping, and named pipes (FIFOs with a 2-second deadline) for `--passfile`,
+    `SOW_GPG_PASSFILE`, and `passfile`, surfacing bounded helper `stderr`
+    diagnostics on failure.
+  - Report `sow.yml` `limit`/`exclude` policy drift in `sow check` as `dirty`
+    instead of integrity failure, allow APT `by-hash` verification by content
+    digest when hardlinks are broken, tolerate `.DS_Store` under `.sow/`, ignore
+    unreadable non-package files during `sow add -R`, resume interrupted v0.7.1
+    local GC plans containing an empty `manifest` array, and consistently return
+    exit code `6` (`rejected`) when a legacy schema v12 workspace requires
+    `sow repo migrate`.
+- Simplify target configuration and harden publication and target GC:
+  - New target GC grace records use the configured `max_cache_ttl` directly
+    (removing the hardcoded 30-day floor and 24-hour padding). **Upgrade note:**
+    review any target configured with `max_cache_ttl: 0s` before upgrading —
+    superseded objects may become eligible at the next target GC, while existing
+    recorded `NotBefore` deadlines remain effective. Backward NTP clock steps
+    retain the time-witness high-water mark.
+  - Default `authoritative_workspace`, `single_writer`, and
+    `exclusive_write_authority` to `true` when omitted (explicit `false` remains
+    rejected), default R2 `region` to `auto`, normalize endpoint/duration
+    formatting, allow dotted R2 bucket names, and reject overlapping R2 targets
+    across region spellings (such as `auto` vs `us-east-1`) for the same
+    `(endpoint, bucket, prefix)`.
+  - Follow CDN redirects during public HTTP verification while rejecting
+    HTTPS-to-HTTP downgrades, verifying connected dial IPs against private
+    loopback/link-local ranges, and refusing cross-origin redirects through an
+    HTTP proxy. Ignore harmless foreign files at target root outside `pool/` and
+    `dists/`.
+- Improve CLI ergonomics and release packaging: duplicate flags use last-wins
+  semantics, boolean flags accept `=true`/`=false`, `--timeout 0s` is accepted,
+  `sow log export FILE` resolves symlinked parent directories (such as macOS
+  `/tmp`) and checks parent directory sync, and release archives and Linux
+  packages ship the `sow` binary and `LICENSE` directly.
+
+This release keeps schema v13 and the existing public repository layout.
+Workspaces already on v0.5.0 through v0.8.0 do not require a schema migration.
+Interrupted v0.7.1 local GC plans with an empty `manifest` array now resume
+directly under v0.9.0 without needing the v0.7.1 binary first. Review targets
+configured with `max_cache_ttl: 0s` before upgrading, as new target GC grace
+records now follow `max_cache_ttl` without a hardcoded 30-day floor.
 
 ## 0.8.0 - 2026-11-23
 

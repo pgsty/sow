@@ -358,8 +358,8 @@ func Publish(ctx context.Context, opts PublishOptions) (result PublishResult, re
 	if err := verifyPublishedFiles(ctx, backend, verificationFiles); err != nil {
 		return result, err
 	}
-	appliedAt := publicationObservedTime(opts.now)
-	if err := store.ObserveRepositoryTime(ctx, appliedAt); err != nil {
+	appliedAt, err := store.ObserveRepositoryTimeEffective(ctx, publicationObservedTime(opts.now))
+	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return result, err
 		}
@@ -1098,14 +1098,9 @@ func verifyPublishedFiles(ctx context.Context, backend publicationBackend, files
 }
 
 func publicationGraceMinimum(ttl time.Duration) (time.Duration, error) {
-	const padding = 24 * time.Hour
-	const maximum = time.Duration(1<<63-1) - padding
-	if ttl < 0 || ttl > maximum {
+	minimum, err := state.PublicationGraceMinimum(ttl)
+	if err != nil {
 		return 0, fmt.Errorf("%w: publication cache TTL is outside the supported range", ErrIntegrity)
-	}
-	minimum := 30 * 24 * time.Hour
-	if cacheMinimum := ttl + padding; cacheMinimum > minimum {
-		minimum = cacheMinimum
 	}
 	return minimum, nil
 }

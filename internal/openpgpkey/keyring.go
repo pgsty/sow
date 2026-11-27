@@ -29,10 +29,10 @@ func ReadSingle(data []byte) (openpgp.EntityList, error) {
 
 func read(data []byte, single bool) (openpgp.EntityList, error) {
 	blocks := [][]byte{data}
-	armored := bytes.HasPrefix(bytes.TrimSpace(data), []byte("-----BEGIN PGP"))
+	armored := hasKeyArmorBlock(data)
 	if armored {
 		var err error
-		blocks, err = SplitArmor(data, openpgp.PublicKeyType, openpgp.PrivateKeyType)
+		blocks, err = SplitKeyArmor(data, openpgp.PublicKeyType, openpgp.PrivateKeyType)
 		if err != nil || single && len(blocks) != 1 {
 			return nil, errInvalidKeyring
 		}
@@ -115,6 +115,61 @@ func (source *packetSource) Read(data []byte) (int, error) {
 		source.reachedEOF = true
 	}
 	return n, err
+}
+
+func hasKeyArmorBlock(data []byte) bool {
+	return bytes.Contains(data, []byte("-----BEGIN "+openpgp.PublicKeyType+"-----")) ||
+		bytes.Contains(data, []byte("-----BEGIN "+openpgp.PrivateKeyType+"-----"))
+}
+
+// SplitKeyArmor extracts complete OpenPGP key armor blocks while tolerating
+// human-readable comment/header text outside the armor fences (RFC 4880 §6.2),
+// such as "# Pigsty RPM Signing Key" headers common in vendor .asc files.
+func SplitKeyArmor(data []byte, types ...string) ([][]byte, error) {
+	remaining := data
+	var blocks [][]byte
+	for len(remaining) > 0 {
+		line, size := armorLine(remaining)
+		end := ""
+		for _, kind := range types {
+			if string(line) == "-----BEGIN "+kind+"-----" {
+				end = "-----END " + kind + "-----"
+				break
+			}
+		}
+		if end == "" {
+			if bytes.HasPrefix(line, []byte("-----BEGIN ")) || bytes.HasPrefix(line, []byte("-----END ")) {
+				return nil, errInvalidKeyring
+			}
+			remaining = remaining[size:]
+			continue
+		}
+		offset := size
+		found, checksum := false, false
+		for offset < len(remaining) {
+			nextLine, nextSize := armorLine(remaining[offset:])
+			offset += nextSize
+			if string(nextLine) == end {
+				blocks = append(blocks, remaining[:offset])
+				remaining = remaining[offset:]
+				found = true
+				break
+			}
+			if bytes.HasPrefix(nextLine, []byte("-----BEGIN ")) || bytes.HasPrefix(nextLine, []byte("-----END ")) || checksum && len(nextLine) != 0 {
+				return nil, errInvalidKeyring
+			}
+			if len(nextLine) == 5 && nextLine[0] == '=' {
+				checksum = true
+			}
+		}
+		if !found {
+			return nil, errInvalidKeyring
+		}
+	}
+	if len(blocks) == 0 {
+		return nil, errInvalidKeyring
+	}
+	return blocks, nil
 }
 
 // SplitArmor returns complete armor blocks of the permitted types, allowing

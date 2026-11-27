@@ -19,6 +19,47 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestWorkspaceConfigNamesAndMigrationExit(t *testing.T) {
+	root := t.TempDir()
+	assertCLISuccess(t, []string{"init", root, "--json"}, "\"ok\":true")
+	assertCLISuccess(t, []string{"repo", "new", "sow.yaml", "-C", root, "--json"}, "sow.yaml")
+	assertCLISuccess(t, []string{"init", root, "--json"}, "\"ok\":true")
+	assertCLISuccess(t, []string{"config", "check", "-C", filepath.Join(root, "sow.yaml"), "--json"}, "\"ok\":true")
+
+	db, err := state.OpenExisting(filepath.Join(root, ".sow", "sow.yaml.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.DB().Exec("PRAGMA user_version=12"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"build", "-r", "sow.yaml", "-C", root, "--json"},
+		{"init", root, "--json"},
+	} {
+		out, _, code := runCLI(args)
+		if code != ExitRejected || !strings.Contains(out, "sow repo migrate") {
+			t.Fatalf("old schema %v: code=%d output=%s", args, code, out)
+		}
+	}
+
+	dual := t.TempDir()
+	for _, name := range []string{"sow.yml", "sow.yaml"} {
+		if err := os.WriteFile(filepath.Join(dual, name), []byte("schema: sow/v3\nrepos: {}\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, args := range [][]string{{"init", dual, "--json"}, {"config", "check", "-C", dual, "--json"}} {
+		out, _, code := runCLI(args)
+		if code == 0 || !strings.Contains(out, "sow.yml") || !strings.Contains(out, "sow.yaml") {
+			t.Fatalf("ambiguous configs: %v code=%d output=%s", args, code, out)
+		}
+	}
+}
+
 func TestMainManagedLifecycleAndJSONEnvelope(t *testing.T) {
 	root := t.TempDir()
 	assertCLISuccess(t, []string{"init", root, "--json"}, `"command":"init"`)

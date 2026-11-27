@@ -27,8 +27,9 @@ proper.
 The snapshot also hardens the untrusted header boundary without changing valid
 tag semantics:
 
-- the lead and both RPM headers require canonical type/magic/version/reserved
-  bytes, including the header-signature lead type used by modern RPM;
+- the lead checks RPM magic, major versions 3 through 6, and binary/source
+  package type. The signature and main headers check their magic and version.
+  Historical lead fields and reserved bytes are ignored;
 - fixed header/index reads use `io.ReadFull`;
 - index count, per-tag ranges, aggregate decoded bytes and aggregate element
   counts are checked in a complete preflight before tag allocation;

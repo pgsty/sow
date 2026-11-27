@@ -59,7 +59,7 @@ func ListDists(ctx context.Context, opts DistListOptions) (result []DistInfo, re
 	}
 	store, err := openReadOnlyState(filepath.Join(ws.Root, ".sow", repoName+".db"))
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrIntegrity, err)
+		return nil, fmt.Errorf("%w: %w", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	if err := validateRepositoryLayoutForRead(ws.Root, repoName, store.SchemaVersion()); err != nil {
@@ -125,7 +125,7 @@ func ShowDist(ctx context.Context, opts DistShowOptions) (result DistInfo, resul
 	}
 	store, err := openReadOnlyState(filepath.Join(ws.Root, ".sow", repoName+".db"))
 	if err != nil {
-		return DistInfo{}, fmt.Errorf("%w: %v", ErrIntegrity, err)
+		return DistInfo{}, fmt.Errorf("%w: %w", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	if err := validateRepositoryLayoutForRead(ws.Root, repoName, store.SchemaVersion()); err != nil {
@@ -476,7 +476,7 @@ func NewDist(ctx context.Context, opts DistNewOptions) (result DistInfo, resultE
 	}
 	store, err := openExistingState(filepath.Join(ws.Root, ".sow", repoName+".db"))
 	if err != nil {
-		return DistInfo{}, fmt.Errorf("%w: %v", ErrIntegrity, err)
+		return DistInfo{}, fmt.Errorf("%w: %w", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
@@ -564,7 +564,7 @@ func removeDist(ctx context.Context, opts DistRemoveOptions, result *RemovalResu
 	}
 	store, err := openExistingState(filepath.Join(ws.Root, ".sow", repoName+".db"))
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrIntegrity, err)
+		return fmt.Errorf("%w: %w", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
@@ -623,7 +623,11 @@ func initializeDeclaredDists(ctx context.Context, root, repoName string, fault f
 	if err := recoverWorkspaceOperation(ctx, root, LockOptions{Timeout: remaining, NoWait: lockOptions.NoWait}); err != nil {
 		return 0, err
 	}
-	currentCfg, currentData, _, err := config.LoadDocument(filepath.Join(root, config.ConfigFilename))
+	configPath, err := config.ResolveConfigPath(root)
+	if err != nil {
+		return 0, err
+	}
+	currentCfg, currentData, _, err := config.LoadDocument(configPath)
 	if err != nil {
 		return 0, err
 	}
@@ -819,7 +823,10 @@ func executeDistAdd(ctx context.Context, root, repoName string, cfg config.Confi
 	if err := callFault(fault, kind+".staged"); err != nil {
 		return DistInfo{}, err
 	}
-	configPath := filepath.Join(root, config.ConfigFilename)
+	configPath, err := config.ResolveConfigPath(root)
+	if err != nil {
+		return DistInfo{}, err
+	}
 	currentSHA, err := config.FileSHA(configPath)
 	if err != nil || currentSHA != payload.OldConfigSHA256 {
 		return DistInfo{}, fmt.Errorf("%w: config changed while staging dist", ErrIntegrity)
@@ -935,13 +942,17 @@ func executeDistRemove(ctx context.Context, root, repoName, distName string, old
 	if err := callFault(fault, "dist.rm.staged"); err != nil {
 		return err
 	}
-	if current, err := config.FileSHA(filepath.Join(root, config.ConfigFilename)); err != nil || current != payload.OldConfigSHA256 {
+	configPath, err := config.ResolveConfigPath(root)
+	if err != nil {
+		return err
+	}
+	if current, err := config.FileSHA(configPath); err != nil || current != payload.OldConfigSHA256 {
 		return fmt.Errorf("%w: config changed while staging dist removal", ErrIntegrity)
 	}
 	if err := requireSameDevice(filepath.Join(root, repoName, "dists"), filepath.Join(root, ".sow", repoName, "recovery")); err != nil {
 		return err
 	}
-	if err := writeAtomic(filepath.Join(root, config.ConfigFilename), newData, 0o644); err != nil {
+	if err := writeAtomic(configPath, newData, 0o644); err != nil {
 		return err
 	}
 	result.Removed = true
@@ -1025,7 +1036,7 @@ func finalizePreApplyDistOperation(parent context.Context, root, repoName, id st
 	if err != nil || payload.Repository != repoName {
 		return errors.Join(returned, fmt.Errorf("%w: retain recoverable Dist operation with invalid payload", ErrIntegrity))
 	}
-	currentSHA, err := config.FileSHA(filepath.Join(root, config.ConfigFilename))
+	currentSHA, err := config.WorkspaceFileSHA(root)
 	if err != nil {
 		return errors.Join(returned, fmt.Errorf("managed: retain recoverable Dist operation: inspect current config: %w", err))
 	}
@@ -1123,7 +1134,7 @@ func recoverDistOperations(ctx context.Context, root, repoName string, store *st
 		if err := validateDistPayloadForRecovery(ctx, root, operation.ID, operation.Kind, operation.State, repoName, payload, store); err != nil {
 			return fmt.Errorf("%w: invalid pending dist payload: %v", ErrIntegrity, err)
 		}
-		currentSHA, err := config.FileSHA(filepath.Join(root, config.ConfigFilename))
+		currentSHA, err := config.WorkspaceFileSHA(root)
 		if err != nil {
 			return err
 		}

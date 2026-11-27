@@ -191,7 +191,7 @@ func openReadRepository(ctx context.Context, root, repoName string) (*state.Stor
 	store, err := openReadOnlyState(filepath.Join(root, ".sow", repoName+".db"))
 	if err != nil {
 		lock.Close()
-		return nil, nil, fmt.Errorf("%w: %v", ErrIntegrity, err)
+		return nil, nil, fmt.Errorf("%w: %w", ErrIntegrity, err)
 	}
 	if err := validateRepositoryLayoutForRead(root, repoName, store.SchemaVersion()); err != nil {
 		store.Close()

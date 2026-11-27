@@ -50,7 +50,7 @@ func Remove(ctx context.Context, opts RemoveOptions) (result RemoveResult, resul
 	}
 	store, err := openExistingState(filepath.Join(ws.Root, ".sow", repoName+".db"))
 	if err != nil {
-		return result, fmt.Errorf("%w: %v", ErrIntegrity, err)
+		return result, fmt.Errorf("%w: %w", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	defer func() {

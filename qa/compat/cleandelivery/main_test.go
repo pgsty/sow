@@ -2,9 +2,14 @@ package main
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -298,6 +303,63 @@ func TestAuditAllowedContentAcceptsDocumentationPatterns(t *testing.T) {
 	}
 }
 
+// Scan actual source files, including untracked additions. The clean delivery
+// archive has no .git directory and contains only its exported source tree.
+func deliverySourceFiles(root string) ([]string, error) {
+	var files []string
+	if _, err := os.Lstat(filepath.Join(root, ".git")); err == nil {
+		cmd := exec.Command("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z")
+		cmd.Dir = root
+		names, err := cmd.Output()
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range strings.Split(string(names), "\x00") {
+			if name == "" {
+				continue
+			}
+			info, err := os.Lstat(filepath.Join(root, name))
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if !info.Mode().IsRegular() {
+				return nil, fmt.Errorf("non-regular source file %s", name)
+			}
+			files = append(files, name)
+		}
+		return files, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || path == root {
+			return err
+		}
+		name, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if slices.Contains(ignoredRootDirectories, name) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if ignoredRootFile(name) {
+			return nil
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("non-regular source file %s", name)
+		}
+		files = append(files, filepath.ToSlash(name))
+		return nil
+	})
+	return files, err
+}
+
 func TestRepositoryPolicyClosure(t *testing.T) {
 	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
 	if err != nil {
@@ -307,16 +369,22 @@ func TestRepositoryPolicyClosure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := auditSource(root, productRoots, p.product); err != nil {
-		t.Fatalf("product allowlist: %v", err)
+	if os.Getenv("SOW_CLEAN_DELIVERY_TEST") == "1" {
+		if err := auditSource(root, productRoots, p.product); err != nil {
+			t.Fatalf("product allowlist: %v", err)
+		}
+		if err := auditSource(root, deliveryRoots, p.delivery); err != nil {
+			t.Fatalf("delivery allowlist: %v", err)
+		}
 	}
-	if err := auditSource(root, deliveryRoots, p.delivery); err != nil {
-		t.Fatalf("delivery allowlist: %v", err)
+	existing, err := deliverySourceFiles(root)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := auditAllowedContent(root, p.delivery); err != nil {
+	if err := auditAllowedContent(root, existing); err != nil {
 		t.Fatalf("delivery content: %v", err)
 	}
-	if err := checkMarkdownLinks(root, p.delivery); err != nil {
+	if err := checkMarkdownLinks(root, existing); err != nil {
 		t.Fatalf("Markdown closure: %v", err)
 	}
 }

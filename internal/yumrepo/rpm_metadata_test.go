@@ -279,14 +279,14 @@ func TestManagedFactsSanitizeLegacyDisplayStringsAndNormalizeSourceAndEVR(t *tes
 	}
 }
 
-func TestWeakDependencyTagAlignmentRejected(t *testing.T) {
+func TestWeakDependencyTagAlignmentTolerated(t *testing.T) {
 	rpmPath := filepath.Join(t.TempDir(), "misaligned-1.2.3-4.x86_64.rpm")
 	writeRPMFixture(t, rpmPath, "misaligned",
 		stringTag(5046, "one", "two"), intTag(5048, 0), stringTag(5047, "", ""),
 	)
-	_, err := readPackage(context.Background(), PackageInput{Path: rpmPath})
-	if err == nil || !strings.Contains(err.Error(), "recommends") || !strings.Contains(err.Error(), "misaligned") {
-		t.Fatalf("misaligned weak dependency error = %v", err)
+	meta, err := readPackage(context.Background(), PackageInput{Path: rpmPath})
+	if err != nil || len(meta.Recommends) != 2 {
+		t.Fatalf("misaligned weak dependency meta=%v err=%v", meta, err)
 	}
 }
 
@@ -604,5 +604,15 @@ func TestUnverifiedCoordinateProbeUsesBoundedRPMHeaders(t *testing.T) {
 	}
 	if _, _, err := InspectManagedPackageFactsReaderKnown(context.Background(), reader, "renamed.rpm", "", int64(len(data))); err == nil {
 		t.Fatal("unverified coordinate satisfied Known digest contract")
+	}
+}
+
+func TestRejectsMisalignedStrongDependenciesAndFilePaths(t *testing.T) {
+	for _, tag := range []fixtureTag{stringTag(tagRequireNames, "a", "b"), stringTag(tagProvideNames, "a", "b"), stringTag(tagConflictNames, "a"), stringTag(tagObsoleteNames, "a"), intTag(tagDirIndexes, 9), intTag(tagFileModes, 0, 0)} {
+		path := filepath.Join(t.TempDir(), "package.rpm")
+		writeRPMFixture(t, path, "package", tag)
+		if _, err := readPackage(context.Background(), PackageInput{Path: path}); err == nil {
+			t.Errorf("accepted misaligned tag %d", tag.id)
+		}
 	}
 }

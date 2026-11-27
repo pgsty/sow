@@ -591,7 +591,11 @@ func TestGenerateRejectsSymlinkAndMalformedRPMWithoutResidue(t *testing.T) {
 		t.Fatal(err)
 	}
 	signer := testSigner(t)
-	for _, input := range []string{link, filepath.Join(parent, "truncated.rpm"), corruptHeader} {
+	// Symlinked RPMs are followed and indexed normally.
+	if _, err := Generate(context.Background(), filepath.Join(parent, "repodata-link"), Options{ELMajor: 8, Revision: 1, Signer: signer}, &SliceIterator{Inputs: []PackageInput{{Path: link}}}); err != nil {
+		t.Fatalf("symlink RPM failed generation: %v", err)
+	}
+	for _, input := range []string{filepath.Join(parent, "truncated.rpm"), corruptHeader} {
 		if strings.Contains(input, "truncated") {
 			if err := os.WriteFile(input, []byte{0xed, 0xab, 0xee, 0xdb}, 0o644); err != nil {
 				t.Fatal(err)

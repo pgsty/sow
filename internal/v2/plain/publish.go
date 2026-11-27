@@ -26,22 +26,26 @@ type publicationPlan struct {
 	removeDEB         []string
 	rpmHistory        bool
 	removeRPMHistory  bool
-	pruneReplacements map[string]pruneReplacement
+	pruneReplacements map[string]*pruneReplacement
 	prune             bool
 	removed           []string
 	rpmPublished      bool
 }
 
-func preparePublication(ctx context.Context, root string, staged stagedBuild, scan scanResult, opts Options) (publicationPlan, error) {
+func preparePublication(ctx context.Context, root string, staged stagedBuild, scan scanResult, opts Options, preserveDEB bool) (publicationPlan, error) {
 	plan := publicationPlan{}
-	if err := prepareRPMPublication(ctx, root, staged, &plan); err != nil {
-		return publicationPlan{}, err
+	if !scan.preserveFormat(formatRPM) {
+		if err := prepareRPMPublication(ctx, root, staged, &plan); err != nil {
+			return publicationPlan{}, err
+		}
+		if err := prepareRPMRetention(ctx, root, staged, &plan); err != nil {
+			return publicationPlan{}, err
+		}
 	}
-	if err := prepareRPMRetention(ctx, root, staged, &plan); err != nil {
-		return publicationPlan{}, err
-	}
-	if err := prepareDEBPublication(ctx, root, staged, &plan); err != nil {
-		return publicationPlan{}, err
+	if !preserveDEB && !scan.preserveFormat(formatDEB) {
+		if err := prepareDEBPublication(ctx, root, staged, &plan); err != nil {
+			return publicationPlan{}, err
+		}
 	}
 	for _, fact := range scan.kept {
 		if fact.format == formatRPM && fact.signed && fact.originalSHA256 != fact.sha256 {
@@ -304,7 +308,17 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 	}
 	if opts.Pigsty {
 		marker := filepath.Join(root, "repo_complete")
-		if err := removeRegularFile(marker, true); err != nil {
+		// Keep the evidence needed to rebuild a mixed-format marker on retry.
+		saveMarker := plan.prune || scan.preserveFormat(formatRPM) || scan.preserveFormat(formatDEB)
+		if saveMarker {
+			if exists, err := pruneMarkerExists(marker); err != nil {
+				return err
+			} else if exists {
+				if err := os.Rename(marker, filepath.Join(root, pruneMarkerName)); err != nil {
+					return err
+				}
+			}
+		} else if err := removeRegularFile(marker, true); err != nil {
 			return err
 		}
 		if err := syncDir(root); err != nil {
@@ -321,6 +335,9 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 			continue
 		}
 		if err := inject(opts.Fault, FaultBeforeRPMPackage, fact.base, sequence); err != nil {
+			return err
+		}
+		if err := fact.validateStat(); err != nil {
 			return err
 		}
 		if err := installStagedFile(filepath.Join(staged.dir, "packages", fact.base), filepath.Join(root, fact.base)); err != nil {
@@ -390,6 +407,9 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 			if err := removeRegularFile(filepath.Join(root, "repodata", name), false); err != nil {
 				return err
 			}
+			if name == "repomd.xml" {
+				plan.rpmPublished = true
+			}
 			if err := inject(opts.Fault, FaultAfterRPMRemoval, "", sequence); err != nil {
 				return err
 			}
@@ -448,10 +468,7 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 	}
 
 	if plan.prune {
-		if err := validatePruneDirectory(root); err != nil {
-			return err
-		}
-		if err := verifyStableInputs(ctx, root, scan); err != nil {
+		if err := validatePruneDirectory(root, false); err != nil {
 			return err
 		}
 		if err := verifyPruneReplacementIdentities(ctx, plan.pruneReplacements); err != nil {
@@ -471,12 +488,12 @@ func publishStage(ctx context.Context, root string, staged stagedBuild, scan sca
 			if err := replacement.verify(ctx); err != nil {
 				return err
 			}
-			current, err := os.Lstat(path)
-			if err != nil || !samePackageStat(fact.sourceInfo, current) {
-				return &Error{Kind: KindIntegrity, Op: "remove changed package", Path: path, Err: errors.Join(err, errors.New("package changed after inspection"))}
-			}
+
 		}
-		if err := removeRegularFile(path, false); err != nil {
+		if err := fact.validateStat(); err != nil {
+			return err
+		}
+		if err := removePackageEntry(path); err != nil {
 			return err
 		}
 		plan.removed = append(plan.removed, fact.base)
@@ -561,6 +578,17 @@ func installStagedFile(source, target string) error {
 	}
 	if err := syncDir(parent); err != nil {
 		return &Error{Kind: KindRuntime, Op: "sync output directory", Path: parent, Err: err}
+	}
+	return nil
+}
+
+func removePackageEntry(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil || (!info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0) {
+		return &Error{Kind: KindIntegrity, Op: "remove package", Path: path, Err: errors.Join(err, errors.New("path is not a regular file or symlink"))}
+	}
+	if err := os.Remove(path); err != nil {
+		return &Error{Kind: KindRuntime, Op: "remove package", Path: path, Err: err}
 	}
 	return nil
 }

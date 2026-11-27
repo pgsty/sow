@@ -168,24 +168,20 @@ func parsePackageKeyringModels(data []byte) (openpgp.EntityList, openpgpv2.Entit
 }
 
 func parseLegacyKeyring(data []byte) (openpgp.EntityList, error) {
-	trimmed := bytes.TrimSpace(data)
-	if bytes.HasPrefix(trimmed, []byte("-----BEGIN PGP")) {
-		if _, err := splitPublicKeyArmorBlocks(trimmed); err != nil {
+	if bytes.Contains(data, []byte("-----BEGIN PGP")) {
+		if _, err := splitPublicKeyArmorBlocks(data); err != nil {
 			return nil, err
 		}
 	}
-	// openpgpkey.Read validates every packet boundary and parses entities one by
-	// one without silently skipping malformed certificates.
 	return openpgpkey.Read(data)
 }
 
 func parseHistoricalKeyring(data []byte) (openpgpv2.EntityList, error) {
-	trimmed := bytes.TrimSpace(data)
 	blocks := [][]byte{data}
-	armored := bytes.HasPrefix(trimmed, []byte("-----BEGIN PGP"))
+	armored := bytes.Contains(data, []byte("-----BEGIN PGP"))
 	if armored {
 		var err error
-		blocks, err = splitPublicKeyArmorBlocks(trimmed)
+		blocks, err = splitPublicKeyArmorBlocks(data)
 		if err != nil {
 			return nil, err
 		}
@@ -227,7 +223,7 @@ func parseHistoricalKeyring(data []byte) (openpgpv2.EntityList, error) {
 }
 
 func splitPublicKeyArmorBlocks(data []byte) ([][]byte, error) {
-	blocks, err := openpgpkey.SplitArmor(data, openpgp.PublicKeyType)
+	blocks, err := openpgpkey.SplitKeyArmor(data, openpgp.PublicKeyType)
 	if err != nil {
 		return nil, fmt.Errorf("yumrepo: armored RPM package keyring must contain complete public-key blocks only: %w", err)
 	}

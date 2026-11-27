@@ -72,8 +72,8 @@ func RunGPG(command *exec.Cmd, source Source) error {
 
 // RPMFile snapshots a source into a private file because rpm may invoke GPG
 // more than once per package. An exhausted pipe cannot serve a second signer.
-// /tmp is outside repository staging and has a predictable macro-safe spelling
-// on both supported operating systems. The caller must always run cleanup.
+// It prefers $TMPDIR when macro-safe for rpm(8) and falls back to /tmp
+// otherwise. The caller must always run cleanup.
 func RPMFile(source Source) (string, func(), error) {
 	noop := func() {}
 	if !source.Explicit() {
@@ -87,11 +87,22 @@ func RPMFile(source Source) (string, func(), error) {
 	if bytes.ContainsAny(secret, "\r\n") {
 		return "", noop, errors.Join(ErrCredential, errors.New("GPG requires a single-line passphrase"))
 	}
-	dir, err := os.MkdirTemp("/tmp", "sow-gpg-pass-")
+	tempBase, err := filepath.Abs(os.TempDir())
+	if err != nil || strings.ContainsAny(tempBase, " \t\r\n%\x00\"'\\") {
+		tempBase = "/tmp"
+	}
+	dir, err := os.MkdirTemp(tempBase, "sow-gpg-pass-")
+	if err != nil && tempBase != "/tmp" {
+		dir, err = os.MkdirTemp("/tmp", "sow-gpg-pass-")
+	}
 	if err != nil {
 		return "", noop, errors.New("cannot create private RPM passfile directory")
 	}
 	path := filepath.Join(dir, "pass")
+	if strings.ContainsAny(path, " \t\r\n%\x00\"'\\") {
+		_ = os.RemoveAll(dir)
+		return "", noop, errors.New("private RPM passfile path contains RPM macro-unsafe characters")
+	}
 	secretLen := len(secret)
 	cleanup := func() {
 		if f, openErr := os.OpenFile(path, os.O_WRONLY, 0); openErr == nil {

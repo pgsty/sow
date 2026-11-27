@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pgsty/sow/internal/r2"
@@ -45,17 +48,89 @@ type httpPublicationVerifier struct {
 	now                  func() time.Time
 }
 
-func newPublicVerificationClient() *http.Client {
+// Redirect connections use a separate pool so even a reused connection has
+// passed the address check. Explicitly configured local delivery stays usable.
+type publicTransport struct {
+	origin, redirect *http.Transport
+	base             *url.URL
+}
+
+func (t publicTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Response == nil || isLoopbackOrLinkLocalHost(t.base.Hostname()) {
+		return t.origin.RoundTrip(req)
+	}
+	if t.origin.Proxy != nil {
+		proxy, err := t.origin.Proxy(req)
+		if err != nil {
+			return nil, err
+		}
+		if proxy != nil {
+			// The configured proxy is trusted for the explicitly configured origin.
+			if req.URL.Scheme == t.base.Scheme && strings.EqualFold(req.URL.Host, t.base.Host) {
+				return t.origin.RoundTrip(req)
+			}
+			return nil, errors.New("cannot verify a cross-origin redirect destination through a proxy")
+		}
+	}
+	return t.redirect.RoundTrip(req)
+}
+
+func (t publicTransport) CloseIdleConnections() {
+	t.origin.CloseIdleConnections()
+	t.redirect.CloseIdleConnections()
+}
+
+func checkPublicDialAddress(_, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	if isLoopbackOrLinkLocalHost(host) {
+		return errors.New("refused redirect connection to a loopback, unspecified or link-local address")
+	}
+	return nil
+}
+
+func newPublicVerificationClient(base *url.URL) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = publicResponseTimeout
 	transport.MaxIdleConns = max(transport.MaxIdleConns, 100)
 	transport.MaxIdleConnsPerHost = max(transport.MaxIdleConnsPerHost, 32)
+	redirect := transport.Clone()
+	redirect.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Control: checkPublicDialAddress}).DialContext
+	redirect.Proxy = nil
 	return &http.Client{
-		Transport: transport,
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
+		Transport: publicTransport{origin: transport, redirect: redirect, base: base},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			if req.URL.Scheme != "https" && req.URL.Scheme != "http" {
+				return fmt.Errorf("disallowed redirect scheme %q", req.URL.Scheme)
+			}
+			origin := via[0].URL
+			if via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme != "https" {
+				return errors.New("refused https-to-http redirect downgrade")
+			}
+			if !isLoopbackOrLinkLocalHost(origin.Hostname()) && isLoopbackOrLinkLocalHost(req.URL.Hostname()) {
+				return errors.New("refused redirect to loopback or link-local address")
+			}
+			return nil
 		},
 	}
+}
+
+func isLoopbackOrLinkLocalHost(host string) bool {
+	lower := strings.ToLower(strings.TrimSpace(host))
+	if strings.TrimSuffix(lower, ".") == "localhost" {
+		return true
+	}
+	ip, err := netip.ParseAddr(lower)
+	if err != nil {
+		return false
+	}
+	ip = ip.Unmap()
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
 }
 
 func (v httpPublicationVerifier) Verify(ctx context.Context, expected state.GenerationFile) error {
@@ -112,7 +187,7 @@ func (v httpPublicationVerifier) httpClient() *http.Client {
 	if v.client != nil {
 		return v.client
 	}
-	return newPublicVerificationClient()
+	return newPublicVerificationClient(v.base)
 }
 
 func (v httpPublicationVerifier) idleTimeout() time.Duration {

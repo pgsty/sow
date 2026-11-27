@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
@@ -44,6 +45,7 @@ func init() {
 		return
 	}
 	if err := runRPMSigningChild(os.Args[2:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(126)
 	}
 	// unix.Exec only returns on failure, but retain an explicit terminal path if
@@ -81,7 +83,17 @@ func runRPMSigningChild(args []string) error {
 	passfile := ""
 	if len(args) == 5 {
 		passfile = args[4]
-		if filepath.Clean(passfile) != passfile || filepath.Dir(filepath.Dir(passfile)) != "/tmp" || !strings.HasPrefix(passfile, "/tmp/sow-gpg-pass-") || filepath.Base(passfile) != "pass" || strings.ContainsAny(passfile, " \t\r\n%\x00\"'\\") {
+		passDir := filepath.Dir(passfile)
+		passParent := filepath.Dir(passDir)
+		tempRoot, err := filepath.Abs(os.TempDir())
+		if err != nil {
+			tempRoot = "/tmp"
+		}
+		if !filepath.IsAbs(passfile) || filepath.Clean(passfile) != passfile ||
+			(passParent != tempRoot && passParent != "/tmp") ||
+			!strings.HasPrefix(filepath.Base(passDir), "sow-gpg-pass-") ||
+			filepath.Base(passfile) != "pass" ||
+			strings.ContainsAny(passfile, " \t\r\n%\x00\"'\\") {
 			return errors.New("invalid RPM signing passfile")
 		}
 	}
@@ -250,7 +262,12 @@ func normalizeRetainedRPMSigningKeys(input []state.RPMSigningKey) ([]state.RPMSi
 	return result, nil
 }
 
-type retainedRPMKeyrings map[string]map[string]openpgp.KeyRing
+type retainedRPMKeyEntry struct {
+	keyring   openpgp.KeyRing
+	publicKey []byte
+}
+
+type retainedRPMKeyrings map[string]map[string]retainedRPMKeyEntry
 
 func loadRetainedRPMKeyrings(ctx context.Context, store *state.Store) (retainedRPMKeyrings, error) {
 	keys, err := store.ListRPMSigningKeys(ctx)
@@ -268,9 +285,12 @@ func loadRetainedRPMKeyrings(ctx context.Context, store *state.Store) (retainedR
 			return nil, fmt.Errorf("%w: retained RPM signing certificate %s cannot form a verifier: %v", ErrIntegrity, key.Fingerprint, err)
 		}
 		if result[key.Fingerprint] == nil {
-			result[key.Fingerprint] = map[string]openpgp.KeyRing{}
+			result[key.Fingerprint] = map[string]retainedRPMKeyEntry{}
 		}
-		result[key.Fingerprint][key.SnapshotSHA256] = keyring
+		result[key.Fingerprint][key.SnapshotSHA256] = retainedRPMKeyEntry{
+			keyring:   keyring,
+			publicKey: append([]byte(nil), key.PublicKey...),
+		}
 	}
 	return result, nil
 }
@@ -564,9 +584,13 @@ func signManagedRPM(ctx context.Context, filename, keyID string, resign bool, cr
 	command := exec.CommandContext(ctx, executable, childArgs...)
 	command.WaitDelay = 5 * time.Second
 	command.ExtraFiles = []*os.File{parent.directory()}
+	stderrBuf := &limitedStderrBuffer{limit: 4096}
 	command.Stdout = io.Discard
-	command.Stderr = io.Discard
+	command.Stderr = stderrBuf
 	if err := command.Run(); err != nil {
+		if detail := stderrBuf.Summary(512); detail != "" {
+			return finish(fmt.Errorf("managed: rpm signing command failed: %w: %s", err, detail))
+		}
 		return finish(fmt.Errorf("managed: rpm signing command failed: %w", err))
 	}
 	var entry unix.Stat_t
@@ -623,8 +647,12 @@ func validateGPGSecretIdentity(ctx context.Context, fingerprint string) error {
 	want := strings.ToUpper(fingerprint)
 	command := exec.CommandContext(ctx, gpg, "--batch", "--no-tty", "--with-colons", "--fingerprint", "--list-secret-keys", want)
 	var stdout bytes.Buffer
-	command.Stdout, command.Stderr = &stdout, io.Discard
+	stderrBuf := &limitedStderrBuffer{limit: 4096}
+	command.Stdout, command.Stderr = &stdout, stderrBuf
 	if err := command.Run(); err != nil {
+		if detail := stderrBuf.Summary(512); detail != "" {
+			return fmt.Errorf("configured OpenPGP secret key is unavailable: %s", detail)
+		}
 		return errors.New("configured OpenPGP secret key is unavailable")
 	}
 	waitingForPrimaryFingerprint := false
@@ -817,11 +845,15 @@ func exportPublicKey(ctx context.Context, identity string) ([]byte, error) {
 	command := exec.CommandContext(ctx, gpg, "--batch", "--no-tty", "--armor", "--export", identity)
 	command.WaitDelay = 5 * time.Second
 	var stdout bytes.Buffer
+	stderrBuf := &limitedStderrBuffer{limit: 4096}
 	command.Stdout = &stdout
-	command.Stderr = io.Discard
+	command.Stderr = stderrBuf
 	if err := command.Run(); err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
+		}
+		if detail := stderrBuf.Summary(512); detail != "" {
+			return nil, fmt.Errorf("gpg public-key export failed: %w: %s", err, detail)
 		}
 		return nil, fmt.Errorf("gpg public-key export failed: %w", err)
 	}
@@ -829,4 +861,35 @@ func exportPublicKey(ctx context.Context, identity string) ([]byte, error) {
 		return nil, errors.New("gpg public-key export returned no bounded key material")
 	}
 	return stdout.Bytes(), nil
+}
+
+type limitedStderrBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (b *limitedStderrBuffer) Write(p []byte) (int, error) {
+	if remaining := b.limit - b.buf.Len(); remaining > 0 {
+		if len(p) > remaining {
+			_, _ = b.buf.Write(p[:remaining])
+		} else {
+			_, _ = b.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (b *limitedStderrBuffer) Summary(maxRunes int) string {
+	s := strings.TrimSpace(b.buf.String())
+	if s == "" {
+		return ""
+	}
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "\ufffd")
+	}
+	runes := []rune(s)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "..."
+	}
+	return s
 }

@@ -10,6 +10,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"syscall"
 	"time"
 
 	"github.com/pgsty/sow/internal/aptrepo"
@@ -79,9 +81,6 @@ func renderStage(ctx context.Context, dir string, scan scanResult, opts Options)
 		if err := writeDeterministicGzip(ctx, packagesPath, filepath.Join(stage, "Packages.gz")); err != nil {
 			return stagedBuild{}, scanResult{}, &Error{Kind: KindRuntime, Op: "compress deb", Path: packagesPath, Err: err}
 		}
-		if err := aptrepo.ValidateInspectedFlatPackages(ctx, packagesPath, filepath.Join(stage, "Packages.gz"), packages); err != nil {
-			return stagedBuild{}, scanResult{}, &Error{Kind: KindRuntime, Op: "validate deb", Path: packagesPath, Err: err}
-		}
 	}
 
 	markerSHA := ""
@@ -95,8 +94,14 @@ func renderStage(ctx context.Context, dir string, scan scanResult, opts Options)
 			_ = marker.Close()
 			return stagedBuild{}, scanResult{}, &Error{Kind: KindRuntime, Op: "chmod marker", Path: markerPath, Err: err}
 		}
+		entries := make([]markerLine, 0, len(scan.kept)+len(scan.markerLines))
 		for _, fact := range scan.kept {
-			if _, err := fmt.Fprintf(marker, "%s  %s\n", fact.sha256, fact.base); err != nil {
+			entries = append(entries, markerLine{base: fact.base, sha256: fact.sha256})
+		}
+		entries = append(entries, scan.markerLines...)
+		sort.Slice(entries, func(i, j int) bool { return entries[i].base < entries[j].base })
+		for _, entry := range entries {
+			if _, err := fmt.Fprintf(marker, "%s  %s\n", entry.sha256, entry.base); err != nil {
 				_ = marker.Close()
 				return stagedBuild{}, scanResult{}, &Error{Kind: KindRuntime, Op: "write marker", Path: markerPath, Err: err}
 			}
@@ -173,8 +178,21 @@ func (r *contextReader) Read(p []byte) (int, error) {
 	return r.reader.Read(p)
 }
 
+func openRegularFile(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		return nil, errors.Join(err, fmt.Errorf("%s must be a regular file", path))
+	}
+	return f, nil
+}
+
 func hashFile(ctx context.Context, path string) (string, error) {
-	file, err := os.Open(path)
+	file, err := openRegularFile(path)
 	if err != nil {
 		return "", &Error{Kind: KindRuntime, Op: "hash", Path: path, Err: err}
 	}

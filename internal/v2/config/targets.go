@@ -12,9 +12,14 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"go.yaml.in/yaml/v4"
 )
 
-var r2BucketPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+var (
+	r2BucketPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9.-]{0,61}[a-z0-9])?$`)
+	r2RegionPattern = regexp.MustCompile(`^[a-z0-9-]{1,64}$`)
+)
 
 const maximumPublicationCacheTTL = time.Duration(1<<63-1) - 24*time.Hour
 
@@ -33,6 +38,62 @@ type TargetConfig struct {
 	AuthoritativeWorkspace  bool   `yaml:"authoritative_workspace" json:"authoritative_workspace"`
 	SingleWriter            bool   `yaml:"single_writer" json:"single_writer"`
 	ExclusiveWriteAuthority bool   `yaml:"exclusive_write_authority" json:"exclusive_write_authority"`
+}
+
+// UnmarshalYAML defaults the workspace-authority flags to true when omitted so
+// operators do not need to repeat boilerplate booleans in every target block,
+// while preserving strict KnownFields checking and rejecting explicit null values.
+func (t *TargetConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(value.Content); i += 2 {
+			k, v := value.Content[i].Value, value.Content[i+1]
+			switch k {
+			case "authoritative_workspace", "single_writer", "exclusive_write_authority":
+				if v.Tag == "!!null" {
+					return fmt.Errorf("target field %q must be a boolean, not null", k)
+				}
+			}
+		}
+	}
+	type rawTargetConfig struct {
+		Repository              string `yaml:"repository"`
+		Provider                string `yaml:"provider"`
+		Endpoint                string `yaml:"endpoint"`
+		Region                  string `yaml:"region,omitempty"`
+		Bucket                  string `yaml:"bucket,omitempty"`
+		Prefix                  string `yaml:"prefix"`
+		Credential              string `yaml:"credential,omitempty"`
+		PublicEndpoint          string `yaml:"public_endpoint"`
+		MaxCacheTTL             string `yaml:"max_cache_ttl"`
+		AuthoritativeWorkspace  *bool  `yaml:"authoritative_workspace"`
+		SingleWriter            *bool  `yaml:"single_writer"`
+		ExclusiveWriteAuthority *bool  `yaml:"exclusive_write_authority"`
+	}
+	var raw rawTargetConfig
+	if err := value.Load(&raw, yaml.WithKnownFields()); err != nil {
+		return err
+	}
+	defaultTrue := func(v *bool) bool {
+		if v == nil {
+			return true
+		}
+		return *v
+	}
+	*t = TargetConfig{
+		Repository:              raw.Repository,
+		Provider:                raw.Provider,
+		Endpoint:                raw.Endpoint,
+		Region:                  raw.Region,
+		Bucket:                  raw.Bucket,
+		Prefix:                  raw.Prefix,
+		Credential:              raw.Credential,
+		PublicEndpoint:          raw.PublicEndpoint,
+		MaxCacheTTL:             raw.MaxCacheTTL,
+		AuthoritativeWorkspace:  defaultTrue(raw.AuthoritativeWorkspace),
+		SingleWriter:            defaultTrue(raw.SingleWriter),
+		ExclusiveWriteAuthority: defaultTrue(raw.ExclusiveWriteAuthority),
+	}
+	return nil
 }
 
 // TargetBinding is the canonical, name-independent identity persisted by the
@@ -61,15 +122,17 @@ func normalizeAndValidateTargets(cfg *Config) error {
 			return fmt.Errorf("target name %q: %w", name, err)
 		}
 		target := cfg.Targets[name]
-		binding, err := validateTarget(name, target, cfg.Repositories)
+		binding, err := validateTarget(name, &target, cfg.Repositories)
 		if err != nil {
 			return fmt.Errorf("target %q: %w", name, err)
 		}
+		cfg.Targets[name] = target
 		bindings = append(bindings, binding)
 	}
 	for index, left := range bindings {
 		for _, right := range bindings[index+1:] {
-			if left.StorageIdentity == right.StorageIdentity && prefixesOverlap(left.Prefix, right.Prefix) {
+			sameBucket := left.Provider == "r2" && right.Provider == "r2" && left.Endpoint == right.Endpoint && left.Bucket == right.Bucket
+			if (left.StorageIdentity == right.StorageIdentity || sameBucket) && prefixesOverlap(left.Prefix, right.Prefix) {
 				return fmt.Errorf("targets %q and %q overlap on storage %s at prefixes %q and %q", left.Name, right.Name, left.StorageIdentity, left.Prefix, right.Prefix)
 			}
 			// file:// endpoints name the storage namespace themselves. Two
@@ -91,22 +154,26 @@ func normalizeAndValidateTargets(cfg *Config) error {
 	return nil
 }
 
-func validateTarget(name string, target TargetConfig, repositories map[string]RepositoryConfig) (TargetBinding, error) {
+func validateTarget(name string, target *TargetConfig, repositories map[string]RepositoryConfig) (TargetBinding, error) {
 	if _, ok := repositories[target.Repository]; !ok || target.Repository == "" {
 		return TargetBinding{}, fmt.Errorf("repository %q is not configured", target.Repository)
 	}
 	if target.Provider != "filesystem" && target.Provider != "r2" {
 		return TargetBinding{}, fmt.Errorf("provider must be filesystem or r2, got %q", target.Provider)
 	}
-	if err := validateCanonicalTargetEndpoint(target.Provider, target.Endpoint); err != nil {
+	normalizedEndpoint, err := normalizeAndValidateTargetEndpoint(target.Provider, target.Endpoint)
+	if err != nil {
 		return TargetBinding{}, err
 	}
+	target.Endpoint = normalizedEndpoint
 	if err := validateCanonicalPrefix(target.Prefix); err != nil {
 		return TargetBinding{}, fmt.Errorf("prefix: %w", err)
 	}
-	if err := validateCanonicalPublicEndpoint(target.PublicEndpoint); err != nil {
+	normalizedPublic, err := normalizeAndValidatePublicEndpoint(target.PublicEndpoint)
+	if err != nil {
 		return TargetBinding{}, fmt.Errorf("public endpoint: %w", err)
 	}
+	target.PublicEndpoint = normalizedPublic
 	if target.Provider == "r2" {
 		public, _ := url.Parse(target.PublicEndpoint)
 		if public.Scheme != "https" && public.Scheme != "http" {
@@ -116,10 +183,15 @@ func validateTarget(name string, target TargetConfig, repositories map[string]Re
 	if target.MaxCacheTTL == "" {
 		return TargetBinding{}, errors.New("max_cache_ttl is required, including explicit 0s")
 	}
-	ttl, err := time.ParseDuration(target.MaxCacheTTL)
-	if err != nil || ttl < 0 || ttl > maximumPublicationCacheTTL || target.MaxCacheTTL != ttl.String() {
-		return TargetBinding{}, fmt.Errorf("max_cache_ttl %q must be canonical and between 0s and %s", target.MaxCacheTTL, maximumPublicationCacheTTL)
+	rawTTL := strings.TrimSpace(target.MaxCacheTTL)
+	if rawTTL == "0" {
+		rawTTL = "0s"
 	}
+	ttl, err := time.ParseDuration(rawTTL)
+	if err != nil || ttl < 0 || ttl > maximumPublicationCacheTTL {
+		return TargetBinding{}, fmt.Errorf("max_cache_ttl %q must be a Go duration between 0s and %s", target.MaxCacheTTL, maximumPublicationCacheTTL)
+	}
+	target.MaxCacheTTL = ttl.String()
 	if !target.AuthoritativeWorkspace || !target.SingleWriter || !target.ExclusiveWriteAuthority {
 		return TargetBinding{}, errors.New("authoritative_workspace, single_writer, and exclusive_write_authority must all be true")
 	}
@@ -129,13 +201,17 @@ func validateTarget(name string, target TargetConfig, repositories map[string]Re
 			return TargetBinding{}, errors.New("filesystem target forbids region, bucket, and credential")
 		}
 	case "r2":
-		if target.Region != "auto" {
-			return TargetBinding{}, errors.New("r2 region must be the canonical value auto")
+		target.Region = strings.ToLower(strings.TrimSpace(target.Region))
+		if target.Region == "" {
+			target.Region = "auto"
+		}
+		if !r2RegionPattern.MatchString(target.Region) {
+			return TargetBinding{}, fmt.Errorf("r2 region %q is invalid", target.Region)
 		}
 		if err := validateTargetComponent("bucket", target.Bucket); err != nil {
 			return TargetBinding{}, err
 		}
-		if !r2BucketPattern.MatchString(target.Bucket) {
+		if !r2BucketPattern.MatchString(target.Bucket) || strings.Contains(target.Bucket, "..") {
 			return TargetBinding{}, fmt.Errorf("bucket %q is not a DNS-safe R2 bucket label", target.Bucket)
 		}
 		if err := validateCredentialReference(target.Credential); err != nil {
@@ -160,7 +236,8 @@ func (cfg Config) TargetBindings() ([]TargetBinding, error) {
 	sort.Strings(names)
 	bindings := make([]TargetBinding, 0, len(names))
 	for _, name := range names {
-		binding, err := validateTarget(name, copyCfg.Targets[name], copyCfg.Repositories)
+		target := copyCfg.Targets[name]
+		binding, err := validateTarget(name, &target, copyCfg.Repositories)
 		if err != nil {
 			return nil, err
 		}
@@ -169,46 +246,89 @@ func (cfg Config) TargetBindings() ([]TargetBinding, error) {
 	return bindings, nil
 }
 
-func validateCanonicalTargetEndpoint(provider, raw string) error {
-	u, err := url.Parse(raw)
+func normalizeAndValidateTargetEndpoint(provider, raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("endpoint %q is not a canonical URL without userinfo, query, or fragment", raw)
+		return "", fmt.Errorf("endpoint %q is not a valid URL without userinfo, query, or fragment", raw)
 	}
+	u.Scheme = strings.ToLower(u.Scheme)
 	if provider == "filesystem" {
-		if u.Scheme != "file" || u.Host != "" || !strings.HasPrefix(u.Path, "/") || u.RawPath != "" || path.Clean(u.Path) != u.Path || u.Path == "/" || strings.HasSuffix(u.Path, "/") || u.String() != raw {
-			return fmt.Errorf("filesystem endpoint %q must be canonical file:///absolute/path without a trailing slash", raw)
+		if u.Scheme != "file" || u.Host != "" || !strings.HasPrefix(u.Path, "/") || u.RawPath != "" {
+			return "", fmt.Errorf("filesystem endpoint %q must be canonical file:///absolute/path", raw)
 		}
-		return nil
+		cleaned := path.Clean(u.Path)
+		if cleaned == "/" {
+			return "", fmt.Errorf("filesystem endpoint %q must not be /", raw)
+		}
+		u.Path = cleaned
+		return u.String(), nil
 	}
-	if u.Scheme != "https" || u.Host == "" || u.Path != "" || u.RawPath != "" || u.String() != raw || !canonicalHost(u.Host) {
-		return fmt.Errorf("r2 endpoint %q must be canonical https://host with no path or default port", raw)
+	if u.Host == "" || u.RawPath != "" {
+		return "", fmt.Errorf("r2 endpoint %q must be https://host (or http://localhost)", raw)
 	}
-	return nil
+	u.Host = normalizeHostPort(u.Scheme, u.Host)
+	if !canonicalHost(u.Host) {
+		return "", fmt.Errorf("r2 endpoint %q host is not valid", raw)
+	}
+	host := u.Hostname()
+	isLocal := host == "localhost" || host == "127.0.0.1" || host == "::1"
+	if u.Scheme != "https" && !(isLocal && u.Scheme == "http") {
+		return "", fmt.Errorf("r2 endpoint %q must use https (or http for localhost)", raw)
+	}
+	if u.Path != "" && u.Path != "/" {
+		return "", fmt.Errorf("r2 endpoint %q must not include a path", raw)
+	}
+	u.Path = ""
+	return u.String(), nil
 }
 
-func validateCanonicalPublicEndpoint(raw string) error {
-	u, err := url.Parse(raw)
-	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.RawPath != "" || u.String() != raw || !strings.HasSuffix(u.Path, "/") {
-		return errors.New("must be a canonical URL ending in /")
+func normalizeAndValidatePublicEndpoint(raw string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.RawPath != "" {
+		return "", errors.New("must be a valid URL without userinfo, query, or fragment")
 	}
+	u.Scheme = strings.ToLower(u.Scheme)
 	if u.Scheme != "https" && u.Scheme != "http" && u.Scheme != "file" {
-		return errors.New("scheme must be https, http, or file")
+		return "", errors.New("scheme must be https, http, or file")
+	}
+	if u.Path == "" {
+		u.Path = "/"
+	}
+	if !strings.HasSuffix(u.Path, "/") {
+		u.Path += "/"
 	}
 	withoutSlash := strings.TrimSuffix(u.Path, "/")
 	if withoutSlash == "" {
 		withoutSlash = "/"
 	}
 	if path.Clean(withoutSlash) != withoutSlash {
-		return errors.New("path contains non-canonical dot or empty segments")
+		return "", errors.New("path contains non-canonical dot or empty segments")
 	}
 	if u.Scheme == "file" {
-		if u.Host != "" || !strings.HasPrefix(u.Path, "/") || path.Clean(strings.TrimSuffix(u.Path, "/")) != strings.TrimSuffix(u.Path, "/") {
-			return errors.New("file endpoint must be canonical and absolute")
+		if u.Host != "" || !strings.HasPrefix(u.Path, "/") {
+			return "", errors.New("file endpoint must be canonical and absolute")
 		}
-	} else if u.Host == "" || !canonicalHost(u.Host) {
-		return errors.New("HTTP endpoint host is not canonical")
+	} else {
+		u.Host = normalizeHostPort(u.Scheme, u.Host)
+		if u.Host == "" || !canonicalHost(u.Host) {
+			return "", errors.New("HTTP endpoint host is not valid ASCII")
+		}
 	}
-	return nil
+	return u.String(), nil
+}
+
+func normalizeHostPort(scheme, hostport string) string {
+	hostport = strings.ToLower(hostport)
+	host, port, err := net.SplitHostPort(hostport)
+	if err == nil {
+		if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+			if strings.Contains(host, ":") {
+				return "[" + host + "]"
+			}
+			return host
+		}
+	}
+	return hostport
 }
 
 func canonicalHost(hostport string) bool {

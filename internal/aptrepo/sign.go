@@ -79,7 +79,7 @@ func NewSigner(key io.Reader, passphrase []byte) (*Signer, error) {
 			}
 		}
 	}
-	if countPrivateSigningKeys(entity) != 1 {
+	if countPrivateSigningKeys(entity) < 1 {
 		return nil, ErrInvalidSigningKey
 	}
 	return &Signer{entity: entity}, nil
@@ -147,7 +147,7 @@ func (s *Signer) Validate(at time.Time) error {
 			usable++
 		}
 	}
-	if usable != 1 {
+	if usable < 1 {
 		return ErrSigningFailed
 	}
 	return nil
@@ -286,7 +286,7 @@ func signingConfig(at time.Time) *packet.Config {
 
 func deterministicSignatureAlgorithm(algorithm packet.PublicKeyAlgorithm) bool {
 	switch algorithm {
-	case packet.PubKeyAlgoRSA, packet.PubKeyAlgoRSASignOnly, packet.PubKeyAlgoEdDSA, packet.PubKeyAlgoEd25519, packet.PubKeyAlgoEd448:
+	case packet.PubKeyAlgoRSA, packet.PubKeyAlgoRSASignOnly, packet.PubKeyAlgoEdDSA, packet.PubKeyAlgoEd25519, packet.PubKeyAlgoEd448, packet.PubKeyAlgoECDSA, packet.PubKeyAlgoDSA:
 		return true
 	default:
 		return false

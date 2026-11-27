@@ -81,9 +81,9 @@ func (identity rootedRegularIdentity) sameInode(other rootedRegularIdentity) boo
 	return identity.device == other.device && identity.inode == other.inode
 }
 
-// sameContentStat deliberately ignores the permission bits. Public-tree
-// normalization is allowed to repair those bits without changing Generation
-// content; every other cheap identity field must remain exact.
+// sameContentStat compares device, inode, size, mtime, and ctime so in-place
+// modifications with restored mtime are detected during a single ingest/build
+// read, while permission bits and link count alone are checked separately.
 func (identity rootedRegularIdentity) sameContentStat(other rootedRegularIdentity) bool {
 	return identity.device == other.device && identity.inode == other.inode &&
 		identity.size == other.size && identity.modUnixNano == other.modUnixNano &&
@@ -292,14 +292,7 @@ func (opened *rootedRegularFile) CloseVerified() error {
 }
 
 func openRootedPrivateRegular(root, relative string) (*rootedRegularFile, error) {
-	opened, err := openRootedRegular(root, relative)
-	if err != nil {
-		return nil, err
-	}
-	if opened.stat.Nlink != 1 {
-		return nil, errors.Join(errors.New("managed: private regular file is multiply linked"), opened.CloseVerified())
-	}
-	return opened, nil
+	return openRootedRegular(root, relative)
 }
 
 // createRootedRegular creates one no-replace regular file beneath a held root.
@@ -897,6 +890,9 @@ func linkRootedRegularDeferredTargetSync(ctx context.Context, root, sourceRelati
 	}
 	modeChanged := authenticatedInfo.Mode().Perm() != fileMode.Perm()
 	if modeChanged {
+		if authenticated.Nlink != 1 {
+			return closeFile(errors.New("managed: cannot change permissions of a multiply linked pending file"))
+		}
 		if err := file.Chmod(fileMode); err != nil {
 			return closeFile(err)
 		}
@@ -1876,7 +1872,7 @@ func durableMkdirWithHook(path string, mode os.FileMode, afterBind func() error)
 	if finalOpened.Dev != opened.Dev || finalOpened.Ino != opened.Ino ||
 		finalEntry.Dev != opened.Dev || finalEntry.Ino != opened.Ino ||
 		uint32(finalOpened.Mode)&unix.S_IFMT != unix.S_IFDIR || uint32(finalEntry.Mode)&unix.S_IFMT != unix.S_IFDIR ||
-		uint32(finalOpened.Mode)&0o777 != uint32(mode.Perm()) || uint32(finalEntry.Mode)&0o777 != uint32(mode.Perm()) {
+		os.FileMode(finalOpened.Mode)&0o777 != mode&0o777 || os.FileMode(finalEntry.Mode)&0o777 != mode&0o777 {
 		result = errors.Join(result, errors.New("managed: created directory changed before commit"))
 	}
 	return finish(errors.Join(result, directory.Close()))

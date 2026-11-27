@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -125,41 +127,36 @@ func TestPruneDryRunNeverWrites(t *testing.T) {
 	}
 }
 
-func TestPruneRejectsInvalidInputsBeforeChanges(t *testing.T) {
+func TestPruneRejectsUnsafeLiveInputsBeforeChanges(t *testing.T) {
 	tests := []struct {
 		name   string
+		strict bool
 		mutate func(*testing.T, string)
 	}{
-		{"damaged replacement", func(t *testing.T, dir string) {
+		{"damaged replacement", false, func(t *testing.T, dir string) {
 			path := filepath.Join(dir, "new.rpm")
 			data := mustRead(t, path)
 			data[len(data)-1] ^= 0xff
 			mustWritePruneFile(t, path, data)
 		}},
-		{"unparseable RPM", func(t *testing.T, dir string) { mustWritePruneFile(t, filepath.Join(dir, "bad.rpm"), []byte("broken")) }},
-		{"duplicate bytes", func(t *testing.T, dir string) {
-			mustWritePruneFile(t, filepath.Join(dir, "alias.rpm"), mustRead(t, filepath.Join(dir, "new.rpm")))
-		}},
-		{"equal EVR", func(t *testing.T, dir string) {
+		{"unparseable RPM in strict mode", true, func(t *testing.T, dir string) { mustWritePruneFile(t, filepath.Join(dir, "bad.rpm"), []byte("broken")) }},
+		{"equal EVR in strict mode", true, func(t *testing.T, dir string) {
 			writePruneRPM(t, filepath.Join(dir, "equal-a.rpm"), rpmFixture{Name: "equal", Version: "1.0", Release: "1", Arch: "x86_64"})
 			writePruneRPM(t, filepath.Join(dir, "equal-b.rpm"), rpmFixture{Name: "equal", Version: "1+0", Release: "1", Arch: "x86_64"})
 		}},
-		{"DEB", func(t *testing.T, dir string) { mustWritePruneFile(t, filepath.Join(dir, "other.deb"), []byte("deb")) }},
-		{"RPM symlink", func(t *testing.T, dir string) {
-			if err := os.Symlink("new.rpm", filepath.Join(dir, "link.rpm")); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{"source RPM", func(t *testing.T, dir string) {
+		{"source RPM in strict mode", true, func(t *testing.T, dir string) {
 			writePruneRPM(t, filepath.Join(dir, "source.rpm"), rpmFixture{Name: "source", Version: "1", Release: "1", Arch: "src"})
 		}},
-		{"signed metadata", func(t *testing.T, dir string) {
+		{"signed metadata", false, func(t *testing.T, dir string) {
 			mustWritePruneFile(t, filepath.Join(dir, "repodata", "repomd.xml.asc"), []byte("signature"))
 		}},
-		{"group metadata", addRepomdGroupData},
-		{"module metadata", addRepomdModulesData},
-		{"managed state", func(t *testing.T, dir string) { mustMkdir(t, filepath.Join(dir, ".sow")) }},
-		{"marker symlink", func(t *testing.T, dir string) {
+		{"group metadata", false, addRepomdGroupData},
+		{"module metadata", false, addRepomdModulesData},
+		{"managed workspace", false, func(t *testing.T, dir string) {
+			mustMkdir(t, filepath.Join(dir, ".sow"))
+			mustWritePruneFile(t, filepath.Join(dir, "sow.yml"), []byte("schema: sow/v3\n"))
+		}},
+		{"marker symlink", false, func(t *testing.T, dir string) {
 			if err := os.Remove(filepath.Join(dir, "repo_complete")); err != nil {
 				t.Fatal(err)
 			}
@@ -173,21 +170,45 @@ func TestPruneRejectsInvalidInputsBeforeChanges(t *testing.T) {
 			dir := pruneFixture(t, true)
 			tt.mutate(t, dir)
 			before := pruneTreeSnapshot(t, dir)
-			for _, dry := range []bool{true, false} {
-				if result, err := Prune(context.Background(), PruneOptions{Dir: dir, DryRun: dry}); err == nil || len(result.Removed) != 0 || result.IndexUpdated {
-					t.Fatalf("unsafe prune accepted: result=%+v err=%v", result, err)
-				}
-				if after := pruneTreeSnapshot(t, dir); !reflect.DeepEqual(before, after) {
-					t.Fatalf("rejected prune changed directory")
-				}
+			if result, err := Prune(context.Background(), PruneOptions{Dir: dir, Strict: tt.strict}); err == nil || len(result.Removed) != 0 || result.IndexUpdated {
+				t.Fatalf("unsafe live prune accepted: result=%+v err=%v", result, err)
+			}
+			if after := pruneTreeSnapshot(t, dir); !reflect.DeepEqual(before, after) {
+				t.Fatalf("rejected prune changed directory")
 			}
 		})
+	}
+}
+
+func TestPruneFaultTolerantDefaults(t *testing.T) {
+	dir := pruneFixture(t, true)
+	// Add a corrupt RPM, a mixed DEB, an identical duplicate, a conflicting equal-EVR group, and a protected equal-EVR group.
+	mustWritePruneFile(t, filepath.Join(dir, "broken.rpm"), []byte("truncated"))
+	mustWritePruneFile(t, filepath.Join(dir, "other.deb"), []byte("deb"))
+	writePruneRPM(t, filepath.Join(dir, "equal-a.rpm"), rpmFixture{Name: "equal", Version: "1.0", Release: "1", Arch: "x86_64"})
+	writePruneRPM(t, filepath.Join(dir, "equal-b.rpm"), rpmFixture{Name: "equal", Version: "1+0", Release: "1", Arch: "x86_64"})
+	writePruneRPM(t, filepath.Join(dir, "prot-1.rpm"), rpmFixture{Name: "prot", Version: "1.0", Release: "1", Arch: "x86_64"})
+	mustWritePruneFile(t, filepath.Join(dir, "prot-copy.rpm"), mustRead(t, filepath.Join(dir, "prot-1.rpm")))
+
+	res, err := Prune(context.Background(), PruneOptions{Dir: dir, Protect: []string{"prot", "missing-cross-distro-pkg"}})
+	if err != nil {
+		t.Fatalf("fault-tolerant Prune failed: %v", err)
+	}
+	if len(res.Removed) != 2 || len(res.Skipped) != 1 || res.Skipped[0].Path != "broken.rpm" || len(res.Warnings) < 3 {
+		t.Fatalf("unexpected fault-tolerant Prune result: %+v", res)
+	}
+	// Conflicting equal-EVR files and protected files must stay intact, while old1/old2 were pruned.
+	for _, keep := range []string{"new.rpm", "equal-a.rpm", "equal-b.rpm", "prot-1.rpm", "prot-copy.rpm", "other.deb"} {
+		if _, err := os.Stat(filepath.Join(dir, keep)); err != nil {
+			t.Fatalf("expected %s to be preserved: %v", keep, err)
+		}
 	}
 }
 
 func TestPruneRejectsManagedAncestorThroughAlias(t *testing.T) {
 	workspace := t.TempDir()
 	mustMkdir(t, filepath.Join(workspace, ".sow"))
+	mustWritePruneFile(t, filepath.Join(workspace, "sow.yml"), []byte("schema: sow/v3\n"))
 	pool := mustMkdir(t, filepath.Join(workspace, "pool"))
 	leaf := mustMkdir(t, filepath.Join(pool, "pkg"))
 	writePruneRPM(t, filepath.Join(leaf, "pkg.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64"})
@@ -258,22 +279,15 @@ func TestPruneInterruptedPublicationAndRemovalConverge(t *testing.T) {
 	}
 }
 
-func TestPruneRejectsChangedInputsAndCancellationBeforeDeleting(t *testing.T) {
-	for _, change := range []string{"new file", "new symlink", "replacement", "replacement after pointer", "cancel after pointer"} {
+func TestPruneRejectsChangedReplacementAndCancellationBeforeDeleting(t *testing.T) {
+	for _, change := range []string{"replacement", "replacement after pointer", "cancel after pointer"} {
 		t.Run(change, func(t *testing.T) {
 			dir := pruneFixture(t, true)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			result, err := Prune(ctx, PruneOptions{Dir: dir, Fault: func(event Fault) error {
-				if event.Point == FaultBeforeStatValidation {
-					switch change {
-					case "new file":
-						writePruneRPM(t, filepath.Join(dir, "extra.rpm"), rpmFixture{Name: "extra", Version: "1", Release: "1", Arch: "x86_64"})
-					case "new symlink":
-						return os.Symlink("new.rpm", filepath.Join(dir, "extra.rpm"))
-					case "replacement":
-						writePruneRPM(t, filepath.Join(dir, "new.rpm"), rpmFixture{Name: "pkg", Version: "4", Release: "1", Arch: "x86_64"})
-					}
+				if event.Point == FaultBeforeStatValidation && change == "replacement" {
+					writePruneRPM(t, filepath.Join(dir, "new.rpm"), rpmFixture{Name: "pkg", Version: "4", Release: "1", Arch: "x86_64"})
 				}
 				if change == "cancel after pointer" && event.Point == FaultAfterRPMPointer {
 					cancel()
@@ -385,17 +399,23 @@ func TestPruneDetectsInPlaceReplacementRewrite(t *testing.T) {
 	})
 }
 
-func TestPruneRejectsProtectionThatMatchesNoPackage(t *testing.T) {
+func TestPruneProtectionUnmatchedWarnsByDefaultAndFailsInStrictMode(t *testing.T) {
 	dir := pruneFixture(t, true)
 	before := pruneTreeSnapshot(t, dir)
 	for _, dry := range []bool{true, false} {
-		result, err := Prune(context.Background(), PruneOptions{Dir: dir, DryRun: dry, Protect: []string{"pkg", "pgk"}})
+		// Strict mode rejects unmatched --protect names.
+		result, err := Prune(context.Background(), PruneOptions{Dir: dir, DryRun: dry, Strict: true, Protect: []string{"pkg", "pgk"}})
 		if KindOf(err) != KindUsage || !strings.Contains(err.Error(), "pgk") || len(result.Removed) != 0 {
-			t.Fatalf("misspelled protection dry=%t result=%+v err=%v", dry, result, err)
+			t.Fatalf("strict misspelled protection dry=%t result=%+v err=%v", dry, result, err)
 		}
 	}
 	if after := pruneTreeSnapshot(t, dir); !reflect.DeepEqual(before, after) {
-		t.Fatal("rejected protection changed directory")
+		t.Fatal("strict rejected protection changed directory")
+	}
+	// Default mode warns and still respects matched --protect names.
+	res, err := Prune(context.Background(), PruneOptions{Dir: dir, DryRun: true, Protect: []string{"pkg", "pgk"}})
+	if err != nil || len(res.Candidates) != 0 || len(res.Warnings) == 0 {
+		t.Fatalf("default unmatched protection res=%+v err=%v", res, err)
 	}
 }
 
@@ -480,18 +500,16 @@ func TestPlainRejectsOversizedPriorIndex(t *testing.T) {
 		mustWritePruneFile(t, path, []byte(body))
 		return dir
 	}
-	for _, dry := range []bool{false, true} {
-		t.Run(fmt.Sprintf("prune dry=%t", dry), func(t *testing.T) {
-			dir := oversized(t)
-			before := pruneTreeSnapshot(t, dir)
-			if _, err := Prune(context.Background(), PruneOptions{Dir: dir, DryRun: dry}); KindOf(err) != KindRejected {
-				t.Fatalf("oversized index accepted: %v", err)
-			}
-			if !reflect.DeepEqual(before, pruneTreeSnapshot(t, dir)) {
-				t.Fatal("rejected command changed repository")
-			}
-		})
-	}
+	t.Run("prune live", func(t *testing.T) {
+		dir := oversized(t)
+		before := pruneTreeSnapshot(t, dir)
+		if _, err := Prune(context.Background(), PruneOptions{Dir: dir}); KindOf(err) != KindRejected {
+			t.Fatalf("oversized index accepted on live prune: %v", err)
+		}
+		if !reflect.DeepEqual(before, pruneTreeSnapshot(t, dir)) {
+			t.Fatal("rejected command changed repository")
+		}
+	})
 	// Create cannot list the types of an index it cannot inspect, but keeps
 	// its established behavior of replacing the old index.
 	t.Run("create", func(t *testing.T) {
@@ -506,59 +524,83 @@ func TestPlainRejectsOversizedPriorIndex(t *testing.T) {
 	})
 }
 
-func TestPruneAndCreateRejectRPMv6AcrossAllRoles(t *testing.T) {
-	v6Tags := []rpmTag{rpmStringTag(5092, strings.Repeat("a", 64))}
-	for _, tc := range []struct {
-		name    string
-		protect []string
-		setup   func(*testing.T, string)
-	}{
-		{
-			name: "single-version",
-			setup: func(t *testing.T, dir string) {
-				writePruneRPM(t, filepath.Join(dir, "only.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64", ExtraTags: v6Tags})
-			},
-		},
-		{
-			name:    "protected",
-			protect: []string{"protected-pkg"},
-			setup: func(t *testing.T, dir string) {
-				writePruneRPM(t, filepath.Join(dir, "protected.rpm"), rpmFixture{Name: "protected-pkg", Version: "1", Release: "1", Arch: "x86_64", ExtraTags: v6Tags})
-				writePruneRPM(t, filepath.Join(dir, "old.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64"})
-				writePruneRPM(t, filepath.Join(dir, "new.rpm"), rpmFixture{Name: "pkg", Version: "2", Release: "1", Arch: "x86_64"})
-			},
-		},
-		{
-			name: "superseded",
-			setup: func(t *testing.T, dir string) {
-				writePruneRPM(t, filepath.Join(dir, "old-v6.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64", ExtraTags: v6Tags})
-				writePruneRPM(t, filepath.Join(dir, "new.rpm"), rpmFixture{Name: "pkg", Version: "2", Release: "1", Arch: "x86_64"})
-			},
-		},
-		{
-			name: "latest-replacement",
-			setup: func(t *testing.T, dir string) {
-				writePruneRPM(t, filepath.Join(dir, "old.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64"})
-				writePruneRPM(t, filepath.Join(dir, "new-v6.rpm"), rpmFixture{Name: "pkg", Version: "2", Release: "1", Arch: "x86_64", ExtraTags: v6Tags})
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			tc.setup(t, dir)
-			before := pruneTreeSnapshot(t, dir)
-			for _, dry := range []bool{true, false} {
-				if result, err := Prune(context.Background(), PruneOptions{Dir: dir, DryRun: dry, Protect: tc.protect}); err == nil || !strings.Contains(err.Error(), "RPM v6") || len(result.Removed) != 0 || result.IndexUpdated {
-					t.Fatalf("Prune dry=%t accepted RPM v6 (%s): result=%+v err=%v", dry, tc.name, result, err)
-				}
-			}
-			if _, err := Create(context.Background(), Options{Dir: dir}); err == nil || !strings.Contains(err.Error(), "RPM v6") {
-				t.Fatalf("Create accepted RPM v6 (%s): %v", tc.name, err)
-			}
-			if !reflect.DeepEqual(before, pruneTreeSnapshot(t, dir)) {
-				t.Fatalf("rejected RPM v6 (%s) mutated directory", tc.name)
-			}
-		})
+func TestCreateAndPruneSupportRPMv6Packages(t *testing.T) {
+	dir := t.TempDir()
+	// Create and live Prune support RPM v6 packages (tag 5092 without tag 5093).
+	sum := sha256.Sum256([]byte("payload for pkg 2 1"))
+	v6Tags := []rpmTag{rpmStringTag(5092, hex.EncodeToString(sum[:]))}
+	writePruneRPM(t, filepath.Join(dir, "old.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64"})
+	writePruneRPM(t, filepath.Join(dir, "new-v6.rpm"), rpmFixture{Name: "pkg", Version: "2", Release: "1", Arch: "x86_64", ExtraTags: v6Tags})
+	// Mark lead major version as 6 (RPM v6).
+	v6Path := filepath.Join(dir, "new-v6.rpm")
+	raw := mustRead(t, v6Path)
+	raw[4] = 6
+	if err := os.WriteFile(v6Path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if res, err := Create(context.Background(), Options{Dir: dir}); err != nil || res.RPM != 2 {
+		t.Fatalf("Create on RPM v6 failed: res=%+v err=%v", res, err)
+	}
+	if res, err := Prune(context.Background(), PruneOptions{Dir: dir, DryRun: true}); err != nil || len(res.Candidates) != 1 || res.Candidates[0].Latest != "new-v6.rpm" {
+		t.Fatalf("Prune --dry-run on RPM v6 failed: res=%+v err=%v", res, err)
+	}
+	// Live prune verifies RPM v6 payload digest (default SHA-256) and removes old.rpm.
+	if res, err := Prune(context.Background(), PruneOptions{Dir: dir}); err != nil || len(res.Removed) != 1 || res.Removed[0] != "old.rpm" {
+		t.Fatalf("live Prune on RPM v6 failed: res=%+v err=%v", res, err)
+	}
+}
+
+func TestPruneMixedRPMAndDEBPreservesDEBIndexAndMarker(t *testing.T) {
+	dir := t.TempDir()
+	writePruneRPM(t, filepath.Join(dir, "old.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64"})
+	writePruneRPM(t, filepath.Join(dir, "new.rpm"), rpmFixture{Name: "pkg", Version: "2", Release: "1", Arch: "x86_64"})
+	writeDEBFixture(t, dir, "app_1.0_amd64.deb", "Package: app\nVersion: 1.0\nArchitecture: amd64\nMaintainer: Test <test@example.com>\nDescription: test\n", "payload")
+	if _, err := Create(context.Background(), Options{Dir: dir, Pigsty: true}); err != nil {
+		t.Fatal(err)
+	}
+	writeDEBFixture(t, dir, "unindexed.deb", debControl("unindexed", "1", "amd64"), "arrived after index")
+	beforePackages := mustRead(t, filepath.Join(dir, "Packages"))
+	beforeGzip := mustRead(t, filepath.Join(dir, "Packages.gz"))
+
+	res, err := Prune(context.Background(), PruneOptions{Dir: dir})
+	if err != nil {
+		t.Fatalf("Prune on mixed RPM+DEB dir failed: %v", err)
+	}
+	if len(res.Removed) != 1 || res.Removed[0] != "old.rpm" {
+		t.Fatalf("Removed=%v, want [old.rpm]", res.Removed)
+	}
+	if !bytes.Equal(mustRead(t, filepath.Join(dir, "Packages")), beforePackages) {
+		t.Fatal("Prune altered or removed existing DEB Packages index")
+	}
+	if !bytes.Equal(mustRead(t, filepath.Join(dir, "Packages.gz")), beforeGzip) {
+		t.Fatal("Prune altered or removed existing DEB Packages.gz index")
+	}
+	marker := string(mustRead(t, filepath.Join(dir, "repo_complete")))
+	if strings.Contains(marker, "unindexed.deb") || !strings.Contains(marker, "app_1.0_amd64.deb") || !strings.Contains(marker, "new.rpm") || strings.Contains(marker, "old.rpm") {
+		t.Fatalf("repo_complete after mixed prune = %q", marker)
+	}
+}
+
+func TestCreateAllCorruptPreservesExistingMetadata(t *testing.T) {
+	dir := t.TempDir()
+	writePruneRPM(t, filepath.Join(dir, "good.rpm"), rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "x86_64"})
+	if _, err := Create(context.Background(), Options{Dir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	beforeRepomd := mustRead(t, filepath.Join(dir, "repodata", "repomd.xml"))
+	// Replace the only RPM with corrupt bytes.
+	if err := os.WriteFile(filepath.Join(dir, "good.rpm"), []byte("not an rpm"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Create(context.Background(), Options{Dir: dir})
+	if err != nil {
+		t.Fatalf("default create with all corrupt packages should preserve metadata with exit 0: %v", err)
+	}
+	if !res.Noop || len(res.Skipped) != 1 || len(res.Warnings) == 0 {
+		t.Fatalf("unexpected result=%+v", res)
+	}
+	if !bytes.Equal(mustRead(t, filepath.Join(dir, "repodata", "repomd.xml")), beforeRepomd) {
+		t.Fatal("existing repodata/repomd.xml was wiped when all packages were corrupt")
 	}
 }
 
@@ -637,4 +679,30 @@ func pruneTreeSnapshot(t *testing.T, root string) map[string]string {
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func TestPruneAllSkippedPreservesMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pkg.rpm")
+	writePruneRPM(t, path, rpmFixture{Name: "pkg", Version: "1", Release: "1", Arch: "noarch"})
+	if _, err := Create(context.Background(), Options{Dir: dir, Pigsty: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("incomplete"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	files := []string{"repodata/repomd.xml", rpmHistoryName, "repo_complete"}
+	before := map[string]string{}
+	for _, name := range files {
+		before[name] = fileSHA(filepath.Join(dir, name))
+	}
+	res, err := Prune(context.Background(), PruneOptions{Dir: dir})
+	if err != nil || !res.Noop || res.IndexUpdated || len(res.Skipped) != 1 || !res.Marker {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	for name, sum := range before {
+		if fileSHA(filepath.Join(dir, name)) != sum {
+			t.Fatalf("%s changed", name)
+		}
+	}
 }

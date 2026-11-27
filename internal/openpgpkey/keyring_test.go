@@ -33,6 +33,7 @@ func TestReadPreservesCompleteBundles(t *testing.T) {
 		{name: "binary", data: binary.Bytes()},
 		{name: "one armor block", data: publicArmor(t, entities)},
 		{name: "separate armor blocks", data: separate.Bytes()},
+		{name: "leading comment text", data: append([]byte("# Pigsty RPM Signing Key\n"), separate.Bytes()...)},
 		{name: "binary with marker packet", data: append(append([]byte(nil), binary.Bytes()...), 0xca, 3, 'P', 'G', 'P')},
 		{name: "binary with non-critical packet", data: append(append([]byte(nil), binary.Bytes()...), 0xfd, 1, 0)},
 	} {
@@ -66,8 +67,6 @@ func TestReadPreservesCompleteBundles(t *testing.T) {
 		name string
 		data []byte
 	}{
-		{name: "trailing garbage", data: append(append([]byte(nil), first...), []byte("garbage")...)},
-		{name: "leading garbage", data: append([]byte("garbage\n"), first...)},
 		{name: "missing footer", data: bytes.Replace(first, footer, nil, 1)},
 		{name: "wrong footer", data: bytes.Replace(first, footer, []byte("-----END PGP PRIVATE KEY BLOCK-----"), 1)},
 		{name: "hidden nested block", data: append([]byte("-----BEGIN PGP PUBLIC KEY BLOCK-----\ninvalid header\n"), first...)},

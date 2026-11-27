@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"unicode/utf8"
 )
 
 const Environment = "SOW_GPG_PASSFILE"
@@ -124,10 +123,11 @@ func fileSource(baseDir, guardRoot, path string, legacy bool) (Source, error) {
 	return Source{root: absGuardRoot, path: path, legacy: legacy}, nil
 }
 
-// Read returns caller-owned bytes. Clear them after use. New passfiles are
-// UTF-8 without BOM, one non-empty line, at most MaxBytes including its optional
-// LF/CRLF terminator. Spaces, tabs, quotes and '#' are literal password bytes.
-// Legacy references retain their existing byte-oriented normalization.
+// Read returns caller-owned bytes. Clear them after use. New passfiles may
+// carry an optional UTF-8 BOM, must be one non-empty line without NUL bytes,
+// and are at most MaxBytes including their optional LF/CRLF terminator.
+// Spaces, tabs, quotes and '#' are literal password bytes. Legacy references
+// retain their existing byte-oriented normalization.
 func (source Source) Read() ([]byte, error) {
 	if !source.Explicit() {
 		return nil, nil
@@ -150,18 +150,22 @@ func (source Source) Read() ([]byte, error) {
 	if source.legacy {
 		secret = bytes.TrimSuffix(secret, []byte("\n"))
 		secret = bytes.TrimSuffix(secret, []byte("\r"))
-	} else if bytes.HasSuffix(secret, []byte("\r\n")) {
-		secret = secret[:len(secret)-2]
-	} else if bytes.HasSuffix(secret, []byte("\n")) {
-		secret = secret[:len(secret)-1]
+	} else {
+		// Strip optional UTF-8 BOM and one trailing LF/CRLF.
+		secret = bytes.TrimPrefix(secret, []byte{0xef, 0xbb, 0xbf})
+		if bytes.HasSuffix(secret, []byte("\r\n")) {
+			secret = secret[:len(secret)-2]
+		} else if bytes.HasSuffix(secret, []byte("\n")) {
+			secret = secret[:len(secret)-1]
+		}
 	}
 	invalid := len(secret) == 0 || len(data) > MaxBytes || bytes.IndexByte(secret, 0) >= 0
 	if !source.legacy {
-		invalid = invalid || !utf8.Valid(secret) || bytes.HasPrefix(secret, []byte{0xef, 0xbb, 0xbf}) || bytes.ContainsAny(secret, "\r\n")
+		invalid = invalid || bytes.ContainsAny(secret, "\r\n")
 	}
 	if invalid {
 		Clear(data)
-		return nil, errors.Join(ErrCredential, errors.New("passfile must contain one non-empty UTF-8 line without BOM, NUL or embedded line breaks, at most 64 KiB"))
+		return nil, errors.Join(ErrCredential, errors.New("passfile must contain one non-empty line without NUL or embedded line breaks, at most 64 KiB"))
 	}
 	return secret, nil
 }

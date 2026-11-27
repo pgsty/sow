@@ -355,7 +355,7 @@ func TestLegacyAppliedAddOmittingNonEmptyDistFinishes(t *testing.T) {
 	}
 }
 
-func TestInputScanDoesNotResolveReplacedDirectory(t *testing.T) {
+func TestInputScanStaysInSelectedDirectory(t *testing.T) {
 	for _, recursive := range []bool{false, true} {
 		t.Run(fmt.Sprint(recursive), func(t *testing.T) {
 			base, err := filepath.EvalSymlinks(t.TempDir())
@@ -367,12 +367,18 @@ func TestInputScanDoesNotResolveReplacedDirectory(t *testing.T) {
 				if err := os.Mkdir(dir, 0755); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(filepath.Join(dir, "pkg.rpm"), []byte(dir), 0644); err != nil {
-					t.Fatal(err)
+				for _, suffix := range []string{"-a.rpm", "-b.rpm"} {
+					if err := os.WriteFile(filepath.Join(dir, filepath.Base(dir)+suffix), []byte(dir), 0644); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			if err := os.Symlink(outside, swapped); err != nil {
 				t.Fatal(err)
+			}
+			files, failures := collectInputFiles(context.Background(), []string{swapped}, recursive)
+			if len(failures) != 0 || len(files) != 2 || filepath.Dir(files[0].Path) != outside || filepath.Dir(files[1].Path) != outside {
+				t.Fatalf("explicit directory symlink: files=%v failures=%v", files, failures)
 			}
 			done := make(chan struct{})
 			var workers sync.WaitGroup
@@ -394,9 +400,12 @@ func TestInputScanDoesNotResolveReplacedDirectory(t *testing.T) {
 			defer func() { close(done); workers.Wait() }()
 			for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
 				files, _ := collectInputFiles(context.Background(), []string{tree}, recursive)
+				// At entry the argument can be the real directory or a valid
+				// explicit symlink. Each successful scan must use just one.
 				for _, file := range files {
-					if !strings.HasPrefix(file.Path, tree+string(filepath.Separator)) {
-						t.Fatalf("enumerated directory escaped: %s", file.Path)
+					dir := filepath.Dir(file.Path)
+					if (dir != tree && dir != outside) || dir != filepath.Dir(files[0].Path) || !strings.HasPrefix(file.Base, filepath.Base(dir)+"-") {
+						t.Fatalf("scan mixed directory identities: %v", files)
 					}
 				}
 			}

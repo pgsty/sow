@@ -98,7 +98,10 @@ func inspectWorkspaceJournal(root string) (*workspaceJournal, error) {
 	if err != nil || journal == nil {
 		return journal, err
 	}
-	configPath := filepath.Join(root, config.ConfigFilename)
+	configPath, err := config.ResolveConfigPath(root)
+	if err != nil {
+		return nil, err
+	}
 	info, statErr := os.Lstat(configPath)
 	if errors.Is(statErr, os.ErrNotExist) {
 		if journal.Kind == "workspace.init" && journal.Phase == "planned" {
@@ -187,7 +190,10 @@ func recoverWorkspaceOperation(ctx context.Context, root string, lockOpts ...Loc
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	configPath := filepath.Join(root, config.ConfigFilename)
+	configPath, err := config.ResolveConfigPath(root)
+	if err != nil {
+		return err
+	}
 	currentSHA := ""
 	configExists := false
 	if info, statErr := os.Lstat(configPath); statErr == nil {

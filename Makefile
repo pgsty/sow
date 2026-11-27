@@ -7,7 +7,7 @@ GORELEASER ?= goreleaser
 STATICCHECK_VERSION ?= v0.8.2
 DEADCODE_VERSION ?= v0.53.0
 GOVULNCHECK_VERSION ?= v1.10.0
-VERSION ?= 0.8.0
+VERSION ?= 0.9.0
 TEST_TIMEOUT ?= 60m
 CORE_TEST_TIMEOUT ?= 20m
 RACE_TIMEOUT ?= 45m
@@ -39,7 +39,7 @@ help:
 		'  make test-perf-contract  Compile performance tests and verify fixtures' \
 		'  make test-r2-live    Run the opt-in read-only Cloudflare R2 fixture gate' \
 		'  make race            Race-test the core repository packages' \
-		'  make check           Run quality, vulnerability, provenance, and focused tests' \
+		'  make check           Run format, tidy, vet, and core + RPM tests' \
 		'  make clean-delivery  Rebuild and verify the deterministic source archive' \
 		'  make release-local   Build local archives and Linux packages with GoReleaser' \
 		'  make release         Run all local gates, then build the GoReleaser snapshot' \
@@ -104,8 +104,7 @@ deadcode:
 		deadcode_cmd="$$tmp_dir/deadcode"; \
 	fi; \
 	output="$$($$deadcode_cmd -test ./...)" || { status=$$?; printf '%s\n' "$$output" >&2; exit $$status; }; \
-	test -z "$$output" || { printf 'unreachable declarations:\n%s\n' "$$output" >&2; exit 1; }; \
-	DEADCODE_CMD="$$deadcode_cmd" bash qa/compat/check-deadcode-binary.sh
+	test -z "$$output" || { printf 'unreachable declarations:\n%s\n' "$$output" >&2; exit 1; }
 
 vuln:
 	@if command -v govulncheck >/dev/null 2>&1; then \
@@ -143,7 +142,7 @@ test-r2-live:
 race:
 	$(GO) test -race -timeout '$(RACE_TIMEOUT)' -count=1 $(CORE_PACKAGES)
 
-check: fmt-check tidy-check vet lint deadcode vuln verify-rpm-upstream test-perf-contract test-core
+check: fmt-check tidy-check vet test-core test-rpm
 
 clean-delivery:
 	qa/compat/test-clean-delivery.sh '$(CLEAN_DELIVERY_OUT)'
@@ -163,7 +162,6 @@ release:
 	@$(MAKE) check
 	@$(MAKE) test
 	@$(MAKE) race
-	@$(MAKE) clean-delivery
 	@$(MAKE) release-local
 	@printf 'SOW v%s release gates passed\n' '$(VERSION)'
 

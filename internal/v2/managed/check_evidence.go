@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/pgsty/sow/internal/aptrepo"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
@@ -123,22 +124,75 @@ type checkVerificationSnapshot struct {
 }
 
 type checkRPMTrustPlan struct {
-	Rings       []yumrepo.RPMSignatureTrustRing
-	Retained    map[string]map[string]string
-	CurrentRing string
-	TrustedRing string
+	Rings           []yumrepo.RPMSignatureTrustRing
+	Retained        map[string]map[string]string
+	RetainedFill    map[string]string
+	RetainedAllRing string
+	CurrentRing     string
+	TrustedRing     string
 }
 
-func buildCheckRPMTrustPlan(retained retainedRPMKeyrings, policy rpmSigningPolicy) checkRPMTrustPlan {
-	plan := checkRPMTrustPlan{Retained: make(map[string]map[string]string)}
+func buildCheckRPMTrustPlan(retained retainedRPMKeyrings, policy rpmSigningPolicy, frozenFill []config.EffectiveRPMPackageSigningConfig) (checkRPMTrustPlan, error) {
+	plan := checkRPMTrustPlan{
+		Retained:     make(map[string]map[string]string),
+		RetainedFill: make(map[string]string),
+	}
 	byIdentity := make(map[string]yumrepo.RPMSignatureTrustRing)
-	for fingerprint, snapshots := range retained {
+	var allIDs []string
+	var allKeys [][]byte
+	fingerprints := make([]string, 0, len(retained))
+	for fingerprint := range retained {
+		fingerprints = append(fingerprints, fingerprint)
+	}
+	sort.Strings(fingerprints)
+	for _, fingerprint := range fingerprints {
+		snapshots := retained[fingerprint]
 		plan.Retained[fingerprint] = make(map[string]string, len(snapshots))
-		for snapshot, keyring := range snapshots {
+		snapshotIDs := make([]string, 0, len(snapshots))
+		for snapshot := range snapshots {
+			snapshotIDs = append(snapshotIDs, snapshot)
+		}
+		sort.Strings(snapshotIDs)
+		for _, snapshot := range snapshotIDs {
+			entry := snapshots[snapshot]
 			identity := "retained/" + fingerprint + "/" + snapshot
 			plan.Retained[fingerprint][snapshot] = identity
-			byIdentity[identity] = yumrepo.RPMSignatureTrustRing{Identity: identity, Keyring: keyring}
+			byIdentity[identity] = yumrepo.RPMSignatureTrustRing{Identity: identity, Keyring: entry.keyring}
+			allIDs = append(allIDs, fingerprint+":"+snapshot)
+			allKeys = append(allKeys, entry.publicKey)
 		}
+	}
+	if len(allKeys) > 1 {
+		combined, err := combineRetainedRPMKeyrings(allKeys)
+		if err != nil {
+			return checkRPMTrustPlan{}, fmt.Errorf("%w: combine retained RPM signing certificates: %v", ErrIntegrity, err)
+		}
+		plan.RetainedAllRing = "retained-all/" + bytesSHA([]byte(strings.Join(allIDs, "\n")))
+		byIdentity[plan.RetainedAllRing] = yumrepo.RPMSignatureTrustRing{Identity: plan.RetainedAllRing, Keyring: combined}
+	}
+	for _, signing := range frozenFill {
+		if signing.Mode != "fill" {
+			continue
+		}
+		allowed := matchedRetainedFillKeys(signing, plan.Retained)
+		fillKey, matchedPairs := canonicalRetainedFillSet(allowed)
+		if len(matchedPairs) < 2 {
+			continue
+		}
+		if _, exists := plan.RetainedFill[fillKey]; exists {
+			continue
+		}
+		materials := make([][]byte, 0, len(matchedPairs))
+		for _, pair := range matchedPairs {
+			materials = append(materials, retained[pair.fingerprint][pair.snapshot].publicKey)
+		}
+		combined, err := combineRetainedRPMKeyrings(materials)
+		if err != nil {
+			return checkRPMTrustPlan{}, fmt.Errorf("%w: combine frozen fill RPM signing certificates: %v", ErrIntegrity, err)
+		}
+		ringID := "retained-fill/" + fillKey
+		plan.RetainedFill[fillKey] = ringID
+		byIdentity[ringID] = yumrepo.RPMSignatureTrustRing{Identity: ringID, Keyring: combined}
 	}
 	if policy.current != nil {
 		plan.CurrentRing = "policy/current/" + policy.currentPrint + "/" + policy.currentSnapshot
@@ -157,7 +211,60 @@ func buildCheckRPMTrustPlan(retained retainedRPMKeyrings, policy rpmSigningPolic
 	for _, identity := range identities {
 		plan.Rings = append(plan.Rings, byIdentity[identity])
 	}
-	return plan
+	return plan, nil
+}
+
+type retainedKeyPair struct {
+	fingerprint string
+	snapshot    string
+}
+
+func matchedRetainedFillKeys(signing config.EffectiveRPMPackageSigningConfig, retained map[string]map[string]string) map[string]map[string]struct{} {
+	allowed := map[string]map[string]struct{}{}
+	for _, fingerprint := range signing.TrustedKeyFingerprints {
+		allowed[strings.ToUpper(fingerprint)] = map[string]struct{}{}
+	}
+	for _, snapshot := range signing.TrustedKeySnapshotSHA256s {
+		for fingerprint, rings := range retained {
+			if _, ok := allowed[fingerprint]; ok {
+				if _, exists := rings[snapshot]; exists {
+					allowed[fingerprint][snapshot] = struct{}{}
+				}
+			}
+		}
+	}
+	return allowed
+}
+
+func canonicalRetainedFillSet(allowed map[string]map[string]struct{}) (string, []retainedKeyPair) {
+	var pairs []retainedKeyPair
+	for fingerprint, snapshots := range allowed {
+		for snapshot := range snapshots {
+			pairs = append(pairs, retainedKeyPair{fingerprint: fingerprint, snapshot: snapshot})
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].fingerprint != pairs[j].fingerprint {
+			return pairs[i].fingerprint < pairs[j].fingerprint
+		}
+		return pairs[i].snapshot < pairs[j].snapshot
+	})
+	ids := make([]string, len(pairs))
+	for i, pair := range pairs {
+		ids[i] = pair.fingerprint + ":" + pair.snapshot
+	}
+	return bytesSHA([]byte(strings.Join(ids, "\n"))), pairs
+}
+
+func combineRetainedRPMKeyrings(materials [][]byte) (openpgp.KeyRing, error) {
+	var combined []byte
+	for i, material := range materials {
+		if i > 0 {
+			combined = append(combined, '\n')
+		}
+		combined = append(combined, material...)
+	}
+	return yumrepo.ParseRPMPackageKeyring(combined)
 }
 
 func (registry *payloadEvidenceRegistry) auditObject(ctx context.Context, source ManagedPackageSource, object state.PackageObject, stored *state.PackageFact, trust checkRPMTrustPlan, observedAt time.Time) (*checkPayloadEvidence, error) {
@@ -471,6 +578,19 @@ func checkRingVerified(evidence *checkPayloadEvidence, identity string) bool {
 	return ok && result.Verified
 }
 
+func checkRingVerifiedByPrimary(evidence *checkPayloadEvidence, identity, primaryFingerprint string) bool {
+	if !checkRingVerified(evidence, identity) {
+		return false
+	}
+	for _, proof := range evidence.SignatureResults[identity].Proofs {
+		if (proof.Coverage == yumrepo.RPMSignatureCoverageHeaderPayloadDigest || proof.Coverage == yumrepo.RPMSignatureCoverageHeaderPayload) &&
+			strings.EqualFold(proof.SignerPrimaryFingerprint, primaryFingerprint) {
+			return true
+		}
+	}
+	return false
+}
+
 func validateStoredRPMEvidence(object state.PackageObject, evidence *checkPayloadEvidence, trust checkRPMTrustPlan) error {
 	if evidence == nil {
 		return errors.New("package authentication evidence is unavailable")
@@ -481,6 +601,9 @@ func validateStoredRPMEvidence(object state.PackageObject, evidence *checkPayloa
 			if checkRingVerified(evidence, ringIdentity) {
 				return nil
 			}
+		}
+		if trust.RetainedAllRing != "" && checkRingVerifiedByPrimary(evidence, trust.RetainedAllRing, identity) {
+			return nil
 		}
 		return fmt.Errorf("package is not verified by its retained signer %s", identity)
 	}
@@ -520,24 +643,20 @@ func validateBuiltRPMAuthorizationEvidence(object state.PackageObject, evidence 
 	if signing.Mode == "always" {
 		allowed[strings.ToUpper(signing.KeyFingerprint)] = map[string]struct{}{signing.KeySnapshotSHA256: {}}
 	} else if signing.Mode == "fill" {
-		for _, fingerprint := range signing.TrustedKeyFingerprints {
-			allowed[strings.ToUpper(fingerprint)] = map[string]struct{}{}
-		}
-		for _, snapshot := range signing.TrustedKeySnapshotSHA256s {
-			for fingerprint, rings := range trust.Retained {
-				if _, ok := allowed[fingerprint]; ok {
-					if _, exists := rings[snapshot]; exists {
-						allowed[fingerprint][snapshot] = struct{}{}
-					}
-				}
-			}
-		}
+		allowed = matchedRetainedFillKeys(signing, trust.Retained)
 	} else {
 		return fmt.Errorf("unknown retained RPM package signing mode %q", signing.Mode)
 	}
 	for fingerprint, snapshots := range allowed {
 		for snapshot := range snapshots {
 			if checkRingVerified(evidence, trust.Retained[fingerprint][snapshot]) {
+				return nil
+			}
+		}
+	}
+	if signing.Mode == "fill" {
+		if fillKey, matchedPairs := canonicalRetainedFillSet(allowed); len(matchedPairs) >= 2 {
+			if ringIdentity := trust.RetainedFill[fillKey]; ringIdentity != "" && checkRingVerified(evidence, ringIdentity) {
 				return nil
 			}
 		}

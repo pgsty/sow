@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,7 +19,6 @@ import (
 	"github.com/pgsty/sow/internal/v2/state"
 	"github.com/pgsty/sow/internal/workmetrics"
 	"github.com/pgsty/sow/internal/yumrepo"
-	"golang.org/x/sys/unix"
 )
 
 type inputFile struct {
@@ -152,7 +152,7 @@ func inspectProbedInput(ctx context.Context, probe *probedInput, snapshot, basen
 			}
 		}
 		after, identityErr := snapshotRootedRegularIdentity(probe.opened)
-		if identityErr == nil && before == after {
+		if identityErr == nil && before.sameContentStat(after) {
 			if readErr == nil && previousDigest != "" && previousDigest != digests.SHA256 {
 				readErr = errors.New("managed: package bytes changed between inspection attempts")
 			}
@@ -223,106 +223,136 @@ func inspectInputReaderWithFacts(ctx context.Context, file *os.File, basename st
 }
 
 func collectInputFiles(ctx context.Context, inputs []string, recursive bool) ([]inputFile, []MutationItem) {
-	seen := make(map[string]struct{})
+	seen := make(map[string]bool)
 	files := []inputFile{}
 	failures := []MutationItem{}
-	addFile := func(filename, display string, explicit bool) bool {
-		base := filepath.Base(filename)
-		if !strings.HasSuffix(base, ".rpm") && !strings.HasSuffix(base, ".deb") {
-			if explicit {
-				failures = append(failures, MutationItem{Input: display, Status: "failed", Error: "input is not an RPM or DEB package"})
-			}
-			return false
+	report := func(input string, err error) {
+		failures = append(failures, MutationItem{Input: input, Status: "failed", Error: err.Error()})
+	}
+	add := func(file inputFile) {
+		if !seen[file.Path] {
+			seen[file.Path] = true
+			files = append(files, file)
 		}
-		absolute, err := filepath.Abs(filename)
-		if err != nil {
-			failures = append(failures, MutationItem{Input: display, Status: "failed", Error: err.Error()})
-			return false
-		}
-		if _, duplicate := seen[absolute]; duplicate {
-			return true
-		}
-		opened, err := openRootedRegular(filepath.Dir(absolute), filepath.Base(absolute))
-		if err != nil {
-			failures = append(failures, MutationItem{Input: display, Status: "failed", Error: "package input is not a real regular file"})
-			return false
-		}
-		if err := opened.CloseVerified(); err != nil {
-			failures = append(failures, MutationItem{Input: display, Status: "failed", Error: "package input changed during scan"})
-			return false
-		}
-		seen[absolute] = struct{}{}
-		files = append(files, inputFile{Path: absolute, Display: display, Base: base})
-		return true
 	}
 	for _, input := range inputs {
-		absolute, err := filepath.Abs(input)
+		if err := ctx.Err(); err != nil {
+			report(input, err)
+			continue
+		}
+		path, err := filepath.Abs(input)
+		if err == nil {
+			path, err = filepath.EvalSymlinks(path)
+		}
 		if err != nil {
-			failures = append(failures, MutationItem{Input: input, Status: "failed", Error: err.Error()})
+			report(input, err)
 			continue
 		}
-		absolute, err = canonicalExternalInput(absolute)
+		info, err := os.Lstat(path)
 		if err != nil {
-			failures = append(failures, MutationItem{Input: input, Status: "failed", Error: err.Error()})
+			report(input, err)
 			continue
 		}
-		if opened, openErr := openRootedRegular(filepath.Dir(absolute), filepath.Base(absolute)); openErr == nil {
-			closeErr := opened.CloseVerified()
-			if closeErr != nil {
-				failures = append(failures, MutationItem{Input: input, Status: "failed", Error: "package input changed during scan"})
+		switch {
+		case info.Mode().IsRegular():
+			if !isInputPackageName(input) {
+				report(input, errors.New("input is not an RPM or DEB package"))
 				continue
 			}
-			addFile(absolute, input, true)
-			continue
-		}
-		directory, binding, dirErr := openBoundRootDirectory(absolute)
-		if dirErr != nil {
-			failures = append(failures, MutationItem{Input: input, Status: "failed", Error: "input is neither a regular file nor a directory"})
-			continue
-		}
-		if err := errors.Join(verifyBoundRootDirectory(directory, binding), directory.Close()); err != nil {
-			failures = append(failures, MutationItem{Input: input, Status: "failed", Error: err.Error()})
-			continue
-		}
-		found := 0
-		if recursive {
-			candidates := []string{}
-			walkErr := walkRootedInputFiles(ctx, absolute, func(relative string, _ *os.File, _ os.FileInfo) error {
-				filename := filepath.Join(absolute, filepath.FromSlash(relative))
-				base := filepath.Base(filename)
-				if strings.HasSuffix(base, ".rpm") || strings.HasSuffix(base, ".deb") {
-					candidates = append(candidates, filename)
-				}
-				return nil
-			})
-			if walkErr != nil {
-				failures = append(failures, MutationItem{Input: input, Status: "failed", Error: walkErr.Error()})
-				continue
-			}
-			for _, filename := range candidates {
-				if addFile(filename, filename, false) {
-					found++
+			add(inputFile{Path: path, Display: input, Base: filepath.Base(input)})
+		case info.IsDir():
+			candidates, err := scanInputDirectory(ctx, path, input, info, recursive, report)
+			if err != nil {
+				report(input, err)
+			} else if len(candidates) == 0 {
+				report(input, errors.New("directory contains no package inputs in the selected scan scope"))
+			} else {
+				for _, candidate := range candidates {
+					add(candidate)
 				}
 			}
-		} else {
-			entries, readErr := listRootedDirectory(absolute)
-			if readErr != nil {
-				failures = append(failures, MutationItem{Input: input, Status: "failed", Error: readErr.Error()})
-				continue
-			}
-			for _, entry := range entries {
-				if uint32(entry.Stat.Mode)&unix.S_IFMT == unix.S_IFREG && addFile(filepath.Join(absolute, entry.Name), filepath.Join(input, entry.Name), false) {
-					found++
-				}
-			}
-		}
-		if found == 0 {
-			failures = append(failures, MutationItem{Input: input, Status: "failed", Error: "directory contains no package inputs in the selected scan scope"})
+		default:
+			report(input, errors.New("input is neither a regular file nor a directory"))
 		}
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
 	sort.SliceStable(failures, func(i, j int) bool { return failures[i].Input < failures[j].Input })
 	return files, failures
+}
+
+func isInputPackageName(name string) bool {
+	return strings.HasSuffix(name, ".rpm") || strings.HasSuffix(name, ".deb")
+}
+
+// Scan the selected directory through one open handle. Package symlinks may
+// point outside it. A regular entry keeps its path for the verified ingest open.
+func scanInputDirectory(ctx context.Context, path, display string, selected os.FileInfo, recursive bool, report func(string, error)) ([]inputFile, error) {
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	opened, err := root.Stat(".")
+	if err != nil || !os.SameFile(selected, opened) {
+		return nil, errors.Join(errors.New("package input directory changed during scan"), err)
+	}
+	if recursive {
+		display = path
+	}
+	var files []inputFile
+	err = fs.WalkDir(root.FS(), ".", func(rel string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		label := filepath.Join(display, rel)
+		if walkErr != nil {
+			if rel == "." {
+				return walkErr
+			}
+			if entry == nil || entry.IsDir() || isInputPackageName(rel) {
+				report(label, walkErr)
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			if !recursive && rel != "." {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !isInputPackageName(entry.Name()) {
+			return nil
+		}
+		filename := filepath.Join(path, rel)
+		if entry.Type()&os.ModeSymlink != 0 {
+			target, err := root.Readlink(rel)
+			if err == nil {
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(filepath.Dir(filename), target)
+				}
+				filename, err = filepath.EvalSymlinks(target)
+			}
+			if err != nil {
+				report(label, err)
+				return nil
+			}
+			info, err := os.Lstat(filename)
+			if err != nil || !info.Mode().IsRegular() {
+				report(label, errors.Join(errors.New("package input is not a regular file"), err))
+				return nil
+			}
+		} else if !entry.Type().IsRegular() {
+			report(label, errors.New("package input is not a regular file"))
+			return nil
+		}
+		files = append(files, inputFile{Path: filename, Display: label, Base: entry.Name()})
+		return nil
+	})
+	after, statErr := os.Lstat(path)
+	if statErr != nil || !os.SameFile(selected, after) {
+		return nil, errors.Join(errors.New("package input directory changed during scan"), statErr)
+	}
+	return files, err
 }
 
 type packageSnapshotDigests struct {
@@ -578,16 +608,6 @@ func (reader *managedContextReader) Read(buffer []byte) (int, error) {
 		return 0, err
 	}
 	return reader.reader.Read(buffer)
-}
-
-// External input ancestors may be symlinks (for example /tmp on macOS).
-// Resolve only the parent; the leaf remains subject to no-follow checks.
-func canonicalExternalInput(filename string) (string, error) {
-	parent, err := filepath.EvalSymlinks(filepath.Dir(filename))
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(parent, filepath.Base(filename)), nil
 }
 
 func privateTemporaryDirectory(prefix string) (string, error) {

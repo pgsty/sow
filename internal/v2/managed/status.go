@@ -69,7 +69,7 @@ func Status(ctx context.Context, opts StatusOptions) (result StatusResult, resul
 	}
 	store, err := openReadOnlyState(database)
 	if err != nil {
-		return result, fmt.Errorf("%w: %v", ErrIntegrity, err)
+		return result, fmt.Errorf("%w: %w", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	initialLocked, initialHolder, probeErr := probeFileLock(filepath.Join(ws.Root, ".sow", "repo-locks", repoName+".lock"))

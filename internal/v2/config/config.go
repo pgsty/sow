@@ -22,10 +22,11 @@ import (
 )
 
 const (
-	ConfigFilename = "sow.yml"
-	Schema         = "sow/v3"
-	LegacySchema   = "sow/v2"
-	maxConfigBytes = 16 << 20
+	ConfigFilename    = "sow.yml"
+	AltConfigFilename = "sow.yaml"
+	Schema            = "sow/v3"
+	LegacySchema      = "sow/v2"
+	maxConfigBytes    = 16 << 20
 )
 
 var (
@@ -151,14 +152,83 @@ func parse(data []byte, allowLegacy bool) (Config, error) {
 	return cfg, nil
 }
 
-// LoadWorkspaceDocumentForMigration is the root-bound compatibility/migration
-// counterpart of LoadWorkspaceDocument. Ordinary writers continue to use the
-// strict loader and therefore cannot cross the schema boundary implicitly.
-func LoadWorkspaceDocumentForMigration(workspace Workspace) (Config, []byte, string, bool, error) {
-	if workspace.rootDevice == 0 || workspace.rootInode == 0 || filepath.Clean(workspace.ConfigPath) != filepath.Join(filepath.Clean(workspace.Root), ConfigFilename) {
-		return Config{}, nil, "", false, errors.New("load workspace config: invalid discovery root binding")
+// ResolveConfigPath selects the config for a workspace, defaulting to sow.yml
+// for a new workspace. A directory named sow.yaml can be an existing repository.
+func ResolveConfigPath(root string) (string, error) {
+	name, err := workspaceConfigName(root)
+	if err != nil {
+		return "", err
 	}
-	data, digest, err := readConfigFileBound(workspace.ConfigPath, workspace.rootDevice, workspace.rootInode, nil)
+	if name == "" {
+		name = ConfigFilename
+	}
+	return filepath.Join(root, name), nil
+}
+
+func workspaceConfigName(root string) (string, error) {
+	var matched string
+	for _, name := range []string{ConfigFilename, AltConfigFilename} {
+		filename := filepath.Join(root, name)
+		info, err := os.Lstat(filename)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err == nil && info.Mode()&os.ModeSymlink != 0 {
+			info, err = os.Stat(filename)
+		}
+		if err != nil {
+			return "", fmt.Errorf("nearest %s %q: %w", name, filename, err)
+		}
+		if name == AltConfigFilename && info.IsDir() {
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return "", fmt.Errorf("nearest %s %q is not a regular file", name, filename)
+		}
+		if matched != "" {
+			return "", fmt.Errorf("ambiguous workspace config in %q: both %s and %s exist", root, matched, name)
+		}
+		matched = name
+	}
+	return matched, nil
+}
+
+// WorkspaceFileSHA returns the digest of the selected workspace config.
+func WorkspaceFileSHA(root string) (string, error) {
+	filename, err := ResolveConfigPath(root)
+	if err != nil {
+		return "", err
+	}
+	return FileSHA(filename)
+}
+
+func validWorkspaceConfigBinding(workspace Workspace) error {
+	if workspace.Root == "" || workspace.ConfigPath == "" || workspace.rootDevice == 0 || workspace.rootInode == 0 {
+		return errors.New("load workspace config: invalid discovery root binding")
+	}
+	cleanRoot := filepath.Clean(workspace.Root)
+	cleanCfg := filepath.Clean(workspace.ConfigPath)
+	base := filepath.Base(cleanCfg)
+	if filepath.Dir(cleanCfg) != cleanRoot || (base != ConfigFilename && base != AltConfigFilename) {
+		return errors.New("load workspace config: invalid discovery root binding")
+	}
+	var st unix.Stat_t
+	if err := unix.Stat(cleanRoot, &st); err != nil {
+		return fmt.Errorf("load config %q: workspace root identity changed after discovery: %w", workspace.ConfigPath, err)
+	}
+	if uint64(st.Dev) != workspace.rootDevice || uint64(st.Ino) != workspace.rootInode {
+		return fmt.Errorf("load config %q: workspace root identity changed after discovery", workspace.ConfigPath)
+	}
+	return nil
+}
+
+// LoadWorkspaceDocumentForMigration is the compatibility/migration counterpart
+// of LoadWorkspaceDocument.
+func LoadWorkspaceDocumentForMigration(workspace Workspace) (Config, []byte, string, bool, error) {
+	if err := validWorkspaceConfigBinding(workspace); err != nil {
+		return Config{}, nil, "", false, err
+	}
+	data, digest, err := readConfigFile(workspace.ConfigPath)
 	if err != nil {
 		return Config{}, nil, "", false, err
 	}
@@ -169,24 +239,20 @@ func LoadWorkspaceDocumentForMigration(workspace Workspace) (Config, []byte, str
 	return cfg, data, digest, legacy, nil
 }
 
-// Load reads and strictly parses one sow.yml. It rejects symlinks and anything
-// other than a regular file.
+// Load reads and parses one sow.yml/sow.yaml file.
 func Load(filename string) (Config, error) {
 	cfg, _, _, err := LoadDocument(filename)
 	return cfg, err
 }
 
-// LoadWithSHA returns the parsed configuration and digest from LoadDocument,
-// discarding the source bytes. Both values come from the same bounded,
-// descriptor-bound read.
+// LoadWithSHA returns the parsed configuration and digest from LoadDocument.
 func LoadWithSHA(filename string) (Config, string, error) {
 	cfg, _, digest, err := LoadDocument(filename)
 	return cfg, digest, err
 }
 
 // LoadDocument returns the parsed config, exact source document, and digest
-// from one descriptor-bound read. Lifecycle journals must preserve the source
-// bytes from this call instead of reopening the pathname after validation.
+// from one bounded read.
 func LoadDocument(filename string) (Config, []byte, string, error) {
 	data, digest, err := readConfigFile(filename)
 	if err != nil {
@@ -199,27 +265,24 @@ func LoadDocument(filename string) (Config, []byte, string, error) {
 	return cfg, data, digest, nil
 }
 
-// LoadWorkspace parses a config only when its descriptor-bound parent is the
-// exact Workspace root inode captured by Discover. This closes the
-// Discover-to-Load gap in which an ancestor could otherwise be replaced by a
-// symlink or another same-shaped directory tree.
+// LoadWorkspace parses a discovered workspace config.
 func LoadWorkspace(workspace Workspace) (Config, error) {
 	cfg, _, _, err := LoadWorkspaceDocument(workspace)
 	return cfg, err
 }
 
-// LoadWorkspaceWithSHA is the workspace-root-bound counterpart of LoadWithSHA.
+// LoadWorkspaceWithSHA is the workspace counterpart of LoadWithSHA.
 func LoadWorkspaceWithSHA(workspace Workspace) (Config, string, error) {
 	cfg, _, digest, err := LoadWorkspaceDocument(workspace)
 	return cfg, digest, err
 }
 
-// LoadWorkspaceDocument returns one root-bound config snapshot and its digest.
+// LoadWorkspaceDocument returns one workspace config snapshot and its digest.
 func LoadWorkspaceDocument(workspace Workspace) (Config, []byte, string, error) {
-	if workspace.rootDevice == 0 || workspace.rootInode == 0 || filepath.Clean(workspace.ConfigPath) != filepath.Join(filepath.Clean(workspace.Root), ConfigFilename) {
-		return Config{}, nil, "", errors.New("load workspace config: invalid discovery root binding")
+	if err := validWorkspaceConfigBinding(workspace); err != nil {
+		return Config{}, nil, "", err
 	}
-	data, digest, err := readConfigFileBound(workspace.ConfigPath, workspace.rootDevice, workspace.rootInode, nil)
+	data, digest, err := readConfigFile(workspace.ConfigPath)
 	if err != nil {
 		return Config{}, nil, "", err
 	}
@@ -230,225 +293,43 @@ func LoadWorkspaceDocument(workspace Workspace) (Config, []byte, string, error) 
 	return cfg, data, digest, nil
 }
 
-// FileSHA returns the digest of one safe, bounded sow.yml without parsing it.
-// Recovery uses it to compare the current decision state with a closed journal.
+// FileSHA returns the digest of one bounded sow.yml without parsing it.
 func FileSHA(filename string) (string, error) {
 	_, digest, err := readConfigFile(filename)
 	return digest, err
 }
 
 func readConfigFile(filename string) ([]byte, string, error) {
-	return readConfigFileBound(filename, 0, 0, nil)
-}
-
-type configDirectoryBinding struct {
-	directories []*os.File
-	components  []string
-	stats       []unix.Stat_t
-}
-
-func openConfigParent(parent string) (*configDirectoryBinding, error) {
-	physical, err := filepath.Abs(parent)
+	if strings.TrimSpace(filename) == "" {
+		return nil, "", fmt.Errorf("load config %q: empty filename", filename)
+	}
+	// Open with O_NONBLOCK so a FIFO/named pipe at the config path never
+	// blocks indefinitely before the regular-file check below runs.
+	fd, err := unix.Open(filename, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, err
+		return nil, "", fmt.Errorf("load config %q: %w", filename, &os.PathError{Op: "open", Path: filename, Err: err})
 	}
-	physical, err = normalizeTrustedRootAlias(filepath.Clean(physical))
-	if err != nil {
-		return nil, err
-	}
-	components := strings.Split(strings.TrimPrefix(physical, string(filepath.Separator)), string(filepath.Separator))
-	if physical == string(filepath.Separator) {
-		components = nil
-	}
-	for _, component := range components {
-		if component == "" || component == "." || component == ".." || filepath.Base(component) != component {
-			return nil, errors.New("config parent has an unsafe path component")
-		}
-	}
-	// These descriptors only bind the lookup chain; reading sow.yml does not
-	// require permission to enumerate any parent directory.
-	rootFD, err := unix.Open(string(filepath.Separator), directorySearchAccess|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
-	if err != nil {
-		return nil, err
-	}
-	binding := &configDirectoryBinding{directories: []*os.File{os.NewFile(uintptr(rootFD), string(filepath.Separator))}, components: components}
-	closeError := func(result error) (*configDirectoryBinding, error) {
-		return nil, errors.Join(result, binding.close(false))
-	}
-	var rootStat unix.Stat_t
-	if err := unix.Fstat(rootFD, &rootStat); err != nil || uint32(rootStat.Mode)&unix.S_IFMT != unix.S_IFDIR {
-		return closeError(errors.Join(errors.New("config filesystem root is unsafe"), err))
-	}
-	binding.stats = append(binding.stats, rootStat)
-	for index, component := range components {
-		parentHandle := binding.directories[len(binding.directories)-1]
-		fd, openErr := unix.Openat(int(parentHandle.Fd()), component, directorySearchAccess|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_DIRECTORY, 0)
-		if openErr != nil {
-			return closeError(openErr)
-		}
-		child := os.NewFile(uintptr(fd), filepath.Join(components[:index+1]...))
-		var opened, entry unix.Stat_t
-		statErr := unix.Fstat(fd, &opened)
-		entryErr := unix.Fstatat(int(parentHandle.Fd()), component, &entry, unix.AT_SYMLINK_NOFOLLOW)
-		if statErr != nil || entryErr != nil || opened.Dev != entry.Dev || opened.Ino != entry.Ino || uint32(opened.Mode)&unix.S_IFMT != unix.S_IFDIR {
-			_ = child.Close()
-			return closeError(errors.Join(errors.New("config parent changed while opening"), statErr, entryErr))
-		}
-		binding.directories = append(binding.directories, child)
-		binding.stats = append(binding.stats, opened)
-	}
-	return binding, nil
-}
-
-// normalizeTrustedRootAlias resolves only a root-level platform alias such as
-// macOS /var -> /private/var. Deeper symlink components remain forbidden by
-// the descriptor walk, so a user-writable Workspace ancestor cannot redirect
-// a config load. Creating or replacing a root-level entry requires system
-// authority and is outside the Workspace writer threat boundary.
-func normalizeTrustedRootAlias(absolute string) (string, error) {
-	components := strings.Split(strings.TrimPrefix(absolute, string(filepath.Separator)), string(filepath.Separator))
-	if len(components) == 0 || components[0] == "" {
-		return absolute, nil
-	}
-	top := filepath.Join(string(filepath.Separator), components[0])
-	info, err := os.Lstat(top)
-	if err != nil {
-		return "", err
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		return absolute, nil
-	}
-	target, err := filepath.EvalSymlinks(top)
-	if err != nil {
-		return "", err
-	}
-	target, err = filepath.Abs(target)
-	if err != nil {
-		return "", err
-	}
-	if len(components) == 1 {
-		return filepath.Clean(target), nil
-	}
-	return filepath.Join(append([]string{filepath.Clean(target)}, components[1:]...)...), nil
-}
-
-func (binding *configDirectoryBinding) directory() *os.File {
-	if binding == nil || len(binding.directories) == 0 {
-		return nil
-	}
-	return binding.directories[len(binding.directories)-1]
-}
-
-func (binding *configDirectoryBinding) verify() error {
-	if binding == nil || len(binding.directories) == 0 || len(binding.directories) != len(binding.stats) || len(binding.components)+1 != len(binding.directories) {
-		return errors.New("invalid config parent binding")
-	}
-	var result error
-	for index, directory := range binding.directories {
-		var opened unix.Stat_t
-		statErr := unix.Fstat(int(directory.Fd()), &opened)
-		expected := binding.stats[index]
-		if statErr != nil || opened.Dev != expected.Dev || opened.Ino != expected.Ino || uint32(opened.Mode)&unix.S_IFMT != unix.S_IFDIR {
-			result = errors.Join(result, errors.New("config parent descriptor changed during read"), statErr)
-		}
-		if index == 0 {
-			continue
-		}
-		var entry unix.Stat_t
-		entryErr := unix.Fstatat(int(binding.directories[index-1].Fd()), binding.components[index-1], &entry, unix.AT_SYMLINK_NOFOLLOW)
-		if entryErr != nil || entry.Dev != expected.Dev || entry.Ino != expected.Ino || uint32(entry.Mode)&unix.S_IFMT != unix.S_IFDIR {
-			result = errors.Join(result, errors.New("config parent pathname changed during read"), entryErr)
-		}
-	}
-	return result
-}
-
-func (binding *configDirectoryBinding) close(verify bool) error {
-	if binding == nil {
-		return nil
-	}
-	var result error
-	if verify {
-		result = binding.verify()
-	}
-	for index := len(binding.directories) - 1; index >= 0; index-- {
-		result = errors.Join(result, binding.directories[index].Close())
-	}
-	binding.directories = nil
-	return result
-}
-
-func readConfigFileBound(filename string, expectedDevice, expectedInode uint64, afterParentBound func() error) ([]byte, string, error) {
-	absolute, err := filepath.Abs(filename)
+	file := os.NewFile(uintptr(fd), filename)
+	defer file.Close()
+	info, err := file.Stat()
 	if err != nil {
 		return nil, "", fmt.Errorf("load config %q: %w", filename, err)
 	}
-	parent := filepath.Dir(absolute)
-	base := filepath.Base(absolute)
-	if base == "" || base == "." || base == ".." || filepath.Base(base) != base {
-		return nil, "", fmt.Errorf("load config %q: unsafe filename", filename)
+	if !info.Mode().IsRegular() {
+		return nil, "", fmt.Errorf("load config %q: not a regular file", filename)
 	}
-	parentBinding, err := openConfigParent(parent)
+	if info.Size() > maxConfigBytes {
+		return nil, "", fmt.Errorf("load config %q: exceeds %d bytes", filename, maxConfigBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxConfigBytes+1))
 	if err != nil {
-		return nil, "", fmt.Errorf("load config %q parent: %w", filename, err)
+		return nil, "", fmt.Errorf("load config %q: %w", filename, err)
 	}
-	finish := func(data []byte, digest string, result error) ([]byte, string, error) {
-		return data, digest, errors.Join(result, parentBinding.close(true))
-	}
-	parentFD := int(parentBinding.directory().Fd())
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(parentFD, &parentStat); err != nil {
-		return finish(nil, "", fmt.Errorf("load config %q parent: %w", filename, err))
-	}
-	if expectedDevice != 0 && (uint64(parentStat.Dev) != expectedDevice || uint64(parentStat.Ino) != expectedInode) {
-		return finish(nil, "", fmt.Errorf("load config %q: workspace root identity changed after discovery", filename))
-	}
-	if afterParentBound != nil {
-		if err := afterParentBound(); err != nil {
-			return finish(nil, "", err)
-		}
-	}
-	var entry unix.Stat_t
-	if err := unix.Fstatat(parentFD, base, &entry, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return finish(nil, "", fmt.Errorf("load config %q: %w", filename, err))
-	}
-	if uint32(entry.Mode)&unix.S_IFMT == unix.S_IFLNK {
-		return finish(nil, "", fmt.Errorf("load config %q: symlink is not allowed", filename))
-	}
-	if uint32(entry.Mode)&unix.S_IFMT != unix.S_IFREG || entry.Nlink != 1 || entry.Size > maxConfigBytes {
-		return finish(nil, "", fmt.Errorf("load config %q: not a bounded regular file", filename))
-	}
-	fd, err := unix.Openat(parentFD, base, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
-	if err != nil {
-		return finish(nil, "", fmt.Errorf("load config %q: %w", filename, err))
-	}
-	file := os.NewFile(uintptr(fd), filename)
-	opened, statErr := file.Stat()
-	var openedRaw unix.Stat_t
-	rawErr := unix.Fstat(fd, &openedRaw)
-	if statErr != nil || rawErr != nil || !opened.Mode().IsRegular() || openedRaw.Nlink != 1 || openedRaw.Dev != entry.Dev || openedRaw.Ino != entry.Ino || opened.Size() > maxConfigBytes {
-		_ = file.Close()
-		return finish(nil, "", fmt.Errorf("load config %q: changed while opening: %w", filename, errors.Join(statErr, rawErr)))
-	}
-	data, readErr := io.ReadAll(io.LimitReader(file, maxConfigBytes+1))
-	afterFD, descriptorErr := file.Stat()
-	var afterRaw, afterEntry unix.Stat_t
-	afterRawErr := unix.Fstat(fd, &afterRaw)
-	entryErr := unix.Fstatat(parentFD, base, &afterEntry, unix.AT_SYMLINK_NOFOLLOW)
-	parentErr := parentBinding.verify()
-	closeErr := file.Close()
-	if err := errors.Join(readErr, descriptorErr, afterRawErr, entryErr, parentErr, closeErr); err != nil {
-		return finish(nil, "", fmt.Errorf("load config %q: %w", filename, err))
-	}
-	if int64(len(data)) != opened.Size() || int64(len(data)) > maxConfigBytes || !afterFD.Mode().IsRegular() ||
-		!os.SameFile(opened, afterFD) || afterFD.Size() != opened.Size() || !afterFD.ModTime().Equal(opened.ModTime()) ||
-		afterRaw.Dev != openedRaw.Dev || afterRaw.Ino != openedRaw.Ino || afterRaw.Nlink != 1 || afterRaw.Size != openedRaw.Size ||
-		afterEntry.Dev != openedRaw.Dev || afterEntry.Ino != openedRaw.Ino || afterEntry.Nlink != 1 || afterEntry.Size != openedRaw.Size ||
-		uint32(afterEntry.Mode)&unix.S_IFMT != unix.S_IFREG {
-		return finish(nil, "", fmt.Errorf("load config %q: changed while reading or exceeds %d bytes", filename, maxConfigBytes))
+	if int64(len(data)) > maxConfigBytes {
+		return nil, "", fmt.Errorf("load config %q: exceeds %d bytes", filename, maxConfigBytes)
 	}
 	sum := sha256.Sum256(data)
-	return finish(data, hex.EncodeToString(sum[:]), nil)
+	return data, hex.EncodeToString(sum[:]), nil
 }
 
 // Marshal emits a stable canonical sow.yml. The input is cloned before

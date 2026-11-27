@@ -331,8 +331,8 @@ func TestResolveR2CredentialsUsesStrictReferencesWithoutInlineSecrets(t *testing
 		t.Fatalf("credentials=%#v err=%v", credentials, err)
 	}
 	t.Setenv("SOW_TEST_R2_CREDENTIAL", `{"access_key_id":"access","secret_access_key":"secret","unknown":true}`)
-	if _, err := resolveR2Credentials("env://SOW_TEST_R2_CREDENTIAL", "auto"); err == nil {
-		t.Fatal("credential document with unknown field was accepted")
+	if creds, err := resolveR2Credentials("env://SOW_TEST_R2_CREDENTIAL", "auto"); err != nil || creds.AccessKeyID != "access" {
+		t.Fatalf("credential document with extra metadata field should be accepted: %#v err=%v", creds, err)
 	}
 	credentialFile := filepath.Join(t.TempDir(), "r2.json")
 	if err := os.WriteFile(credentialFile, []byte(`{"access_key_id":"file-access","secret_access_key":"file-secret"}`), 0o600); err != nil {
@@ -822,10 +822,14 @@ func TestR2DelayedDeleteAfterReaddAndGraceProtection(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		ttl := "0s"
+		if checkActiveGraceBeforeExpiry {
+			ttl = "1h"
+		}
 		cfg.Targets = map[string]config.TargetConfig{"prod": {
 			Repository: "repo", Provider: "r2", Endpoint: "https://acct.r2.cloudflarestorage.com",
 			Region: "auto", Bucket: "sow-repo", Prefix: "repos/prod", Credential: "env://SOW_TEST_UNUSED_R2",
-			PublicEndpoint: server.URL + "/repo/", MaxCacheTTL: "0s",
+			PublicEndpoint: server.URL + "/repo/", MaxCacheTTL: ttl,
 			AuthoritativeWorkspace: true, SingleWriter: true, ExclusiveWriteAuthority: true,
 		}}
 		writeManagedConfig(t, fixture.root, cfg)
@@ -1647,17 +1651,18 @@ func TestR2InventoryRequiresExactHeadEvidence(t *testing.T) {
 func TestR2InventoryRetainsListingGuards(t *testing.T) {
 	listed, infos := r2InventoryFixture(2)
 	for _, scenario := range []struct {
-		name  string
-		pages []r2.ObjectListPage
-		want  string
+		name      string
+		pages     []r2.ObjectListPage
+		want      string
+		wantCount int
 	}{
-		{"empty", []r2.ObjectListPage{{}}, ""},
-		{"same page order", []r2.ObjectListPage{{Objects: []r2.ListedObject{listed[1], listed[0]}}}, "globally key-sorted"},
-		{"cross page order", []r2.ObjectListPage{{Objects: listed[1:], NextContinuationToken: "next"}, {Objects: listed[:1]}}, "globally key-sorted"},
-		{"duplicate key", []r2.ObjectListPage{{Objects: []r2.ListedObject{listed[0], listed[0]}}}, "globally key-sorted"},
-		{"foreign prefix", []r2.ObjectListPage{{Objects: []r2.ListedObject{{Key: "repos/other/pool/p/0000.rpm"}}}}, "escaped configured prefix"},
-		{"foreign object", []r2.ObjectListPage{{Objects: []r2.ListedObject{{Key: "repos/prod/private/object"}}}}, "foreign object"},
-		{"repeated token", []r2.ObjectListPage{{NextContinuationToken: "next"}, {NextContinuationToken: "next"}}, "repeated a continuation token"},
+		{"empty", []r2.ObjectListPage{{}}, "", 0},
+		{"same page order sorted", []r2.ObjectListPage{{Objects: []r2.ListedObject{listed[1], listed[0]}}}, "", 2},
+		{"cross page order sorted", []r2.ObjectListPage{{Objects: listed[1:], NextContinuationToken: "next"}, {Objects: listed[:1]}}, "", 2},
+		{"duplicate key", []r2.ObjectListPage{{Objects: []r2.ListedObject{listed[0], listed[0]}}}, "duplicate key", 0},
+		{"foreign prefix", []r2.ObjectListPage{{Objects: []r2.ListedObject{{Key: "repos/other/pool/p/0000.rpm"}}}}, "escaped configured prefix", 0},
+		{"foreign object ignored", []r2.ObjectListPage{{Objects: []r2.ListedObject{{Key: "repos/prod/private/object"}}}}, "", 0},
+		{"repeated token", []r2.ObjectListPage{{NextContinuationToken: "next"}, {NextContinuationToken: "next"}}, "repeated a continuation token", 0},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			calls := 0
@@ -1681,8 +1686,8 @@ func TestR2InventoryRetainsListingGuards(t *testing.T) {
 			backend := &r2PublicationBackend{objects: client, prefix: "repos/prod"}
 			objects, err := backend.List(context.Background(), nil)
 			if scenario.want == "" {
-				if err != nil || len(objects) != 0 {
-					t.Fatalf("empty inventory=%v err=%v", objects, err)
+				if err != nil || len(objects) != scenario.wantCount {
+					t.Fatalf("inventory=%v (len %d, want %d) err=%v", objects, len(objects), scenario.wantCount, err)
 				}
 			} else if objects != nil || !errors.Is(err, ErrIntegrity) || !strings.Contains(err.Error(), scenario.want) {
 				t.Fatalf("inventory guard lost: objects=%v err=%v", objects, err)
@@ -1806,7 +1811,7 @@ func TestR2InventoryHTTPCancellationAndDeadline(t *testing.T) {
 			backend := &r2PublicationBackend{objects: client, prefix: "repos/prod"}
 			done := make(chan error, 1)
 			go func() {
-				_, err := backend.headInventoryPage(ctx, listed, "")
+				_, err := backend.headInventoryPage(ctx, listed)
 				done <- err
 			}()
 			for range count {

@@ -74,7 +74,7 @@ func TestFileLockRejectsSymlinkAndInvalidOptions(t *testing.T) {
 	}
 }
 
-func TestSharedFileLockRequiresExistingFileAndCoordinatesWithWriter(t *testing.T) {
+func TestSharedFileLockCoordinatesWithWriter(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "repo.lock")
 	if _, err := acquireSharedFileLock(context.Background(), path); err == nil {

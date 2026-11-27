@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"unicode/utf8"
 
 	"github.com/klauspost/compress/zstd"
@@ -100,15 +101,7 @@ func inspectPackagePath(ctx context.Context, filePath, component, originalBasena
 	if err := validateComponent(component); err != nil {
 		return Package{}, err
 	}
-	pathInfo, err := os.Lstat(filePath)
-	if err != nil {
-		return Package{}, fmt.Errorf("aptrepo: lstat deb: %w", err)
-	}
-	if !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 {
-		return Package{}, errors.New("aptrepo: deb input is not a regular file")
-	}
-
-	f, err := os.Open(filePath)
+	f, err := os.OpenFile(filePath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return Package{}, fmt.Errorf("aptrepo: open deb: %w", err)
 	}
@@ -122,8 +115,8 @@ func inspectPackagePath(ctx context.Context, filePath, component, originalBasena
 	if err != nil {
 		return Package{}, fmt.Errorf("aptrepo: stat deb: %w", err)
 	}
-	if !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
-		return Package{}, errors.New("aptrepo: deb changed while opening")
+	if !info.Mode().IsRegular() {
+		return Package{}, errors.New("aptrepo: deb input is not a regular file")
 	}
 	var pkg Package
 	if singlePass {
@@ -133,15 +126,6 @@ func inspectPackagePath(ctx context.Context, filePath, component, originalBasena
 	}
 	if err != nil {
 		return Package{}, err
-	}
-	after, err := f.Stat()
-	if err != nil {
-		return Package{}, fmt.Errorf("aptrepo: stat deb after inspection: %w", err)
-	}
-	pathAfter, pathErr := os.Lstat(filePath)
-	if pkg.Size != info.Size() || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) ||
-		pathErr != nil || !pathAfter.Mode().IsRegular() || pathAfter.Mode()&os.ModeSymlink != 0 || !os.SameFile(pathInfo, pathAfter) {
-		return Package{}, errors.New("aptrepo: deb changed while being inspected")
 	}
 	if err := f.Close(); err != nil {
 		return Package{}, fmt.Errorf("aptrepo: close deb: %w", err)
@@ -412,20 +396,6 @@ func scanDebArMembers(ctx context.Context, reader io.ReaderAt, size int64) (*deb
 		if header[58] != '`' || header[59] != '\n' {
 			return nil, errors.New("malformed ar member header terminator")
 		}
-		for _, field := range []struct {
-			name string
-			raw  []byte
-		}{
-			{name: "Timestamp", raw: header[16:28]},
-			{name: "OwnerID", raw: header[28:34]},
-			{name: "GroupID", raw: header[34:40]},
-		} {
-			if trimmed := strings.TrimSpace(string(field.raw)); trimmed != "" {
-				if _, err := strconv.ParseInt(trimmed, 10, 64); err != nil {
-					return nil, fmt.Errorf("invalid ar member %s %q: %w", field.name, trimmed, err)
-				}
-			}
-		}
 		memberSize, err := strconv.ParseInt(strings.TrimSpace(string(header[48:58])), 10, 64)
 		if err != nil || memberSize < 0 {
 			return nil, fmt.Errorf("invalid ar member size %q", strings.TrimSpace(string(header[48:58])))
@@ -442,14 +412,14 @@ func scanDebArMembers(ctx context.Context, reader io.ReaderAt, size int64) (*deb
 				return nil, errors.New("duplicate debian-binary member")
 			}
 			versionSeen = true
-			if memberSize != int64(len("2.0\n")) {
+			if memberSize == 0 || memberSize > 64 {
 				return nil, fmt.Errorf("unexpected debian-binary size %d", memberSize)
 			}
 			versionBytes, err := io.ReadAll(memberData)
 			if err != nil {
 				return nil, err
 			}
-			if string(versionBytes) != "2.0\n" {
+			if !strings.HasPrefix(strings.TrimSpace(string(versionBytes)), "2.") {
 				return nil, fmt.Errorf("unsupported debian binary version %q", versionBytes)
 			}
 		case memberName == "control.tar" || strings.HasPrefix(memberName, "control.tar."):
@@ -549,11 +519,30 @@ func loadDebControlArchive(ctx context.Context, member *debArEntry) (parsed debB
 		if int64(len(body)) != header.Size || limited.N == 0 {
 			return debBinaryControl{}, fmt.Errorf("control file exceeds %d bytes or is truncated", maxDebControlFile)
 		}
+		if !utf8.Valid(body) {
+			var normalized bytes.Buffer
+			for _, b := range body {
+				normalized.WriteRune(rune(b))
+			}
+			body = normalized.Bytes()
+		}
 		if err := validateBinaryControlDocument(body); err != nil {
 			return debBinaryControl{}, err
 		}
 		if err := control.Unmarshal(&parsed, bytes.NewReader(body)); err != nil {
 			return debBinaryControl{}, err
+		}
+		if len(parsed.Paragraph.Order) > 1 {
+			dedup := make([]string, 0, len(parsed.Paragraph.Order))
+			seenOrder := make(map[string]struct{}, len(parsed.Paragraph.Order))
+			for _, field := range parsed.Paragraph.Order {
+				if _, ok := seenOrder[field]; ok {
+					continue
+				}
+				seenOrder[field] = struct{}{}
+				dedup = append(dedup, field)
+			}
+			parsed.Paragraph.Order = dedup
 		}
 		found = true
 	}
@@ -567,24 +556,50 @@ func validateBinaryControlDocument(body []byte) error {
 	if len(body) == 0 {
 		return errors.New("empty binary control paragraph")
 	}
-	seen := make(map[string]struct{})
+	type controlField struct {
+		rawName string
+		lines   []string
+	}
+	seen := make(map[string]controlField)
+	var currentKey string
+	var currentRawName string
+	var currentLines []string
+	flushCurrent := func(lineNo int) error {
+		if currentKey == "" {
+			return nil
+		}
+		if prev, duplicate := seen[currentKey]; duplicate {
+			if prev.rawName != currentRawName || !sameStrings(prev.lines, currentLines) {
+				return fmt.Errorf("binary control line %d repeats field %q", lineNo, currentRawName)
+			}
+		} else {
+			seen[currentKey] = controlField{rawName: currentRawName, lines: append([]string(nil), currentLines...)}
+		}
+		currentKey = ""
+		currentRawName = ""
+		currentLines = nil
+		return nil
+	}
 	haveField, haveCurrentField, paragraphEnded := false, false, false
-	for index, raw := range bytes.Split(body, []byte{'\n'}) {
+	lines := bytes.Split(body, []byte{'\n'})
+	for index, raw := range lines {
 		line := raw
 		if len(line) != 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
 		}
 		for _, value := range line {
-			if value == '\r' || value == 0 || value == 0x7f || (value < 0x20 && value != '\t') {
+			// Permit printable US-ASCII, HTAB, and legacy 8-bit Latin-1 bytes
+			// (>= 0x80), while rejecting NUL and ASCII control characters.
+			if (value < 0x20 && value != '\t') || value == 0x7f {
 				return fmt.Errorf("binary control line %d contains a forbidden control byte", index+1)
 			}
 		}
-		if !utf8.Valid(line) {
-			return fmt.Errorf("binary control line %d is not valid UTF-8", index+1)
-		}
 		if len(line) == 0 {
 			if !haveField {
-				return fmt.Errorf("binary control line %d starts an empty paragraph", index+1)
+				continue
+			}
+			if err := flushCurrent(index + 1); err != nil {
+				return err
 			}
 			paragraphEnded = true
 			haveCurrentField = false
@@ -597,23 +612,40 @@ func validateBinaryControlDocument(body []byte) error {
 			if !haveCurrentField {
 				return fmt.Errorf("binary control line %d has an orphan continuation", index+1)
 			}
+			currentLines = append(currentLines, string(line))
 			continue
+		}
+		if err := flushCurrent(index + 1); err != nil {
+			return err
 		}
 		colon := bytes.IndexByte(line, ':')
 		if colon <= 0 || !validBinaryControlFieldName(line[:colon]) {
 			return fmt.Errorf("binary control line %d has an invalid field name", index+1)
 		}
-		name := strings.ToLower(string(line[:colon]))
-		if _, duplicate := seen[name]; duplicate {
-			return fmt.Errorf("binary control line %d repeats field %q", index+1, line[:colon])
-		}
-		seen[name] = struct{}{}
+		currentRawName = string(line[:colon])
+		currentKey = strings.ToLower(currentRawName)
+		currentLines = []string{strings.TrimSpace(string(line[colon+1:]))}
 		haveField, haveCurrentField = true, true
+	}
+	if err := flushCurrent(len(lines)); err != nil {
+		return err
 	}
 	if !haveField {
 		return errors.New("empty binary control paragraph")
 	}
 	return nil
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func validBinaryControlFieldName(name []byte) bool {
@@ -684,27 +716,56 @@ func PoolPath(component, source, filename string) (string, error) {
 	return path.Join("pool", component, prefix, source, filename), nil
 }
 
-// safeDebBasename accepts Debian's common epoch filename spelling while
-// keeping URL and filesystem path interpretation unambiguous. APT archives in
-// the wild encode the version's ':' as %3a (or %3A); no other percent escape
-// is needed for a Debian package basename, so encoded separators, dots,
-// percent signs, NULs, and double-encoding remain rejected.
+// safeDebBasename accepts Debian package basenames (including common percent
+// escapes such as %3a for epoch colons or %2b for '+') while rejecting encoded
+// control characters, path separators, dots, double-encoding, and URL-special
+// delimiters.
 func safeDebBasename(value string) bool {
-	if len(value) <= len(".deb") || !strings.HasSuffix(value, ".deb") || !asciiAlphaNumeric(value[0]) {
+	if len(value) <= len(".deb") || !strings.HasSuffix(value, ".deb") || (!asciiAlphaNumeric(value[0]) && value[0] != '_') {
 		return false
 	}
 	for i := 1; i < len(value); i++ {
 		c := value[i]
-		if asciiAlphaNumeric(c) || strings.ContainsRune("+._:~-", rune(c)) {
+		if asciiAlphaNumeric(c) || strings.ContainsRune("+._:~-@", rune(c)) {
 			continue
 		}
-		if c == '%' && i+2 < len(value) && value[i+1] == '3' && (value[i+2] == 'a' || value[i+2] == 'A') {
+		if c == '%' && i+2 < len(value) && isHexDigit(value[i+1]) && isHexDigit(value[i+2]) {
+			if !isSafeDebPercentEscapedByte(value[i+1], value[i+2]) {
+				return false
+			}
 			i += 2
 			continue
 		}
 		return false
 	}
 	return true
+}
+
+func debHexNibble(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
+}
+
+func isSafeDebPercentEscapedByte(hi, lo byte) bool {
+	b := (debHexNibble(hi) << 4) | debHexNibble(lo)
+	if b <= 0x20 || b >= 0x7f {
+		return false
+	}
+	switch b {
+	case '/', '\\', '.', '%', '?', '#', '"', '<', '>':
+		return false
+	}
+	return true
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
 func asciiAlphaNumeric(c byte) bool {
@@ -745,11 +806,15 @@ func validateComponent(component string) error {
 }
 
 func hashPackage(ctx context.Context, filePath string) (string, int64, error) {
-	f, err := os.Open(filePath)
+	f, err := os.OpenFile(filePath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return "", 0, fmt.Errorf("aptrepo: open deb for hashing: %w", err)
 	}
 	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return "", 0, errors.Join(err, errors.New("aptrepo: deb input must be a regular file"))
+	}
 
 	digest, size, err := hashReader(ctx, f)
 	if err != nil {

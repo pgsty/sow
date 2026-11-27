@@ -36,15 +36,17 @@ func TestCreateDEBFlatRegularOnlyStable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if first.RPM != 0 || first.DEB != 1 || strings.Join(first.Kept, ",") != "alpha.deb" || first.Marker {
+	// Symlinked top-level package is followed and deduplicated with identical alpha.deb;
+	// nested subdirectory packages are not scanned.
+	if first.RPM != 0 || first.DEB != 2 || strings.Join(first.Kept, ",") != "alpha.deb,linked.deb" || first.Marker {
 		t.Fatalf("unexpected result: %+v", first)
 	}
 	packages := mustRead(t, filepath.Join(dir, "Packages"))
 	if !bytes.Contains(packages, []byte("Package: alpha\n")) || !bytes.Contains(packages, []byte("Filename: ./alpha.deb\n")) {
 		t.Fatalf("flat Packages missing expected fields:\n%s", packages)
 	}
-	if bytes.Contains(packages, []byte("nested")) || bytes.Contains(packages, []byte("linked")) {
-		t.Fatalf("non-top-level package entered index:\n%s", packages)
+	if bytes.Contains(packages, []byte("nested")) {
+		t.Fatalf("nested subdirectory package entered index:\n%s", packages)
 	}
 	if got := gunzip(t, mustRead(t, filepath.Join(dir, "Packages.gz"))); !bytes.Equal(got, packages) {
 		t.Fatal("Packages.gz does not expand to Packages")
@@ -263,8 +265,13 @@ func TestCreateSigningOptionGuardsAndDuplicateBytes(t *testing.T) {
 	}
 	debOnly := t.TempDir()
 	writeDEBFixture(t, debOnly, "alpha.deb", debControl("alpha", "1.0-1", "amd64"), "alpha")
-	if _, err := Create(context.Background(), Options{Dir: debOnly, SignWith: "E7935D8DB9BD8B20"}); err == nil || KindOf(err) != KindRejected {
-		t.Fatalf("DEB-only signing error=%v kind=%s", err, KindOf(err))
+	// Default mode warns on DEB-only --sign-with; --strict rejects it.
+	debRes, err := Create(context.Background(), Options{Dir: debOnly, SignWith: "E7935D8DB9BD8B20"})
+	if err != nil || len(debRes.Warnings) == 0 {
+		t.Fatalf("DEB-only signing default res=%+v err=%v", debRes, err)
+	}
+	if _, err := Create(context.Background(), Options{Dir: debOnly, SignWith: "E7935D8DB9BD8B20", Strict: true}); err == nil || KindOf(err) != KindRejected {
+		t.Fatalf("DEB-only signing strict error=%v kind=%s", err, KindOf(err))
 	}
 
 	dir := t.TempDir()
@@ -334,6 +341,9 @@ func TestCreateRejectsMarkerBeforeMetadataChange(t *testing.T) {
 func TestCreateRejectsManagedAncestorThroughAliasAndPigstyFiltersBeforeConflict(t *testing.T) {
 	workspace := t.TempDir()
 	mustMkdir(t, filepath.Join(workspace, ".sow"))
+	if err := os.WriteFile(filepath.Join(workspace, "sow.yml"), []byte("schema: sow/v3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	leaf := mustMkdir(t, filepath.Join(workspace, "pool", "pkg"))
 	writeDEBFixture(t, leaf, "alpha.deb", debControl("alpha", "1.0-1", "amd64"), "alpha")
 	alias := filepath.Join(t.TempDir(), "alias")
@@ -342,6 +352,17 @@ func TestCreateRejectsManagedAncestorThroughAliasAndPigstyFiltersBeforeConflict(
 	}
 	if _, err := Create(context.Background(), Options{Dir: filepath.Join(alias, "pkg")}); KindOf(err) != KindRejected {
 		t.Fatalf("managed workspace alias error = %v", err)
+	}
+
+	// A stray plain file named .sow in an ancestor directory is NOT a managed workspace.
+	strayParent := t.TempDir()
+	if err := os.WriteFile(filepath.Join(strayParent, ".sow"), []byte("not a workspace\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	strayRepo := mustMkdir(t, filepath.Join(strayParent, "flat"))
+	writeDEBFixture(t, strayRepo, "alpha.deb", debControl("alpha", "1.0-1", "amd64"), "alpha")
+	if res, err := Create(context.Background(), Options{Dir: strayRepo}); err != nil || res.DEB != 1 {
+		t.Fatalf("stray ancestor .sow file blocked create: res=%+v err=%v", res, err)
 	}
 
 	dir := t.TempDir()
@@ -354,37 +375,52 @@ func TestCreateRejectsManagedAncestorThroughAliasAndPigstyFiltersBeforeConflict(
 	}
 }
 
-func TestCreateRejectsCoordinateConflict(t *testing.T) {
+func TestCreateCoordinateConflictSkipsByDefaultAndFailsInStrictMode(t *testing.T) {
 	dir := t.TempDir()
 	control := debControl("same", "1.0-1", "amd64")
 	writeDEBFixture(t, dir, "one.deb", control, "one")
 	writeDEBFixture(t, dir, "two.deb", control, "two")
-	_, err := Create(context.Background(), Options{Dir: dir, Jobs: 2})
+	// Strict mode fails closed without writing metadata.
+	_, err := Create(context.Background(), Options{Dir: dir, Jobs: 2, Strict: true})
 	if err == nil || KindOf(err) != KindRejected || !strings.Contains(err.Error(), "same logical coordinate") {
-		t.Fatalf("coordinate conflict error = %v", err)
+		t.Fatalf("strict coordinate conflict error = %v", err)
 	}
 	if _, err := os.Lstat(filepath.Join(dir, "Packages")); !os.IsNotExist(err) {
-		t.Fatal("coordinate conflict wrote metadata")
+		t.Fatal("strict coordinate conflict wrote metadata")
+	}
+	// Default mode keeps deterministic first file, skips conflict with warning.
+	res, err := Create(context.Background(), Options{Dir: dir, Jobs: 2})
+	if err != nil || res.DEB != 1 || len(res.Skipped) != 1 || res.Skipped[0].Path != "two.deb" || len(res.Warnings) == 0 {
+		t.Fatalf("default coordinate conflict res=%+v err=%v", res, err)
 	}
 }
 
-func TestCreateRejectsRPMCoordinateConflict(t *testing.T) {
+func TestCreateRPMCoordinateConflictSkipsByDefaultAndFailsInStrictMode(t *testing.T) {
 	dir := t.TempDir()
 	writeRPMFixture(t, filepath.Join(dir, "one.rpm"), rpmFixture{Name: "same", Version: "1", Release: "1", Arch: "x86_64", Payload: "one"})
 	writeRPMFixture(t, filepath.Join(dir, "two.rpm"), rpmFixture{Name: "same", Version: "1", Release: "1", Arch: "x86_64", Payload: "two"})
-	_, err := Create(context.Background(), Options{Dir: dir, Jobs: 2})
+	_, err := Create(context.Background(), Options{Dir: dir, Jobs: 2, Strict: true})
 	if err == nil || KindOf(err) != KindRejected || !strings.Contains(err.Error(), "same logical coordinate") {
-		t.Fatalf("RPM coordinate conflict error = %v", err)
+		t.Fatalf("strict RPM coordinate conflict error = %v", err)
 	}
 	if _, err := os.Lstat(filepath.Join(dir, "repodata")); !os.IsNotExist(err) {
-		t.Fatal("RPM coordinate conflict wrote metadata")
+		t.Fatal("strict RPM coordinate conflict wrote metadata")
+	}
+	res, err := Create(context.Background(), Options{Dir: dir, Jobs: 2})
+	if err != nil || res.RPM != 1 || len(res.Skipped) != 1 || res.Skipped[0].Path != "two.rpm" {
+		t.Fatalf("default RPM coordinate conflict res=%+v err=%v", res, err)
 	}
 }
 
-func TestCreateRejectsEmptyDirectory(t *testing.T) {
-	_, err := Create(context.Background(), Options{Dir: t.TempDir()})
+func TestCreateEmptyDirectoryWarnsByDefaultAndRejectsInStrictMode(t *testing.T) {
+	dir := t.TempDir()
+	res, err := Create(context.Background(), Options{Dir: dir})
+	if err != nil || res.RPM != 0 || res.DEB != 0 || len(res.Warnings) == 0 {
+		t.Fatalf("default empty directory res=%+v err=%v", res, err)
+	}
+	_, err = Create(context.Background(), Options{Dir: dir, Strict: true})
 	if err == nil || KindOf(err) != KindRejected {
-		t.Fatalf("empty directory error = %v, kind = %s", err, KindOf(err))
+		t.Fatalf("strict empty directory error = %v, kind = %s", err, KindOf(err))
 	}
 }
 
@@ -409,22 +445,33 @@ func TestCreateJobsDeterministic(t *testing.T) {
 	}
 }
 
-func TestCreateParseErrorSelectionDeterministic(t *testing.T) {
+func TestCreateParseErrorSelectionDeterministicAndFaultTolerant(t *testing.T) {
 	dir := t.TempDir()
+	writeRPMFixture(t, filepath.Join(dir, "good.rpm"), rpmFixture{Name: "good", Version: "1", Release: "1", Arch: "x86_64", Payload: "good"})
 	if err := os.WriteFile(filepath.Join(dir, "z.deb"), []byte("bad z"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "a.deb"), []byte("bad a"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, one := Create(context.Background(), Options{Dir: dir, Jobs: 1})
-	_, many := Create(context.Background(), Options{Dir: dir, Jobs: 8})
+	// Strict mode reports the first failing package deterministically regardless of worker count.
+	_, one := Create(context.Background(), Options{Dir: dir, Jobs: 1, Strict: true})
+	_, many := Create(context.Background(), Options{Dir: dir, Jobs: 8, Strict: true})
 	if one == nil || many == nil || one.Error() != many.Error() || !strings.Contains(one.Error(), "a.deb") {
-		t.Fatalf("parse errors differ by jobs:\n1: %v\n8: %v", one, many)
+		t.Fatalf("strict parse errors differ by jobs:\n1: %v\n8: %v", one, many)
+	}
+	// Default mode skips corrupt packages with deterministic warnings and indexes good.rpm!
+	res, err := Create(context.Background(), Options{Dir: dir, Jobs: 4})
+	if err != nil || res.RPM != 1 || len(res.Skipped) != 2 || res.Skipped[0].Path != "a.deb" || res.Skipped[1].Path != "z.deb" {
+		t.Fatalf("fault-tolerant create res=%+v err=%v", res, err)
+	}
+	primary := readPrimaryXML(t, filepath.Join(dir, "repodata"))
+	if !bytes.Contains(primary, []byte(`href="good.rpm"`)) {
+		t.Fatalf("good.rpm missing from repodata after skipping bad packages: %s", primary)
 	}
 }
 
-func TestCreateParseFailurePreservesExistingMetadata(t *testing.T) {
+func TestCreateStrictParseFailurePreservesExistingMetadata(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "broken.deb"), []byte("not a deb"), 0o644); err != nil {
 		t.Fatal(err)
@@ -437,11 +484,11 @@ func TestCreateParseFailurePreservesExistingMetadata(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "Packages.gz"), oldGzip, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Create(context.Background(), Options{Dir: dir}); err == nil {
-		t.Fatal("invalid package unexpectedly succeeded")
+	if _, err := Create(context.Background(), Options{Dir: dir, Strict: true}); err == nil {
+		t.Fatal("invalid package unexpectedly succeeded in strict mode")
 	}
 	if !bytes.Equal(mustRead(t, filepath.Join(dir, "Packages")), oldPackages) || !bytes.Equal(mustRead(t, filepath.Join(dir, "Packages.gz")), oldGzip) {
-		t.Fatal("parse failure changed old metadata")
+		t.Fatal("strict parse failure changed old metadata")
 	}
 }
 
@@ -716,7 +763,7 @@ func fileSHA(path string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func TestSignRPMWithCommandEnforcesFlatRepoRootPassfileBoundary(t *testing.T) {
+func TestSignRPMWithCommandAcceptsSymlinkPassfileAndSurfacesStderr(t *testing.T) {
 	binDir := t.TempDir()
 	calledFile := filepath.Join(binDir, "rpm-called")
 	fakeRPM := filepath.Join(binDir, "rpm")
@@ -727,67 +774,32 @@ func TestSignRPMWithCommandEnforcesFlatRepoRootPassfileBoundary(t *testing.T) {
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	repoRoot := t.TempDir()
-	if resolved, err := filepath.EvalSymlinks(repoRoot); err == nil {
-		repoRoot = resolved
-	}
-	stagedDir := filepath.Join(repoRoot, ".sow-plain-stage-test", "packages")
-	if err := os.MkdirAll(stagedDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	stagedRPM := filepath.Join(stagedDir, "pkg.rpm")
+	stagedRPM := filepath.Join(repoRoot, "pkg.rpm")
 	if err := os.WriteFile(stagedRPM, []byte("rpm"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-
 	outsideDir := t.TempDir()
 	outsidePass := filepath.Join(outsideDir, "real.pass")
 	if err := os.WriteFile(outsidePass, []byte("secret-value\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	inRepoReal := filepath.Join(repoRoot, "real.pass")
-	if err := os.WriteFile(inRepoReal, []byte("secret-value\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// Symlinks anywhere inside the flat repository root (not just under the
-	// private stage directory) must be rejected before rpm is invoked.
-	inRepoToOutside := filepath.Join(repoRoot, "link-out.pass")
-	if err := os.Symlink(outsidePass, inRepoToOutside); err != nil {
-		t.Fatal(err)
-	}
-	inRepoToInside := filepath.Join(repoRoot, "link-in.pass")
-	if err := os.Symlink(inRepoReal, inRepoToInside); err != nil {
-		t.Fatal(err)
-	}
-	outsideBounce := filepath.Join(outsideDir, "bounce.pass")
-	if err := os.Symlink(inRepoReal, outsideBounce); err != nil {
-		t.Fatal(err)
-	}
-
-	for _, unsafe := range []string{inRepoToOutside, inRepoToInside, outsideBounce} {
-		_ = os.Remove(calledFile)
-		ctx := signing.WithPassFile(context.Background(), unsafe)
-		err := signRPMWithCommand(ctx, repoRoot, stagedRPM, "0123456789ABCDEF", false)
-		if !errors.Is(err, signing.ErrCredential) {
-			t.Fatalf("signRPMWithCommand(%s) error=%v, want signing.ErrCredential", unsafe, err)
-		}
-		if _, statErr := os.Stat(calledFile); !errors.Is(statErr, os.ErrNotExist) {
-			t.Fatalf("rpm was invoked despite rejected passfile %s", unsafe)
-		}
-	}
-
-	// External symlink outside the flat repository root (such as a Kubernetes
-	// Secret mount) must still be accepted.
 	outsideLink := filepath.Join(outsideDir, "k8s-secret.pass")
 	if err := os.Symlink(outsidePass, outsideLink); err != nil {
 		t.Fatal(err)
 	}
-	_ = os.Remove(calledFile)
 	ctx := signing.WithPassFile(context.Background(), outsideLink)
 	if err := signRPMWithCommand(ctx, repoRoot, stagedRPM, "0123456789ABCDEF", false); err != nil {
-		t.Fatalf("signRPMWithCommand external symlink error=%v", err)
+		t.Fatalf("signRPMWithCommand symlink error=%v", err)
 	}
 	if _, statErr := os.Stat(calledFile); statErr != nil {
-		t.Fatalf("rpm was not invoked for valid external symlink passfile: %v", statErr)
+		t.Fatalf("rpm was not invoked: %v", statErr)
+	}
+	// Verify rpm stderr diagnostics are surfaced on signing failure.
+	failScript := "#!/bin/sh\necho 'gpg: key expired' >&2\nexit 1\n"
+	if err := os.WriteFile(fakeRPM, []byte(failScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := signRPMWithCommand(ctx, repoRoot, stagedRPM, "0123456789ABCDEF", false); err == nil || !strings.Contains(err.Error(), "gpg: key expired") {
+		t.Fatalf("signRPMWithCommand stderr missing: %v", err)
 	}
 }

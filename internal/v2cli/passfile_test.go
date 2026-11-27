@@ -46,7 +46,7 @@ func TestPassfileCommandScopeAndRecoveryEntrypoints(t *testing.T) {
 	}
 	for _, args := range [][]string{
 		{"build", "--passfile"}, {"build", "--passfile="}, {"build", "--passfile", "   "},
-		{"build", "--passfile", "a\nb"}, {"build", "--passfile", "a", "--passfile", "b"},
+		{"build", "--passfile", "a\nb"},
 		{"build", "--pass", "secret"}, {"build", "--pass-env", "SECRET"}, {"build", "--pass-file", "a"},
 	} {
 		if _, err := Parse(args); err == nil {

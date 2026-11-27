@@ -39,6 +39,7 @@ func TestTargetsRejectStoragePrefixOverlap(t *testing.T) {
 			cfg := Default()
 			cfg.Repositories["repo"] = RepositoryConfig{}
 			left, right := targetFixture(tc.left), targetFixture(tc.right)
+			right.Region = "us-east-1"
 			if tc.left == "" {
 				left.PublicEndpoint = "https://repo.example.test/"
 			}
@@ -57,7 +58,6 @@ func TestTargetsRejectNonCanonicalAndSecretInputs(t *testing.T) {
 		edit func(*TargetConfig)
 		want string
 	}{
-		{"endpoint-case", func(v *TargetConfig) { v.Endpoint = "https://ACCT.r2.cloudflarestorage.com" }, "canonical"},
 		{"endpoint-userinfo", func(v *TargetConfig) { v.Endpoint = "https://key@acct.r2.cloudflarestorage.com" }, "userinfo"},
 		{"prefix-leading", func(v *TargetConfig) { v.Prefix = "/repos/acme" }, "prefix"},
 		{"prefix-encoded-separator", func(v *TargetConfig) { v.Prefix = "repos%2Facme" }, "percent-encoded"},
@@ -77,6 +77,75 @@ func TestTargetsRejectNonCanonicalAndSecretInputs(t *testing.T) {
 			_, err := Marshal(cfg)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("want %q rejection, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestTargetsAcceptErgonomicYAMLDefaultsAndStandardDurations(t *testing.T) {
+	cfg, err := Parse([]byte(`
+schema: sow/v3
+repos:
+  repo: {}
+targets:
+  prod:
+    repository: repo
+    provider: r2
+    endpoint: https://ACCT.r2.cloudflarestorage.com/
+    region: us-east-1
+    bucket: repo.example.com
+    prefix: repos/prod
+    credential: env://SOW_R2_CREDENTIAL
+    public_endpoint: https://REPO.EXAMPLE.COM/repos/prod
+    max_cache_ttl: 1h
+  local:
+    repository: repo
+    provider: filesystem
+    endpoint: file:///srv/sow/repo/
+    prefix: mirror
+    public_endpoint: file:///srv/sow/repo/mirror
+    max_cache_ttl: "0"
+`))
+	if err != nil {
+		t.Fatalf("Parse ergonomic targets: %v", err)
+	}
+	prod := cfg.Targets["prod"]
+	if prod.Endpoint != "https://acct.r2.cloudflarestorage.com" || prod.PublicEndpoint != "https://repo.example.com/repos/prod/" || prod.MaxCacheTTL != "1h0m0s" || !prod.AuthoritativeWorkspace || !prod.SingleWriter || !prod.ExclusiveWriteAuthority {
+		t.Fatalf("normalized prod target = %#v", prod)
+	}
+	local := cfg.Targets["local"]
+	if local.Endpoint != "file:///srv/sow/repo" || local.PublicEndpoint != "file:///srv/sow/repo/mirror/" || local.MaxCacheTTL != "0s" {
+		t.Fatalf("normalized local target = %#v", local)
+	}
+
+	// Unknown fields (typos or pasted secrets) and explicit null authority flags
+	// inside targets must still be rejected by KnownFields / UnmarshalYAML.
+	for _, tc := range []struct {
+		name, extra string
+	}{
+		{"unknown typo", "    single_write: false\n"},
+		{"pasted secret", "    secret_access_key: leaked\n"},
+		{"null authority flag", "    single_writer: null\n"},
+		{"r2 path", "    endpoint: https://acct.r2.cloudflarestorage.com/subpath\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := `
+schema: sow/v3
+repos:
+  repo: {}
+targets:
+  prod:
+    repository: repo
+    provider: r2
+    endpoint: https://acct.r2.cloudflarestorage.com
+    bucket: repo
+    prefix: repos/prod
+    credential: env://SOW_R2_CREDENTIAL
+    public_endpoint: https://repo.example.com/repos/prod/
+    max_cache_ttl: 1h
+` + tc.extra
+			if _, err := Parse([]byte(doc)); err == nil {
+				t.Fatalf("expected Parse rejection for %s", tc.name)
 			}
 		})
 	}

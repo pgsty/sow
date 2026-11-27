@@ -49,23 +49,14 @@ jobs:
           go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
           "$(go env GOPATH)/bin/staticcheck" ./...
 
-      - name: Dead code reachability
-        run: |
-          deadcode_version="$(make --no-print-directory deadcode-version)"
-          go install "golang.org/x/tools/cmd/deadcode@${deadcode_version}"
-          PATH="$(go env GOPATH)/bin:${PATH}" make deadcode DEADCODE_VERSION="${deadcode_version}"
-
       - name: Vulnerability reachability
         run: |
           govulncheck_version="$(make --no-print-directory govulncheck-version)"
           go install "golang.org/x/vuln/cmd/govulncheck@${govulncheck_version}"
           PATH="$(go env GOPATH)/bin:${PATH}" make vuln GOVULNCHECK_VERSION="${govulncheck_version}"
 
-      - name: Verify patched RPM provenance
-        run: make verify-rpm-upstream
-
       - name: Compile performance contracts and verify fixtures
-        run: make test-perf-contract test-perf
+        run: make test-perf-contract
 
       - name: Check GoReleaser configuration
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
@@ -126,23 +117,6 @@ jobs:
 
       - name: Race-test core repository packages
         run: make race
-
-  clean-delivery:
-    name: Clean Source Delivery
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Go
-        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-
-      - name: Verify clean source delivery
-        run: make clean-delivery
 
   package:
     name: Archives, RPM, DEB

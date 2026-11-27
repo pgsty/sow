@@ -59,8 +59,15 @@ func prepareMutationBuildPreflight(ctx context.Context, root, repoName string, c
 	if len(distNames) == 0 {
 		return nil, nil
 	}
-	if err := probeRootedDirectoryExchange(root, filepath.Join(repoName, "dists"), filepath.Join(".sow", repoName, "stage")); err != nil {
-		return nil, fmt.Errorf("%w: atomic Dist exchange is unavailable: %w", ErrRejected, err)
+	dists, stage := filepath.Join(repoName, "dists"), filepath.Join(".sow", repoName, "stage")
+	var exchangeErr error
+	if store.ReadOnly() {
+		exchangeErr = requireSameDevice(filepath.Join(root, dists), filepath.Join(root, stage))
+	} else {
+		exchangeErr = probeRootedDirectoryExchange(root, dists, stage)
+	}
+	if exchangeErr != nil {
+		return nil, fmt.Errorf("%w: atomic Dist exchange is unavailable: %w", ErrRejected, exchangeErr)
 	}
 	summary, err := store.Summary(ctx)
 	if err != nil {
@@ -791,17 +798,28 @@ func priorAPTByHashObjects(ctx context.Context, liveDist string, architectures [
 				// pointer and is superseded by the first managed build.
 				continue
 			}
-			if sourceErr != nil || sourceInfo.before.Size() != want.size || !os.SameFile(indexedInfo.before, sourceInfo.before) {
+			if sourceErr != nil || sourceInfo.before.Size() != want.size {
 				_ = indexedInfo.CloseVerified()
 				if sourceInfo != nil {
 					_ = sourceInfo.CloseVerified()
 				}
-				return nil, fmt.Errorf("%w: prior APT by-hash object for %s is absent or not its index hardlink", ErrIntegrity, relative)
+				return nil, fmt.Errorf("%w: prior APT by-hash object for %s is absent or differs in size", ErrIntegrity, relative)
 			}
+			sameInode := os.SameFile(indexedInfo.before, sourceInfo.before)
 			hash := sha256.New()
 			_, hashErr := io.Copy(hash, &managedContextReader{ctx: ctx, reader: sourceInfo.file})
+			indexedDigestOK := true
+			if hashErr == nil && !sameInode {
+				idxHash := sha256.New()
+				_, idxErr := io.Copy(idxHash, &managedContextReader{ctx: ctx, reader: indexedInfo.file})
+				if idxErr != nil {
+					hashErr = idxErr
+				} else if hex.EncodeToString(idxHash.Sum(nil)) != want.digest {
+					indexedDigestOK = false
+				}
+			}
 			verifyErr := errors.Join(indexedInfo.CloseVerified(), sourceInfo.CloseVerified())
-			if hashErr != nil || verifyErr != nil || hex.EncodeToString(hash.Sum(nil)) != want.digest {
+			if hashErr != nil || verifyErr != nil || hex.EncodeToString(hash.Sum(nil)) != want.digest || !indexedDigestOK {
 				return nil, fmt.Errorf("%w: prior APT by-hash object for %s differs from Release", ErrIntegrity, relative)
 			}
 			targetRelative := filepath.ToSlash(filepath.Join(binaryRelative, "by-hash", "SHA256", want.digest))
@@ -883,7 +901,7 @@ func loadMutationOperation(ctx context.Context, store *state.Store, root, repoNa
 	if err != nil {
 		return operation, payload, manifest, err
 	}
-	configSHA, err := config.FileSHA(filepath.Join(root, config.ConfigFilename))
+	configSHA, err := config.WorkspaceFileSHA(root)
 	if err != nil || configSHA != payload.ConfigSHA256 {
 		return state.Operation{}, mutationOperationPayload{}, mutationManifest{}, fmt.Errorf("%w: current config differs from active mutation", ErrIntegrity)
 	}

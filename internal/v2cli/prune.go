@@ -11,7 +11,7 @@ import (
 
 func executePrune(ctx context.Context, inv Invocation, stdout, stderr io.Writer) int {
 	result, err := plain.Prune(ctx, plain.PruneOptions{
-		Dir: inv.Positionals[0], DryRun: inv.DryRun, Protect: inv.Protect,
+		Dir: inv.Positionals[0], DryRun: inv.DryRun, Strict: inv.Strict, Protect: inv.Protect,
 		Jobs: inv.Jobs, MetadataTimestamp: inv.MetadataTimestamp,
 		Timeout: inv.Global.Timeout, NoWait: inv.Global.NoWait,
 	})
@@ -33,6 +33,9 @@ func executePrune(ctx context.Context, inv Invocation, stdout, stderr io.Writer)
 	} else if result.Dir != "" {
 		if code := writeHuman(stdout, stderr, pruneHuman(result, err == nil)); code != ExitOK {
 			return code
+		}
+		for _, warning := range result.Warnings {
+			fmt.Fprintf(stderr, "warning: %s\n", warning)
 		}
 	}
 	if err != nil {
@@ -64,7 +67,11 @@ func pruneHuman(result plain.PruneResult, success bool) string {
 	if !success {
 		action = "prune incomplete"
 	}
-	fmt.Fprintf(&output, "%s %s: kept=%d candidates=%d removed=%d index_updated=%t noop=%t\n",
-		action, result.Dir, len(result.Kept), len(result.Candidates), len(result.Removed), result.IndexUpdated, result.Noop)
+	skippedSuffix := ""
+	if len(result.Skipped) > 0 {
+		skippedSuffix = fmt.Sprintf(" skipped=%d", len(result.Skipped))
+	}
+	fmt.Fprintf(&output, "%s %s: kept=%d candidates=%d removed=%d%s index_updated=%t noop=%t\n",
+		action, result.Dir, len(result.Kept), len(result.Candidates), len(result.Removed), skippedSuffix, result.IndexUpdated, result.Noop)
 	return output.String()
 }

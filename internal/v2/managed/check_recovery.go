@@ -53,7 +53,7 @@ func inspectMutationRecoveryView(ctx context.Context, root, repoName string, sto
 	if err := jsonUnmarshalStrict(candidate.PayloadJSON, &payload); err != nil || payload.Version != mutationOperationVersion || payload.Repository != repoName || payload.Kind != candidate.Kind || !lowercaseSHA256.MatchString(payload.ConfigSHA256) || len(payload.Dists) == 0 {
 		return nil, fmt.Errorf("%w: invalid pending mutation binding", ErrIntegrity)
 	}
-	configSHA, err := config.FileSHA(filepath.Join(root, config.ConfigFilename))
+	configSHA, err := config.WorkspaceFileSHA(root)
 	if err != nil || configSHA != payload.ConfigSHA256 {
 		return nil, fmt.Errorf("%w: current config differs from pending mutation", ErrIntegrity)
 	}

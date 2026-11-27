@@ -254,7 +254,24 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 	if retainedErr != nil {
 		signatureIssues = append(signatureIssues, retainedErr.Error())
 	}
-	trustPlan := buildCheckRPMTrustPlan(retainedRPMKeys, rpmPolicy)
+	var frozenFillConfigs []config.EffectiveRPMPackageSigningConfig
+	if retainedErr == nil {
+		for _, distName := range distNames {
+			dist, distErr := store.GetDist(ctx, distName)
+			if distErr != nil || dist.Format != "rpm" {
+				continue
+			}
+			frozen, decodeErr := decodeRetainedEffectiveSigning(dist.EffectiveSigningJSON)
+			if decodeErr == nil && frozen.RPM.Packages.Mode == "fill" {
+				frozenFillConfigs = append(frozenFillConfigs, frozen.RPM.Packages)
+			}
+		}
+	}
+	trustPlan, trustErr := buildCheckRPMTrustPlan(retainedRPMKeys, rpmPolicy, frozenFillConfigs)
+	if trustErr != nil {
+		retainedErr = errors.Join(retainedErr, trustErr)
+		signatureIssues = append(signatureIssues, trustErr.Error())
+	}
 	digests := make([]string, len(objects))
 	for index, object := range objects {
 		digests[index] = object.SHA256
@@ -305,8 +322,8 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 						continue
 					}
 					objectEvidence[index] = evidence
-					if object.Storage == "pool" && evidence.Identity.mode.Perm() != 0o644 {
-						objectIssues[index] = append(objectIssues[index], fmt.Sprintf("public package %s mode is not 0644", object.SHA256))
+					if object.Storage == "pool" && (evidence.Identity.mode.Perm()&0o400 == 0 || evidence.Identity.mode.Perm()&0o002 != 0) {
+						objectIssues[index] = append(objectIssues[index], fmt.Sprintf("public package %s mode %#o is unreadable or world-writable", object.SHA256, evidence.Identity.mode.Perm()))
 						continue
 					}
 					if object.Format == "deb" {
@@ -419,7 +436,9 @@ func checkLocked(ctx context.Context, ws config.Workspace, cfg config.Config, re
 		desired, _ := store.MembershipDigests(ctx, distName, false)
 		built, _ := store.MembershipDigests(ctx, distName, true)
 		if !sameStringSet(wanted, desired) {
-			membershipIssues = append(membershipIssues, fmt.Sprintf("Dist %s Desired Membership violates current policy", distName))
+			// Policy changes (limit/exclude) in sow.yml require a rebuild
+			// (dirty), not an integrity failure.
+			dirtyDists = append(dirtyDists, distName)
 		}
 		if cfg.Repositories[repoName].Dists[distName].Format == "rpm" && policyErr == nil {
 			for _, object := range desiredObjects {
@@ -790,21 +809,23 @@ func validateManagedPublicModes(ctx context.Context, repositoryRoot string) ([]s
 	inspect := func(root string) error {
 		return walkRootedTree(ctx, root, func(relative string, _ *os.File, info os.FileInfo) error {
 			checked++
-			if info.Mode().Perm() != 0o644 {
-				return fmt.Errorf("public file %s mode is %#o, want 0644", filepath.Join(root, filepath.FromSlash(relative)), info.Mode().Perm())
+			perm := info.Mode().Perm()
+			if perm&0o444 != 0o444 || perm&0o002 != 0 {
+				return fmt.Errorf("public file %s mode %#o is not world-readable or is world-writable", filepath.Join(root, filepath.FromSlash(relative)), perm)
 			}
 			return nil
 		}, func(relative string, _ *os.File, info os.FileInfo) error {
 			checked++
-			if info.Mode().Perm() != 0o755 {
-				return fmt.Errorf("public directory %s mode is %#o, want 0755", filepath.Join(root, filepath.FromSlash(relative)), info.Mode().Perm())
+			perm := info.Mode().Perm()
+			if perm&0o555 != 0o555 || perm&0o002 != 0 {
+				return fmt.Errorf("public directory %s mode %#o is not world-searchable or is world-writable", filepath.Join(root, filepath.FromSlash(relative)), perm)
 			}
 			return nil
 		})
 	}
 	rootInfo, err := os.Lstat(repositoryRoot)
-	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || rootInfo.Mode().Perm() != 0o755 {
-		issues = append(issues, "public repository root is missing, unsafe, or not mode 0755")
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || rootInfo.Mode().Perm()&0o555 != 0o555 || rootInfo.Mode().Perm()&0o002 != 0 {
+		issues = append(issues, "public repository root is missing, unreadable, or world-writable")
 		return issues, checked
 	}
 	checked++

@@ -28,19 +28,24 @@ func executeLogExport(ctx context.Context, inv Invocation, stdout, stderr io.Wri
 		return writeFailure("log export", false, err, nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
 	}
 	parent := filepath.Dir(absolute)
-	info, err := os.Lstat(parent)
+	info, err := os.Stat(parent)
 	if err != nil {
-		return writeFailure("log export", false, fmt.Errorf("log export parent is not a real directory: %w", err), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
+		return writeFailure("log export", false, fmt.Errorf("log export parent is not a directory: %w", err), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return writeFailure("log export", false, fmt.Errorf("log export parent is not a real directory: %s", parent), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
+	if !info.IsDir() {
+		return writeFailure("log export", false, fmt.Errorf("log export parent is not a directory: %s", parent), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
 	}
-	if _, err := os.Lstat(absolute); err == nil {
+	realParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		return writeFailure("log export", false, err, nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
+	}
+	realTarget := filepath.Join(realParent, filepath.Base(absolute))
+	if _, err := os.Lstat(realTarget); err == nil {
 		return writeFailure("log export", false, Errorf(ErrRejected, "export target already exists: %s", absolute), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return writeFailure("log export", false, err, nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
 	}
-	tmp, err := os.CreateTemp(parent, ".sow-log-export-")
+	tmp, err := os.CreateTemp(realParent, ".sow-log-export-")
 	if err != nil {
 		return writeFailure("log export", false, err, nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
 	}
@@ -51,16 +56,18 @@ func executeLogExport(ctx context.Context, inv Invocation, stdout, stderr io.Wri
 	if err := errors.Join(exportErr, closeErr); err != nil {
 		return writeFailure("log export", false, classifyManagedError("log export", markCommandInterrupted(ctx, err)), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
 	}
-	if err := os.Link(tmpName, absolute); err != nil {
+	if err := os.Link(tmpName, realTarget); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return writeFailure("log export", false, Errorf(ErrRejected, "export target already exists: %s", absolute), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
+		}
 		return writeFailure("log export", false, err, nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
 	}
-	if err := os.Remove(tmpName); err != nil {
-		return writeFailure("log export", false, err, nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
+	directory, err := os.Open(realParent)
+	if err == nil {
+		err = errors.Join(directory.Sync(), directory.Close())
 	}
-	if directory, err := os.Open(parent); err != nil {
-		return writeFailure("log export", false, err, nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
-	} else if err := errors.Join(directory.Sync(), directory.Close()); err != nil {
-		return writeFailure("log export", false, err, nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
+	if err != nil {
+		return writeFailure("log export", false, fmt.Errorf("export installed at %s but syncing its directory failed: %w", absolute, err), nullableString(inv.Global.Repo), nil, nil, stdout, stderr)
 	}
 	return writeHuman(stdout, stderr, fmt.Sprintf("exported %d operations to %s\n", count, absolute))
 }

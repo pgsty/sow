@@ -87,9 +87,9 @@ func TestRetainedRPMTrustPreservesEveryCertificateInBundle(t *testing.T) {
 			}
 		})
 	}
-	malformed := append(append([]byte(nil), separate.Bytes()...), []byte("hidden trailing material")...)
+	malformed := append(append([]byte(nil), separate.Bytes()...), []byte("-----BEGIN PGP PUBLIC KEY BLOCK-----\ntruncated\n")...)
 	if _, err := retainedRPMSigningKeysFromMaterial(malformed); err == nil {
-		t.Fatal("retained trust accepted incomplete input")
+		t.Fatal("retained trust accepted truncated armor block")
 	}
 }
 

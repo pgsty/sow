@@ -38,18 +38,30 @@ func TestVerifyPackageDigestsRealRPMs(t *testing.T) {
 	}
 }
 
-// RPM v6 writes PAYLOADSHA256 without PAYLOADSHA256ALGO. Report the format
-// rather than an opaque "algorithm 0" failure.
-func TestVerifyPackageDigestsNamesUnsupportedRPMv6(t *testing.T) {
+// RPM v6 writes PAYLOADSHA256 without PAYLOADSHA256ALGO; default algorithm is SHA-256.
+func TestVerifyPackageDigestsSupportsRPMv6(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v6.rpm")
 	writeRPMFixture(t, path, "v6", fixtureTag{id: rpmTagPayloadDigest, typ: 8, count: 1, data: append([]byte(strings.Repeat("0", 64)), 0)})
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Mismatched zeroed payload SHA-256 is verified as SHA-256 and fails on mismatch,
+	// not because RPM v6 is rejected outright.
 	err = VerifyPackageDigests(context.Background(), bytes.NewReader(data))
-	if !errors.Is(err, ErrInvalidPackage) || !strings.Contains(err.Error(), "RPM v6 packages are not supported") {
-		t.Fatalf("v6 digest error=%v", err)
+	if !errors.Is(err, ErrInvalidPackage) || !strings.Contains(err.Error(), "SHA-256 payload digest mismatch") {
+		t.Fatalf("v6 mismatched digest error=%v", err)
+	}
+	// InspectFlatPackage succeeds cleanly on RPM v6 packages without PAYLOADSHA256ALGO.
+	if _, info, err := InspectFlatPackage(context.Background(), PackageInput{Path: path}); err != nil || info.Name != "v6" {
+		t.Fatalf("InspectFlatPackage on RPM v6 failed: info=%+v err=%v", info, err)
+	}
+	// Real RPM with lead version bumped to 6 and tag 5093 omitted (RPM v6 format)
+	// passes full VerifyPackageDigests cleanly.
+	v6Valid := bytes.Clone(withoutSignatureDigestTags(readPGDGRPMFixture(t), 1004))
+	v6Valid[4] = 6
+	if err := VerifyPackageDigests(context.Background(), bytes.NewReader(v6Valid)); err != nil {
+		t.Fatalf("VerifyPackageDigests rejected valid RPM v6 lead: %v", err)
 	}
 }
 

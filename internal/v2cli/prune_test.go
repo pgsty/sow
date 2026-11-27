@@ -26,7 +26,7 @@ func TestParsePruneDefaultsAndOptions(t *testing.T) {
 	}
 	for _, args := range [][]string{
 		{"prune"}, {"prune", "a", "b"},
-		{"prune", "packages", "--dry-run=true"}, {"prune", "packages", "--dry-run", "--dry-run"},
+		{"prune", "packages", "--dry-run=maybe"},
 		{"prune", "packages", "--protect"}, {"prune", "packages", "--protect="},
 		{"prune", "packages", "--protect", "age_*"}, {"prune", "packages", "--protect", "path/name"},
 		{"prune", "packages", "--apply"}, {"prune", "packages", "--keep", "2"},
@@ -98,7 +98,7 @@ func TestMainPruneFailureJSONAndCancellation(t *testing.T) {
 		code int
 	}{
 		{[]string{"prune", "--json"}, ExitUsage},
-		{[]string{"prune", t.TempDir(), "--json"}, ExitRejected},
+		{[]string{"prune", t.TempDir(), "--strict", "--json"}, ExitRejected},
 	} {
 		stdout, stderr, code := runCLI(tt.args)
 		var envelope Envelope

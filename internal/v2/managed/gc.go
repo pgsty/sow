@@ -366,17 +366,12 @@ func parseLocalGCPlan(data []byte) (localGCPlan, error) {
 	}
 	var plan localGCPlan
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&plan); err != nil {
 		return localGCPlan{}, err
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return localGCPlan{}, errors.New("local GC plan has trailing content")
-	}
-	canonical, err := json.Marshal(plan)
-	if err != nil || !bytes.Equal(canonical, data) {
-		return localGCPlan{}, errors.Join(errors.New("local GC plan is not canonical JSON"), err)
 	}
 	if err := validateLocalGCPlan(plan); err != nil {
 		return localGCPlan{}, err

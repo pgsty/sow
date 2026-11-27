@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,9 +43,8 @@ const (
 )
 
 var (
-	credentialIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,256}$`)
 	regionPattern       = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
-	copyBucketPattern   = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	copyBucketPattern   = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9.-]{0,61}[a-z0-9])?$`)
 	errUploadNoProgress = errors.New("R2 upload made no progress before its idle deadline")
 	// ErrReadNoProgress reports a response body that stopped delivering bytes
 	// while its request remained otherwise live.
@@ -59,11 +59,20 @@ type S3Credentials struct {
 }
 
 func (c S3Credentials) validate() error {
-	if !credentialIDPattern.MatchString(c.AccessKeyID) || !regionPattern.MatchString(c.Region) || !safeHeaderSecret(c.SecretAccessKey, 4096) ||
+	if !safeAccessKeyID(c.AccessKeyID, 256) || !regionPattern.MatchString(c.Region) || !safeHeaderSecret(c.SecretAccessKey, 4096) ||
 		(c.SessionToken != "" && !safeHeaderSecret(c.SessionToken, 16<<10)) {
 		return errors.New("S3 access key, secret, and region are required")
 	}
 	return nil
+}
+
+// safeAccessKeyID permits printable ASCII access key IDs while rejecting
+// characters that can break or inject AWS SigV4 Authorization credential scope.
+func safeAccessKeyID(value string, maximum int) bool {
+	if !safeHeaderSecret(value, maximum) {
+		return false
+	}
+	return !strings.ContainsAny(value, `/,=";`)
 }
 
 func safeHeaderSecret(value string, maximum int) bool {
@@ -174,18 +183,23 @@ func (c *signedObjectHTTP) listObjectsV2Prefix(ctx context.Context, prefix, cont
 	if err != nil {
 		return ObjectListPage{}, err
 	}
-	if response.EncodingType != types.EncodingTypeUrl {
-		return ObjectListPage{}, fmt.Errorf("%w: ListObjectsV2 returned an unexpected document", ErrCapability)
-	}
 	if len(response.Contents) > maxListPageKeys {
 		return ObjectListPage{}, fmt.Errorf("%w: ListObjectsV2 exceeded requested max-keys", ErrCapability)
 	}
+	if response.EncodingType != "" && response.EncodingType != types.EncodingTypeUrl {
+		return ObjectListPage{}, fmt.Errorf("%w: ListObjectsV2 returned unsupported encoding-type %q", ErrCapability, response.EncodingType)
+	}
 	page := ObjectListPage{Objects: make([]ListedObject, 0, len(response.Contents))}
-	lastKey := ""
+	urlEncoded := response.EncodingType == types.EncodingTypeUrl
 	for _, object := range response.Contents {
-		key, err := url.PathUnescape(aws.ToString(object.Key))
-		if err != nil {
-			return ObjectListPage{}, fmt.Errorf("decode ListObjectsV2 key: %w", err)
+		rawKey := aws.ToString(object.Key)
+		key := rawKey
+		if urlEncoded {
+			var decodeErr error
+			key, decodeErr = url.PathUnescape(rawKey)
+			if decodeErr != nil {
+				return ObjectListPage{}, fmt.Errorf("decode ListObjectsV2 key: %w", decodeErr)
+			}
 		}
 		if len(key) > 1024 {
 			return ObjectListPage{}, errors.New("ListObjectsV2 key exceeds S3 safety limit")
@@ -196,11 +210,13 @@ func (c *signedObjectHTTP) listObjectsV2Prefix(ctx context.Context, prefix, cont
 		if aws.ToInt64(object.Size) < 0 {
 			return ObjectListPage{}, errors.New("ListObjectsV2 returned a negative object size")
 		}
-		if lastKey != "" && key <= lastKey {
-			return ObjectListPage{}, errors.New("ListObjectsV2 page is not strictly key-sorted")
-		}
-		lastKey = key
 		page.Objects = append(page.Objects, ListedObject{Key: key, Size: aws.ToInt64(object.Size), ETag: aws.ToString(object.ETag)})
+	}
+	sort.Slice(page.Objects, func(i, j int) bool { return page.Objects[i].Key < page.Objects[j].Key })
+	for i := 1; i < len(page.Objects); i++ {
+		if page.Objects[i].Key == page.Objects[i-1].Key {
+			return ObjectListPage{}, fmt.Errorf("%w: ListObjectsV2 returned duplicate key %q", ErrCapability, page.Objects[i].Key)
+		}
 	}
 	next := aws.ToString(response.NextContinuationToken)
 	if aws.ToBool(response.IsTruncated) {
@@ -208,8 +224,6 @@ func (c *signedObjectHTTP) listObjectsV2Prefix(ctx context.Context, prefix, cont
 			return ObjectListPage{}, fmt.Errorf("%w: truncated ListObjectsV2 response has no safe continuation token", ErrCapability)
 		}
 		page.NextContinuationToken = next
-	} else if next != "" {
-		return ObjectListPage{}, fmt.Errorf("%w: non-truncated ListObjectsV2 response returned a continuation token", ErrCapability)
 	}
 	return page, nil
 }
@@ -509,14 +523,14 @@ func splitS3BucketRoot(rawBase, configuredBucket string, allowInsecure bool) (*u
 	if base.Path != "" && path.Clean(base.Path) != cleanBasePath {
 		return nil, nil, "", false, errors.New("object base URL path is not canonical")
 	}
-	if configuredBucket != "" && !copyBucketPattern.MatchString(configuredBucket) {
+	if configuredBucket != "" && (!copyBucketPattern.MatchString(configuredBucket) || strings.Contains(configuredBucket, "..")) {
 		return nil, nil, "", false, errors.New("object bucket must be a DNS-safe label")
 	}
 	bucketRoot := *base
 	endpoint := *base
 	trimmedPath := strings.Trim(base.Path, "/")
 	if trimmedPath != "" {
-		if strings.Contains(trimmedPath, "/") || !copyBucketPattern.MatchString(trimmedPath) {
+		if strings.Contains(trimmedPath, "/") || !copyBucketPattern.MatchString(trimmedPath) || strings.Contains(trimmedPath, "..") {
 			return nil, nil, "", false, errors.New("object base URL path must contain exactly one bucket label")
 		}
 		if configuredBucket != "" && configuredBucket != trimmedPath {
@@ -570,7 +584,7 @@ func (c *s3SDKHTTPClient) Do(request *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	if response.Body != nil && c.readIdleTimeout > 0 {
+	if response.Body != nil && response.Body != http.NoBody && request.Method != http.MethodHead && c.readIdleTimeout > 0 {
 		response.Body = NewIdleReadCloser(request.Context(), response.Body, c.readIdleTimeout)
 	}
 	// net/http's real transport exposes Content-Length both in the parsed field

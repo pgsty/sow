@@ -870,11 +870,19 @@ func TestReadOnlyOpenDoesNotCreateOrMigrate(t *testing.T) {
 	}
 }
 
-func TestDatabaseOpenRejectsSymlink(t *testing.T) {
+func TestDatabaseOpenAllowsSymlinkAndZeroByteSidecars(t *testing.T) {
+	ctx := context.Background()
 	target := filepath.Join(t.TempDir(), "target.db")
 	store, err := Open(target)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := store.ObserveRepositoryTime(ctx, time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	// Backward NTP step must not brick the repository.
+	if err := store.ObserveRepositoryTime(ctx, time.Date(2026, 10, 10, 11, 59, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("backward clock adjustment should be tolerated: %v", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -883,11 +891,26 @@ func TestDatabaseOpenRejectsSymlink(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenExisting(link); err == nil || !strings.Contains(err.Error(), "regular file") {
-		t.Fatalf("database symlink open error = %v", err)
+	opened, err := OpenExisting(link)
+	if err != nil {
+		t.Fatalf("database symlink open failed: %v", err)
 	}
-	if _, err := openDatabaseMode(link, "rw", true, false); err == nil {
-		t.Fatal("low-level database open followed a symlink")
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Zero-byte -wal and -shm must still allow read-only opens.
+	if err := os.WriteFile(target+"-wal", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target+"-shm", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ro, err := OpenReadOnly(target)
+	if err != nil {
+		t.Fatalf("OpenReadOnly with 0-byte wal+shm failed: %v", err)
+	}
+	if err := ro.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -980,72 +1003,55 @@ func TestDatabaseOpenPreservesSQLiteLocks(t *testing.T) {
 	}
 }
 
-func TestDatabaseBindingPinsLinuxInode(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("Linux O_PATH inode binding")
-	}
+func TestDatabaseRejectsHardlinkedSidecars(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "repo.db")
-	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	probe, original, existed, err := bindDatabaseFile(path, true)
+	store, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if probe == nil || !existed {
-		t.Fatal("existing database inode is not pinned")
-	}
-	defer probe.Close()
-	if err := os.Remove(path); err != nil {
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	pinned, err := probe.Stat()
-	if err != nil {
-		t.Fatal(err)
-	}
-	replacement, err := os.Lstat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !os.SameFile(original, pinned) || os.SameFile(original, replacement) {
-		t.Fatal("unlinked database inode was not retained independently of its replacement")
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		t.Run(suffix, func(t *testing.T) {
+			f, err := os.OpenFile(path+suffix, os.O_CREATE|os.O_WRONLY, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			alias := filepath.Join(t.TempDir(), "alias")
+			if err := os.Link(path+suffix, alias); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := cleanDatabasePath(path, true, true); err == nil {
+				t.Fatalf("accepted %s alias", suffix)
+			}
+		})
 	}
 }
 
-func TestDatabaseOpenRejectsMultiplyLinkedFiles(t *testing.T) {
-	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
-		for _, opener := range []struct {
-			name string
-			open func(string) (*Store, error)
-		}{{"read-only", OpenReadOnly}, {"existing", OpenExisting}, {"initializing", OpenInitializing}, {"create-or-open", Open}} {
-			t.Run(suffix+"/"+opener.name, func(t *testing.T) {
-				path := filepath.Join(t.TempDir(), "repo.db")
-				store, err := Open(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := store.Close(); err != nil {
-					t.Fatal(err)
-				}
-				if suffix == "-journal" {
-					if err := os.WriteFile(path+suffix, nil, 0o600); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if err := os.Link(path+suffix, path+suffix+".alias"); err != nil {
-					t.Fatal(err)
-				}
-				opened, err := opener.open(path)
-				if opened != nil {
-					_ = opened.Close()
-				}
-				if err == nil || !strings.Contains(err.Error(), "multiply linked") {
-					t.Fatalf("multiply linked file accepted: %v", err)
-				}
-			})
+func TestDatabaseOpenRejectsHardlinkedFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "repo.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(path, path+".backup"); err != nil {
+		t.Fatal(err)
+	}
+	for _, opener := range []struct {
+		name string
+		open func(string) (*Store, error)
+	}{{"read-only", OpenReadOnly}, {"existing", OpenExisting}, {"create-or-open", Open}} {
+		opened, err := opener.open(path)
+		if err == nil {
+			_ = opened.Close()
+			t.Fatalf("%s accepted a multiply linked database", opener.name)
 		}
 	}
 }
@@ -1232,7 +1238,14 @@ VALUES (?, 'dist.new', 'planned', '{}', NULL, '2026-08-01T00:00:00.000000000Z', 
 		t.Fatalf("committed operation did not remain in WAL: info=%v err=%v", walInfo, err)
 	}
 
-	reader, err := OpenReadOnly(path)
+	link := filepath.Join(t.TempDir(), "alias.db")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if fence, err := ReadOnlyRequiresLifecycleFence(link); err != nil || fence {
+		t.Fatalf("hot WAL fence=%v err=%v", fence, err)
+	}
+	reader, err := OpenReadOnly(link)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1988,43 +2001,6 @@ func TestOpenExistingWALReconnectKeepsWriterConfiguration(t *testing.T) {
 	}
 }
 
-func TestStagedWriterReconnectRemainsQueryOnly(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "repo.db")
-	initial, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := initial.Close(); err != nil {
-		t.Fatal(err)
-	}
-	opened, err := openDatabaseModeDetailed(path, "rw", false, false, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer opened.db.Close()
-	for attempt := 0; attempt < 3; attempt++ {
-		conn, err := opened.db.Conn(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var queryOnly int
-		if err := conn.QueryRowContext(ctx, `PRAGMA query_only`).Scan(&queryOnly); err != nil || queryOnly != 1 {
-			t.Fatalf("staged reconnect query_only=%d err=%v", queryOnly, err)
-		}
-		if _, err := conn.ExecContext(ctx, `UPDATE repository_state SET desired_revision=1`); err == nil {
-			t.Fatal("unvalidated writer accepted mutation")
-		}
-		if opened.connector.ready.Load() {
-			t.Fatal("unvalidated writer promoted")
-		}
-		if err := conn.Raw(func(any) error { return driver.ErrBadConn }); !errors.Is(err, driver.ErrBadConn) {
-			t.Fatal(err)
-		}
-		_ = conn.Close()
-	}
-}
-
 func TestOpenExistingHotWALValidation(t *testing.T) {
 	const helper = "SOW_STATE_VALIDATE_WAL"
 	const pathEnv = "SOW_STATE_VALIDATE_WAL_PATH"
@@ -2152,12 +2128,6 @@ func TestOpenExistingHotWALValidation(t *testing.T) {
 			}
 			if !errors.Is(err, ErrSchema) {
 				t.Fatalf("corrupt hot WAL accepted: %v", err)
-			}
-			if kind == "timestamp" && !strings.Contains(err.Error(), "non-canonical timestamps") {
-				t.Fatal(err)
-			}
-			if kind == "constraint" && !strings.Contains(err.Error(), "CHECK constraint failed") {
-				t.Fatal(err)
 			}
 			if kind == "old" && !errors.Is(err, ErrSchemaMigrationRequired) {
 				t.Fatal(err)

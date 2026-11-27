@@ -12,7 +12,6 @@ require (
 	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8
 	go.yaml.in/yaml/v4 v4.0.0
 	golang.org/x/sys v0.50.0
-	modernc.org/libc v1.82.12
 	modernc.org/sqlite v1.63.0
 	pault.ag/go/debian v0.21.4
 )
@@ -42,6 +41,7 @@ require (
 	golang.org/x/crypto v0.59.0 // indirect
 	golang.org/x/tools v0.53.0 // indirect
 	modernc.org/gc/v3 v3.2.1 // indirect
+	modernc.org/libc v1.82.12 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.13.0 // indirect
 	pault.ag/go/topsort v0.1.1 // indirect

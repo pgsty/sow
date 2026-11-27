@@ -175,7 +175,7 @@ func TestChangesRejectsCheckObservedPublicModeErrorWithoutEmittingPlan(t *testin
 	if err := errors.Join(err, closeErr); err != nil || len(objects) != 1 {
 		t.Fatalf("objects=%#v err=%v", objects, err)
 	}
-	if err := os.Chmod(filepath.Join(root, "repo", filepath.FromSlash(objects[0].PoolPath)), 0o600); err != nil {
+	if err := os.Chmod(filepath.Join(root, "repo", filepath.FromSlash(objects[0].PoolPath)), 0o666); err != nil {
 		t.Fatal(err)
 	}
 	checked, err := Check(ctx, CheckOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1})

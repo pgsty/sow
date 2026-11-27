@@ -58,9 +58,6 @@ func TestReadHeaderRejectsInvalidDescriptorAndUnterminatedStrings(t *testing.T) 
 	for name, mutate := range map[string]func([]byte){
 		"magic":   func(value []byte) { value[0] ^= 0xff },
 		"version": func(value []byte) { value[3] = 2 },
-		"reserved": func(value []byte) {
-			value[4] = 1
-		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			input := append([]byte(nil), valid...)
@@ -111,19 +108,55 @@ func TestReadHeaderRepeatedSourceRPM(t *testing.T) {
 	}
 }
 
-func TestReadHeaderRejectsConflictingMainTags(t *testing.T) {
-	first := syntheticHeaderIndex{tag: 1000, kind: uint32(TagTypeString), count: 1}
-	for name, second := range map[string]syntheticHeaderIndex{
-		"value": {tag: 1000, kind: uint32(TagTypeString), offset: 2, count: 1},
-		"type":  {tag: 1000, kind: uint32(TagTypeStringArray), count: 1},
-		"count": {tag: 1000, kind: uint32(TagTypeString), count: 2},
-	} {
-		t.Run(name, func(t *testing.T) {
-			header := encodeSyntheticHeader([]syntheticHeaderIndex{first, second}, []byte{'a', 0, 'b', 0})
+func TestReadHeaderRejectsConflictingDuplicateTagsAndAllSignatureDuplicates(t *testing.T) {
+	cases := []struct {
+		name  string
+		index []syntheticHeaderIndex
+		store []byte
+	}{
+		{
+			name: "value",
+			index: []syntheticHeaderIndex{
+				{tag: 1000, kind: uint32(TagTypeString), offset: 0, count: 1},
+				{tag: 1000, kind: uint32(TagTypeString), offset: 2, count: 1},
+			},
+			store: []byte{'a', 0, 'b', 0},
+		},
+		{
+			name: "type",
+			index: []syntheticHeaderIndex{
+				{tag: 1000, kind: uint32(TagTypeString), offset: 0, count: 1},
+				{tag: 1000, kind: uint32(TagTypeInt32), offset: 0, count: 1},
+			},
+			store: []byte{'a', 0, 0, 0},
+		},
+		{
+			name: "count",
+			index: []syntheticHeaderIndex{
+				{tag: 1000, kind: uint32(TagTypeStringArray), offset: 0, count: 1},
+				{tag: 1000, kind: uint32(TagTypeStringArray), offset: 0, count: 2},
+			},
+			store: []byte{'a', 0, 'b', 0},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			header := encodeSyntheticHeader(tc.index, tc.store)
 			if _, err := readHeader(bytes.NewReader(header), false); err == nil || !strings.Contains(err.Error(), "duplicate header tag") {
-				t.Fatalf("conflicting main header tag error = %v", err)
+				t.Fatalf("conflicting main header tag (%s) error = %v", tc.name, err)
+			}
+			if _, err := readHeader(bytes.NewReader(header), true); err == nil || !strings.Contains(err.Error(), "duplicate header tag") {
+				t.Fatalf("conflicting signature header tag (%s) error = %v", tc.name, err)
 			}
 		})
+	}
+	// Even identical duplicates remain rejected in signature headers.
+	ident := encodeSyntheticHeader([]syntheticHeaderIndex{
+		{tag: 1000, kind: uint32(TagTypeString), offset: 0, count: 1},
+		{tag: 1000, kind: uint32(TagTypeString), offset: 0, count: 1},
+	}, []byte{'a', 0})
+	if _, err := readHeader(bytes.NewReader(ident), true); err == nil || !strings.Contains(err.Error(), "duplicate header tag") {
+		t.Fatalf("identical signature header duplicate error = %v", err)
 	}
 }
 

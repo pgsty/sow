@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -37,8 +38,8 @@ func TestPassfileContent(t *testing.T) {
 		{"two lines", "secret\nother", "", true},
 		{"extra empty line", "secret\n\n", "", true},
 		{"NUL", "secret\x00", "", true},
-		{"BOM", "\ufeffsecret", "", true},
-		{"invalid UTF8", "secret\xff", "", true},
+		{"BOM stripped", "\ufeffsecret\n", "secret", false},
+		{"raw single-line bytes", "secret\xff\n", "secret\xff", false},
 		{"oversized", strings.Repeat("p", MaxBytes) + "\n", "", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -118,7 +119,7 @@ func TestPassfilePrecedenceAndPathBases(t *testing.T) {
 	}
 }
 
-func TestPassfileRejectsUnsafeFiles(t *testing.T) {
+func TestPassfileSupportsSymlinksAndRejectsDirectoriesOrEmptyFIFOs(t *testing.T) {
 	root := t.TempDir()
 	writePass(t, filepath.Join(root, "real"), "secret")
 	if err := os.Symlink("real", filepath.Join(root, "link")); err != nil {
@@ -133,19 +134,28 @@ func TestPassfileRejectsUnsafeFiles(t *testing.T) {
 	if err := os.Symlink(root, filepath.Join(root, "parent-link")); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"missing", "link", "fifo", "directory", "parent-link/real"} {
+	for _, name := range []string{"missing", "fifo", "directory"} {
 		source, err := Select(context.Background(), root, name, "")
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err := source.Read(); !errors.Is(err, ErrCredential) {
-			t.Errorf("accepted unsafe file %s: %v", name, err)
+			t.Errorf("accepted invalid passfile %s: %v", name, err)
+		}
+	}
+	// Symlinks (in-workspace and external Kubernetes Secret mounts) are accepted.
+	for _, name := range []string{"link", "parent-link/real"} {
+		source, err := Select(context.Background(), root, name, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := source.Read()
+		defer Clear(got)
+		if err != nil || string(got) != "secret" {
+			t.Errorf("symlink passfile %s failed: got=%q err=%v", name, got, err)
 		}
 	}
 
-	// External secret mounts (e.g. Kubernetes Secret ..data symlink projection)
-	// outside the workspace root are allowed, provided they resolve to a safe
-	// regular file outside the workspace.
 	externalDir := t.TempDir()
 	k8sSnapshot := filepath.Join(externalDir, "..2026_11_21_00_00")
 	if err := os.Mkdir(k8sSnapshot, 0o700); err != nil {
@@ -167,50 +177,6 @@ func TestPassfileRejectsUnsafeFiles(t *testing.T) {
 	defer Clear(gotExt)
 	if err != nil || string(gotExt) != "k8s-secret" {
 		t.Fatalf("external k8s secret symlink passfile failed: got=%q err=%v", gotExt, err)
-	}
-
-	// External symlink pointing back inside workspace root must still be rejected.
-	bounceLink := filepath.Join(externalDir, "bounce")
-	if err := os.Symlink(filepath.Join(root, "real"), bounceLink); err != nil {
-		t.Fatal(err)
-	}
-	bounceSource, err := Select(context.Background(), root, bounceLink, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := bounceSource.Read(); !errors.Is(err, ErrCredential) {
-		t.Fatalf("external symlink bouncing into workspace was accepted: %v", err)
-	}
-
-	// CLI --passfile and SOW_GPG_PASSFILE must enforce the exact same workspace
-	// O_NOFOLLOW and anti-bounce-back boundaries while keeping external K8s
-	// Secret symlinks working.
-	for _, candidate := range []string{filepath.Join(root, "link"), bounceLink} {
-		cliSrc, err := Select(WithPassFile(context.Background(), candidate), root, "", "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := cliSrc.Read(); !errors.Is(err, ErrCredential) {
-			t.Fatalf("CLI --passfile accepted unsafe workspace path %s: %v", candidate, err)
-		}
-		t.Setenv(Environment, candidate)
-		envSrc, err := Select(context.Background(), root, "", "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := envSrc.Read(); !errors.Is(err, ErrCredential) {
-			t.Fatalf("SOW_GPG_PASSFILE accepted unsafe workspace path %s: %v", candidate, err)
-		}
-	}
-	_ = os.Unsetenv(Environment)
-	cliExt, err := Select(WithPassFile(context.Background(), externalPass), root, "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	gotCLIExt, err := cliExt.Read()
-	defer Clear(gotCLIExt)
-	if err != nil || string(gotCLIExt) != "k8s-secret" {
-		t.Fatalf("CLI --passfile rejected external k8s secret symlink: got=%q err=%v", gotCLIExt, err)
 	}
 }
 
@@ -267,162 +233,59 @@ func TestRPMCredentialIsPrivateRepeatableAndRemoved(t *testing.T) {
 	}
 }
 
-func TestPassfileRejectsExternalSubdirSymlinkAndHandlesNonCanonicalRoot(t *testing.T) {
-	base := t.TempDir()
-	realParent := filepath.Join(base, "real-parent")
-	ws := filepath.Join(realParent, "ws")
-	sub := filepath.Join(ws, "sub")
-	if err := os.MkdirAll(sub, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	outside := filepath.Join(base, "outside")
-	if err := os.MkdirAll(outside, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	outsideSecret := filepath.Join(outside, "ext.pass")
-	writePass(t, outsideSecret, "ext-secret\n")
-	inWsRegular := filepath.Join(sub, "regular.pass")
-	writePass(t, inWsRegular, "in-ws-secret\n")
-	inWsEscapeLink := filepath.Join(sub, "escape.link")
-	if err := os.Symlink(outsideSecret, inWsEscapeLink); err != nil {
-		t.Fatal(err)
-	}
-	inWsDirLink := filepath.Join(ws, "dir-link")
-	if err := os.Symlink(sub, inWsDirLink); err != nil {
-		t.Fatal(err)
-	}
-
-	// External symlink pointing to a subdirectory of the workspace must be
-	// rejected whether its leaf is a regular file inside the workspace or an
-	// in-workspace symlink escaping back outside.
-	extSubLink := filepath.Join(outside, "to-ws-sub")
-	if err := os.Symlink(sub, extSubLink); err != nil {
-		t.Fatal(err)
-	}
-	for _, candidate := range []string{
-		filepath.Join(extSubLink, "regular.pass"),
-		filepath.Join(extSubLink, "escape.link"),
-	} {
-		src, err := Select(WithPassFile(context.Background(), candidate), ws, "", "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := src.Read(); !errors.Is(err, ErrCredential) {
-			t.Fatalf("external subdir symlink path %s was accepted: %v", candidate, err)
-		}
-	}
-
-	// A non-canonical workspace root under a symlinked parent must still allow
-	// genuine regular passfiles inside the workspace while rejecting symlinks
-	// inside the workspace.
-	parentAlias := filepath.Join(base, "parent-alias")
-	if err := os.Symlink(realParent, parentAlias); err != nil {
-		t.Fatal(err)
-	}
-	aliasWS := filepath.Join(parentAlias, "ws")
-	okSrc, err := Select(WithPassFile(context.Background(), filepath.Join(aliasWS, "sub", "regular.pass")), aliasWS, "", "")
+func TestRPMFileUsesTMPDIR(t *testing.T) {
+	customTmp := t.TempDir()
+	t.Setenv("TMPDIR", customTmp)
+	sourcePath := filepath.Join(t.TempDir(), "pass")
+	writePass(t, sourcePath, "tmpdir-secret\n")
+	source, err := Select(context.Background(), "", sourcePath, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := okSrc.Read()
-	defer Clear(got)
-	if err != nil || string(got) != "in-ws-secret" {
-		t.Fatalf("regular passfile under symlinked parent alias failed: got=%q err=%v", got, err)
+	path, cleanup, err := RPMFile(source)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, unsafe := range []string{
-		filepath.Join(aliasWS, "sub", "escape.link"),
-		filepath.Join(aliasWS, "dir-link", "regular.pass"),
-	} {
-		badSrc, err := Select(WithPassFile(context.Background(), unsafe), aliasWS, "", "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := badSrc.Read(); !errors.Is(err, ErrCredential) {
-			t.Fatalf("in-workspace symlink via parent alias %s was accepted: %v", unsafe, err)
-		}
+	defer cleanup()
+	if !strings.HasPrefix(path, customTmp) {
+		t.Fatalf("RPMFile ignored TMPDIR: got %q, want under %q", path, customTmp)
 	}
+}
 
-	// External symlink directly to the workspace root itself, multi-hop leaf
-	// bounce through an in-workspace symlink, and multi-hop directory bounce
-	// through an in-workspace directory symlink must all be rejected.
-	extRootLink := filepath.Join(outside, "to-ws-root")
-	if err := os.Symlink(ws, extRootLink); err != nil {
+func TestPassfileReadDeadlineForIdleWriter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pass.fifo")
+	if err := unix.Mkfifo(path, 0600); err != nil {
 		t.Fatal(err)
 	}
-	extLeafHop := filepath.Join(outside, "leaf-hop")
-	if err := os.Symlink(inWsEscapeLink, extLeafHop); err != nil {
+	writer, err := os.OpenFile(path, os.O_RDWR|unix.O_NONBLOCK, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
-	inWsDirEscape := filepath.Join(ws, "dir-escape")
-	if err := os.Symlink(outside, inWsDirEscape); err != nil {
-		t.Fatal(err)
-	}
-	extDirHop := filepath.Join(outside, "dir-hop")
-	if err := os.Symlink(inWsDirEscape, extDirHop); err != nil {
-		t.Fatal(err)
-	}
-	extDotDotHop := filepath.Join(outside, "dotdot-hop")
-	if err := os.Symlink(ws+"/sub/../../../outside/ext.pass", extDotDotHop); err != nil {
-		t.Fatal(err)
-	}
-	for _, attack := range []string{
-		filepath.Join(extRootLink, "sub", "regular.pass"),
-		extLeafHop,
-		filepath.Join(extDirHop, "ext.pass"),
-		extDotDotHop,
-	} {
-		src, err := Select(WithPassFile(context.Background(), attack), ws, "", "")
-		if err != nil {
-			t.Fatal(err)
+	defer writer.Close()
+	done := make(chan error, 1)
+	go func() { _, err := readSourceFile("", path); done <- err }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("idle writer: %v", err)
 		}
-		if _, err := src.Read(); !errors.Is(err, ErrCredential) {
-			t.Fatalf("adversarial symlink bounce %s was accepted: %v", attack, err)
-		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("FIFO read did not time out")
 	}
-
-	// On case-insensitive filesystems (e.g. macOS APFS), alternating case on the
-	// workspace root must not bypass in-workspace O_NOFOLLOW or external
-	// bounce-back rejection, while still permitting regular files inside root.
-	mixedWS := filepath.Join(realParent, "MixedCaseWS")
-	if err := os.MkdirAll(mixedWS, 0o700); err != nil {
+	// Keep a reader open until the writer has supplied the line and EOF.
+	reader, err := os.OpenFile(path, os.O_RDONLY|unix.O_NONBLOCK, 0)
+	if err != nil {
 		t.Fatal(err)
 	}
-	lowerWS := filepath.Join(realParent, "mixedcasews")
-	if lowerInfo, statErr := os.Stat(lowerWS); statErr == nil {
-		if mixedInfo, err := os.Stat(mixedWS); err == nil && os.SameFile(lowerInfo, mixedInfo) {
-			mixedReg := filepath.Join(mixedWS, "reg.pass")
-			writePass(t, mixedReg, "mixed-secret\n")
-			mixedEscape := filepath.Join(mixedWS, "escape.link")
-			if err := os.Symlink(outsideSecret, mixedEscape); err != nil {
-				t.Fatal(err)
-			}
-			extBounceLower := filepath.Join(outside, "bounce-lower")
-			if err := os.Symlink(filepath.Join(lowerWS, "reg.pass"), extBounceLower); err != nil {
-				t.Fatal(err)
-			}
-			// Regular file accessed via alternate casing must still work.
-			regSrc, err := Select(WithPassFile(context.Background(), filepath.Join(lowerWS, "reg.pass")), mixedWS, "", "")
-			if err != nil {
-				t.Fatal(err)
-			}
-			regBytes, err := regSrc.Read()
-			defer Clear(regBytes)
-			if err != nil || string(regBytes) != "mixed-secret" {
-				t.Fatalf("regular passfile via alternate FS case failed: got=%q err=%v", regBytes, err)
-			}
-			// Both in-workspace symlink escape and external bounce via alternate casing must fail.
-			for _, attack := range []string{
-				filepath.Join(lowerWS, "escape.link"),
-				extBounceLower,
-			} {
-				badSrc, err := Select(WithPassFile(context.Background(), attack), mixedWS, "", "")
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := badSrc.Read(); !errors.Is(err, ErrCredential) {
-					t.Fatalf("case-insensitive bypass %s was accepted: %v", attack, err)
-				}
-			}
-		}
+	defer reader.Close()
+	if _, err := writer.WriteString("test line\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := readSourceFile("", path)
+	if err != nil || string(data) != "test line\n" {
+		t.Fatalf("active FIFO read: %v", err)
 	}
 }

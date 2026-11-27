@@ -111,9 +111,6 @@ func newPendingSourceGuard(sources []ManagedPackageSource) (*pendingSourceGuard,
 		if err != nil {
 			return nil, errors.Join(err, guard.Close())
 		}
-		if opened.stat.Nlink != 1 {
-			return nil, errors.Join(fmt.Errorf("%w: pending package source %s is multiply linked before build", ErrIntegrity, source.Object.SHA256), opened.CloseVerified(), guard.Close())
-		}
 		owner, relative := source.Owner, source.Relative
 		if owner == "" {
 			owner, relative = filepath.Dir(source.Path), filepath.Base(source.Path)
@@ -148,8 +145,8 @@ func (guard *pendingSourceGuard) Close() error {
 		sameIdentity := os.SameFile(entry.before, opened.before) &&
 			entry.before.Size() == opened.before.Size() && entry.before.ModTime().Equal(opened.before.ModTime()) &&
 			entry.stat.Dev == opened.stat.Dev && entry.stat.Ino == opened.stat.Ino && entry.stat.Size == opened.stat.Size
-		if !sameIdentity || opened.stat.Nlink != 1 {
-			result = errors.Join(result, fmt.Errorf("%w: pending package %s was replaced or multiply linked during build", ErrIntegrity, digest))
+		if !sameIdentity {
+			result = errors.Join(result, fmt.Errorf("%w: pending package %s was replaced during build", ErrIntegrity, digest))
 		}
 		result = errors.Join(result, opened.CloseVerified())
 	}

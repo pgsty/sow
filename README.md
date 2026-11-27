@@ -2,7 +2,7 @@
 
 [![Website: sow.pgsty.com](https://img.shields.io/badge/Website-sow.pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://sow.pgsty.com)
 [![Docs](https://img.shields.io/badge/Docs-sow.pgsty.com%2Fdocs-slategray?style=flat)](https://sow.pgsty.com/docs/)
-[![Version: 0.8.0](https://img.shields.io/badge/version-0.8.0-slategray?style=flat&logo=github&logoColor=white)](https://github.com/pgsty/sow/tree/v0.8.0)
+[![Version: 0.9.0](https://img.shields.io/badge/version-0.9.0-slategray?style=flat&logo=github&logoColor=white)](https://github.com/pgsty/sow/tree/v0.9.0)
 [![CI](https://img.shields.io/github/actions/workflow/status/pgsty/sow/ci.yml?style=flat&branch=main&label=CI&logo=githubactions&logoColor=white)](https://github.com/pgsty/sow/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/github/go-mod/go-version/pgsty/sow?style=flat&logo=go&logoColor=white&color=slategray)](go.mod)
 [![License: Apache-2.0](https://img.shields.io/github/license/pgsty/sow?logo=opensourceinitiative&logoColor=green&color=slategray)](LICENSE)
@@ -71,13 +71,24 @@ For a password-protected signing key, SOW 0.7.0 and later accept
 `--passfile /run/secrets/gpg-password`. You can also set `SOW_GPG_PASSFILE`
 to that path or configure `passfile` next to a managed signing
 `key`. Priority is CLI, per-key config (including legacy `passphrase`), then environment.
-Use one nonempty UTF-8 line: one final LF or CRLF is removed, with no trimming of spaces
-or tabs. Keep the file outside the repository, normally mode `0600` (external secret
-symlinks such as Kubernetes `Secret` mounts are accepted as long as they do not resolve
-into the workspace). No default file is searched. For `create`, `--sign-with` still selects and enables signing.
+Use one nonempty line. SOW strips an optional UTF-8 BOM and a final LF or CRLF,
+and preserves spaces and tabs. Regular files, symlinks (including Kubernetes
+Secret mounts), and named pipes are supported. A FIFO writer has two seconds to
+supply the line and close its end. Store credentials outside published paths.
+Signing helpers receive a passphrase file or file descriptor. On failure SOW can
+include a short diagnostic from up to 4 KiB of helper stderr. For flat RPMs,
+`--sign-with` selects the key and enables signing.
 Signing and recovery commands share this interface; check `sow help COMMAND` in
 your installed binary and see
 [password files](https://sow.pgsty.com/docs/reference/config/#passfile) for the full contract.
+
+Flat `create` and `prune` skip unreadable or invalid packages and source RPMs
+by default. A format whose candidates all fail keeps its previous index.
+`create --strict` rejects bad inputs and conflicting coordinates before writing.
+Human output reports warnings on stderr. Successful `--json` commands include
+warnings and skipped paths in the stdout envelope and leave stderr empty.
+Native RPM 6 signatures (OPENPGP tag 278) are supported for package signing
+and verification, including packages carrying several signatures.
 
 Plain `sow create` treats repository metadata as a deterministic result of the directory:
 change the inputs and run it again. RPM publication installs and syncs new hash-named
@@ -110,15 +121,16 @@ sow prune ./packages --protect age_18 --protect age_18-llvmjit
 ```
 
 Prune keeps the highest Epoch/Version/Release per package name and architecture.
-`--protect` keeps every version of an exact package name and must match a package.
-It binds replacement RPM digests and indexed bytes to a stable file identity,
-checks that identity before each deletion and completion, refreshes an existing
-`repo_complete` marker, and can be rerun after an
-interruption. It operates on top-level regular binary RPMs in a local
-publication source; managed workspaces, mixed RPM/DEB directories, equal-version
-files, RPM v6 packages, repositories with `repomd.xml.asc`, and a `repomd.xml`
-that lists metadata SOW does not generate (such as comps groups) are rejected.
-`--metadata-timestamp` works as for `create`. `--dry-run` changes no files.
+`--protect` keeps every version of an exact package name.
+A missing protection name produces a warning. Equal-version RPMs with different
+contents keep their whole name/architecture group. `--strict` makes these conflicts,
+unmatched protection names, and bad inputs fail before publication. Prune verifies
+the replacement before deleting older packages. In a mixed directory it updates
+the RPM index and carries forward existing `repo_complete` digests for DEB names
+still present. Newly arrived DEBs enter the marker when `create --pigsty` indexes them.
+An interrupted prune can be rerun. Managed workspaces, detached metadata signatures
+and unsupported RPM metadata require separate handling. `--dry-run` previews the
+candidates. `--metadata-timestamp` works as for `create`.
 Publishing the result and accommodating clients with cached old indexes remain
 part of the publication workflow.
 
@@ -169,18 +181,32 @@ to report-only and accept `--delete` for opt-in conditional deletion). `sow help
 authoritative CLI reference shipped with the binary; machine consumers can rely on the
 closed `--json` envelopes and the documented exit-code contract.
 
+New publication grace records use the target's `max_cache_ttl`. Review any existing
+`max_cache_ttl: 0s` before upgrading. With zero TTL, superseded objects may be eligible
+at the next target GC. Existing records keep their later deletion deadlines.
+Public HTTP verification follows CDN redirects and checks the connected address.
+When an HTTP proxy would resolve a cross-origin redirect, configure the final
+public endpoint directly or route that destination directly.
+A signed `rm --check` is a preview. ECDSA and DSA can produce different signature bytes
+in a fresh build. Crash recovery reuses the staged or installed metadata.
+
+A workspace accepts either `sow.yml` or `sow.yaml`. With `sow.yml`, an existing
+repository directory named `sow.yaml` is supported. If a populated workspace
+loses `.sow/workspace.lock`, stop all SOW processes and scheduled jobs for that
+workspace. As the workspace owner, exclusively create the empty lock with mode
+`0600`, then run `sow init` before restarting jobs.
+
 Upgrading a workspace created by SOW v0.3 or v0.4? Stop writers, back up the workspace,
-and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Versions 0.5.0 through 0.8.0 use
+and run `sow repo migrate REPOSITORY --workdir DIR` once per Repository. Versions 0.5.0 through 0.9.0 use
 schema v13 to index pool-path ownership without scanning unrelated publication history;
 configuration and public layout stay unchanged. Then run `sow build` and `sow check`:
 the updated RPM authentication and APT metadata contracts require one rebuild of affected
 Dists. Later unchanged RPMs reuse matching Built evidence instead of repeated payload
 verification. Do not reopen the migrated database with an older binary.
-Upgrading from v0.5.0 through v0.7.1 to v0.8.0 requires no schema migration or public-layout change.
-If local GC was interrupted under v0.7.1 or earlier, complete it with the previous binary
-(`sow gc -r REPOSITORY -C WORKSPACE`) before switching to v0.8.0: an old plan with an empty
-`manifest` array requires the previous binary to finish recovery. Binary `.deb` packages
-using `control.tar.lzma` are no longer supported in v0.8.0; repack them with `.tar`, `.gz`,
+Upgrading from v0.5.0 through v0.8.0 to v0.9.0 requires no schema migration or public-layout change.
+The current version can resume an interrupted v0.7.1 local GC plan containing
+an empty `manifest` array. Binary `.deb` packages
+using `control.tar.lzma` are no longer supported since v0.8.0; repack them with `.tar`, `.gz`,
 `.bz2`, `.xz`, or `.zst` before importing.
 If a Repository migrated by v0.5 or v0.6 reports an invalid transition control target
 after a later build, upgrade to v0.7.0 or newer; no manual repair is needed.
@@ -202,7 +228,7 @@ a usable GPG installation and key.
 make build          # write the binary to bin/sow
 make test-core      # focused repository-manager tests
 make test           # all Go packages plus the patched RPM module
-make check          # format, module, vet, staticcheck, deadcode, vuln, focused tests
+make check          # format, module, vet, core tests, and patched RPM tests
 make release-local  # GoReleaser snapshot archives and packages under dist/
 ```
 

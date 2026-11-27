@@ -99,7 +99,7 @@ func TestHTTPPublicationVerifierBoundsTransientOversizeAndSlowBodies(t *testing.
 		}))
 		defer server.Close()
 		base, _ := url.Parse(server.URL + "/")
-		verifier := httpPublicationVerifier{client: newPublicVerificationClient(), base: base, readIdleTimeout: 20 * time.Millisecond}
+		verifier := httpPublicationVerifier{client: newPublicVerificationClient(base), base: base, readIdleTimeout: 20 * time.Millisecond}
 		expected := state.GenerationFile{Path: "pool/p/package.rpm", Phase: "payload", Size: int64(len(body)), SHA256: hex.EncodeToString(digest[:])}
 		if err := verifier.Verify(context.Background(), expected); err != nil {
 			t.Fatal(err)
@@ -171,5 +171,31 @@ func TestR2PublicAbsenceRemainsDisabled(t *testing.T) {
 	backend := &r2PublicationBackend{}
 	if err := backend.VerifyPublicAbsent(context.Background(), "pool/p/package.rpm"); !errors.Is(err, ErrRejected) {
 		t.Fatalf("R2 absence error=%v", err)
+	}
+}
+
+func TestPublicVerificationRedirects(t *testing.T) {
+	request := func(raw string) *http.Request {
+		r, err := http.NewRequest(http.MethodGet, raw, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	origin, cdn := request("http://repo.example.test"), request("https://cdn.example.test")
+	c := newPublicVerificationClient(origin.URL)
+	if err := c.CheckRedirect(cdn, []*http.Request{origin}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CheckRedirect(request("http://mirror.example.test"), []*http.Request{origin, cdn}); err == nil {
+		t.Fatal("accepted HTTPS downgrade on second hop")
+	}
+	for _, ip := range []string{"127.0.0.1:80", "[::1]:80", "169.254.1.2:80", "[fe80::1%eth0]:80", "0.0.0.0:80"} {
+		if err := checkPublicDialAddress("tcp", ip, nil); err == nil {
+			t.Errorf("accepted resolved address %s", ip)
+		}
+	}
+	if err := checkPublicDialAddress("tcp", "192.0.2.42:443", nil); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -408,7 +408,7 @@ func TestLoadAndPublicHelpers(t *testing.T) {
 	if err := os.Symlink(filename, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(link); err == nil || !strings.Contains(err.Error(), "symlink") {
+	if _, err := Load(link); err != nil {
 		t.Fatalf("Load symlink error = %v", err)
 	}
 	if _, err := Load(root); err == nil || !strings.Contains(err.Error(), "regular file") {
@@ -426,7 +426,7 @@ func TestLoadAndPublicHelpers(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(oversized); err == nil || !strings.Contains(err.Error(), "bounded regular file") {
+	if _, err := Load(oversized); err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("Load oversized error = %v", err)
 	}
 }

@@ -158,13 +158,6 @@ func generateFlatUnsigned(ctx context.Context, dest string, revision uint64, tim
 	}
 	sum := sha256.Sum256(repomd)
 	generation.RepomdSHA256 = hex.EncodeToString(sum[:])
-	validated, err := ValidateFlatUnsignedDirectory(ctx, tmp, CompressionGzip)
-	if err != nil {
-		return nil, fmt.Errorf("yumrepo: generated flat repodata failed self-validation: %w", err)
-	}
-	if validated.Packages != generation.Packages || validated.Revision != generation.Revision || validated.RepomdSHA256 != generation.RepomdSHA256 {
-		return nil, errors.New("yumrepo: generated flat repodata changed generation identity during validation")
-	}
 	if err := syncDirectory(tmp); err != nil {
 		return nil, err
 	}

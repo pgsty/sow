@@ -2725,7 +2725,7 @@ func TestRepositoryLifecycleOwnsDurableLockFiles(t *testing.T) {
 	}
 }
 
-func TestLifecycleNeverRecreatesMissingFixedLockFiles(t *testing.T) {
+func TestLifecycleInitRepairsMissingLockFiles(t *testing.T) {
 	ctx := context.Background()
 	t.Run("workspace", func(t *testing.T) {
 		root := t.TempDir()
@@ -2737,13 +2737,26 @@ func TestLifecycleNeverRecreatesMissingFixedLockFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := NewRepository(ctx, RepositoryNewOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Name: "repo"}); !errors.Is(err, ErrIntegrity) {
-			t.Fatalf("missing workspace lock was not rejected: %v", err)
+			t.Fatalf("missing workspace lock error=%v, want ErrIntegrity", err)
 		}
 		if _, err := Init(ctx, InitOptions{Dir: root}); !errors.Is(err, ErrIntegrity) {
-			t.Fatalf("init recreated missing lock in initialized state: %v", err)
+			t.Fatalf("init recreated a missing workspace lock: %v", err)
 		}
 		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("workspace lock was recreated: %v", err)
+			t.Fatalf("workspace lock reappeared: %v", err)
+		}
+		lock, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := lock.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := NewRepository(ctx, RepositoryNewOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Name: "repo"}); err != nil {
+			t.Fatalf("NewRepository after offline lock repair failed: %v", err)
 		}
 	})
 
@@ -2760,10 +2773,13 @@ func TestLifecycleNeverRecreatesMissingFixedLockFiles(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := NewDist(ctx, DistNewOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Name: "el9", Format: "rpm"}); !errors.Is(err, ErrIntegrity) {
-			t.Fatalf("missing repository lock was not rejected: %v", err)
+			t.Fatalf("missing repository lock error=%v, want ErrIntegrity", err)
 		}
-		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("repository lock was recreated: %v", err)
+		if _, err := Init(ctx, InitOptions{Dir: root}); err != nil {
+			t.Fatalf("Init should repair missing repository lock: %v", err)
+		}
+		if _, err := NewDist(ctx, DistNewOptions{WorkspaceOptions: WorkspaceOptions{Workdir: root, CWD: root}, Repository: "repo", Name: "el9", Format: "rpm"}); err != nil {
+			t.Fatalf("NewDist after Init repair failed: %v", err)
 		}
 	})
 }

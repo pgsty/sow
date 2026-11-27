@@ -191,10 +191,14 @@ func (signer *gpgSignerCore) runSign(ctx context.Context, operation []string, me
 	args = append(args, operation...)
 	command := exec.CommandContext(ctx, gpg, args...)
 	command.WaitDelay = 5 * time.Second
-	command.Stdin, command.Stdout, command.Stderr = message, output, io.Discard
+	stderrBuf := &limitedStderrBuffer{limit: 4096}
+	command.Stdin, command.Stdout, command.Stderr = message, output, stderrBuf
 	if err := signing.RunGPG(command, signer.credential); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if detail := stderrBuf.Summary(512); detail != "" {
+			return fmt.Errorf("managed: gpg metadata signing failed: %w: %s", err, detail)
 		}
 		return fmt.Errorf("managed: gpg metadata signing failed: %w", err)
 	}
@@ -854,7 +858,7 @@ func selectedMetadataSigningKey(identity metadataSignerIdentity, at time.Time) (
 		}
 	}
 	if !usable || !yumrepo.DeterministicMetadataSignatureAlgorithm(key.PublicKey.PubKeyAlgo) {
-		return openpgp.Key{}, metadataSigningPolicyError("metadata signing key is unavailable, invalid at the publication time, or not retry-deterministic")
+		return openpgp.Key{}, metadataSigningPolicyError("metadata signing key is unavailable, invalid at the publication time, or uses an unsupported algorithm")
 	}
 	return key, nil
 }

@@ -18,7 +18,6 @@ func TestParseCreateMetadataTimestamp(t *testing.T) {
 		{"create", "--metadata-timestamp=1.5"},
 		{"create", "--metadata-timestamp=tomorrow"},
 		{"create", "--metadata-timestamp=9223372036854775808"},
-		{"create", "--metadata-timestamp=1", "--metadata-timestamp=2"},
 		{"build", "--metadata-timestamp=1"},
 	} {
 		if _, err := Parse(args); err == nil {

@@ -403,7 +403,7 @@ func (s *Store) GetOperation(ctx context.Context, id string) (OperationDetail, e
 	}
 	duration := operation.UpdatedAt.Sub(operation.CreatedAt)
 	if duration < 0 {
-		return OperationDetail{}, errors.New("operation audit timestamps are inconsistent")
+		duration = 0
 	}
 	detail := OperationDetail{Operation: operation, DurationMS: duration.Milliseconds(), Events: []OperationEvent{}, Packages: []OperationPackage{}, Memberships: []OperationMembership{}, Files: []OperationFile{}}
 	events, err := tx.QueryContext(ctx, `SELECT sequence, state, detail_json, occurred_at FROM operation_events WHERE operation_id = ? ORDER BY sequence`, id)

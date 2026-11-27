@@ -456,7 +456,10 @@ func preflightInitConfig(directory string) error {
 	if realRoot, evalErr := filepath.EvalSymlinks(cleanRoot); evalErr == nil {
 		cleanRoot = filepath.Clean(realRoot)
 	}
-	filename := filepath.Join(cleanRoot, config.ConfigFilename)
+	filename, err := config.ResolveConfigPath(cleanRoot)
+	if err != nil {
+		return Errorf(ErrConfig, "%v", err)
+	}
 	_, err = os.Lstat(filename)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -534,6 +537,8 @@ func classifyManagedError(_ string, err error) error {
 		return Errorf(ErrDiscovery, "%v", err)
 	case errors.Is(err, managed.ErrConfigInput):
 		return Errorf(ErrConfig, "%v", err)
+	case errors.Is(err, state.ErrSchemaMigrationRequired):
+		return Errorf(ErrRejected, "%v", err)
 	case errors.Is(err, managed.ErrIntegrity):
 		return Errorf(ErrIntegrity, "%v", err)
 	case errors.Is(err, managed.ErrRejected):
@@ -541,7 +546,6 @@ func classifyManagedError(_ string, err error) error {
 	case errors.Is(err, managed.ErrNotReady):
 		return Errorf(ErrIntegrity, "%v", err)
 	case errors.Is(err, state.ErrSchema):
-		// Every write entry reports an old or unusable database schema alike.
 		return Errorf(ErrIntegrity, "%v", err)
 	default:
 		return err
@@ -633,11 +637,13 @@ func failureInvocationContext(args []string) (string, bool) {
 		if token == "--" {
 			break
 		}
-		name, _, inline := splitOption(token)
+		name, inlineVal, inline := splitOption(token)
 		switch name {
 		case "--json":
 			if !inline {
 				jsonOutput = true
+			} else if val, parseErr := parseBoolFlag(name, inlineVal, true); parseErr == nil {
+				jsonOutput = val
 			}
 		case "--passfile", "-C", "--workdir", "-r", "--repo", "-d", "--dist", "-T", "--timeout":
 			if !inline && index+1 < len(args) {

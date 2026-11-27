@@ -252,7 +252,7 @@ func TestNoopBuildJournalRepairsLegacyPublicModesAndRecoversMidTree(t *testing.T
 	poolFile := filepath.Join(root, "repo", filepath.FromSlash(objects[0].PoolPath))
 	repomd := filepath.Join(root, "repo", "dists", "el9", "x86_64", "repodata", "repomd.xml")
 	for _, filename := range []string{poolFile, repomd} {
-		if err := os.Chmod(filename, 0o600); err != nil {
+		if err := os.Chmod(filename, 0o666); err != nil {
 			t.Fatal(err)
 		}
 	}

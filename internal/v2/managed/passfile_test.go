@@ -405,8 +405,8 @@ func TestPassfileProtectedGPGAndRPMSigning(t *testing.T) {
 						if err := os.Symlink(passfile, inRepoLink); err != nil {
 							t.Fatal(err)
 						}
-						if _, err := plain.Create(context.Background(), plain.Options{Dir: filepath.Dir(path), SignWith: fingerprint, PassFile: inRepoLink, Overwrite: true, Jobs: 1}); !errors.Is(err, signing.ErrCredential) {
-							t.Fatalf("plain Create accepted in-repository passfile symlink: err=%v", err)
+						if _, err := plain.Create(context.Background(), plain.Options{Dir: filepath.Dir(path), SignWith: fingerprint, PassFile: inRepoLink, Overwrite: true, Jobs: 1}); err != nil {
+							t.Fatalf("plain Create should accept symlinked passfile: err=%v", err)
 						}
 						if err := os.Remove(inRepoLink); err != nil {
 							t.Fatal(err)

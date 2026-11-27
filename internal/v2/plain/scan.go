@@ -12,7 +12,6 @@ import (
 
 	"github.com/pgsty/sow/internal/aptrepo"
 	"github.com/pgsty/sow/internal/yumrepo"
-	"golang.org/x/sys/unix"
 )
 
 type packageFormat string
@@ -38,18 +37,25 @@ type packageFact struct {
 	parsedRPM      *yumrepo.FlatPackage
 	deb            aptrepo.Package
 	sourceInfo     os.FileInfo
-	sourceStat     unix.Stat_t
-	hasSourceStat  bool
 }
 
 type scanResult struct {
-	all        []packageFact
-	index      []packageFact
-	kept       []packageFact
-	removed    []packageFact
-	hasRPM     bool
-	hasDEB     bool
-	duplicates int
+	all         []packageFact
+	index       []packageFact
+	kept        []packageFact
+	removed     []packageFact
+	skipped     []SkippedPackage
+	warnings    []string
+	hasRPM      bool
+	hasDEB      bool
+	duplicates  int
+	otherDEBs   []string
+	markerLines []markerLine
+}
+
+type markerLine struct {
+	base   string
+	sha256 string
 }
 
 type packageCandidate struct {
@@ -59,12 +65,14 @@ type packageCandidate struct {
 	info   os.FileInfo
 }
 
-func listPackageCandidates(dir string) ([]packageCandidate, error) {
+func listPackageCandidates(dir string, rpmOnly bool) ([]packageCandidate, []SkippedPackage, []string, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, &Error{Kind: KindRuntime, Op: "scan", Path: dir, Err: err}
+		return nil, nil, nil, &Error{Kind: KindRuntime, Op: "scan", Path: dir, Err: err}
 	}
 	var candidates []packageCandidate
+	var skipped []SkippedPackage
+	var otherDEBs []string
 	for _, entry := range entries {
 		base := entry.Name()
 		var format packageFormat
@@ -76,30 +84,58 @@ func listPackageCandidates(dir string) ([]packageCandidate, error) {
 		default:
 			continue
 		}
-		path := filepath.Join(dir, base)
-		info, err := os.Lstat(path)
+		fullPath := filepath.Join(dir, base)
+		info, err := os.Stat(fullPath)
 		if err != nil {
-			return nil, &Error{Kind: KindRuntime, Op: "lstat", Path: path, Err: err}
-		}
-		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			if rpmOnly && format == formatDEB {
+				continue
+			}
+			skipped = append(skipped, SkippedPackage{Path: base, Reason: fmt.Sprintf("unreadable package: %v", err)})
 			continue
 		}
-		candidates = append(candidates, packageCandidate{base: base, path: path, format: format, info: info})
+		if !info.Mode().IsRegular() {
+			if !info.IsDir() && !(rpmOnly && format == formatDEB) {
+				skipped = append(skipped, SkippedPackage{Path: base, Reason: "package input is not a regular file"})
+			}
+			continue
+		}
+		if rpmOnly && format == formatDEB {
+			otherDEBs = append(otherDEBs, base)
+			continue
+		}
+		candidates = append(candidates, packageCandidate{base: base, path: fullPath, format: format, info: info})
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].base < candidates[j].base })
-	return candidates, nil
+	sort.Slice(skipped, func(i, j int) bool { return skipped[i].Path < skipped[j].Path })
+	sort.Strings(otherDEBs)
+	return candidates, skipped, otherDEBs, nil
 }
 
-func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanResult, error) {
-	candidates, err := listPackageCandidates(dir)
+func scanPackages(ctx context.Context, dir string, jobs int, pigsty, strict, rpmOnly bool) (scanResult, error) {
+	candidates, brokenLinks, otherDEBs, err := listPackageCandidates(dir, rpmOnly)
 	if err != nil {
 		return scanResult{}, err
 	}
-	if len(candidates) == 0 {
-		if pigsty {
-			return scanResult{}, nil
+	var warnings []string
+	var skipped []SkippedPackage
+	for _, item := range brokenLinks {
+		if strict {
+			return scanResult{}, &Error{Kind: KindRuntime, Op: "stat", Path: filepath.Join(dir, item.Path), Err: errors.New(item.Reason)}
 		}
-		return scanResult{}, &Error{Kind: KindRejected, Op: "scan", Path: dir, Err: errors.New("no supported top-level regular RPM or DEB packages")}
+		skipped = append(skipped, item)
+		warnings = append(warnings, fmt.Sprintf("skipped %s: %s", item.Path, item.Reason))
+	}
+	if rpmOnly && len(otherDEBs) > 0 {
+		warnings = append(warnings, "directory also contains DEB packages; prune operates on RPM packages only")
+	}
+	if len(candidates) == 0 {
+		if strict && !pigsty {
+			return scanResult{}, &Error{Kind: KindRejected, Op: "scan", Path: dir, Err: errors.New("no supported top-level RPM or DEB packages")}
+		}
+		if !pigsty && len(skipped) == 0 {
+			warnings = append(warnings, "no RPM or DEB packages found; nothing to index")
+		}
+		return scanResult{skipped: skipped, warnings: warnings, otherDEBs: otherDEBs}, nil
 	}
 	type parsed struct {
 		index int
@@ -127,7 +163,7 @@ func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanR
 					if candidate.format == formatRPM {
 						op = "parse rpm"
 					}
-					results <- parsed{index: i, err: &Error{Kind: KindRuntime, Op: op, Path: candidate.path, Err: err}}
+					results <- parsed{index: i, err: &Error{Kind: KindOf(err), Op: op, Path: candidate.path, Err: err}}
 					continue
 				}
 				if candidate.format == formatRPM && isSourceRPMArch(fact.arch) {
@@ -152,38 +188,59 @@ func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanR
 		group.Wait()
 		close(results)
 	}()
-	facts := make([]packageFact, len(candidates))
+	parsedFacts := make([]packageFact, len(candidates))
 	parseErrors := make([]error, len(candidates))
 	for result := range results {
 		if result.err != nil {
 			parseErrors[result.index] = result.err
 			continue
 		}
-		facts[result.index] = result.fact
-	}
-	for _, parseErr := range parseErrors {
-		if parseErr != nil {
-			return scanResult{}, parseErr
-		}
+		parsedFacts[result.index] = result.fact
 	}
 	if err := ctx.Err(); err != nil {
 		return scanResult{}, &Error{Kind: KindRuntime, Op: "scan", Path: dir, Err: err}
 	}
 
-	result := scanResult{all: facts}
+	facts := make([]packageFact, 0, len(candidates))
+	for i, parseErr := range parseErrors {
+		if parseErr != nil {
+			if strict || KindOf(parseErr) == KindIntegrity {
+				return scanResult{}, parseErr
+			}
+			reason := parseErr.Error()
+			if unwrapped := errors.Unwrap(parseErr); unwrapped != nil {
+				reason = unwrapped.Error()
+			}
+			skipped = append(skipped, SkippedPackage{Path: candidates[i].base, Reason: reason})
+			warnings = append(warnings, fmt.Sprintf("skipped %s: %s", candidates[i].base, reason))
+			continue
+		}
+		facts = append(facts, parsedFacts[i])
+	}
+
+	unifyDEBCoordinates(facts)
+	result := scanResult{all: facts, skipped: skipped, warnings: warnings, otherDEBs: otherDEBs}
 	coordinates := make(map[string]packageFact, len(facts))
 	for _, fact := range facts {
 		if pigsty && shouldRemove(fact) {
 			result.removed = append(result.removed, fact)
 			continue
 		}
-		if previous, exists := coordinates[fact.coordinate]; exists {
-			if previous.sha256 != fact.sha256 {
-				return scanResult{}, &Error{Kind: KindRejected, Op: "coordinate conflict", Path: fact.base, Err: fmt.Errorf("%s and %s have the same logical coordinate but different SHA-256", previous.base, fact.base)}
+		if !rpmOnly {
+			if previous, exists := coordinates[fact.coordinate]; exists {
+				if previous.sha256 != fact.sha256 {
+					if strict {
+						return scanResult{}, &Error{Kind: KindRejected, Op: "coordinate conflict", Path: fact.base, Err: fmt.Errorf("%s and %s have the same logical coordinate but different SHA-256", previous.base, fact.base)}
+					}
+					reason := fmt.Sprintf("conflicts with %s (same logical coordinate, different SHA-256)", previous.base)
+					result.skipped = append(result.skipped, SkippedPackage{Path: fact.base, Reason: reason})
+					result.warnings = append(result.warnings, fmt.Sprintf("skipped %s: %s", fact.base, reason))
+					continue
+				}
+				result.duplicates++
+			} else {
+				coordinates[fact.coordinate] = fact
 			}
-			result.duplicates++
-		} else {
-			coordinates[fact.coordinate] = fact
 		}
 		result.kept = append(result.kept, fact)
 	}
@@ -203,18 +260,92 @@ func scanPackages(ctx context.Context, dir string, jobs int, pigsty bool) (scanR
 	return result, nil
 }
 
-func inspectPackageFact(ctx context.Context, path, base string, format packageFormat, before os.FileInfo) (packageFact, error) {
-	if before == nil {
-		var err error
-		before, err = os.Lstat(path)
-		if err != nil {
-			return packageFact{}, errors.Join(err, errors.New("package changed before inspection"))
+// Equal Debian versions can have different spellings. Keep scan order (basename)
+// for conflict resolution, while grouping equivalent coordinates in O(n log n).
+func unifyDEBCoordinates(facts []packageFact) {
+	var debs []*packageFact
+	for i := range facts {
+		if facts[i].format == formatDEB {
+			debs = append(debs, &facts[i])
 		}
 	}
-	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 {
-		return packageFact{}, errors.New("package changed before inspection")
+	sort.SliceStable(debs, func(i, j int) bool { return aptrepo.ComparePackageIdentity(debs[i].deb, debs[j].deb) < 0 })
+	for i := 1; i < len(debs); i++ {
+		if aptrepo.ComparePackageIdentity(debs[i-1].deb, debs[i].deb) == 0 {
+			debs[i].coordinate = debs[i-1].coordinate
+		}
 	}
-	fact := packageFact{format: format, base: base, path: path, originalPath: path}
+}
+
+func (s scanResult) preserveFormat(format packageFormat) bool {
+	if format == formatRPM && s.hasRPM || format == formatDEB && s.hasDEB {
+		return false
+	}
+	for _, skipped := range s.skipped {
+		if filepath.Ext(skipped.Path) == "."+string(format) {
+			return true
+		}
+	}
+	return false
+}
+
+func validatePackageStats(root string, scan scanResult, rpmOnly bool) error {
+	candidates, _, _, err := listPackageCandidates(root, rpmOnly)
+	if err != nil {
+		return err
+	}
+	expected := make(map[string]os.FileInfo, len(scan.all)+len(scan.skipped))
+	for _, skipped := range scan.skipped {
+		expected[skipped.Path] = nil
+	}
+	for _, fact := range scan.all {
+		expected[fact.base] = fact.sourceInfo
+	}
+	verified := 0
+	for _, candidate := range candidates {
+		info, known := expected[candidate.base]
+		if !known {
+			return &Error{Kind: KindIntegrity, Op: "validate package set", Path: candidate.path, Err: errors.New("package appeared after inspection")}
+		}
+		if info == nil {
+			continue
+		} // Already reported and excluded from the index.
+		if !samePackageStat(info, candidate.info) {
+			return &Error{Kind: KindIntegrity, Op: "validate package", Path: candidate.path, Err: errors.New("package stat changed after inspection")}
+		}
+		verified++
+	}
+	if verified != len(scan.all) {
+		return &Error{Kind: KindIntegrity, Op: "validate package set", Path: root, Err: errors.New("package disappeared after inspection")}
+	}
+	return nil
+}
+
+func (f packageFact) validateStat() error {
+	info, err := os.Stat(f.originalPath)
+	if err != nil || !samePackageStat(f.sourceInfo, info) {
+		return &Error{Kind: KindIntegrity, Op: "validate package", Path: f.originalPath, Err: errors.Join(errors.New("package stat changed after inspection"), err)}
+	}
+	return nil
+}
+
+func inspectPackageFact(ctx context.Context, path, base string, format packageFormat, before os.FileInfo) (_ packageFact, resultErr error) {
+	if before == nil {
+		var err error
+		before, err = os.Stat(path)
+		if err != nil {
+			return packageFact{}, err
+		}
+	}
+	if !before.Mode().IsRegular() {
+		return packageFact{}, errors.New("package input is not a regular file")
+	}
+	fact := packageFact{format: format, base: base, path: path, originalPath: path, sourceInfo: before}
+	defer func() {
+		if err := fact.validateStat(); err != nil {
+			resultErr = err
+		}
+	}()
 	switch format {
 	case formatRPM:
 		parsed, pkg, err := yumrepo.InspectFlatPackage(ctx, yumrepo.PackageInput{Path: path, Basename: base})
@@ -233,16 +364,6 @@ func inspectPackageFact(ctx context.Context, path, base string, format packageFo
 	default:
 		return packageFact{}, fmt.Errorf("unsupported package format %q", format)
 	}
-	info, err := os.Lstat(path)
-	if err != nil || !samePackageStat(before, info) {
-		return packageFact{}, errors.Join(err, errors.New("package changed after inspection"))
-	}
-	fact.sourceInfo = info
-	var st unix.Stat_t
-	if unix.Lstat(path, &st) == nil {
-		fact.sourceStat = st
-		fact.hasSourceStat = true
-	}
 	fact.originalSHA256 = fact.sha256
 	return fact, nil
 }
@@ -250,11 +371,9 @@ func inspectPackageFact(ctx context.Context, path, base string, format packageFo
 func samePackageStat(before, after os.FileInfo) bool {
 	return before != nil && after != nil &&
 		before.Mode().IsRegular() && after.Mode().IsRegular() &&
-		before.Mode()&os.ModeSymlink == 0 && after.Mode()&os.ModeSymlink == 0 &&
 		os.SameFile(before, after) &&
 		before.Size() == after.Size() &&
-		before.ModTime().Equal(after.ModTime()) &&
-		before.Mode() == after.Mode()
+		before.ModTime().Equal(after.ModTime())
 }
 
 func isSourceRPMArch(arch string) bool {

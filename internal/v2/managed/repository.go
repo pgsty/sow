@@ -100,7 +100,7 @@ func repositoryInfo(ctx context.Context, root, name string, cfg config.Config) (
 	}
 	store, err := openReadOnlyState(filepath.Join(root, ".sow", name+".db"))
 	if err != nil {
-		return RepositoryInfo{}, fmt.Errorf("%w: repository %q is not initialized: %v", ErrIntegrity, name, err)
+		return RepositoryInfo{}, fmt.Errorf("%w: repository %q is not initialized: %w", ErrIntegrity, name, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	if err := validateRepositoryLayoutForRead(root, name, store.SchemaVersion()); err != nil {
@@ -415,7 +415,7 @@ func removeRepository(ctx context.Context, opts RepositoryRemoveOptions, result 
 	}
 	store, err := openExistingState(filepath.Join(ws.Root, ".sow", opts.Name+".db"))
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrIntegrity, err)
+		return fmt.Errorf("%w: %w", ErrIntegrity, err)
 	}
 	if err := store.RequireTerminalLayout(ctx); err != nil {
 		store.Close()

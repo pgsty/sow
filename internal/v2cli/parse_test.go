@@ -54,7 +54,8 @@ func TestParseLocalMatrixAndCardinality(t *testing.T) {
 		{"publish", "prod", "-N"}, {"publish", "prod", "--abort"}, {"publish", "prod", "--rebind"},
 		{"retain", "add", "1", "-N"}, {"retain", "ls", "-r", "pgsql"}, {"retain", "rm", "18446744073709551615"}, {"gc", "-N"}, {"gc", "prod", "-N"}, {"gc", "prod", "--delete"}, {"prune", "dir", "--protect", "--json"},
 		{"export", "rpm-leaf", "el9", "x86_64", "/tmp/leaf"}, {"export", "rpm-leaf", "el9", "aarch64", "/tmp/leaf", "--hardlink", "--json"},
-		{"log"}, {"log", "123456789"}, {"log", "export", "-"}, {"log", "prune", "2026-08-01T00:00:00Z", "-N"},
+		{"log"}, {"log", "123456789"}, {"log", "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}, {"log", "export", "-"}, {"log", "prune", "2026-08-01T00:00:00Z", "-N"},
+		{"publish", "prod", "--abort=true"}, {"gc", "prod", "--delete=false"},
 	}
 	for _, args := range valid {
 		if _, err := Parse(args); err != nil {
@@ -62,18 +63,18 @@ func TestParseLocalMatrixAndCardinality(t *testing.T) {
 		}
 	}
 	invalid := [][]string{
-		{"create", "a", "b"}, {"create", "-j", "0"}, {"create", "--all"},
+		{"create", "a", "b"}, {"create", "-j", "0"}, {"create", "--all"}, {"create", "-S", "B9BD8B20"},
 		{"create", "--overwrite"}, {"create", "--sign-with", "short"}, {"create", "--sign-with", "0x0XE7935D8DB9BD8B20"}, {"create", "-S", "0X0xE7935D8DB9BD8B20"},
 		{"repo", "new"}, {"repo", "new", "one", "two"}, {"repo", "ls", "--force"},
-		{"repo", "migrate", "one", "two"}, {"repo", "migrate", "--force"}, {"repo", "migrate", "--abort", "--abort"},
+		{"repo", "migrate", "one", "two"}, {"repo", "migrate", "--force"},
 		{"dist", "new", "el9"}, {"dist", "new", "el9", "--format", "apk"},
 		{"dist", "show"}, {"config", "check", "extra"},
 		{"add"}, {"rm"}, {"rm", "pkg", "--check", "--skip"}, {"rm", "pkg", "--check", "-T", "1s"},
-		{"show"}, {"where"}, {"changes", "1", "2"}, {"publish"}, {"publish", "a", "b"}, {"publish", "prod", "-r", "repo"}, {"publish", "prod", "--abort=true"}, {"publish", "prod", "--abort", "--rebind"}, {"check", "-T", "1s"},
-		{"retain"}, {"retain", "add", "0"}, {"retain", "add", "-1"}, {"retain", "rm"}, {"retain", "ls", "1"}, {"gc", "prod", "extra"}, {"gc", "prod", "-r", "repo"}, {"gc", "-d", "el9"}, {"gc", "--delete"}, {"gc", "prod", "--delete", "--delete"}, {"gc", "prod", "--delete=true"},
-		{"export"}, {"export", "unknown"}, {"export", "rpm-leaf", "el9", "x86_64"}, {"export", "rpm-leaf", "el9", "x86_64", "/tmp/leaf", "--hardlink", "--hardlink"},
+		{"show"}, {"where"}, {"changes", "1", "2"}, {"publish"}, {"publish", "a", "b"}, {"publish", "prod", "-r", "repo"}, {"publish", "prod", "--abort", "--rebind"}, {"check", "-T", "1s"},
+		{"retain"}, {"retain", "add", "0"}, {"retain", "add", "-1"}, {"retain", "rm"}, {"retain", "ls", "1"}, {"gc", "prod", "extra"}, {"gc", "prod", "-r", "repo"}, {"gc", "-d", "el9"}, {"gc", "--delete"},
+		{"export"}, {"export", "unknown"}, {"export", "rpm-leaf", "el9", "x86_64"},
 		{"export", "rpm-leaf", "EL9", "x86_64", "/tmp/leaf"}, {"export", "rpm-leaf", "el9", "noarch", "/tmp/leaf"},
-		{"log", "one", "two"}, {"log", "operation-id"}, {"log", "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"}, {"log", "export", "a", "b"}, {"log", "export", "--json"}, {"log", "prune", "date", "-d", "el9"},
+		{"log", "one", "two"}, {"log", "operation-id"}, {"log", "export", "a", "b"}, {"log", "export", "--json"}, {"log", "prune", "date", "-d", "el9"},
 	}
 	for _, args := range invalid {
 		if _, err := Parse(args); err == nil {
@@ -89,13 +90,16 @@ func TestParseLockOptions(t *testing.T) {
 	if _, err := Parse([]string{"repo", "new", "one", "-N", "-T", "0"}); err != nil {
 		t.Fatalf("no-wait with zero timeout: %v", err)
 	}
-	for _, value := range []string{"-1s", "forever", "1d", "1us", "1µs", "1ns", "0s", ""} {
+	if _, err := Parse([]string{"repo", "new", "one", "-N", "-T", "0s"}); err != nil {
+		t.Fatalf("no-wait with 0s timeout: %v", err)
+	}
+	for _, value := range []string{"-1s", "forever", "1d", ""} {
 		args := []string{"create", "--timeout=" + value}
 		if _, err := Parse(args); err == nil {
 			t.Errorf("timeout %q succeeded", value)
 		}
 	}
-	for _, value := range []string{"1ms", "1.5s", ".5m", "1h30m", "+2s"} {
+	for _, value := range []string{"0", "0s", "1ms", "1.5s", ".5m", "1h30m", "+2s"} {
 		if _, err := Parse([]string{"create", "--timeout=" + value}); err != nil {
 			t.Errorf("timeout %q failed: %v", value, err)
 		}
@@ -115,16 +119,17 @@ func TestParseHelpBypassesRequiredOperands(t *testing.T) {
 	}
 }
 
-func TestParseRejectsUnknownAndDuplicateOptions(t *testing.T) {
-	for _, args := range [][]string{
-		{"create", "--recursive"}, {"create", "--json", "--json"},
-		{"create", "-S", "E7935D8DB9BD8B20", "--sign-with", "E7935D8DB9BD8B20"}, {"create", "-S", "E7935D8DB9BD8B20", "--overwrite", "--overwrite"},
-		{"repo", "show", "-r", "one", "--repo", "two"},
-		{"dist", "new", "x", "--format", "rpm", "--format", "deb"},
-	} {
-		if _, err := Parse(args); err == nil {
-			t.Errorf("Parse(%q) succeeded", args)
-		}
+func TestParseRejectsUnknownOptionsAndLastWinsDuplicates(t *testing.T) {
+	if _, err := Parse([]string{"create", "--recursive"}); err == nil {
+		t.Errorf("unknown option succeeded")
+	}
+	inv, err := Parse([]string{"repo", "show", "-r", "one", "--repo", "two"})
+	if err != nil || inv.Global.Repo != "two" {
+		t.Fatalf("duplicate --repo last-wins: %+v, err=%v", inv, err)
+	}
+	inv, err = Parse([]string{"dist", "new", "x", "--format", "rpm", "--format", "deb"})
+	if err != nil || inv.Format != "deb" {
+		t.Fatalf("duplicate --format last-wins: %+v, err=%v", inv, err)
 	}
 }
 

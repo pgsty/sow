@@ -128,7 +128,7 @@ func buildPublicationPlan(input PublicationPlanInput, reconcileLegacy bool) (Pub
 				return PublicationPlan{}, fmt.Errorf("publication deletion %q lacks base identity", change.Path)
 			}
 			if prior.Phase == "pointer" {
-				return PublicationPlan{}, fmt.Errorf("publication pointer removal %q is unsupported; signing-mode and view withdrawal transitions require an explicit safe protocol", change.Path)
+				return PublicationPlan{}, fmt.Errorf("%w: publication cannot delete live pointer %q", ErrConflict, change.Path)
 			}
 			op.Size, op.SHA256, op.ExpectedOldSHA256 = prior.Size, prior.SHA256, prior.SHA256
 			plan.DeleteCandidates = append(plan.DeleteCandidates, op)

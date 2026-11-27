@@ -717,7 +717,7 @@ func TestJournaledBuildRecoveryUsesFrozenSigningMaterial(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	options := WorkspaceOptions{Workdir: root, CWD: root}
-	privateKey, _ := managedTestPrivateKey(t, "journaled-build-recovery")
+	privateKey, _ := managedTestPrivateKeyWithAlgorithm(t, "journaled-build-recovery", packet.PubKeyAlgoECDSA)
 	t.Setenv("SOW_TEST_RECOVERY_METADATA_KEY", string(privateKey))
 	cfg := config.Default()
 	repository := config.RepositoryConfig{Dists: map[string]config.DistConfig{"el9": {Format: "rpm"}}}

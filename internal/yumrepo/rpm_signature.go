@@ -13,6 +13,7 @@ import (
 	"crypto/sha512"
 	"crypto/subtle"
 	"encoding"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -105,13 +106,31 @@ func inspectEmbeddedRPMSignaturePackets(ctx context.Context, r io.Reader) ([]emb
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse RPM signature header: %w", ErrEmbeddedSignature, err)
 	}
-	// RPM 4.19+/6.0 multi-signature tag RPMSIGTAG_OPENPGP (278) is not supported
-	// yet; fail closed rather than silently misclassifying a tag-278-only RPM as
-	// unsigned or skipping unverified signatures.
-	if signatureHeader.GetTag(278) != nil {
-		return nil, fmt.Errorf("%w: RPMSIGTAG_OPENPGP (tag 278) is not supported", ErrEmbeddedSignature)
+	// RPM 6 treats OPENPGP as authoritative. Legacy tags beside it are
+	// compatibility copies and must never mask a bad modern signature.
+	if tag := signatureHeader.GetTag(278); tag != nil {
+		values := tag.StringSlice()
+		if tag.Type != crpm.TagTypeStringArray || len(values) == 0 || len(values) > 64 {
+			return nil, fmt.Errorf("%w: RPMSIGTAG_OPENPGP must contain 1..64 signatures", ErrEmbeddedSignature)
+		}
+		signatures := make([]embeddedRPMSignaturePacket, 0, len(values))
+		for _, value := range values {
+			if len(value) > base64.StdEncoding.EncodedLen(maxEmbeddedRPMSignatureBytes) {
+				return nil, fmt.Errorf("%w: RPMSIGTAG_OPENPGP packet exceeds size limit", ErrEmbeddedSignature)
+			}
+			data, err := base64.StdEncoding.DecodeString(value)
+			if err != nil {
+				return nil, fmt.Errorf("%w: RPMSIGTAG_OPENPGP base64: %v", ErrEmbeddedSignature, err)
+			}
+			sig, err := inspectRPMSignaturePacket(278, "RPMSIGTAG_OPENPGP", data)
+			if err != nil {
+				return nil, err
+			}
+			signatures = append(signatures, sig)
+		}
+		return signatures, nil
 	}
-	signatures := make([]embeddedRPMSignaturePacket, 0, len(embeddedRPMSignatureTags))
+	var signatures []embeddedRPMSignaturePacket
 	for _, known := range embeddedRPMSignatureTags {
 		tag := signatureHeader.GetTag(known.id)
 		if tag == nil {
@@ -120,42 +139,42 @@ func inspectEmbeddedRPMSignaturePackets(ctx context.Context, r io.Reader) ([]emb
 		if tag.Type != crpm.TagTypeBinary {
 			return nil, fmt.Errorf("%w: %s must be a binary tag", ErrEmbeddedSignature, known.name)
 		}
-		packet := tag.Bytes()
-		if len(packet) == 0 || len(packet) > maxEmbeddedRPMSignatureBytes {
-			return nil, fmt.Errorf("%w: %s packet size %d is outside 1..%d", ErrEmbeddedSignature, known.name, len(packet), maxEmbeddedRPMSignatureBytes)
-		}
-		version, publicKeyAlgorithm, hashAlgorithm, issuerKeyID, err := parseOpenPGPSignaturePacket(packet)
+		sig, err := inspectRPMSignaturePacket(known.id, known.name, tag.Bytes())
 		if err != nil {
-			return nil, fmt.Errorf("%w: %s: %v", ErrEmbeddedSignature, known.name, err)
+			return nil, err
 		}
-		createdAt, err := parseOpenPGPSignatureCreationTime(packet)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %s creation time: %v", ErrEmbeddedSignature, known.name, err)
-		}
-		// rpm 4.16 and later store DSA, ECDSA and EdDSA header signatures in
-		// RPMSIGTAG_DSA; only RSA has its own header signature tag.
-		if known.id == 267 && publicKeyAlgorithm != 17 && publicKeyAlgorithm != 19 && publicKeyAlgorithm != 22 {
-			return nil, fmt.Errorf("%w: %s carries public-key algorithm %d, want DSA, ECDSA, or EdDSA", ErrEmbeddedSignature, known.name, publicKeyAlgorithm)
-		}
-		if known.id == 268 && publicKeyAlgorithm != 1 && publicKeyAlgorithm != 3 {
-			return nil, fmt.Errorf("%w: %s carries public-key algorithm %d, want RSA", ErrEmbeddedSignature, known.name, publicKeyAlgorithm)
-		}
-		digest := sha256.Sum256(packet)
-		metadata := EmbeddedRPMSignature{
-			HeaderTag: known.name, HeaderTagID: known.id, PacketSHA256: hex.EncodeToString(digest[:]),
-			PacketSize: int64(len(packet)), PacketVersion: version,
-			PublicKeyAlgorithm: publicKeyAlgorithm, HashAlgorithm: hashAlgorithm, IssuerKeyID: issuerKeyID,
-			SignatureCreatedAt: createdAt,
-		}
-		signatures = append(signatures, embeddedRPMSignaturePacket{
-			metadata: metadata,
-			packet:   append([]byte(nil), packet...),
-		})
+		signatures = append(signatures, sig)
 	}
 	if len(signatures) == 0 {
-		return nil, fmt.Errorf("%w: %w: RPM signature header contains no PGP, GPG, RSA, or DSA signature tag", ErrEmbeddedSignature, ErrUnsignedRPMPackage)
+		return nil, fmt.Errorf("%w: %w: RPM signature header contains no recognized signature tag", ErrEmbeddedSignature, ErrUnsignedRPMPackage)
 	}
 	return signatures, nil
+}
+
+func inspectRPMSignaturePacket(id int, name string, packet []byte) (embeddedRPMSignaturePacket, error) {
+	if len(packet) == 0 || len(packet) > maxEmbeddedRPMSignatureBytes {
+		return embeddedRPMSignaturePacket{}, fmt.Errorf("%w: %s packet size %d is outside 1..%d", ErrEmbeddedSignature, name, len(packet), maxEmbeddedRPMSignatureBytes)
+	}
+	version, publicKeyAlgorithm, hashAlgorithm, issuerKeyID, createdAt, err := inspectOpenPGPSignature(packet)
+	if err != nil {
+		return embeddedRPMSignaturePacket{}, fmt.Errorf("%w: %s: %v", ErrEmbeddedSignature, name, err)
+	}
+	// rpm 4.16 and later store DSA, ECDSA and EdDSA header signatures in
+	// RPMSIGTAG_DSA; only RSA has its own header signature tag.
+	if id == 267 && publicKeyAlgorithm != 17 && publicKeyAlgorithm != 19 && publicKeyAlgorithm != 22 {
+		return embeddedRPMSignaturePacket{}, fmt.Errorf("%w: %s carries public-key algorithm %d, want DSA, ECDSA, or EdDSA", ErrEmbeddedSignature, name, publicKeyAlgorithm)
+	}
+	if id == 268 && publicKeyAlgorithm != 1 && publicKeyAlgorithm != 3 {
+		return embeddedRPMSignaturePacket{}, fmt.Errorf("%w: %s carries public-key algorithm %d, want RSA", ErrEmbeddedSignature, name, publicKeyAlgorithm)
+	}
+	digest := sha256.Sum256(packet)
+	metadata := EmbeddedRPMSignature{
+		HeaderTag: name, HeaderTagID: id, PacketSHA256: hex.EncodeToString(digest[:]),
+		PacketSize: int64(len(packet)), PacketVersion: version,
+		PublicKeyAlgorithm: publicKeyAlgorithm, HashAlgorithm: hashAlgorithm, IssuerKeyID: issuerKeyID,
+		SignatureCreatedAt: createdAt,
+	}
+	return embeddedRPMSignaturePacket{metadata: metadata, packet: packet}, nil
 }
 
 // RPMSignatureNeutralDigest hashes the immutable main header and payload while
@@ -227,7 +246,7 @@ type preparedEmbeddedRPMSignature struct {
 	signedBytes int64
 	hasher      hash.Hash
 	v3          *preparedOpenPGPV3Signature
-	v4          *packet.Signature
+	signature   *packet.Signature
 }
 
 type preparedOpenPGPV3Signature struct {
@@ -304,8 +323,8 @@ func VerifyEmbeddedRPMSignaturesMulti(ctx context.Context, r io.ReadSeeker, ring
 		switch candidate.metadata.PacketVersion {
 		case 3:
 			entry.v3, entry.hasher, err = prepareOpenPGPV3SignatureHash(candidate.packet, createdAt)
-		case 4:
-			entry.v4, entry.hasher, err = prepareOpenPGPV4SignatureHash(candidate.packet, createdAt)
+		case 4, 6:
+			entry.signature, entry.hasher, err = prepareOpenPGPSignatureHash(candidate.packet, createdAt)
 		default:
 			err = fmt.Errorf("unsupported OpenPGP signature version %d", candidate.metadata.PacketVersion)
 		}
@@ -386,15 +405,15 @@ func VerifyEmbeddedRPMSignaturesMulti(ctx context.Context, r io.ReadSeeker, ring
 				if entry.v3 != nil {
 					return entry.v3.hashID.New(), nil
 				}
-				return entry.v4.PrepareVerify()
+				return entry.signature.PrepareVerify()
 			})
 			if cloneErr == nil && entry.v3 != nil {
 				signer, cloneErr = verifyPreparedOpenPGPV3Signature(cloned, entry.v3, ring.Keyring, entry.candidate.metadata.SignatureCreatedAt)
 			} else if cloneErr == nil {
-				signer, cloneErr = verifyPreparedOpenPGPV4Signature(cloned, entry.v4, ring.Keyring, entry.candidate.metadata.SignatureCreatedAt)
+				signer, cloneErr = verifyPreparedOpenPGPSignature(cloned, entry.signature, ring.Keyring, entry.candidate.metadata.SignatureCreatedAt)
 			}
 			if cloneErr != nil {
-				result.Err = fmt.Errorf("%w: %s is not valid under trust ring %q: %v", ErrRPMPackageSignature, entry.candidate.metadata.HeaderTag, ring.Identity, cloneErr)
+				result.Err = fmt.Errorf("%w: %s is not valid under the trusted keyring %q: %v", ErrRPMPackageSignature, entry.candidate.metadata.HeaderTag, ring.Identity, cloneErr)
 				break
 			}
 			proof := verifiedEmbeddedRPMProof(entry.candidate.metadata, entry.coverage, entry.signedBytes, signer)
@@ -547,29 +566,29 @@ func verifyPreparedOpenPGPV3Signature(hasher hash.Hash, prepared *preparedOpenPG
 	return openpgp.Key{}, lastErr
 }
 
-func prepareOpenPGPV4SignatureHash(encoded []byte, createdAt time.Time) (*packet.Signature, hash.Hash, error) {
+func prepareOpenPGPSignatureHash(encoded []byte, createdAt time.Time) (*packet.Signature, hash.Hash, error) {
 	packets := packet.NewReader(bytes.NewReader(encoded))
 	value, err := packets.Next()
 	if err != nil {
 		return nil, nil, err
 	}
 	signature, ok := value.(*packet.Signature)
-	if !ok || signature.Version != 4 || signature.SigType != packet.SigTypeBinary || signature.IssuerKeyId == nil {
-		return nil, nil, errors.New("malformed OpenPGP v4 binary signature")
+	if !ok || (signature.Version != 4 && signature.Version != 6) || signature.SigType != packet.SigTypeBinary || signature.IssuerKeyId == nil {
+		return nil, nil, errors.New("malformed OpenPGP binary signature")
 	}
 	if trailing, nextErr := packets.Next(); nextErr != io.EOF || trailing != nil || !signature.CreationTime.UTC().Equal(createdAt) {
-		return nil, nil, errors.New("trailing or changed OpenPGP v4 signature material")
+		return nil, nil, errors.New("trailing or changed OpenPGP signature material")
 	}
 	for _, notation := range signature.Notations {
 		if notation.IsCritical {
-			return nil, nil, fmt.Errorf("OpenPGP v4 signature has unsupported critical notation %q", notation.Name)
+			return nil, nil, fmt.Errorf("OpenPGP signature has unsupported critical notation %q", notation.Name)
 		}
 	}
 	hasher, err := signature.PrepareVerify()
 	return signature, hasher, err
 }
 
-func verifyPreparedOpenPGPV4Signature(hasher hash.Hash, signature *packet.Signature, keyring openpgp.KeyRing, createdAt time.Time) (openpgp.Key, error) {
+func verifyPreparedOpenPGPSignature(hasher hash.Hash, signature *packet.Signature, keyring openpgp.KeyRing, createdAt time.Time) (openpgp.Key, error) {
 	var selected *openpgp.Key
 	var fingerprint string
 	var lastErr error
@@ -578,22 +597,26 @@ func verifyPreparedOpenPGPV4Signature(hasher hash.Hash, signature *packet.Signat
 			lastErr = errors.New("trusted key uses a different public-key algorithm")
 			continue
 		}
+		if len(signature.IssuerFingerprint) > 0 && !bytes.Equal(signature.IssuerFingerprint, candidate.PublicKey.Fingerprint) {
+			lastErr = errors.New("trusted key has a different issuer fingerprint")
+			continue
+		}
 		if err := validateOpenPGPSigningKeyAt(candidate, createdAt); err != nil {
 			lastErr = err
 			continue
 		}
 		current := hex.EncodeToString(candidate.PublicKey.Fingerprint)
 		if selected != nil && current != fingerprint {
-			return openpgp.Key{}, fmt.Errorf("ambiguous trusted OpenPGP v4 issuer %016x", *signature.IssuerKeyId)
+			return openpgp.Key{}, fmt.Errorf("ambiguous trusted OpenPGP issuer %016x", *signature.IssuerKeyId)
 		}
 		copyCandidate := candidate
 		selected, fingerprint = &copyCandidate, current
 	}
 	if selected == nil {
 		if lastErr != nil {
-			return openpgp.Key{}, fmt.Errorf("OpenPGP v4 signature issuer %016x has no historically valid trusted signing key: %w", *signature.IssuerKeyId, lastErr)
+			return openpgp.Key{}, fmt.Errorf("OpenPGP signature issuer %016x has no historically valid trusted signing key: %w", *signature.IssuerKeyId, lastErr)
 		}
-		return openpgp.Key{}, fmt.Errorf("OpenPGP v4 signature issuer %016x has no historically valid trusted signing key", *signature.IssuerKeyId)
+		return openpgp.Key{}, fmt.Errorf("OpenPGP signature issuer %016x has no historically valid trusted signing key", *signature.IssuerKeyId)
 	}
 	if err := selected.PublicKey.VerifySignature(hasher, signature); err != nil {
 		return openpgp.Key{}, err
@@ -608,7 +631,7 @@ func verifyPreparedOpenPGPV4Signature(hasher hash.Hash, signature *packet.Signat
 // hashed creation time no later than at+MaxRPMSignatureClockSkew. Historical
 // key validity is evaluated at that authenticated creation time, not at at.
 //
-// RPM's modern RPMSIGTAG_RSA/RPMSIGTAG_DSA packets sign only the raw main
+// RPM's OPENPGP, RSA and DSA header packets sign only the raw main
 // header. For those packets this function also streams and checks the SHA-2
 // payload digest stored in the signed header. Historical RPMs without that tag
 // are accepted only when a separately verified legacy PGP/GPG/PGP5 packet
@@ -616,296 +639,12 @@ func verifyPreparedOpenPGPV4Signature(hasher hash.Hash, signature *packet.Signat
 // packets must verify, and at least one trusted path must authenticate the
 // payload; unsigned packages, unknown issuers, untrusted keys and altered bytes
 // fail closed with ErrRPMPackageSignature.
-func VerifyEmbeddedRPMSignatures(ctx context.Context, r io.ReadSeeker, keyring openpgp.KeyRing, at time.Time) (verified []VerifiedEmbeddedRPMSignature, err error) {
-	if ctx == nil {
-		return nil, errors.New("yumrepo: nil context")
-	}
-	if r == nil {
-		return nil, fmt.Errorf("%w: nil RPM reader", ErrRPMPackageSignature)
-	}
-	if keyring == nil {
-		return nil, fmt.Errorf("%w: nil OpenPGP trust ring", ErrRPMPackageSignature)
-	}
-	if at.IsZero() {
-		return nil, fmt.Errorf("%w: a non-zero verification time is required", ErrRPMPackageSignature)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	originalOffset, err := r.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return nil, fmt.Errorf("%w: read original RPM offset: %v", ErrRPMPackageSignature, err)
-	}
-	defer func() {
-		if _, restoreErr := r.Seek(originalOffset, io.SeekStart); restoreErr != nil && err == nil {
-			verified = nil
-			err = fmt.Errorf("%w: restore RPM offset: %v", ErrRPMPackageSignature, restoreErr)
-		}
-	}()
-
-	if _, err := r.Seek(0, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("%w: seek RPM start: %v", ErrRPMPackageSignature, err)
-	}
-	packets, err := inspectEmbeddedRPMSignaturePackets(ctx, r)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrRPMPackageSignature, err)
-	}
-	mainHeaderStart, err := r.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return nil, fmt.Errorf("%w: locate RPM main header: %v", ErrRPMPackageSignature, err)
-	}
-	layout, err := inspectRPMVerificationLayout(ctx, r, mainHeaderStart)
+func VerifyEmbeddedRPMSignatures(ctx context.Context, r io.ReadSeeker, keyring openpgp.KeyRing, at time.Time) ([]VerifiedEmbeddedRPMSignature, error) {
+	results, err := VerifyEmbeddedRPMSignaturesMulti(ctx, r, []RPMSignatureTrustRing{{Identity: "signer", Keyring: keyring}}, at)
 	if err != nil {
 		return nil, err
 	}
-
-	verified = make([]VerifiedEmbeddedRPMSignature, 0, len(packets))
-	payloadChecked := false
-	payloadAuthenticated := false
-	var payloadAlgorithm, payloadDigest string
-	for _, candidate := range packets {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		createdAt := candidate.metadata.SignatureCreatedAt
-		if createdAt.IsZero() {
-			return nil, fmt.Errorf("%w: %s has no authenticated signature creation time", ErrRPMPackageSignature, candidate.metadata.HeaderTag)
-		}
-		latestAllowed := at.UTC().Add(MaxRPMSignatureClockSkew)
-		if createdAt.After(latestAllowed) {
-			return nil, fmt.Errorf("%w: %s creation time %s is later than observation %s plus %s clock skew", ErrRPMPackageSignature, candidate.metadata.HeaderTag, createdAt.Format(time.RFC3339), at.UTC().Format(time.RFC3339), MaxRPMSignatureClockSkew)
-		}
-		coverage, signedStart, signedBytes := signedRPMRange(candidate.metadata.HeaderTagID, layout)
-		if _, err := r.Seek(signedStart, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("%w: seek %s signed bytes: %v", ErrRPMPackageSignature, candidate.metadata.HeaderTag, err)
-		}
-		signed := &exactLengthReader{r: &contextReader{ctx: ctx, r: r}, remaining: signedBytes}
-		var signerKey openpgp.Key
-		switch candidate.metadata.PacketVersion {
-		case 3:
-			signerKey, err = verifyOpenPGPV3DetachedSignature(signed, candidate.packet, keyring, createdAt)
-			if err != nil {
-				return nil, fmt.Errorf("%w: %s is not valid under the trusted keyring: %w", ErrRPMPackageSignature, candidate.metadata.HeaderTag, err)
-			}
-		case 4:
-			signerKey, err = verifyOpenPGPV4DetachedSignature(signed, candidate.packet, keyring, createdAt)
-			if err != nil {
-				return nil, fmt.Errorf("%w: %s is not valid under the trusted keyring: %w", ErrRPMPackageSignature, candidate.metadata.HeaderTag, err)
-			}
-		default:
-			return nil, fmt.Errorf("%w: unsupported OpenPGP signature version %d", ErrRPMPackageSignature, candidate.metadata.PacketVersion)
-		}
-		if signed.remaining != 0 {
-			return nil, fmt.Errorf("%w: %s signed range is truncated by %d bytes", ErrRPMPackageSignature, candidate.metadata.HeaderTag, signed.remaining)
-		}
-		if coverage == RPMSignatureCoverageHeaderPayloadDigest {
-			if len(layout.payloadDigests) == 0 && layout.payloadHashAlgo == 0 {
-				coverage = RPMSignatureCoverageHeader
-			} else if !payloadChecked {
-				payloadAlgorithm, payloadDigest, err = verifySignedRPMPayloadDigest(ctx, r, layout)
-				if err != nil {
-					return nil, err
-				}
-				payloadChecked = true
-				payloadAuthenticated = true
-			}
-		} else {
-			payloadAuthenticated = true
-		}
-		proof := VerifiedEmbeddedRPMSignature{
-			EmbeddedRPMSignature:   candidate.metadata,
-			Coverage:               coverage,
-			SignedBytes:            signedBytes,
-			SignerKeyID:            fmt.Sprintf("%016x", signerKey.PublicKey.KeyId),
-			SignerFingerprint:      hex.EncodeToString(signerKey.PublicKey.Fingerprint),
-			PublicKeyAlgorithmName: openPGPPublicKeyAlgorithmName(candidate.metadata.PublicKeyAlgorithm),
-			HashAlgorithmName:      openPGPHashAlgorithmName(candidate.metadata.HashAlgorithm),
-		}
-		if signerKey.Entity != nil && signerKey.Entity.PrimaryKey != nil {
-			proof.SignerPrimaryFingerprint = hex.EncodeToString(signerKey.Entity.PrimaryKey.Fingerprint)
-		}
-		if coverage == RPMSignatureCoverageHeaderPayloadDigest {
-			proof.PayloadDigestAlgorithm = payloadAlgorithm
-			proof.PayloadDigest = payloadDigest
-		}
-		verified = append(verified, proof)
-	}
-	if !payloadAuthenticated {
-		return nil, fmt.Errorf("%w: no trusted embedded signature authenticates the RPM payload", ErrRPMPackageSignature)
-	}
-	return verified, nil
-}
-
-func verifyOpenPGPV3DetachedSignature(signed io.Reader, encoded []byte, keyring openpgp.KeyRing, createdAt time.Time) (openpgp.Key, error) {
-	body, err := unwrapOpenPGPSignaturePacket(encoded)
-	if err != nil {
-		return openpgp.Key{}, err
-	}
-	if len(body) < 22 || body[0] != 3 || body[1] != 5 || body[2] != 0x00 {
-		return openpgp.Key{}, errors.New("malformed OpenPGP v3 binary signature")
-	}
-	if !time.Unix(int64(binary.BigEndian.Uint32(body[3:7])), 0).UTC().Equal(createdAt) {
-		return openpgp.Key{}, errors.New("OpenPGP v3 signature creation time changed during verification")
-	}
-	issuerKeyID := binary.BigEndian.Uint64(body[7:15])
-	publicKeyAlgorithm := int(body[15])
-	hashAlgorithm := int(body[16])
-	hashID, err := openPGPHash(hashAlgorithm)
-	if err != nil {
-		return openpgp.Key{}, err
-	}
-	hasher := hashID.New()
-	if _, err := io.Copy(hasher, signed); err != nil {
-		return openpgp.Key{}, err
-	}
-	if _, err := hasher.Write(body[2:7]); err != nil {
-		return openpgp.Key{}, err
-	}
-	digest := hasher.Sum(nil)
-	if len(digest) < 2 || subtle.ConstantTimeCompare(digest[:2], body[17:19]) != 1 {
-		return openpgp.Key{}, errors.New("OpenPGP v3 signed-hash prefix mismatch")
-	}
-	material := body[19:]
-	first, material, err := readOpenPGPMPI(material)
-	if err != nil {
-		return openpgp.Key{}, err
-	}
-	var second []byte
-	if publicKeyAlgorithm == 17 {
-		second, material, err = readOpenPGPMPI(material)
-		if err != nil {
-			return openpgp.Key{}, err
-		}
-	}
-	if len(material) != 0 {
-		return openpgp.Key{}, errors.New("trailing OpenPGP v3 signature material")
-	}
-
-	// KeysByIdUsage rejects historical OpenPGP keys whose self-signature
-	// predates the Key Flags subpacket even though RFC 4880 treats absent key
-	// flags as unrestricted. Enumerate the exact issuer here, then apply usage
-	// and temporal policy explicitly at the authenticated signature time.
-	keys := openPGPKeysByIDAt(keyring, issuerKeyID, createdAt)
-	if len(keys) == 0 {
-		return openpgp.Key{}, fmt.Errorf("OpenPGP v3 signature issuer %016x is not in the trusted keyring", issuerKeyID)
-	}
-	var lastErr error
-	for _, key := range keys {
-		if key.PublicKey == nil || int(key.PublicKey.PubKeyAlgo) != publicKeyAlgorithm {
-			lastErr = errors.New("trusted key uses a different public-key algorithm")
-			continue
-		}
-		if err := validateOpenPGPSigningKeyAt(key, createdAt); err != nil {
-			lastErr = err
-			continue
-		}
-		switch publicKeyAlgorithm {
-		case 1, 3:
-			publicKey, ok := key.PublicKey.PublicKey.(*rsa.PublicKey)
-			if !ok {
-				lastErr = errors.New("trusted RSA key has an incompatible implementation")
-				continue
-			}
-			keyBytes := (publicKey.N.BitLen() + 7) / 8
-			if len(first) > keyBytes {
-				lastErr = errors.New("OpenPGP RSA signature is larger than the trusted key")
-				continue
-			}
-			padded := make([]byte, keyBytes)
-			copy(padded[keyBytes-len(first):], first)
-			if err := rsa.VerifyPKCS1v15(publicKey, hashID, digest, padded); err != nil {
-				lastErr = errors.New("OpenPGP RSA signature verification failed")
-				continue
-			}
-		case 17:
-			publicKey, ok := key.PublicKey.PublicKey.(*dsa.PublicKey)
-			if !ok {
-				lastErr = errors.New("trusted DSA key has an incompatible implementation")
-				continue
-			}
-			truncated := digest
-			subgroupBytes := (publicKey.Q.BitLen() + 7) / 8
-			if len(truncated) > subgroupBytes {
-				truncated = truncated[:subgroupBytes]
-			}
-			if !dsa.Verify(publicKey, truncated, new(big.Int).SetBytes(first), new(big.Int).SetBytes(second)) {
-				lastErr = errors.New("OpenPGP DSA signature verification failed")
-				continue
-			}
-		default:
-			return openpgp.Key{}, fmt.Errorf("unsupported OpenPGP v3 public-key algorithm %d", publicKeyAlgorithm)
-		}
-		return key, nil
-	}
-	if lastErr == nil {
-		lastErr = errors.New("no trusted OpenPGP v3 signing key verified the packet")
-	}
-	return openpgp.Key{}, lastErr
-}
-
-// verifyOpenPGPV4DetachedSignature performs the cryptographic verification at
-// the packet layer, then applies SOW's historical key policy. The legacy
-// high-level OpenPGP verifier evaluates the parsed latest self-certification and
-// revocations even when a package signature predates a normal renewal. That can
-// make a newly exported public certificate strand retained stable RPMs.
-func verifyOpenPGPV4DetachedSignature(signed io.Reader, encoded []byte, keyring openpgp.KeyRing, createdAt time.Time) (openpgp.Key, error) {
-	packets := packet.NewReader(bytes.NewReader(encoded))
-	value, err := packets.Next()
-	if err != nil {
-		return openpgp.Key{}, err
-	}
-	signature, ok := value.(*packet.Signature)
-	if !ok || signature.Version != 4 || signature.SigType != packet.SigTypeBinary || signature.IssuerKeyId == nil {
-		return openpgp.Key{}, errors.New("malformed OpenPGP v4 binary signature")
-	}
-	if trailing, nextErr := packets.Next(); nextErr != io.EOF || trailing != nil {
-		return openpgp.Key{}, errors.New("trailing OpenPGP v4 signature material")
-	}
-	if !signature.CreationTime.UTC().Equal(createdAt) {
-		return openpgp.Key{}, errors.New("OpenPGP v4 signature creation time changed during verification")
-	}
-	for _, notation := range signature.Notations {
-		if notation.IsCritical {
-			return openpgp.Key{}, fmt.Errorf("OpenPGP v4 signature has unsupported critical notation %q", notation.Name)
-		}
-	}
-
-	var selected *openpgp.Key
-	var fingerprint string
-	var lastErr error
-	for _, candidate := range openPGPKeysByIDAt(keyring, *signature.IssuerKeyId, createdAt) {
-		if candidate.PublicKey == nil || candidate.PublicKey.PubKeyAlgo != signature.PubKeyAlgo {
-			lastErr = errors.New("trusted key uses a different public-key algorithm")
-			continue
-		}
-		if err := validateOpenPGPSigningKeyAt(candidate, createdAt); err != nil {
-			lastErr = err
-			continue
-		}
-		current := hex.EncodeToString(candidate.PublicKey.Fingerprint)
-		if selected != nil && current != fingerprint {
-			return openpgp.Key{}, fmt.Errorf("ambiguous trusted OpenPGP v4 issuer %016x", *signature.IssuerKeyId)
-		}
-		copyCandidate := candidate
-		selected, fingerprint = &copyCandidate, current
-	}
-	if selected == nil {
-		if lastErr != nil {
-			return openpgp.Key{}, fmt.Errorf("OpenPGP v4 signature issuer %016x has no historically valid trusted signing key: %w", *signature.IssuerKeyId, lastErr)
-		}
-		return openpgp.Key{}, fmt.Errorf("OpenPGP v4 signature issuer %016x has no historically valid trusted signing key", *signature.IssuerKeyId)
-	}
-	hasher, err := signature.PrepareVerify()
-	if err != nil {
-		return openpgp.Key{}, err
-	}
-	if _, err := io.Copy(hasher, signed); err != nil {
-		return openpgp.Key{}, err
-	}
-	if err := selected.PublicKey.VerifySignature(hasher, signature); err != nil {
-		return openpgp.Key{}, err
-	}
-	return *selected, nil
+	return results[0].Proofs, results[0].Err
 }
 
 func validateOpenPGPSigningKeyAt(key openpgp.Key, at time.Time) error {
@@ -1285,21 +1024,21 @@ func inspectRPMVerificationLayout(ctx context.Context, r io.ReadSeeker, wantMain
 	layout := rpmVerificationLayout{mainHeaderStart: int64(mainStart), mainHeaderEnd: int64(mainEnd), fileEnd: fileEnd}
 	digestTag := pkg.Header.GetTag(rpmTagPayloadDigest)
 	algorithmTag := pkg.Header.GetTag(rpmTagPayloadDigestAlgo)
-	if digestTag != nil && algorithmTag == nil {
-		return rpmVerificationLayout{}, fmt.Errorf("%w: RPM v6 packages are not supported (payload digest has no algorithm tag)", ErrRPMPackageSignature)
-	}
 	if digestTag != nil {
 		layout.payloadDigests = append([]string(nil), digestTag.StringSlice()...)
 	}
 	if algorithmTag != nil {
 		layout.payloadHashAlgo = int(algorithmTag.Int64())
+	} else if digestTag != nil {
+		// RPM v6 defines PAYLOADSHA256 (5092) as always SHA-256 without tag 5093.
+		layout.payloadHashAlgo = rpmHashSHA256
 	}
 	return layout, nil
 }
 
 func signedRPMRange(tagID int, layout rpmVerificationLayout) (RPMSignatureCoverage, int64, int64) {
 	switch tagID {
-	case 267, 268:
+	case 267, 268, 278:
 		return RPMSignatureCoverageHeaderPayloadDigest, layout.mainHeaderStart, layout.mainHeaderEnd - layout.mainHeaderStart
 	default:
 		return RPMSignatureCoverageHeaderPayload, layout.mainHeaderStart, layout.fileEnd - layout.mainHeaderStart
@@ -1325,12 +1064,8 @@ func verifySignedRPMPayloadDigest(ctx context.Context, r io.ReadSeeker, layout r
 		return "", "", fmt.Errorf("%w: seek RPM payload: %v", ErrRPMPackageSignature, err)
 	}
 	payloadBytes := layout.fileEnd - layout.mainHeaderEnd
-	reader := &exactLengthReader{r: &contextReader{ctx: ctx, r: r}, remaining: payloadBytes}
-	if _, err := io.Copy(hasher, reader); err != nil {
+	if _, err := io.CopyN(hasher, &contextReader{ctx: ctx, r: r}, payloadBytes); err != nil {
 		return "", "", fmt.Errorf("%w: hash RPM payload: %w", ErrRPMPackageSignature, err)
-	}
-	if reader.remaining != 0 {
-		return "", "", fmt.Errorf("%w: RPM payload is truncated by %d bytes", ErrRPMPackageSignature, reader.remaining)
 	}
 	actual := hex.EncodeToString(hasher.Sum(nil))
 	if actual != digest {
@@ -1354,23 +1089,6 @@ func rpmPayloadHasher(algorithm int) (hash.Hash, string, int, error) {
 	}
 }
 
-type exactLengthReader struct {
-	r         io.Reader
-	remaining int64
-}
-
-func (r *exactLengthReader) Read(p []byte) (int, error) {
-	if r.remaining <= 0 {
-		return 0, io.EOF
-	}
-	if int64(len(p)) > r.remaining {
-		p = p[:r.remaining]
-	}
-	n, err := r.r.Read(p)
-	r.remaining -= int64(n)
-	return n, err
-}
-
 func openPGPPublicKeyAlgorithmName(algorithm int) string {
 	switch algorithm {
 	case 1:
@@ -1383,6 +1101,10 @@ func openPGPPublicKeyAlgorithmName(algorithm int) string {
 		return "ECDSA"
 	case 22:
 		return "EdDSA"
+	case 27:
+		return "Ed25519"
+	case 28:
+		return "Ed448"
 	default:
 		return fmt.Sprintf("OpenPGP-%d", algorithm)
 	}
@@ -1403,6 +1125,29 @@ func openPGPHashAlgorithmName(algorithm int) string {
 	default:
 		return fmt.Sprintf("OpenPGP-%d", algorithm)
 	}
+}
+
+func inspectOpenPGPSignature(encoded []byte) (version, keyAlgo, hashAlgo int, issuer string, created time.Time, err error) {
+	body, err := unwrapOpenPGPSignaturePacket(encoded)
+	if err != nil {
+		return 0, 0, 0, "", time.Time{}, err
+	}
+	if len(body) > 0 && body[0] == 6 {
+		value, err := packet.Read(bytes.NewReader(encoded))
+		if err != nil {
+			return 0, 0, 0, "", time.Time{}, err
+		}
+		sig, ok := value.(*packet.Signature)
+		if !ok || sig.SigType != packet.SigTypeBinary || sig.IssuerKeyId == nil || sig.IssuerKeyVersion != 6 || len(sig.IssuerFingerprint) != 32 || sig.CreationTime.Unix() <= 0 {
+			return 0, 0, 0, "", time.Time{}, errors.New("invalid OpenPGP v6 binary signature, issuer fingerprint or creation time")
+		}
+		return 6, int(sig.PubKeyAlgo), int(body[3]), fmt.Sprintf("%016x", *sig.IssuerKeyId), sig.CreationTime.UTC(), nil
+	}
+	version, keyAlgo, hashAlgo, issuer, err = parseOpenPGPSignaturePacket(encoded)
+	if err == nil {
+		created, err = parseOpenPGPSignatureCreationTime(encoded)
+	}
+	return
 }
 
 func parseOpenPGPSignaturePacket(encoded []byte) (version, publicKeyAlgorithm, hashAlgorithm int, issuerKeyID string, err error) {

@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 
 	"github.com/pgsty/sow/internal/v2/signing"
-	"golang.org/x/sys/unix"
 )
 
 // Create builds flat RPM and/or DEB metadata for one directory. It does not
@@ -23,12 +22,12 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 	if err != nil {
 		return Result{}, &Error{Kind: KindRuntime, Op: "resolve directory", Path: opts.Dir, Err: err}
 	}
-	info, err := os.Lstat(root)
+	info, err := os.Stat(root)
 	if err != nil {
 		return Result{}, &Error{Kind: KindRuntime, Op: "inspect directory", Path: root, Err: err}
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return Result{}, &Error{Kind: KindRejected, Op: "inspect directory", Path: root, Err: errors.New("target is not a real directory")}
+	if !info.IsDir() {
+		return Result{}, &Error{Kind: KindRejected, Op: "inspect directory", Path: root, Err: errors.New("target is not a directory")}
 	}
 	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
@@ -67,9 +66,78 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 		}
 	}
 
-	scan, err := scanPackages(ctx, root, opts.Jobs, opts.Pigsty)
+	scan, err := scanPackages(ctx, root, opts.Jobs, opts.Pigsty, opts.Strict, false)
 	if err != nil {
 		return Result{}, err
+	}
+	preserveRPM, preserveDEB := scan.preserveFormat(formatRPM), scan.preserveFormat(formatDEB)
+	if preserveRPM || preserveDEB {
+		// A failed format keeps its old index, including any would-be exclusions.
+		removed := scan.removed[:0]
+		for _, f := range scan.removed {
+			if !(preserveRPM && f.format == formatRPM || preserveDEB && f.format == formatDEB) {
+				removed = append(removed, f)
+			}
+		}
+		scan.removed = removed
+		priorRPMIndex, hasPriorRPMIndex, err := priorFormatIndexPath(root, formatRPM)
+		if err != nil {
+			return Result{}, &Error{Kind: KindRuntime, Op: "inspect prior rpm index", Path: root, Err: err}
+		}
+		priorDEBIndex, hasPriorDEBIndex, err := priorFormatIndexPath(root, formatDEB)
+		if err != nil {
+			return Result{}, &Error{Kind: KindRuntime, Op: "inspect prior deb index", Path: root, Err: err}
+		}
+		if preserveRPM {
+			if hasPriorRPMIndex {
+				scan.warnings = append(scan.warnings, "all RPM candidates were skipped; existing RPM metadata preserved")
+			} else {
+				scan.warnings = append(scan.warnings, "all RPM candidates were skipped")
+			}
+		}
+		if preserveDEB {
+			if hasPriorDEBIndex {
+				scan.warnings = append(scan.warnings, "all DEB candidates were skipped; existing DEB metadata preserved")
+			} else {
+				scan.warnings = append(scan.warnings, "all DEB candidates were skipped")
+			}
+		}
+		removeOtherIndex := (!preserveRPM && !scan.hasRPM && hasPriorRPMIndex) || (!preserveDEB && !scan.hasDEB && hasPriorDEBIndex)
+		skip := len(scan.kept) == 0 && len(scan.removed) == 0 && !removeOtherIndex
+		if opts.Pigsty && !skip {
+			preservedFormat := formatDEB
+			index, priorIndexExists := priorDEBIndex, hasPriorDEBIndex
+			if preserveRPM {
+				preservedFormat = formatRPM
+				index, priorIndexExists = priorRPMIndex, hasPriorRPMIndex
+			}
+			var lines []markerLine
+			var markerErr error
+			if priorIndexExists {
+				lines, markerErr = readPriorMarker(root, func(name string) bool {
+					return filepath.Ext(name) == "."+string(preservedFormat)
+				})
+				if errors.Is(markerErr, os.ErrNotExist) {
+					markerErr = fmt.Errorf("existing %s cannot be carried forward without repo_complete", index)
+				} else if markerErr == nil && len(lines) == 0 {
+					markerErr = fmt.Errorf("existing %s has no entries in repo_complete", index)
+				}
+			}
+			if markerErr != nil {
+				scan.warnings = append(scan.warnings, "cannot carry forward repo_complete; skipped publication: "+markerErr.Error())
+				skip = true
+			}
+			scan.markerLines = lines
+		}
+		if skip {
+			scan.removed = nil
+			populateResult(&result, scan, stagedBuild{}, opts, false)
+			result.Marker, err = pruneMarkerExists(filepath.Join(root, "repo_complete"))
+			if err == nil && result.Marker {
+				result.MarkerSHA256, err = hashFile(ctx, filepath.Join(root, "repo_complete"))
+			}
+			return result, err
+		}
 	}
 	if err := lock.Validate(); err != nil {
 		return Result{}, err
@@ -85,15 +153,11 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 		_ = os.RemoveAll(staged.dir)
 		return Result{}, err
 	}
-	if err := verifyStableInputs(ctx, root, scan); err != nil {
-		_ = os.RemoveAll(staged.dir)
-		return Result{}, err
-	}
 	if err := lock.Validate(); err != nil {
 		_ = os.RemoveAll(staged.dir)
 		return Result{}, err
 	}
-	plan, err := preparePublication(ctx, root, staged, scan, opts)
+	plan, err := preparePublication(ctx, root, staged, scan, opts, false)
 	if err != nil {
 		_ = os.RemoveAll(staged.dir)
 		return Result{}, err
@@ -105,8 +169,15 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 	// Create replaces a foreign repomd.xml, as createrepo_c does; for example,
 	// Pigsty relies on this to retire legacy synthetic module metadata. Report
 	// the data types that the rebuilt index no longer carries.
-	prior, err := inspectPriorRPMMetadata(root)
+	var prior priorRPMMetadata
+	if !preserveRPM && plan.changed {
+		prior, err = inspectPriorRPMMetadata(root)
+	}
 	if err != nil {
+		_ = os.RemoveAll(staged.dir)
+		return Result{}, err
+	}
+	if err := validatePackageStats(root, scan, false); err != nil {
 		_ = os.RemoveAll(staged.dir)
 		return Result{}, err
 	}
@@ -114,7 +185,9 @@ func Create(ctx context.Context, opts Options) (result Result, resultErr error) 
 		return Result{}, err
 	}
 	populateResult(&result, scan, staged, opts, plan.changed)
-	result.DroppedMetadata = prior.unsupported
+	if plan.rpmPublished {
+		result.DroppedMetadata = prior.unsupported
+	}
 	return result, nil
 }
 
@@ -133,44 +206,25 @@ func populateResult(result *Result, scan scanResult, staged stagedBuild, opts Op
 	for _, fact := range scan.removed {
 		result.Removed = append(result.Removed, fact.base)
 	}
+	result.Skipped = scan.skipped
+	result.Warnings = scan.warnings
 	result.Marker = opts.Pigsty
 	result.Signer = opts.SignWith
 	result.MarkerSHA256 = staged.markerSHA
 	result.Noop = !changed && len(scan.removed) == 0
 }
 
-func verifyStableInputs(ctx context.Context, root string, scan scanResult) error {
-	candidates, err := listPackageCandidates(root)
-	if err != nil {
-		return err
+func priorFormatIndexPath(root string, format packageFormat) (string, bool, error) {
+	candidates := []string{"Packages", "Packages.gz"}
+	if format == formatRPM {
+		candidates = []string{filepath.Join("repodata", "repomd.xml")}
 	}
-	if len(candidates) != len(scan.all) {
-		return &Error{Kind: KindIntegrity, Op: "verify input stats", Path: root, Err: fmt.Errorf("package set changed after inspection: got %d files, want %d", len(candidates), len(scan.all))}
-	}
-	for index, fact := range scan.all {
-		if err := ctx.Err(); err != nil {
-			return &Error{Kind: KindRuntime, Op: "verify input stats", Path: root, Err: err}
-		}
-		candidate := candidates[index]
-		if candidate.base != fact.base || candidate.format != fact.format {
-			return &Error{Kind: KindIntegrity, Op: "verify input stats", Path: root, Err: errors.New("package set changed after inspection")}
-		}
-		before, after := fact.sourceInfo, candidate.info
-		if before == nil || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || before.Mode() != after.Mode() {
-			return &Error{Kind: KindIntegrity, Op: "verify input stats", Path: fact.originalPath, Err: errors.New("package stat changed after inspection")}
-		}
-		if fact.hasSourceStat {
-			var afterStat unix.Stat_t
-			if err := unix.Lstat(candidate.path, &afterStat); err != nil {
-				return &Error{Kind: KindIntegrity, Op: "verify input stats", Path: fact.originalPath, Err: err}
-			}
-			if afterStat.Ctim != fact.sourceStat.Ctim {
-				digest, err := hashFile(ctx, candidate.path)
-				if err != nil || digest != fact.originalSHA256 {
-					return &Error{Kind: KindIntegrity, Op: "verify input stats", Path: fact.originalPath, Err: errors.Join(err, errors.New("package content changed after inspection"))}
-				}
-			}
+	for _, rel := range candidates {
+		if _, err := os.Lstat(filepath.Join(root, rel)); err == nil {
+			return rel, true, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", false, err
 		}
 	}
-	return nil
+	return candidates[0], false, nil
 }

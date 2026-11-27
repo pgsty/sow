@@ -112,13 +112,16 @@ func Init(ctx context.Context, opts InitOptions) (result InitResult, resultErr e
 	defer func() { resultErr = errors.Join(resultErr, rootGuard.Close()) }()
 	result = InitResult{Workspace: root, Existing: []string{}}
 	started := time.Now()
-	configPath := filepath.Join(root, config.ConfigFilename)
+	configPath, err := config.ResolveConfigPath(root)
+	if err != nil {
+		return result, fmt.Errorf("%w: %w", ErrRejected, err)
+	}
 	stateRoot := filepath.Join(root, ".sow")
 	var existingConfig config.Config
 	configExists := false
 	if info, statErr := os.Lstat(configPath); statErr == nil {
 		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return result, fmt.Errorf("%w: sow.yml is not a regular file", ErrRejected)
+			return result, fmt.Errorf("%w: %s is not a regular file", ErrRejected, filepath.Base(configPath))
 		}
 		existingConfig, err = config.Load(configPath)
 		if err != nil {
@@ -131,6 +134,9 @@ func Init(ctx context.Context, opts InitOptions) (result InitResult, resultErr e
 	if info, statErr := os.Lstat(stateRoot); statErr == nil {
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return result, fmt.Errorf("%w: reserved path .sow is not a real directory", ErrRejected)
+		}
+		if err := validateReadOnlyControlPaths(root); err != nil {
+			return result, err
 		}
 	} else if errors.Is(statErr, os.ErrNotExist) {
 		// Before the first lock inode exists there cannot be a serialized Managed
@@ -218,7 +224,14 @@ func Init(ctx context.Context, opts InitOptions) (result InitResult, resultErr e
 		if err != nil {
 			return result, err
 		}
-		result.Existing = append(result.Existing, config.ConfigFilename)
+		result.Existing = append(result.Existing, filepath.Base(configPath))
+	}
+	// Under workspace.lock, repair any missing per-repository lock files for
+	// already-configured repositories before recovery or checks open them.
+	for _, repoName := range config.RepositoryNames(cfg) {
+		if _, err := durableEnsureRegularFile(filepath.Join(root, ".sow", "repo-locks", repoName+".lock"), 0o600); err != nil {
+			return result, err
+		}
 	}
 	// Recovery must precede the state-aware preflight: an applied operation may
 	// have installed a new view while its SQLite finalization was interrupted.
@@ -337,7 +350,7 @@ func recoverInitializedRepositories(ctx context.Context, root string, cfg config
 		store, err := openExistingState(filepath.Join(root, ".sow", repoName+".db"))
 		if err != nil {
 			repoLock.Close()
-			return fmt.Errorf("%w: %v", ErrIntegrity, err)
+			return fmt.Errorf("%w: %w", ErrIntegrity, err)
 		}
 		recoverErr := recoverDistOperations(ctx, root, repoName, store)
 		if recoverErr == nil {
@@ -556,7 +569,7 @@ func checkConfigAtRootMode(ctx context.Context, root string, cfg config.Config, 
 			}
 			store, openErr := openReadOnlyState(dbPath)
 			if openErr != nil {
-				return ConfigCheckResult{}, fmt.Errorf("%w: repository %q state: %v", ErrIntegrity, repoName, openErr)
+				return ConfigCheckResult{}, fmt.Errorf("%w: repository %q state: %w", ErrIntegrity, repoName, openErr)
 			}
 			if layoutErr := validateRepositoryLayoutForRead(root, repoName, store.SchemaVersion()); layoutErr != nil {
 				store.Close()
@@ -720,6 +733,9 @@ func validateReadOnlyStateEntries(root string, cfg config.Config) error {
 		return fmt.Errorf("%w: inspect state root entries: %v", ErrIntegrity, err)
 	}
 	for _, entry := range entries {
+		if entry.Name == ".DS_Store" {
+			continue
+		}
 		if _, ok := allowed[entry.Name]; !ok {
 			return fmt.Errorf("%w: state root contains unowned entry %q", ErrRejected, entry.Name)
 		}
@@ -843,7 +859,7 @@ func ensureWorkspaceLock(root string) (bool, error) {
 		if len(entries) == 1 && entries[0].Name == "workspace.lock" {
 			continue
 		}
-		return false, fmt.Errorf("%w: workspace lock is missing from non-empty state root", ErrIntegrity)
+		return false, fmt.Errorf("%w: workspace.lock is missing from non-empty .sow; stop all SOW processes and jobs for this workspace, then exclusively create an empty .sow/workspace.lock as the workspace owner (0600) and rerun sow init", ErrIntegrity)
 	}
 }
 

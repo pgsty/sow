@@ -13,12 +13,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/pgsty/sow/internal/r2"
 	"github.com/pgsty/sow/internal/v2/config"
 	"github.com/pgsty/sow/internal/v2/state"
-	"golang.org/x/sys/unix"
 )
 
 const maxR2CredentialBytes = 64 << 10
@@ -140,6 +140,7 @@ func newR2PublicationBackend(target config.TargetConfig) (*r2PublicationBackend,
 	objectBase := strings.TrimSuffix(target.Endpoint, "/") + "/" + target.Bucket
 	client, err := r2.NewClient(r2.Config{
 		Bucket: target.Bucket, ObjectBaseURL: objectBase, Credentials: credentials,
+		AllowInsecure: strings.HasPrefix(target.Endpoint, "http://"),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("%w: initialize R2 storage transport: %v", ErrRejected, err)
@@ -157,7 +158,7 @@ func newR2PublicationBackend(target config.TargetConfig) (*r2PublicationBackend,
 	}
 	return &r2PublicationBackend{
 		objects: client, prefix: target.Prefix, publicBase: publicBase,
-		publicClient: newPublicVerificationClient(), maxCacheTTL: maxCacheTTL,
+		publicClient: newPublicVerificationClient(publicBase), maxCacheTTL: maxCacheTTL,
 		transientRetryWindow: publicTransientWindow, publicReadIdleTimeout: publicResponseTimeout,
 	}, nil
 }
@@ -178,15 +179,18 @@ func resolveR2Credentials(reference, region string) (r2.S3Credentials, error) {
 		body = []byte(value)
 	case strings.HasPrefix(reference, "file://"):
 		filename := strings.TrimPrefix(reference, "file://")
-		// O_NONBLOCK keeps a FIFO or device from blocking open while the
-		// Repository lock is held. Symlinks, such as mounted secrets, still work.
-		fd, openErr := unix.Open(filename, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		file, openErr := os.OpenFile(filename, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 		if openErr != nil {
 			return r2.S3Credentials{}, fmt.Errorf("%w: open R2 credential reference: %v", ErrNotReady, openErr)
 		}
-		file := os.NewFile(uintptr(fd), filename)
-		if info, statErr := file.Stat(); statErr != nil || !info.Mode().IsRegular() {
-			return r2.S3Credentials{}, errors.Join(fmt.Errorf("%w: R2 credential reference is not a regular file", ErrRejected), statErr, file.Close())
+		info, statErr := file.Stat()
+		if statErr != nil {
+			file.Close()
+			return r2.S3Credentials{}, fmt.Errorf("%w: open R2 credential reference: %v", ErrNotReady, statErr)
+		}
+		if !info.Mode().IsRegular() {
+			file.Close()
+			return r2.S3Credentials{}, fmt.Errorf("%w: R2 credential reference must resolve to a regular file", ErrRejected)
 		}
 		body, err = io.ReadAll(io.LimitReader(file, maxR2CredentialBytes+1))
 		closeErr := file.Close()
@@ -201,13 +205,12 @@ func resolveR2Credentials(reference, region string) (r2.S3Credentials, error) {
 	}
 	var document r2CredentialDocument
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
-	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&document); err != nil {
 		return r2.S3Credentials{}, fmt.Errorf("%w: decode R2 credential document", ErrRejected)
 	}
 	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return r2.S3Credentials{}, fmt.Errorf("%w: R2 credential document has trailing data", ErrRejected)
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return r2.S3Credentials{}, fmt.Errorf("%w: R2 credential document has trailing content", ErrRejected)
 	}
 	return r2.S3Credentials{
 		AccessKeyID: document.AccessKeyID, SecretAccessKey: document.SecretAccessKey,
@@ -227,18 +230,24 @@ func (b *r2PublicationBackend) objectKey(objectPath string) (string, error) {
 	return b.prefix + "/" + objectPath, nil
 }
 
-func (b *r2PublicationBackend) relativeKey(key string) (string, error) {
+func (b *r2PublicationBackend) relativeKey(key string) (string, bool, error) {
 	if b.prefix != "" {
 		prefix := b.prefix + "/"
 		if !strings.HasPrefix(key, prefix) {
-			return "", fmt.Errorf("%w: R2 list escaped configured prefix", ErrIntegrity)
+			return "", false, fmt.Errorf("%w: R2 list escaped configured prefix", ErrIntegrity)
 		}
 		key = strings.TrimPrefix(key, prefix)
 	}
-	if _, err := b.objectKey(key); err != nil {
-		return "", fmt.Errorf("%w: R2 target contains foreign object %q", ErrIntegrity, key)
+	if !strings.HasPrefix(key, "pool/") && !strings.HasPrefix(key, "dists/") {
+		// Harmless foreign objects outside pool/ and dists/ (e.g. index.html,
+		// RPM-GPG-KEY, robots.txt) are ignored instead of failing publication.
+		return "", false, nil
 	}
-	return key, nil
+	if _, err := b.objectKey(key); err != nil {
+		// Illegal/unmigrated objects inside pool/ or dists/ remain an integrity error.
+		return "", false, fmt.Errorf("%w: R2 target contains unmanaged object %q", ErrIntegrity, key)
+	}
+	return key, true, nil
 }
 
 func (b *r2PublicationBackend) List(ctx context.Context, _ map[string]struct{}) ([]publicationRemoteObject, error) {
@@ -249,7 +258,7 @@ func (b *r2PublicationBackend) List(ctx context.Context, _ map[string]struct{}) 
 	objects := []publicationRemoteObject{}
 	continuation := ""
 	seenTokens := map[string]struct{}{}
-	previousKey := ""
+	seenKeys := map[string]struct{}{}
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -258,14 +267,17 @@ func (b *r2PublicationBackend) List(ctx context.Context, _ map[string]struct{}) 
 		if err != nil {
 			return nil, err
 		}
-		pageObjects, err := b.headInventoryPage(ctx, page.Objects, previousKey)
+		for _, item := range page.Objects {
+			if _, dup := seenKeys[item.Key]; dup {
+				return nil, fmt.Errorf("%w: R2 listing returned duplicate key %q", ErrIntegrity, item.Key)
+			}
+			seenKeys[item.Key] = struct{}{}
+		}
+		pageObjects, err := b.headInventoryPage(ctx, page.Objects)
 		if err != nil {
 			return nil, err
 		}
 		objects = append(objects, pageObjects...)
-		if len(page.Objects) > 0 {
-			previousKey = page.Objects[len(page.Objects)-1].Key
-		}
 		if page.NextContinuationToken == "" {
 			break
 		}
@@ -279,9 +291,22 @@ func (b *r2PublicationBackend) List(ctx context.Context, _ map[string]struct{}) 
 	return objects, nil
 }
 
-func (b *r2PublicationBackend) headInventoryPage(ctx context.Context, listed []r2.ListedObject, previousKey string) ([]publicationRemoteObject, error) {
-	objects := make([]publicationRemoteObject, len(listed))
-	workers := min(r2InventoryHeadWorkers, len(listed))
+func (b *r2PublicationBackend) headInventoryPage(ctx context.Context, listed []r2.ListedObject) ([]publicationRemoteObject, error) {
+	managedListed := make([]r2.ListedObject, 0, len(listed))
+	managedRelative := make([]string, 0, len(listed))
+	for _, item := range listed {
+		relative, ok, err := b.relativeKey(item.Key)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		managedListed = append(managedListed, item)
+		managedRelative = append(managedRelative, relative)
+	}
+	objects := make([]publicationRemoteObject, len(managedListed))
+	workers := min(r2InventoryHeadWorkers, len(managedListed))
 	if workers == 0 {
 		return objects, nil
 	}
@@ -306,11 +331,7 @@ func (b *r2PublicationBackend) headInventoryPage(ctx context.Context, listed []r
 		go func() {
 			defer group.Done()
 			for sequence := range jobs {
-				previous := previousKey
-				if sequence > 0 {
-					previous = listed[sequence-1].Key
-				}
-				object, err := b.headInventoryObject(ctx, listed[sequence], previous)
+				object, err := b.headInventoryObject(ctx, managedListed[sequence], managedRelative[sequence])
 				// Each outstanding job owns one buffered slot, including during
 				// cancellation, so workers never wait for an abandoned receiver.
 				results[sequence%workers] <- result{object: object, err: err}
@@ -320,7 +341,7 @@ func (b *r2PublicationBackend) headInventoryPage(ctx context.Context, listed []r
 	for sequence := range workers {
 		jobs <- sequence
 	}
-	for sequence := range listed {
+	for sequence := range managedListed {
 		// Consume in list order to retain the serial inventory and first error.
 		// A slot is reused only after consumption, bounding queued work and
 		// completed results to the worker count even when an early HEAD is slow.
@@ -329,21 +350,14 @@ func (b *r2PublicationBackend) headInventoryPage(ctx context.Context, listed []r
 			return nil, result.err
 		}
 		objects[sequence] = result.object
-		if next := sequence + workers; next < len(listed) {
+		if next := sequence + workers; next < len(managedListed) {
 			jobs <- next
 		}
 	}
 	return objects, nil
 }
 
-func (b *r2PublicationBackend) headInventoryObject(ctx context.Context, listed r2.ListedObject, previousKey string) (publicationRemoteObject, error) {
-	if previousKey != "" && listed.Key <= previousKey {
-		return publicationRemoteObject{}, fmt.Errorf("%w: R2 inventory is not globally key-sorted", ErrIntegrity)
-	}
-	relative, err := b.relativeKey(listed.Key)
-	if err != nil {
-		return publicationRemoteObject{}, err
-	}
+func (b *r2PublicationBackend) headInventoryObject(ctx context.Context, listed r2.ListedObject, relative string) (publicationRemoteObject, error) {
 	if err := ctx.Err(); err != nil {
 		return publicationRemoteObject{}, errors.Join(fmt.Errorf("%w: R2 listed object %q lacks exact HEAD evidence", ErrIntegrity, relative), err)
 	}

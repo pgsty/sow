@@ -854,15 +854,15 @@ func TestRemoveOwnedDirectoryUnlinksSymlinkWithoutFollowingIt(t *testing.T) {
 	}
 }
 
-func TestManagedSurfacesRejectHardlinkedControlFiles(t *testing.T) {
+func TestManagedControlFileHardlinks(t *testing.T) {
 	t.Run("config", func(t *testing.T) {
 		root := t.TempDir()
 		writeManagedConfig(t, root, config.Default())
 		if err := os.Link(filepath.Join(root, config.ConfigFilename), filepath.Join(root, "config-hardlink")); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := CheckConfig(context.Background(), WorkspaceOptions{Workdir: root, CWD: root}); err == nil {
-			t.Fatal("config check accepted a multiply linked sow.yml")
+		if _, err := CheckConfig(context.Background(), WorkspaceOptions{Workdir: root, CWD: root}); err != nil {
+			t.Fatalf("config check failed on hardlinked sow.yml: %v", err)
 		}
 	})
 
@@ -917,7 +917,7 @@ func TestManagedSurfacesRejectHardlinkedControlFiles(t *testing.T) {
 	})
 }
 
-func TestBuildRejectsHardlinkedPrivatePendingObjectWithoutPublicEffect(t *testing.T) {
+func TestBuildPreservesPermissionsOfHardlinkedPendingObject(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	options := WorkspaceOptions{Workdir: root, CWD: root}
@@ -936,30 +936,23 @@ func TestBuildRejectsHardlinkedPrivatePendingObjectWithoutPublicEffect(t *testin
 	if err != nil || len(added.Items) != 1 || added.Items[0].SHA256 == "" {
 		t.Fatalf("Add=%#v err=%v", added, err)
 	}
-	before, _, err := digestTree(ctx, filepath.Join(root, "repo"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	pending := filepath.Join(root, ".sow", "repo", "pending", added.Items[0].SHA256)
 	alias := filepath.Join(root, "pending-hardlink")
 	if err := os.Link(pending, alias); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1}); !errors.Is(err, ErrIntegrity) {
-		t.Fatalf("Build accepted a multiply linked private pending object: %v", err)
+	if err := os.Chmod(pending, 0o600); err != nil {
+		t.Fatal(err)
 	}
-	after, _, err := digestTree(ctx, filepath.Join(root, "repo"))
+	if _, err := Build(ctx, BuildOptions{WorkspaceOptions: options, Repository: "repo", Jobs: 1}); err == nil {
+		t.Fatal("Build changed a multiply linked private object")
+	}
+	info, err := os.Stat(alias)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if before != after {
-		t.Fatalf("failed hardlink build changed public Repository: before=%s after=%s", before, after)
-	}
-	if pendingInfo, err := os.Lstat(pending); err != nil || pendingInfo.Mode().Perm() != 0o644 {
-		t.Fatalf("pending object changed: info=%#v err=%v", pendingInfo, err)
-	}
-	if aliasInfo, err := os.Lstat(alias); err != nil || aliasInfo.Mode().Perm() != 0o644 {
-		t.Fatalf("external hardlink changed: info=%#v err=%v", aliasInfo, err)
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("alias permissions changed: %v", info.Mode())
 	}
 }
 

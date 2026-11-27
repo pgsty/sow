@@ -52,8 +52,9 @@ func (workspace Workspace) RootIdentity() (device, inode uint64, ok bool) {
 	return workspace.rootDevice, workspace.rootInode, true
 }
 
-// Discover searches Workdir, then cwd, then SOW_DIR. Each start searches only
-// its own nearest ancestors. It never changes the process working directory.
+// Discover searches Workdir if explicitly provided, otherwise cwd then SOW_DIR.
+// Each start searches only its own nearest ancestors. It never changes the
+// process working directory.
 func Discover(opts DiscoverOptions) (Workspace, error) {
 	cwd := opts.CWD
 	if cwd == "" {
@@ -85,9 +86,9 @@ func Discover(opts DiscoverOptions) (Workspace, error) {
 		candidates = append(candidates, candidate{opts.Workdir, DiscoveryWorkdir})
 	} else {
 		candidates = append(candidates, candidate{cwd, DiscoveryCWD})
-	}
-	if sowDir != "" {
-		candidates = append(candidates, candidate{sowDir, DiscoveryEnvironment})
+		if sowDir != "" {
+			candidates = append(candidates, candidate{sowDir, DiscoveryEnvironment})
+		}
 	}
 
 	seen := make(map[string]struct{})
@@ -102,7 +103,7 @@ func Discover(opts DiscoverOptions) (Workspace, error) {
 			continue
 		}
 		seen[start] = struct{}{}
-		root, found, err := findWorkspaceRoot(start)
+		root, configName, found, err := findWorkspaceRoot(start)
 		if err != nil {
 			return Workspace{}, fmt.Errorf("discover workspace from %s %q: %w", candidate.source, start, err)
 		}
@@ -127,69 +128,44 @@ func Discover(opts DiscoverOptions) (Workspace, error) {
 			return Workspace{}, fmt.Errorf("resolve workspace discovery start %q: %w", start, err)
 		}
 		var rootStat unix.Stat_t
-		if err := unix.Lstat(realRoot, &rootStat); err != nil {
+		if err := unix.Stat(realRoot, &rootStat); err != nil {
 			return Workspace{}, fmt.Errorf("bind workspace root %q: %w", realRoot, err)
 		}
 		if uint32(rootStat.Mode)&unix.S_IFMT != unix.S_IFDIR {
 			return Workspace{}, fmt.Errorf("bind workspace root %q: not a directory", realRoot)
 		}
 		return Workspace{
-			Root: realRoot, ConfigPath: filepath.Join(realRoot, ConfigFilename),
+			Root: realRoot, ConfigPath: filepath.Join(realRoot, configName),
 			StartDir: realStart, CWD: resolvedCWD, Source: candidate.source,
 			lexicalRoot: root, lexicalStart: start,
 			rootDevice: uint64(rootStat.Dev), rootInode: uint64(rootStat.Ino),
 		}, nil
 	}
-	hint := ""
-	for _, candidate := range candidates {
-		if start, err := absoluteClean(candidate.path); err == nil {
-			for dir := start; ; dir = filepath.Dir(dir) {
-				if info, statErr := os.Lstat(filepath.Join(dir, "sow.yaml")); statErr == nil && info.Mode().IsRegular() {
-					hint = "; found sow.yaml (SOW uses sow.yml)"
-					break
-				}
-				parent := filepath.Dir(dir)
-				if parent == dir {
-					break
-				}
-			}
-		}
-		if hint != "" {
-			break
-		}
-	}
-	return Workspace{}, fmt.Errorf("workspace not found (searched %s)%s; run sow init or set --workdir/SOW_DIR", strings.Join(misses, ", "), hint)
+	return Workspace{}, fmt.Errorf("workspace not found (searched %s); run sow init or set --workdir/SOW_DIR", strings.Join(misses, ", "))
 }
 
-func findWorkspaceRoot(start string) (string, bool, error) {
+func findWorkspaceRoot(start string) (string, string, bool, error) {
 	info, err := os.Stat(start)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", false, nil
+			return "", "", false, nil
 		}
-		return "", false, err
+		return "", "", false, err
 	}
 	if !info.IsDir() {
-		return "", false, fmt.Errorf("start is not a directory")
+		return "", "", false, fmt.Errorf("start is not a directory")
 	}
 	for dir := start; ; dir = filepath.Dir(dir) {
-		candidate := filepath.Join(dir, ConfigFilename)
-		info, err := os.Lstat(candidate)
-		switch {
-		case err == nil:
-			if info.Mode()&os.ModeSymlink != 0 {
-				return "", false, fmt.Errorf("nearest %s %q is a symlink", ConfigFilename, candidate)
-			}
-			if !info.Mode().IsRegular() {
-				return "", false, fmt.Errorf("nearest %s %q is not a regular file", ConfigFilename, candidate)
-			}
-			return dir, true, nil
-		case !os.IsNotExist(err):
-			return "", false, err
+		name, err := workspaceConfigName(dir)
+		if err != nil {
+			return "", "", false, err
+		}
+		if name != "" {
+			return dir, name, true, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", false, nil
+			return "", "", false, nil
 		}
 	}
 }
@@ -376,9 +352,9 @@ func DistContainingCWD(ws Workspace, cfg Config, repository string) (string, boo
 	return "", false, nil
 }
 
-// RepositoryPath derives the only legal physical Repository path. Missing is
+// RepositoryPath derives the Repository path beneath workspaceRoot. Missing is
 // allowed so repo new/init can use the same derivation; an existing target must
-// be a real directory, never a symlink.
+// resolve to a directory.
 func RepositoryPath(workspaceRoot, name string) (string, error) {
 	if err := ValidateName(name); err != nil {
 		return "", fmt.Errorf("repository name %q: %w", name, err)
@@ -387,26 +363,28 @@ func RepositoryPath(workspaceRoot, name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("workspace root: %w", err)
 	}
-	rootInfo, err := os.Lstat(root)
+	rootInfo, err := os.Stat(root)
 	if err != nil {
 		return "", fmt.Errorf("workspace root %q: %w", root, err)
 	}
-	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
-		return "", fmt.Errorf("workspace root %q must be a real directory", root)
+	if !rootInfo.IsDir() {
+		return "", fmt.Errorf("workspace root %q must be a directory", root)
 	}
 	target := filepath.Join(root, name)
 	rel, err := filepath.Rel(root, target)
 	if err != nil || escapes(rel) || rel != name {
 		return "", fmt.Errorf("repository path %q escapes workspace root %q", target, root)
 	}
-	info, err := os.Lstat(target)
-	switch {
-	case err == nil && info.Mode()&os.ModeSymlink != 0:
-		return "", fmt.Errorf("repository path %q is a symlink", target)
-	case err == nil && !info.IsDir():
-		return "", fmt.Errorf("repository path %q is not a directory", target)
-	case err != nil && !os.IsNotExist(err):
-		return "", fmt.Errorf("inspect repository path %q: %w", target, err)
+	if _, lerr := os.Lstat(target); lerr == nil {
+		info, err := os.Stat(target)
+		if err != nil {
+			return "", fmt.Errorf("inspect repository path %q: %w", target, err)
+		}
+		if !info.IsDir() {
+			return "", fmt.Errorf("repository path %q is not a directory", target)
+		}
+	} else if !errors.Is(lerr, os.ErrNotExist) {
+		return "", fmt.Errorf("inspect repository path %q: %w", target, lerr)
 	}
 	return target, nil
 }
@@ -426,7 +404,7 @@ func validateDirectoryChain(root, rel string) error {
 			return err
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("path component %q is a symlink", current)
+			return fmt.Errorf("path component %q must not be a symlink", current)
 		}
 		if !info.IsDir() {
 			return fmt.Errorf("path component %q is not a directory", current)

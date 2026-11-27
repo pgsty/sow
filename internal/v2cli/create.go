@@ -22,7 +22,7 @@ func ExecuteCreate(ctx context.Context, inv Invocation, stdout, stderr io.Writer
 		directory = inv.Positionals[0]
 	}
 	result, err := create(ctx, plain.Options{
-		Dir: directory, Jobs: inv.Jobs, Pigsty: inv.Pigsty,
+		Dir: directory, Jobs: inv.Jobs, Pigsty: inv.Pigsty, Strict: inv.Strict,
 		MetadataTimestamp: inv.MetadataTimestamp,
 		SignWith:          inv.SignWith, Overwrite: inv.Overwrite, PassFile: inv.Global.PassFile,
 		Timeout: inv.Global.Timeout, NoWait: inv.Global.NoWait,
@@ -39,6 +39,10 @@ func ExecuteCreate(ctx context.Context, inv Invocation, stdout, stderr io.Writer
 				fmt.Fprintln(stderr, writeErr)
 				return ExitRuntime
 			}
+		} else {
+			for _, warning := range result.Warnings {
+				fmt.Fprintf(stderr, "warning: %s\n", warning)
+			}
 		}
 		fmt.Fprintln(stderr, err)
 		return ExitCode(classified)
@@ -50,10 +54,17 @@ func ExecuteCreate(ctx context.Context, inv Invocation, stdout, stderr io.Writer
 		}
 		return ExitOK
 	}
-	if _, err := fmt.Fprintf(stdout, "created %s: rpm=%d deb=%d signed=%d removed=%d marker=%t noop=%t recovered=%t\n",
-		result.Dir, result.RPM, result.DEB, len(result.Signed), len(result.Removed), result.Marker, result.Noop, result.Recovered); err != nil {
+	skippedSuffix := ""
+	if len(result.Skipped) > 0 {
+		skippedSuffix = fmt.Sprintf(" skipped=%d", len(result.Skipped))
+	}
+	if _, err := fmt.Fprintf(stdout, "created %s: rpm=%d deb=%d signed=%d removed=%d%s marker=%t noop=%t recovered=%t\n",
+		result.Dir, result.RPM, result.DEB, len(result.Signed), len(result.Removed), skippedSuffix, result.Marker, result.Noop, result.Recovered); err != nil {
 		fmt.Fprintln(stderr, err)
 		return ExitRuntime
+	}
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(stderr, "warning: %s\n", warning)
 	}
 	if len(result.DroppedMetadata) != 0 {
 		fmt.Fprintf(stderr, "warning: replaced repodata/repomd.xml without metadata that SOW does not generate: %s\n", strings.Join(result.DroppedMetadata, ", "))

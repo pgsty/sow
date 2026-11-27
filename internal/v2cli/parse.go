@@ -55,6 +55,7 @@ type Invocation struct {
 	Rebind      bool
 	Delete      bool
 	DryRun      bool
+	Strict      bool
 	Protect     []string
 
 	MetadataTimestamp int64
@@ -91,13 +92,14 @@ type commandSpec struct {
 	rebind    bool
 	deleteOpt bool
 	prune     bool
+	strict    bool
 
 	metadataTimestamp bool
 }
 
 var commandSpecs = map[string]commandSpec{
-	"create":          {globals: usePassFile | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, pigsty: true, signWith: true, overwrite: true, metadataTimestamp: true},
-	"prune":           {globals: useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, jobs: true, prune: true, metadataTimestamp: true},
+	"create":          {globals: usePassFile | useTimeout | useNoWait | useJSON, minArgs: 0, maxArgs: 1, jobs: true, pigsty: true, signWith: true, overwrite: true, strict: true, metadataTimestamp: true},
+	"prune":           {globals: useTimeout | useNoWait | useJSON, minArgs: 1, maxArgs: 1, jobs: true, prune: true, strict: true, metadataTimestamp: true},
 	"init":            {globals: usePassFile | useJSON, minArgs: 0, maxArgs: 1},
 	"config check":    {globals: usePassFile | useWorkdir | useJSON},
 	"config show":     {globals: useWorkdir | useRepo | useDist | useJSON, all: true},
@@ -132,8 +134,8 @@ var commandSpecs = map[string]commandSpec{
 
 var errUsage = errors.New("usage error")
 
-var publicDurationPattern = regexp.MustCompile(`^\+?(?:(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:ms|s|m|h))+$`)
 var gpgKeyIDPattern = regexp.MustCompile(`(?i)^(?:[0-9a-f]{16}|[0-9a-f]{40}|[0-9a-f]{64})$`)
+var legacyOperationIDPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var exportDistPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
 func usageError(format string, args ...any) error {
@@ -269,8 +271,10 @@ func Parse(args []string) (Invocation, error) {
 		return Invocation{}, usageError("gc --delete requires TARGET")
 	}
 	if key == "log" && len(positionals) == 1 {
-		if _, err := parseNonnegativeInt64(positionals[0], "operation"); err != nil {
-			return Invocation{}, err
+		if !legacyOperationIDPattern.MatchString(positionals[0]) {
+			if _, err := parseNonnegativeInt64(positionals[0], "operation"); err != nil {
+				return Invocation{}, err
+			}
 		}
 	}
 	if (key == "retain add" || key == "retain rm") && len(positionals) == 1 {
@@ -314,15 +318,17 @@ func extractGlobal(args []string) ([]string, GlobalOptions, bool, bool, error) {
 			}
 			version = true
 		case "-N", "--no-wait":
-			if hasInline || out.noWaitSet {
-				return nil, out, false, false, usageError("%s is duplicated or has a value", name)
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, out, false, false, err
 			}
-			out.NoWait, out.noWaitSet = true, true
+			out.NoWait, out.noWaitSet = val, true
 		case "--json":
-			if hasInline || out.jsonSet {
-				return nil, out, false, false, usageError("--json is duplicated or has a value")
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, out, false, false, err
 			}
-			out.JSON, out.jsonSet = true, true
+			out.JSON, out.jsonSet = val, true
 		case "--passfile", "-C", "--workdir", "-r", "--repo", "-d", "--dist", "-T", "--timeout":
 			value := inline
 			if !hasInline {
@@ -337,29 +343,17 @@ func extractGlobal(args []string) ([]string, GlobalOptions, bool, bool, error) {
 			}
 			switch name {
 			case "--passfile":
-				if out.passfileSet {
-					return nil, out, false, false, usageError("--passfile is duplicated")
-				}
 				if err := signing.ValidatePath(value); err != nil {
 					return nil, out, false, false, usageError("--%v", err)
 				}
 				out.PassFile, out.passfileSet = value, true
 			case "-C", "--workdir":
-				if out.workdirSet {
-					return nil, out, false, false, usageError("--workdir is duplicated")
-				}
 				out.Workdir, out.workdirSet = value, true
 			case "-r", "--repo":
-				if out.repoSet {
-					return nil, out, false, false, usageError("--repo is duplicated")
-				}
 				out.Repo, out.repoSet = value, true
 			case "-d", "--dist":
 				out.Dists, out.distSet = append(out.Dists, value), true
 			case "-T", "--timeout":
-				if out.timeoutSet {
-					return nil, out, false, false, usageError("--timeout is duplicated")
-				}
 				duration, parseErr := parseDuration(value)
 				if parseErr != nil {
 					return nil, out, false, false, parseErr
@@ -382,9 +376,6 @@ func extractGlobal(args []string) ([]string, GlobalOptions, bool, bool, error) {
 func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, error) {
 	positionals := make([]string, 0, len(args))
 	stopped := false
-	metadataTimestampSet := false
-	jobsSet, pigstySet, signWithSet, overwriteSet, allSet, forceSet, formatSet := false, false, false, false, false, false, false
-	recursiveSet, skipSet, checkSet, hardlinkSet, abortSet, rebindSet, deleteSet := false, false, false, false, false, false, false
 	for i := 0; i < len(args); i++ {
 		token := args[i]
 		if token == "--" && !stopped {
@@ -398,10 +389,23 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 		name, inline, hasInline := splitOption(token)
 		switch name {
 		case "--dry-run":
-			if !spec.prune || inv.DryRun || hasInline {
-				return nil, usageError("option --dry-run is not allowed, duplicated, or has a value")
+			if !spec.prune {
+				return nil, usageError("option --dry-run is not allowed")
 			}
-			inv.DryRun = true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.DryRun = val
+		case "--strict":
+			if !spec.strict {
+				return nil, usageError("option --strict is not allowed")
+			}
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.Strict = val
 		case "--protect":
 			if !spec.prune {
 				return nil, usageError("option --protect is not allowed")
@@ -416,8 +420,8 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 			i = next
 			inv.Protect = append(inv.Protect, value)
 		case "-j", "--jobs":
-			if !spec.jobs || jobsSet {
-				return nil, usageError("option %s is not allowed or is duplicated", name)
+			if !spec.jobs {
+				return nil, usageError("option %s is not allowed", name)
 			}
 			value, next, err := optionValue(args, i, name, inline, hasInline)
 			if err != nil {
@@ -428,10 +432,10 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 			if err != nil || n < 1 {
 				return nil, usageError("--jobs must be an integer greater than or equal to 1")
 			}
-			inv.Jobs, jobsSet = n, true
+			inv.Jobs = n
 		case "--metadata-timestamp":
-			if !spec.metadataTimestamp || metadataTimestampSet {
-				return nil, usageError("option --metadata-timestamp is not allowed or is duplicated")
+			if !spec.metadataTimestamp {
+				return nil, usageError("option --metadata-timestamp is not allowed")
 			}
 			value, next, err := optionValue(args, i, name, inline, hasInline)
 			if err != nil {
@@ -442,15 +446,19 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 			if err != nil || n > uint64(yumrepo.MaxMetadataTimestamp) {
 				return nil, usageError("--metadata-timestamp must be Unix seconds in 0..%d", yumrepo.MaxMetadataTimestamp)
 			}
-			inv.MetadataTimestamp, metadataTimestampSet = int64(n), true
+			inv.MetadataTimestamp = int64(n)
 		case "--pigsty":
-			if !spec.pigsty || pigstySet || hasInline {
-				return nil, usageError("option --pigsty is not allowed, duplicated, or has a value")
+			if !spec.pigsty {
+				return nil, usageError("option --pigsty is not allowed")
 			}
-			inv.Pigsty, pigstySet = true, true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.Pigsty = val
 		case "-S", "--sign-with":
-			if !spec.signWith || signWithSet {
-				return nil, usageError("option %s is not allowed or is duplicated", name)
+			if !spec.signWith {
+				return nil, usageError("option %s is not allowed", name)
 			}
 			value, next, err := optionValue(args, i, name, inline, hasInline)
 			if err != nil {
@@ -461,25 +469,37 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 			if !gpgKeyIDPattern.MatchString(value) {
 				return nil, usageError("--sign-with must be a 16, 40, or 64 hexadecimal GPG key ID/fingerprint")
 			}
-			inv.SignWith, signWithSet = strings.ToUpper(value), true
+			inv.SignWith = strings.ToUpper(value)
 		case "--overwrite":
-			if !spec.overwrite || overwriteSet || hasInline {
-				return nil, usageError("option --overwrite is not allowed, duplicated, or has a value")
+			if !spec.overwrite {
+				return nil, usageError("option --overwrite is not allowed")
 			}
-			inv.Overwrite, overwriteSet = true, true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.Overwrite = val
 		case "--all":
-			if !spec.all || allSet || hasInline {
-				return nil, usageError("option --all is not allowed, duplicated, or has a value")
+			if !spec.all {
+				return nil, usageError("option --all is not allowed")
 			}
-			inv.All, allSet = true, true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.All = val
 		case "-f", "--force":
-			if !spec.force || forceSet || hasInline {
-				return nil, usageError("option %s is not allowed, duplicated, or has a value", name)
+			if !spec.force {
+				return nil, usageError("option %s is not allowed", name)
 			}
-			inv.Force, forceSet = true, true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.Force = val
 		case "--format":
-			if !spec.format || formatSet {
-				return nil, usageError("option --format is not allowed or is duplicated")
+			if !spec.format {
+				return nil, usageError("option --format is not allowed")
 			}
 			value, next, err := optionValue(args, i, name, inline, hasInline)
 			if err != nil {
@@ -489,47 +509,86 @@ func parseLocal(args []string, spec commandSpec, inv *Invocation) ([]string, err
 			if value != "rpm" && value != "deb" {
 				return nil, usageError("--format must be rpm or deb")
 			}
-			inv.Format, formatSet = value, true
+			inv.Format = value
 		case "-R", "--recursive":
-			if !spec.recursive || recursiveSet || hasInline {
-				return nil, usageError("option %s is not allowed, duplicated, or has a value", name)
+			if !spec.recursive {
+				return nil, usageError("option %s is not allowed", name)
 			}
-			inv.Recursive, recursiveSet = true, true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.Recursive = val
 		case "--skip":
-			if !spec.skip || skipSet || hasInline {
-				return nil, usageError("option --skip is not allowed, duplicated, or has a value")
+			if !spec.skip {
+				return nil, usageError("option --skip is not allowed")
 			}
-			inv.Skip, skipSet = true, true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.Skip = val
 		case "-c", "--check":
-			if !spec.check || checkSet || hasInline {
-				return nil, usageError("option %s is not allowed, duplicated, or has a value", name)
+			if !spec.check {
+				return nil, usageError("option %s is not allowed", name)
 			}
-			inv.Check, checkSet = true, true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.Check = val
 		case "--hardlink":
-			if !spec.hardlink || hardlinkSet || hasInline {
-				return nil, usageError("option --hardlink is not allowed, duplicated, or has a value")
+			if !spec.hardlink {
+				return nil, usageError("option --hardlink is not allowed")
 			}
-			inv.Hardlink, hardlinkSet = true, true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.Hardlink = val
 		case "--abort":
-			if !spec.abort || abortSet || hasInline {
-				return nil, usageError("option --abort is not allowed, duplicated, or has a value")
+			if !spec.abort {
+				return nil, usageError("option --abort is not allowed")
 			}
-			inv.Abort, abortSet = true, true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.Abort = val
 		case "--rebind":
-			if !spec.rebind || rebindSet || hasInline {
-				return nil, usageError("option --rebind is not allowed, duplicated, or has a value")
+			if !spec.rebind {
+				return nil, usageError("option --rebind is not allowed")
 			}
-			inv.Rebind, rebindSet = true, true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.Rebind = val
 		case "--delete":
-			if !spec.deleteOpt || deleteSet || hasInline {
-				return nil, usageError("option --delete is not allowed, duplicated, or has a value")
+			if !spec.deleteOpt {
+				return nil, usageError("option --delete is not allowed")
 			}
-			inv.Delete, deleteSet = true, true
+			val, err := parseBoolFlag(name, inline, hasInline)
+			if err != nil {
+				return nil, err
+			}
+			inv.Delete = val
 		default:
 			return nil, usageError("unknown option %q", token)
 		}
 	}
 	return positionals, nil
+}
+
+func parseBoolFlag(name, inline string, hasInline bool) (bool, error) {
+	if !hasInline {
+		return true, nil
+	}
+	val, err := strconv.ParseBool(inline)
+	if err != nil {
+		return false, usageError("%s expects a boolean value (true or false), got %q", name, inline)
+	}
+	return val, nil
 }
 
 func validateGlobalUse(command string, global GlobalOptions, allowed optionUse) error {
@@ -558,12 +617,9 @@ func parseDuration(value string) (time.Duration, error) {
 	if value == "0" {
 		return 0, nil
 	}
-	if !publicDurationPattern.MatchString(value) {
-		return 0, usageError("--timeout must be 0 or a positive Go duration using ms, s, m, or h")
-	}
 	duration, err := time.ParseDuration(value)
-	if err != nil || duration <= 0 {
-		return 0, usageError("--timeout must be 0 or a positive Go duration using ms, s, m, or h")
+	if err != nil || duration < 0 {
+		return 0, usageError("--timeout must be 0 or a non-negative Go duration (e.g. 0s, 500ms, 30s, 5m)")
 	}
 	return duration, nil
 }

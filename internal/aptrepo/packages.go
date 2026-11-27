@@ -70,7 +70,7 @@ func (w *PackagesWriter) writeAt(pkg Package, filename string) error {
 	if w.last != nil && comparePackages(*w.last, pkg) > 0 {
 		return ErrPackagesOutOfOrder
 	}
-	if w.last != nil && w.last.Name == pkg.Name && version.Compare(w.last.debianVersion, pkg.debianVersion) == 0 && w.last.Architecture == pkg.Architecture {
+	if w.last != nil && ComparePackageIdentity(*w.last, pkg) == 0 {
 		return ErrDuplicatePackageIdentity
 	}
 	paragraph := packageParagraph(pkg)
@@ -155,7 +155,7 @@ func writeFlatPackages(ctx context.Context, w io.Writer, packages []Package, ver
 		if err := validatePackageMetadata(pkg); err != nil {
 			return err
 		}
-		if previous != nil && previous.Name == pkg.Name && version.Compare(previous.debianVersion, pkg.debianVersion) == 0 && previous.Architecture == pkg.Architecture {
+		if previous != nil && ComparePackageIdentity(*previous, pkg) == 0 {
 			return ErrDuplicatePackageIdentity
 		}
 		base := filepath.Base(pkg.SourcePath)
@@ -198,14 +198,19 @@ func ComparePackages(a, b Package) int {
 	return comparePackages(a, b)
 }
 
-func comparePackages(a, b Package) int {
+// ComparePackageIdentity compares the coordinates used for duplicate detection.
+func ComparePackageIdentity(a, b Package) int {
 	if c := strings.Compare(a.Name, b.Name); c != 0 {
 		return c
 	}
 	if c := version.Compare(a.debianVersion, b.debianVersion); c != 0 {
 		return c
 	}
-	if c := strings.Compare(a.Architecture, b.Architecture); c != 0 {
+	return strings.Compare(a.Architecture, b.Architecture)
+}
+
+func comparePackages(a, b Package) int {
+	if c := ComparePackageIdentity(a, b); c != 0 {
 		return c
 	}
 	if c := strings.Compare(a.PoolPath, b.PoolPath); c != 0 {

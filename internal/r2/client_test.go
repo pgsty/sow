@@ -509,20 +509,22 @@ func TestReadProgressMonitorBoundsOnlyIdleTime(t *testing.T) {
 	})
 
 	t.Run("healthy slow stream", func(t *testing.T) {
-		reader, writer := io.Pipe()
-		go func() {
-			defer writer.Close()
-			for _, value := range []byte("healthy") {
-				time.Sleep(5 * time.Millisecond)
-				_, _ = writer.Write([]byte{value})
+		synctest.Test(t, func(t *testing.T) {
+			reader, writer := io.Pipe()
+			go func() {
+				defer writer.Close()
+				for _, value := range []byte("healthy") {
+					time.Sleep(5 * time.Millisecond)
+					_, _ = writer.Write([]byte{value})
+				}
+			}()
+			monitored := NewIdleReadCloser(context.Background(), reader, 20*time.Millisecond)
+			body, readErr := io.ReadAll(monitored)
+			closeErr := monitored.Close()
+			if readErr != nil || closeErr != nil || string(body) != "healthy" {
+				t.Fatalf("slow body=%q read=%v close=%v", body, readErr, closeErr)
 			}
-		}()
-		monitored := NewIdleReadCloser(context.Background(), reader, 20*time.Millisecond)
-		body, readErr := io.ReadAll(monitored)
-		closeErr := monitored.Close()
-		if readErr != nil || closeErr != nil || string(body) != "healthy" {
-			t.Fatalf("slow body=%q read=%v close=%v", body, readErr, closeErr)
-		}
+		})
 	})
 }
 

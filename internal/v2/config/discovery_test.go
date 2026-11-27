@@ -82,7 +82,6 @@ func TestDiscoverFallbackMatrix(t *testing.T) {
 		root string
 		src  DiscoverySource
 	}{
-		{"workdir misses then env", DiscoverOptions{Workdir: none, CWD: cwd, SOWDir: env}, envRoot, DiscoveryEnvironment},
 		{"cwd", DiscoverOptions{CWD: cwd, SOWDir: env}, cwdRoot, DiscoveryCWD},
 		{"env fallback", DiscoverOptions{CWD: none, SOWDir: env}, envRoot, DiscoveryEnvironment},
 	}
@@ -99,10 +98,12 @@ func TestDiscoverFallbackMatrix(t *testing.T) {
 	}
 }
 
-func TestDiscoverExplicitWorkdirNeverFallsBackToCWD(t *testing.T) {
+func TestDiscoverExplicitWorkdirNeverFallsBackToCWDOrEnv(t *testing.T) {
 	base := t.TempDir()
 	cwdRoot := filepath.Join(base, "cwd-ws")
+	envRoot := filepath.Join(base, "env-ws")
 	writeConfigFixture(t, cwdRoot)
+	writeConfigFixture(t, envRoot)
 	cwd := filepath.Join(cwdRoot, "deep")
 	missingWorkdir := filepath.Join(base, "missing-workdir")
 	if err := os.MkdirAll(cwd, 0o755); err != nil {
@@ -112,11 +113,11 @@ func TestDiscoverExplicitWorkdirNeverFallsBackToCWD(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := Discover(DiscoverOptions{Workdir: missingWorkdir, CWD: cwd})
+	_, err := Discover(DiscoverOptions{Workdir: missingWorkdir, CWD: cwd, SOWDir: envRoot})
 	if err == nil {
-		t.Fatal("explicit workdir unexpectedly fell back to cwd workspace")
+		t.Fatal("explicit workdir unexpectedly fell back to cwd or SOW_DIR workspace")
 	}
-	if !strings.Contains(err.Error(), "workdir") || strings.Contains(err.Error(), "cwd=") {
+	if !strings.Contains(err.Error(), "workdir") || strings.Contains(err.Error(), "cwd=") || strings.Contains(err.Error(), "SOW_DIR=") {
 		t.Fatalf("discovery error = %v, want only explicit workdir evidence", err)
 	}
 }
@@ -149,8 +150,12 @@ func TestDiscoverEnvironmentAndFailures(t *testing.T) {
 	if err := os.Symlink(filepath.Join(root, ConfigFilename), filepath.Join(symlinkRoot, ConfigFilename)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Discover(DiscoverOptions{Workdir: symlinkRoot, CWD: filepath.Join(base, "missing"), SOWDir: filepath.Join(base, "also-missing")}); err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("symlink config error = %v", err)
+	ws, err = Discover(DiscoverOptions{Workdir: symlinkRoot, CWD: filepath.Join(base, "missing")})
+	if err != nil {
+		t.Fatalf("symlinked sow.yml should be accepted: %v", err)
+	}
+	if _, err := LoadWorkspace(ws); err != nil {
+		t.Fatalf("LoadWorkspace on symlinked sow.yml: %v", err)
 	}
 }
 
@@ -177,7 +182,7 @@ func TestDiscoverSymlinkStartsPreservePriorityAndConfigBoundary(t *testing.T) {
 			t.Fatalf("symlink SOW_DIR = %#v, err=%v", ws, err)
 		}
 	})
-	t.Run("workdir miss still falls back to environment", func(t *testing.T) {
+	t.Run("explicit workdir miss does not fall back to environment", func(t *testing.T) {
 		empty := filepath.Join(base, "empty")
 		if err := os.Mkdir(empty, 0o755); err != nil {
 			t.Fatal(err)
@@ -186,25 +191,28 @@ func TestDiscoverSymlinkStartsPreservePriorityAndConfigBoundary(t *testing.T) {
 		if err := os.Symlink(empty, emptyLink); err != nil {
 			t.Fatal(err)
 		}
-		ws, err := Discover(DiscoverOptions{Workdir: emptyLink, CWD: missing, SOWDir: link})
-		if err != nil || ws.Root != realPath(t, root) || ws.Source != DiscoveryEnvironment {
-			t.Fatalf("symlink miss fallback = %#v, err=%v", ws, err)
+		if _, err := Discover(DiscoverOptions{Workdir: emptyLink, CWD: missing, SOWDir: link}); err == nil {
+			t.Fatal("explicit workdir miss unexpectedly fell back to SOW_DIR")
 		}
 	})
-	t.Run("config symlink is a hard error", func(t *testing.T) {
-		bad := filepath.Join(base, "bad-workspace")
-		if err := os.Mkdir(bad, 0o755); err != nil {
+	t.Run("config symlink is supported", func(t *testing.T) {
+		linkedWS := filepath.Join(base, "linked-workspace")
+		if err := os.Mkdir(linkedWS, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Symlink(filepath.Join(root, ConfigFilename), filepath.Join(bad, ConfigFilename)); err != nil {
+		if err := os.Symlink(filepath.Join(root, ConfigFilename), filepath.Join(linkedWS, ConfigFilename)); err != nil {
 			t.Fatal(err)
 		}
-		badLink := filepath.Join(base, "bad-workspace-link")
-		if err := os.Symlink(bad, badLink); err != nil {
+		wsLink := filepath.Join(base, "linked-workspace-link")
+		if err := os.Symlink(linkedWS, wsLink); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Discover(DiscoverOptions{Workdir: badLink, CWD: missing, SOWDir: link}); err == nil || !strings.Contains(err.Error(), "is a symlink") {
-			t.Fatalf("config symlink unexpectedly accepted or fell back: %v", err)
+		ws, err := Discover(DiscoverOptions{Workdir: wsLink, CWD: missing})
+		if err != nil {
+			t.Fatalf("symlinked config should work: %v", err)
+		}
+		if _, err := LoadWorkspace(ws); err != nil {
+			t.Fatalf("LoadWorkspace on symlinked config: %v", err)
 		}
 	})
 	t.Run("regular file start remains rejected", func(t *testing.T) {
@@ -214,7 +222,7 @@ func TestDiscoverSymlinkStartsPreservePriorityAndConfigBoundary(t *testing.T) {
 	})
 }
 
-func TestLoadWorkspaceRejectsAncestorReplacementAfterDiscovery(t *testing.T) {
+func TestLoadWorkspaceDetectsRootReplacementAfterDiscovery(t *testing.T) {
 	base := t.TempDir()
 	live := filepath.Join(base, "live")
 	workspaceRoot := filepath.Join(live, "workspace")
@@ -234,38 +242,12 @@ func TestLoadWorkspaceRejectsAncestorReplacementAfterDiscovery(t *testing.T) {
 	if err := os.Symlink(external, live); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(workspace.ConfigPath); err == nil {
-		t.Fatal("generic config load followed a replaced ancestor symlink")
-	}
 	if _, err := LoadWorkspace(workspace); err == nil {
-		t.Fatalf("workspace ancestor replacement accepted: %v", err)
+		t.Fatalf("workspace root replacement accepted")
 	}
 }
 
-func TestWorkspaceConfigReadDetectsAncestorReplacementAfterParentBinding(t *testing.T) {
-	base := t.TempDir()
-	live := filepath.Join(base, "live")
-	workspaceRoot := filepath.Join(live, "workspace")
-	external := filepath.Join(base, "external")
-	writeConfigFixture(t, workspaceRoot)
-	writeConfigFixture(t, filepath.Join(external, "workspace"))
-	workspace, err := Discover(DiscoverOptions{Workdir: workspaceRoot, CWD: workspaceRoot})
-	if err != nil {
-		t.Fatal(err)
-	}
-	original := filepath.Join(base, "original")
-	data, _, err := readConfigFileBound(workspace.ConfigPath, workspace.rootDevice, workspace.rootInode, func() error {
-		if err := os.Rename(live, original); err != nil {
-			return err
-		}
-		return os.Symlink(external, live)
-	})
-	if err == nil {
-		t.Fatalf("workspace ancestor replacement accepted with data %q", data)
-	}
-}
-
-func TestDiscoverHintsWhenSOWYAMLExistsWithoutSOWYML(t *testing.T) {
+func TestDiscoverSupportsSOWYAML(t *testing.T) {
 	root := t.TempDir()
 	nested := filepath.Join(root, "sub", "dir")
 	if err := os.MkdirAll(nested, 0o755); err != nil {
@@ -274,11 +256,19 @@ func TestDiscoverHintsWhenSOWYAMLExistsWithoutSOWYML(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "sow.yaml"), []byte("schema: sow/v3\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Discover(DiscoverOptions{Workdir: root}); err == nil || !strings.Contains(err.Error(), "found sow.yaml (SOW uses sow.yml)") {
-		t.Fatalf("explicit workdir error=%v, want sow.yaml hint", err)
+	ws, err := Discover(DiscoverOptions{Workdir: root})
+	if err != nil {
+		t.Fatalf("Discover(sow.yaml): %v", err)
 	}
-	if _, err := Discover(DiscoverOptions{CWD: nested}); err == nil || !strings.Contains(err.Error(), "found sow.yaml (SOW uses sow.yml)") {
-		t.Fatalf("upward walk error=%v, want sow.yaml hint", err)
+	if filepath.Base(ws.ConfigPath) != AltConfigFilename {
+		t.Fatalf("ConfigPath=%q, want %s", ws.ConfigPath, AltConfigFilename)
+	}
+	if _, err := LoadWorkspace(ws); err != nil {
+		t.Fatalf("LoadWorkspace(sow.yaml): %v", err)
+	}
+	wsNested, err := Discover(DiscoverOptions{CWD: nested})
+	if err != nil || wsNested.Root != ws.Root {
+		t.Fatalf("upward walk for sow.yaml = %#v, err=%v", wsNested, err)
 	}
 }
 

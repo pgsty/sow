@@ -105,6 +105,7 @@ type Options struct {
 	Dir       string
 	Jobs      int
 	Pigsty    bool
+	Strict    bool
 	SignWith  string
 	PassFile  string
 	Overwrite bool
@@ -116,18 +117,27 @@ type Options struct {
 	Fault func(Fault) error
 }
 
+// SkippedPackage records a package file that was skipped due to corruption,
+// unsupported format, or conflict in default fault-tolerant mode.
+type SkippedPackage struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
+
 type Result struct {
-	Dir          string   `json:"dir"`
-	RPM          int      `json:"rpm"`
-	DEB          int      `json:"deb"`
-	Kept         []string `json:"kept"`
-	Removed      []string `json:"removed"`
-	Signed       []string `json:"signed,omitempty"`
-	Signer       string   `json:"signer,omitempty"`
-	Marker       bool     `json:"marker"`
-	MarkerSHA256 string   `json:"marker_sha256,omitempty"`
-	Noop         bool     `json:"noop"`
-	Recovered    bool     `json:"recovered"`
+	Dir          string           `json:"dir"`
+	RPM          int              `json:"rpm"`
+	DEB          int              `json:"deb"`
+	Kept         []string         `json:"kept"`
+	Removed      []string         `json:"removed"`
+	Skipped      []SkippedPackage `json:"skipped,omitempty"`
+	Warnings     []string         `json:"warnings,omitempty"`
+	Signed       []string         `json:"signed,omitempty"`
+	Signer       string           `json:"signer,omitempty"`
+	Marker       bool             `json:"marker"`
+	MarkerSHA256 string           `json:"marker_sha256,omitempty"`
+	Noop         bool             `json:"noop"`
+	Recovered    bool             `json:"recovered"`
 	// DroppedMetadata lists repomd.xml data types, such as group or modules,
 	// that the replaced index carried but SOW does not generate.
 	DroppedMetadata []string `json:"dropped_metadata,omitempty"`
@@ -136,6 +146,9 @@ type Result struct {
 func normalizeOptions(ctx context.Context, opts Options) (Options, error) {
 	if ctx == nil {
 		return Options{}, &Error{Kind: KindUsage, Op: "create", Err: errors.New("nil context")}
+	}
+	if err := ctx.Err(); err != nil {
+		return Options{}, err
 	}
 	if opts.Dir == "" {
 		opts.Dir = "."

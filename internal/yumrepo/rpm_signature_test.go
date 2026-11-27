@@ -1118,12 +1118,12 @@ func TestVerifyEmbeddedRPMSignaturesRejectsHeaderAndPayloadTampering(t *testing.
 	layout := testRPMVerificationLayout(t, data)
 
 	headerTampered := append([]byte(nil), data...)
-	digest := []byte(strings.ToLower(layout.payloadDigests[0]))
-	offset := bytes.Index(headerTampered[layout.mainHeaderStart:layout.mainHeaderEnd], digest)
+	// Change ordinary header data and leave the signed digest field intact.
+	offset := bytes.Index(headerTampered[layout.mainHeaderStart:layout.mainHeaderEnd], []byte("pgdg-redhat"))
 	if offset < 0 {
-		t.Fatalf("payload digest %q is absent from signed main header", digest)
+		t.Fatal("package name missing from header")
 	}
-	headerTampered[int(layout.mainHeaderStart)+offset] ^= 1 // 0..9/a..f remains hexadecimal for this fixture.
+	headerTampered[int(layout.mainHeaderStart)+offset] = 'x'
 	_, err := VerifyEmbeddedRPMSignatures(context.Background(), bytes.NewReader(headerTampered), keyring, rpmSignatureVerificationTime)
 	if !errors.Is(err, ErrRPMPackageSignature) || !strings.Contains(err.Error(), "not valid under the trusted keyring") {
 		t.Fatalf("signed-header tamper error=%v", err)
@@ -1565,7 +1565,7 @@ func TestInspectEmbeddedRPMSignaturesRejectsUnsignedAndMalformedPackets(t *testi
 	if closeErr != nil {
 		t.Fatal(closeErr)
 	}
-	if !errors.Is(inspectErr, ErrEmbeddedSignature) || !strings.Contains(inspectErr.Error(), "no PGP, GPG, RSA, or DSA") {
+	if !errors.Is(inspectErr, ErrEmbeddedSignature) || !errors.Is(inspectErr, ErrUnsignedRPMPackage) {
 		t.Fatalf("unsigned RPM error=%v", inspectErr)
 	}
 
@@ -1907,9 +1907,13 @@ func insertFixtureSignatureTags(t *testing.T, filename string, tags []fixtureSig
 	for i, tag := range tags {
 		offset := i * 16
 		binary.BigEndian.PutUint32(indexes[offset:offset+4], tag.id)
-		binary.BigEndian.PutUint32(indexes[offset+4:offset+8], 7) // RPM_BIN_TYPE.
+		kind, count := uint32(7), len(tag.packet) // BIN
+		if tag.id == 278 {
+			kind, count = 8, bytes.Count(tag.packet, []byte{0})
+		} // STRING_ARRAY
+		binary.BigEndian.PutUint32(indexes[offset+4:offset+8], kind)
 		binary.BigEndian.PutUint32(indexes[offset+8:offset+12], uint32(store.Len()))
-		binary.BigEndian.PutUint32(indexes[offset+12:offset+16], uint32(len(tag.packet)))
+		binary.BigEndian.PutUint32(indexes[offset+12:offset+16], uint32(count))
 		store.Write(tag.packet)
 	}
 	binary.BigEndian.PutUint32(descriptor[12:16], uint32(store.Len()))
@@ -1917,5 +1921,88 @@ func insertFixtureSignatureTags(t *testing.T, filename string, tags []fixtureSig
 	updated := bytes.Join([][]byte{data[:96], descriptor, indexes, store.Bytes(), padding, data[112:]}, nil)
 	if err := os.WriteFile(filename, updated, 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func verifyOpenPGPV4DetachedSignature(signed io.Reader, encoded []byte, keyring openpgp.KeyRing, createdAt time.Time) (openpgp.Key, error) {
+	signature, hasher, err := prepareOpenPGPSignatureHash(encoded, createdAt)
+	if err != nil {
+		return openpgp.Key{}, err
+	}
+	if _, err := io.Copy(hasher, signed); err != nil {
+		return openpgp.Key{}, err
+	}
+	return verifyPreparedOpenPGPSignature(hasher, signature, keyring, createdAt)
+}
+
+func TestVerifyRPMOpenPGPArray(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "modern.rpm")
+	const payload = "fixture payload"
+	digest := sha256.Sum256([]byte(payload))
+	writeRPMFixture(t, path, "modern", stringTag(rpmTagPayloadDigest, hex.EncodeToString(digest[:])))
+	unsigned, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := unsigned[112 : len(unsigned)-len(payload)]
+	var ring openpgp.EntityList
+	var packets [][]byte
+	for _, modern := range []bool{false, true} {
+		cfg := &packet.Config{Algorithm: packet.PubKeyAlgoRSA, RSABits: 2048, V6Keys: modern, Time: func() time.Time { return rpmSignatureVerificationTime.Add(-time.Hour) }}
+		key, err := openpgp.NewEntity("Package signer", "", "signer@example.invalid", cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var sig bytes.Buffer
+		if err := openpgp.DetachSign(&sig, key, bytes.NewReader(header), cfg); err != nil {
+			t.Fatal(err)
+		}
+		ring = append(ring, key)
+		packets = append(packets, sig.Bytes())
+	}
+	array := func(data []byte) []byte { return append([]byte(base64.StdEncoding.EncodeToString(data)), 0) }
+	for _, tc := range []struct {
+		name  string
+		tags  []fixtureSignatureTag
+		count int
+	}{
+		{"only", []fixtureSignatureTag{{278, array(packets[0])}}, 1},
+		{"v6 packet", []fixtureSignatureTag{{278, array(packets[1])}}, 1},
+		{"multiple with legacy copy", []fixtureSignatureTag{{268, packets[0]}, {278, append(array(packets[0]), array(packets[1])...)}}, 2},
+		{"invalid second signature", []fixtureSignatureTag{{268, packets[0]}, {278, append(array(packets[0]), []byte("invalid!\x00")...)}}, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(path, unsigned, 0644); err != nil {
+				t.Fatal(err)
+			}
+			insertFixtureSignatureTags(t, path, tc.tags)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proofs, err := VerifyEmbeddedRPMSignatures(ctx, bytes.NewReader(data), ring, rpmSignatureVerificationTime)
+			if tc.count == 0 {
+				if !errors.Is(err, ErrRPMPackageSignature) {
+					t.Fatalf("invalid array: %v", err)
+				}
+				return
+			}
+			if err != nil || len(proofs) != tc.count {
+				t.Fatalf("proofs=%v err=%v", proofs, err)
+			}
+			for _, proof := range proofs {
+				if proof.HeaderTagID != 278 || proof.Coverage != RPMSignatureCoverageHeaderPayloadDigest || proof.PayloadDigest != hex.EncodeToString(digest[:]) {
+					t.Fatalf("proof=%+v", proof)
+				}
+			}
+			if tc.name == "v6 packet" && proofs[0].PacketVersion != 6 {
+				t.Fatalf("signature version=%d", proofs[0].PacketVersion)
+			}
+			data[len(data)-1] ^= 1
+			if _, err := VerifyEmbeddedRPMSignatures(ctx, bytes.NewReader(data), ring, rpmSignatureVerificationTime); !errors.Is(err, ErrRPMPackageSignature) {
+				t.Fatalf("changed payload: %v", err)
+			}
+		})
 	}
 }

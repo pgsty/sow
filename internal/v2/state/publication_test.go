@@ -502,7 +502,7 @@ func TestPublicationStatePersistsPrivateRecordsAndTextGeneration(t *testing.T) {
 	if _, err := store.DB().Exec(`UPDATE publication_target_bindings SET max_cache_ttl_ns = ? WHERE target_identity = ?`, binding.MaxCacheTTL.Nanoseconds(), binding.TargetIdentity); err != nil {
 		t.Fatal(err)
 	}
-	short := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: checkpoint.CheckpointIdentity, VerifiedAt: verified, NotBefore: verified.Add(29 * 24 * time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
+	short := GraceRecord{TargetIdentity: binding.TargetIdentity, CheckpointIdentity: checkpoint.CheckpointIdentity, VerifiedAt: verified, NotBefore: verified.Add(binding.MaxCacheTTL - time.Hour), CachePolicyIdentity: strings.Repeat("c", 64)}
 	if err := store.PutGraceRecord(ctx, &short); !errors.Is(err, ErrConflict) {
 		t.Fatalf("short grace error=%v", err)
 	}
@@ -876,9 +876,17 @@ func TestPublicationStateRejectsUnsortedViewsOverlapShortGraceAndR2Delete(t *tes
 	overlap := binding
 	overlap.TargetName = "overlap"
 	overlap.Prefix = "prod"
-	overlap.TargetIdentity = publicationIdentity("sow/target/v1", overlap.TargetStorageID, overlap.Prefix)
+	overlap.Region = "us-east-1"
+	overlap.TargetStorageID, overlap.TargetIdentity, overlap.ConfigIdentity = "", "", ""
 	if err := store.BindPublicationTarget(ctx, overlap); !errors.Is(err, ErrConflict) {
 		t.Fatalf("overlap error=%v", err)
+	}
+	overlap.Prefix = "sibling"
+	if err := store.BindPublicationTarget(ctx, overlap); err != nil {
+		t.Fatalf("disjoint prefix on same bucket: %v", err)
+	}
+	if err := store.BindPublicationTarget(ctx, binding); err != nil {
+		t.Fatalf("resume original binding: %v", err)
 	}
 	_, manifestSHA, _ := ManifestBytes(manifest)
 	attempt := PublicationAttempt{RepositoryID: binding.RepositoryID, TargetIdentity: binding.TargetIdentity, TargetGeneration: 1, ManifestSHA256: manifestSHA, PlanSHA256: strings.Repeat("b", 64), Phase: "planned", Views: []PublicationAttemptView{

@@ -450,8 +450,13 @@ func TestEncryptedMetadataKeysUseReferencedPassphraseWithoutPersistence(t *testi
 
 func managedTestPrivateKey(t *testing.T, name string) ([]byte, string) {
 	t.Helper()
+	return managedTestPrivateKeyWithAlgorithm(t, name, packet.PubKeyAlgoRSA)
+}
+
+func managedTestPrivateKeyWithAlgorithm(t *testing.T, name string, algo packet.PublicKeyAlgorithm) ([]byte, string) {
+	t.Helper()
 	created := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-	packetConfig := &packet.Config{
+	packetConfig := &packet.Config{Algorithm: algo, Curve: packet.CurveNistP256,
 		DefaultHash: crypto.SHA256,
 		RSABits:     1024,
 		Time:        func() time.Time { return created },

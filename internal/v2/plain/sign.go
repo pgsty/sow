@@ -1,6 +1,7 @@
 package plain
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -8,10 +9,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/pgsty/sow/internal/v2/signing"
@@ -66,7 +67,11 @@ func stageSignedRPMs(ctx context.Context, root, stage string, scan scanResult, o
 		return scan, nil
 	}
 	if !scan.hasRPM {
-		return scanResult{}, &Error{Kind: KindRejected, Op: "sign rpm", Err: errors.New("--sign-with requires at least one retained top-level RPM package")}
+		if opts.Strict {
+			return scanResult{}, &Error{Kind: KindRejected, Op: "sign rpm", Err: errors.New("--sign-with requires at least one retained top-level RPM package")}
+		}
+		scan.warnings = append(scan.warnings, "--sign-with specified but no RPM packages were retained to sign")
+		return scan, nil
 	}
 
 	type group struct {
@@ -110,14 +115,17 @@ func stageSignedRPMs(ctx context.Context, root, stage string, scan scanResult, o
 				return scanResult{}, &Error{Kind: KindRuntime, Op: "inspect rpm signature", Path: representative.originalPath, Err: err}
 			}
 			needsSigning = len(signatures) == 0
-			if !needsSigning && signKeyring != nil {
-				if err := verifyExistingSignedRPM(ctx, representative.originalPath, signatures, signKeyring); err != nil {
-					return scanResult{}, &Error{Kind: KindIntegrity, Op: "verify existing rpm signature", Path: representative.originalPath, Err: err}
-				}
-			}
 		}
 		if !needsSigning {
 			continue
+		}
+		// Reject symlinked RPMs that require in-place signing upfront before
+		// publication can withdraw markers or partially install outputs.
+		for _, original := range current.facts {
+			linfo, lerr := os.Lstat(original.originalPath)
+			if lerr != nil || !linfo.Mode().IsRegular() || linfo.Mode()&os.ModeSymlink != 0 {
+				return scanResult{}, &Error{Kind: KindRejected, Op: "sign rpm", Path: original.base, Err: errors.New("cannot sign symlinked or non-regular RPM in place")}
+			}
 		}
 		if !packageDirCreated {
 			if err := os.Mkdir(packageDir, 0o700); err != nil {
@@ -131,7 +139,7 @@ func stageSignedRPMs(ctx context.Context, root, stage string, scan scanResult, o
 			return scanResult{}, err
 		}
 		signedPath := filepath.Join(packageDir, representative.base)
-		if err := copyStageRPM(ctx, representative.originalPath, signedPath, representative.originalSHA256); err != nil {
+		if err := copyStageRPM(ctx, representative.originalPath, signedPath); err != nil {
 			return scanResult{}, err
 		}
 		if err := signer(ctx, signedPath, opts.SignWith, opts.Overwrite); err != nil {
@@ -161,7 +169,7 @@ func stageSignedRPMs(ctx context.Context, root, stage string, scan scanResult, o
 			path := signedPath
 			if index != 0 {
 				path = filepath.Join(packageDir, original.base)
-				if err := copyStageRPM(ctx, signedPath, path, ""); err != nil {
+				if err := copyStageRPM(ctx, signedPath, path); err != nil {
 					return scanResult{}, err
 				}
 				if err := preserveStageRPMMetadata(path, original.originalPath); err != nil {
@@ -205,26 +213,10 @@ func preserveStageRPMMetadata(target, original string) error {
 	if err != nil || !targetInfo.Mode().IsRegular() || targetInfo.Mode()&os.ModeSymlink != 0 {
 		return &Error{Kind: KindRuntime, Op: "inspect rpm signing output", Path: target, Err: errors.Join(err, errors.New("output is not a regular file"))}
 	}
-	info, err := os.Lstat(original)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+	info, err := os.Stat(original)
+	if err != nil || !info.Mode().IsRegular() {
 		return &Error{Kind: KindRuntime, Op: "inspect rpm signing mode", Path: original, Err: errors.Join(err, errors.New("input is not a regular file"))}
 	}
-	wantOwner, err := ownershipFromInfo(info)
-	if err != nil {
-		return &Error{Kind: KindRuntime, Op: "inspect rpm signing ownership", Path: original, Err: err}
-	}
-	gotOwner, err := ownershipFromInfo(targetInfo)
-	if err != nil {
-		return &Error{Kind: KindRuntime, Op: "inspect rpm signing ownership", Path: target, Err: err}
-	}
-	if gotOwner != wantOwner {
-		if err := os.Chown(target, wantOwner.uid, wantOwner.gid); err != nil && !errors.Is(err, syscall.EPERM) {
-			return &Error{Kind: KindRuntime, Op: "preserve rpm signing ownership", Path: target, Err: err}
-		}
-	}
-	// A signing helper may leave mode 000. The private stage is owner-only, so
-	// make the already-bound inode temporarily accessible, reopen it, and then
-	// restore the complete source metadata through that descriptor.
 	if err := os.Chmod(target, 0o600); err != nil {
 		return &Error{Kind: KindRuntime, Op: "open rpm signing output", Path: target, Err: err}
 	}
@@ -246,6 +238,47 @@ func preserveStageRPMMetadata(target, original string) error {
 	return nil
 }
 
+func exportCommandSignKeyring(ctx context.Context, key string) (openpgp.KeyRing, error) {
+	gpg, err := exec.LookPath("gpg")
+	if err != nil {
+		return nil, errors.New("gpg executable is required for --sign-with")
+	}
+	command := exec.CommandContext(ctx, gpg, "--batch", "--no-tty", "--export", "0x"+key)
+	command.WaitDelay = 5 * time.Second
+	stderrBuf := &limitedStderrBuffer{limit: 4096}
+	command.Stderr = stderrBuf
+	publicKey, err := command.Output()
+	if err != nil || len(publicKey) == 0 {
+		if detail := stderrBuf.Summary(512); detail != "" {
+			return nil, fmt.Errorf("cannot export configured OpenPGP public key from gpg: %s", detail)
+		}
+		return nil, errors.New("cannot export configured OpenPGP public key from gpg")
+	}
+	return yumrepo.ParseRPMPackageKeyring(publicKey)
+}
+
+func verifyCryptographicRPMSignature(ctx context.Context, path string, signKeyring openpgp.KeyRing) error {
+	file, err := openRegularFile(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = yumrepo.VerifyEmbeddedRPMSignatures(ctx, file, signKeyring, time.Now().UTC())
+	return err
+}
+
+func signatureNeutralDigest(ctx context.Context, path string) (string, error) {
+	file, err := openRegularFile(path)
+	if err != nil {
+		return "", &Error{Kind: KindRuntime, Op: "open rpm for signature-neutral digest", Path: path, Err: err}
+	}
+	digest, digestErr := yumrepo.RPMSignatureNeutralDigest(ctx, file)
+	if err := errors.Join(digestErr, file.Close()); err != nil {
+		return "", &Error{Kind: KindRuntime, Op: "hash signature-neutral rpm", Path: path, Err: err}
+	}
+	return digest, nil
+}
+
 func embeddedRPMSignaturesAllowUnsigned(ctx context.Context, path string) ([]yumrepo.EmbeddedRPMSignature, error) {
 	signatures, err := embeddedRPMSignatures(ctx, path)
 	if errors.Is(err, yumrepo.ErrUnsignedRPMPackage) {
@@ -254,59 +287,8 @@ func embeddedRPMSignaturesAllowUnsigned(ctx context.Context, path string) ([]yum
 	return signatures, err
 }
 
-func exportCommandSignKeyring(ctx context.Context, key string) (openpgp.KeyRing, error) {
-	gpg, err := exec.LookPath("gpg")
-	if err != nil {
-		return nil, errors.New("gpg executable is required for --sign-with")
-	}
-	command := exec.CommandContext(ctx, gpg, "--batch", "--no-tty", "--export", "0x"+key)
-	command.WaitDelay = 5 * time.Second
-	command.Stderr = io.Discard
-	publicKey, err := command.Output()
-	if err != nil || len(publicKey) == 0 {
-		return nil, errors.New("cannot export configured OpenPGP public key from gpg")
-	}
-	return yumrepo.ParseRPMPackageKeyring(publicKey)
-}
-
-func verifyExistingSignedRPM(ctx context.Context, path string, signatures []yumrepo.EmbeddedRPMSignature, signKeyring openpgp.KeyRing) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	if err := yumrepo.VerifyPackageDigests(ctx, file); err != nil {
-		return err
-	}
-	claimsSignKey := false
-	for _, sig := range signatures {
-		if id, parseErr := strconv.ParseUint(sig.IssuerKeyID, 16, 64); parseErr == nil && len(signKeyring.KeysById(id)) != 0 {
-			claimsSignKey = true
-			break
-		}
-	}
-	if !claimsSignKey {
-		return nil
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	_, err = yumrepo.VerifyEmbeddedRPMSignatures(ctx, file, signKeyring, time.Now().UTC())
-	return err
-}
-
-func verifyCryptographicRPMSignature(ctx context.Context, path string, signKeyring openpgp.KeyRing) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	_, err = yumrepo.VerifyEmbeddedRPMSignatures(ctx, file, signKeyring, time.Now().UTC())
-	return err
-}
-
 func embeddedRPMSignatures(ctx context.Context, path string) ([]yumrepo.EmbeddedRPMSignature, error) {
-	file, err := os.Open(path)
+	file, err := openRegularFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -324,32 +306,16 @@ func embeddedRPMSignatures(ctx context.Context, path string) ([]yumrepo.Embedded
 	return signatures, nil
 }
 
-func signatureNeutralDigest(ctx context.Context, path string) (string, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return "", &Error{Kind: KindRuntime, Op: "open rpm for signature-neutral digest", Path: path, Err: err}
-	}
-	digest, digestErr := yumrepo.RPMSignatureNeutralDigest(ctx, file)
-	if err := errors.Join(digestErr, file.Close()); err != nil {
-		return "", &Error{Kind: KindRuntime, Op: "hash signature-neutral rpm", Path: path, Err: err}
-	}
-	return digest, nil
-}
-
-func copyStageRPM(ctx context.Context, source, target, expectedSHA string) (_ error) {
-	before, err := os.Lstat(source)
-	if err != nil || !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 {
+func copyStageRPM(ctx context.Context, source, target string) error {
+	before, err := os.Stat(source)
+	if err != nil || !before.Mode().IsRegular() {
 		return &Error{Kind: KindRuntime, Op: "inspect rpm signing input", Path: source, Err: errors.Join(err, errors.New("input is not a regular file"))}
 	}
-	in, err := os.Open(source)
+	in, err := openRegularFile(source)
 	if err != nil {
 		return &Error{Kind: KindRuntime, Op: "open rpm signing input", Path: source, Err: err}
 	}
 	defer in.Close()
-	opened, err := in.Stat()
-	if err != nil || !os.SameFile(before, opened) {
-		return &Error{Kind: KindIntegrity, Op: "bind rpm signing input", Path: source, Err: errors.Join(err, errors.New("input changed while opening"))}
-	}
 	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return &Error{Kind: KindRuntime, Op: "create rpm signing stage", Path: target, Err: err}
@@ -369,19 +335,6 @@ func copyStageRPM(ctx context.Context, source, target, expectedSHA string) (_ er
 	}
 	if err := errors.Join(out.Sync(), out.Close()); err != nil {
 		return &Error{Kind: KindRuntime, Op: "sync rpm signing stage", Path: target, Err: err}
-	}
-	after, err := os.Lstat(source)
-	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
-		return &Error{Kind: KindIntegrity, Op: "bind rpm signing input", Path: source, Err: errors.Join(err, errors.New("input changed while copying"))}
-	}
-	if expectedSHA != "" {
-		digest, err := hashFile(ctx, target)
-		if err != nil {
-			return err
-		}
-		if digest != expectedSHA {
-			return &Error{Kind: KindIntegrity, Op: "verify rpm signing stage", Path: target, Err: errors.New("stage copy differs from inspected input")}
-		}
 	}
 	ok = true
 	return nil
@@ -417,13 +370,46 @@ func signRPMWithCommand(ctx context.Context, root, path, key string, overwrite b
 	args = append(args, operation, "--", path)
 	command := exec.CommandContext(ctx, rpm, args...)
 	command.WaitDelay = 5 * time.Second
-	// The RPM/GPG environment may contain secret-bearing pinentry or macro
-	// diagnostics. Suppress child output rather than reflecting it through the
-	// CLI/JSON error surface; the operation and exit status remain actionable.
+	stderrBuf := &limitedStderrBuffer{limit: 4096}
 	command.Stdout = io.Discard
-	command.Stderr = io.Discard
+	command.Stderr = stderrBuf
 	if err := command.Run(); err != nil {
+		detail := stderrBuf.Summary(512)
+		if detail != "" {
+			return fmt.Errorf("rpm %s failed: %w (%s)", operation, err, detail)
+		}
 		return fmt.Errorf("rpm %s failed: %w", operation, err)
 	}
 	return nil
+}
+
+type limitedStderrBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (b *limitedStderrBuffer) Write(p []byte) (int, error) {
+	if remaining := b.limit - b.buf.Len(); remaining > 0 {
+		if len(p) > remaining {
+			_, _ = b.buf.Write(p[:remaining])
+		} else {
+			_, _ = b.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (b *limitedStderrBuffer) Summary(maxRunes int) string {
+	s := strings.TrimSpace(b.buf.String())
+	if s == "" {
+		return ""
+	}
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "\ufffd")
+	}
+	runes := []rune(s)
+	if len(runes) > maxRunes {
+		return string(runes[:maxRunes]) + "..."
+	}
+	return s
 }

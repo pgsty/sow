@@ -170,7 +170,7 @@ func Add(ctx context.Context, opts AddOptions) (result AddResult, resultErr erro
 	}
 	store, err := openExistingState(filepath.Join(ws.Root, ".sow", repoName+".db"))
 	if err != nil {
-		return result, fmt.Errorf("%w: %v", ErrIntegrity, err)
+		return result, fmt.Errorf("%w: %w", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	if err := recoverDistOperations(ctx, ws.Root, repoName, store); err != nil {
@@ -894,7 +894,10 @@ func packageCompatibilityDiagnostic(root, repoName string, object state.PackageO
 			allowedCanonical[architecture] = struct{}{}
 		}
 	}
-	configPath := filepath.Join(root, config.ConfigFilename)
+	configPath, err := config.ResolveConfigPath(root)
+	if err != nil {
+		return err.Error()
+	}
 	if len(matchingFormat) == 0 {
 		return fmt.Sprintf("package format %q has no compatible selected Dist (selected: %s); select or configure a %s Dist under repos.%s.dists in %s", object.Format, strings.Join(selected, ", "), object.Format, repoName, configPath)
 	}
@@ -1340,7 +1343,7 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 			return fmt.Errorf("%w: mutation build Dist set differs from operation", ErrIntegrity)
 		}
 	}
-	configSHA, configErr := config.FileSHA(filepath.Join(root, config.ConfigFilename))
+	configSHA, configErr := config.WorkspaceFileSHA(root)
 	if configErr != nil {
 		return configErr
 	}
@@ -1366,7 +1369,11 @@ func recoverMutationOperation(ctx context.Context, root, repoName string, store 
 			return err
 		}
 	}
-	cfg, err := config.Load(filepath.Join(root, config.ConfigFilename))
+	configPath, err := config.ResolveConfigPath(root)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		return err
 	}

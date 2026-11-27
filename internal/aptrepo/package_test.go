@@ -85,7 +85,8 @@ func TestInspectPackageAndReadablePoolPath(t *testing.T) {
 }
 
 func TestPackageFactsRoundTripPreservesManagedParagraphBytes(t *testing.T) {
-	debPath := writeMinimalDeb(t, t.TempDir(), "libfoo-bin_1.2.3-1_amd64.deb", fixtureControl)
+	control := strings.Replace(fixtureControl, "minimal real deb fixture", "caf\xe9", 1)
+	debPath := writeMinimalDeb(t, t.TempDir(), "libfoo-bin_1.2.3-1_amd64.deb", control)
 	pkg, err := InspectPackage(context.Background(), debPath, "main")
 	if err != nil {
 		t.Fatal(err)
@@ -113,6 +114,9 @@ func TestPackageFactsRoundTripPreservesManagedParagraphBytes(t *testing.T) {
 	}
 	if err := cachedWriter.WriteManaged(decoded, managedPath); err != nil {
 		t.Fatal(err)
+	}
+	if !bytes.Contains(originalBytes.Bytes(), []byte("Description: café")) {
+		t.Fatal("Packages lost the legacy description")
 	}
 	if !bytes.Equal(originalBytes.Bytes(), cachedBytes.Bytes()) {
 		t.Fatalf("fact round-trip changed Packages paragraph:\noriginal:\n%s\ncached:\n%s", originalBytes.Bytes(), cachedBytes.Bytes())
@@ -191,14 +195,14 @@ func TestBinaryControlRequiresOneStrictParagraph(t *testing.T) {
 	}{
 		{"duplicate", fixtureControl + "Package: duplicate\n", "repeats field"},
 		{"case-insensitive duplicate", fixtureControl + "package: duplicate\n", "repeats field"},
+		{"case-variant identical duplicate", fixtureControl + "package: libfoo-bin\n", "repeats field"},
+		{"multiline differing duplicate", fixtureControl + "Description: short\n first body\nDescription: short\n second body\n", "repeats field"},
 		{"second paragraph", fixtureControl + "\nPackage: second\n", "more than one paragraph"},
 		{"invalid field", "Bad Field: value\n", "invalid field name"},
 		{"comment", "# comment\n", "invalid field name"},
 		{"orphan continuation", " continuation\n", "orphan continuation"},
 		{"nul", "Package: good\x00bad\n", "forbidden control byte"},
-		{"control", "Package: good\x1bbad\n", "forbidden control byte"},
-		{"non-utf8", "Package: good\nMaintainer: \xff\xfe\n", "not valid UTF-8"},
-		{"leading empty paragraph", "\nPackage: good\n", "empty paragraph"},
+		{"ansi escape", "Package: good\x1b[31mbad\n", "forbidden control byte"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -207,14 +211,37 @@ func TestBinaryControlRequiresOneStrictParagraph(t *testing.T) {
 			}
 		})
 	}
-	valid := strings.ReplaceAll(fixtureControl+"X_Custom: accepted\n", "\n", "\r\n")
-	if err := validateBinaryControlDocument([]byte(valid)); err != nil {
-		t.Fatalf("strict validator rejected a valid custom-field CRLF paragraph: %v", err)
+	for _, accepted := range []struct {
+		name string
+		body string
+	}{
+		{"custom CRLF", strings.ReplaceAll(fixtureControl+"X_Custom: accepted\n", "\n", "\r\n")},
+		{"legacy Latin-1 maintainer", "Package: good\nMaintainer: Jos\xe9\n"},
+		{"leading blank line", "\nPackage: good\n"},
+		{"identical duplicate field", fixtureControl + "Package: libfoo-bin\n"},
+	} {
+		t.Run(accepted.name, func(t *testing.T) {
+			if err := validateBinaryControlDocument([]byte(accepted.body)); err != nil {
+				t.Fatalf("validator rejected %s: %v", accepted.name, err)
+			}
+		})
 	}
 
 	duplicateDeb := writeMinimalDeb(t, t.TempDir(), "libfoo-bin_1.2.3-1_amd64.deb", fixtureControl+"Package: duplicate\n")
 	if _, err := InspectPackage(context.Background(), duplicateDeb, "main"); err == nil || !strings.Contains(err.Error(), "repeats field") {
 		t.Fatalf("InspectPackage duplicate-field error = %v", err)
+	}
+	identDeb := writeMinimalDeb(t, t.TempDir(), "libfoo-bin_1.2.3-1_amd64.deb", fixtureControl+"Package: libfoo-bin\n")
+	identPkg, err := InspectFlatPackage(context.Background(), identDeb, "main")
+	if err != nil {
+		t.Fatalf("InspectFlatPackage identical duplicate field failed: %v", err)
+	}
+	var flatBuf bytes.Buffer
+	if err := WriteInspectedFlatPackages(context.Background(), &flatBuf, []Package{identPkg}); err != nil {
+		t.Fatalf("WriteInspectedFlatPackages identical duplicate field failed: %v", err)
+	}
+	if strings.Count(flatBuf.String(), "Package: libfoo-bin\n") != 1 {
+		t.Fatalf("duplicate field emitted twice in Packages:\n%s", flatBuf.String())
 	}
 
 	var lzmaDeb bytes.Buffer
@@ -307,15 +334,16 @@ func TestInspectPackageRejectsUnsafeSource(t *testing.T) {
 	}
 }
 
-func TestInspectPackageRejectsSymlinkInput(t *testing.T) {
+func TestInspectPackageFollowsSymlinkInput(t *testing.T) {
 	dir := t.TempDir()
 	target := writeMinimalDeb(t, dir, "alpha_1.0-1_amd64.deb", fixtureControl)
 	link := filepath.Join(t.TempDir(), "alpha_1.0-1_amd64.deb")
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := InspectPackage(context.Background(), link, "main"); err == nil || !strings.Contains(err.Error(), "not a regular file") {
-		t.Fatalf("InspectPackage symlink error = %v", err)
+	pkg, err := InspectPackage(context.Background(), link, "main")
+	if err != nil || pkg.Name != "libfoo-bin" {
+		t.Fatalf("InspectPackage symlink failed: pkg=%+v err=%v", pkg, err)
 	}
 }
 

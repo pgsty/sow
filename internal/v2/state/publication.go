@@ -20,15 +20,18 @@ const (
 	maximumPublicationCacheTTL   = time.Duration(1<<63-1) - publicationCacheGracePadding
 )
 
-func publicationGraceMinimum(ttl time.Duration) (time.Duration, error) {
+// PublicationGraceMinimum returns the minimum grace period before previously
+// published objects may be deleted, respecting the configured max_cache_ttl
+// without imposing a hardcoded 30-day floor.
+func PublicationGraceMinimum(ttl time.Duration) (time.Duration, error) {
 	if ttl < 0 || ttl > maximumPublicationCacheTTL {
 		return 0, errors.New("invalid publication cache TTL")
 	}
-	minimum := 30 * 24 * time.Hour
-	if cacheMinimum := ttl + publicationCacheGracePadding; cacheMinimum > minimum {
-		minimum = cacheMinimum
-	}
-	return minimum, nil
+	return ttl, nil
+}
+
+func publicationGraceMinimum(ttl time.Duration) (time.Duration, error) {
+	return PublicationGraceMinimum(ttl)
 }
 
 func effectivePublicationGraceDeadline(historicalText, appliedText string, ttlNS int64) (time.Time, error) {
@@ -334,7 +337,7 @@ func (s *Store) BindPublicationTarget(ctx context.Context, binding PublicationTa
 	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT target_identity, target_name, prefix FROM publication_target_bindings WHERE target_storage_id = ? ORDER BY prefix, target_name`, binding.TargetStorageID)
+	rows, err := tx.QueryContext(ctx, `SELECT target_identity, target_name, prefix FROM publication_target_bindings WHERE target_storage_id = ? OR (? = 'r2' AND provider = 'r2' AND endpoint = ? AND bucket = ?) ORDER BY prefix, target_name`, binding.TargetStorageID, binding.Provider, binding.Endpoint, binding.Bucket)
 	if err != nil {
 		return err
 	}
@@ -983,7 +986,7 @@ WHERE b.target_identity = ? AND c.checkpoint_identity = ?`, record.TargetIdentit
 		return err
 	}
 	if record.NotBefore.Before(record.VerifiedAt.Add(minimum)) {
-		return fmt.Errorf("%w: grace is shorter than max(30d, cache TTL + 24h)", ErrConflict)
+		return fmt.Errorf("%w: grace is shorter than configured cache TTL", ErrConflict)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO publication_grace_records(grace_identity, schema_version, target_identity, checkpoint_identity, verified_at, not_before, cache_policy_identity, state) VALUES (?, 1, ?, ?, ?, ?, ?, 'grace')`, record.GraceIdentity, record.TargetIdentity, record.CheckpointIdentity, formatTimestamp(record.VerifiedAt), formatTimestamp(record.NotBefore), record.CachePolicyIdentity); err != nil {
 		return err

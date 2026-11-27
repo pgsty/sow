@@ -37,7 +37,7 @@ func Build(ctx context.Context, opts BuildOptions) (result BuildResult, resultEr
 	defer func() { resultErr = errors.Join(resultErr, repoLock.Close()) }()
 	store, err := openExistingState(filepath.Join(ws.Root, ".sow", repoName+".db"))
 	if err != nil {
-		return result, fmt.Errorf("%w: %v", ErrIntegrity, err)
+		return result, fmt.Errorf("%w: %w", ErrIntegrity, err)
 	}
 	defer func() { resultErr = errors.Join(resultErr, store.Close()) }()
 	defer func() {

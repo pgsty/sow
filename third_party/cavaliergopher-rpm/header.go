@@ -90,7 +90,7 @@ func readHeaderWithLimits(r io.Reader, signature bool, limits headerLimits) (*He
 	if _, err := io.ReadFull(r, hdrBytes[:]); err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(hdrBytes.Magic(), []byte{0x8e, 0xad, 0xe8}) || hdrBytes.Version() != 1 || !allZero(hdrBytes[4:8]) {
+	if !bytes.Equal(hdrBytes.Magic(), []byte{0x8e, 0xad, 0xe8}) || hdrBytes.Version() != 1 {
 		return nil, errorf("invalid rpm header descriptor")
 	}
 	headerSize := uint64(hdrBytes.Size())
@@ -168,8 +168,11 @@ func readHeaderWithLimits(r io.Reader, signature bool, limits headerLimits) (*He
 		}
 		tag := &Tag{ID: ix.Tag(), Type: ix.Type(), Value: value}
 		if previous := tags[tag.ID]; previous != nil {
-			// EL10 RPMs can store the same SOURCERPM string at two offsets.
-			if signature || value == nil || !reflect.DeepEqual(previous, tag) {
+			// Signature headers must never repeat a tag. Main headers may
+			// repeat an identical tag (e.g. EL10 packages repeating SOURCERPM),
+			// but conflicting duplicate tags remain rejected to avoid
+			// differential parsing ambiguity.
+			if signature || !reflect.DeepEqual(previous, tag) {
 				return nil, errorf("duplicate header tag: %d", tag.ID)
 			}
 			continue
@@ -254,13 +257,4 @@ func validateHeaderIndex(index int, ix rpmIndex, store []byte, budget *headerDec
 	default:
 		return errorf("unknown index data type: %0X", ix.Type())
 	}
-}
-
-func allZero(values []byte) bool {
-	for _, value := range values {
-		if value != 0 {
-			return false
-		}
-	}
-	return true
 }

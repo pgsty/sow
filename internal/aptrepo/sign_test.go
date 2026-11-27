@@ -160,7 +160,7 @@ func TestSingleKeyReadersConsumeCompleteInput(t *testing.T) {
 	}
 }
 
-func TestSignerRejectsMultipleUsableSigningKeys(t *testing.T) {
+func TestSignerAcceptsPrimaryPlusSigningSubkey(t *testing.T) {
 	created := time.Date(2026, 7, 12, 1, 0, 0, 0, time.UTC)
 	entity := newTestEntity(t, "multiple-signers", created)
 	config := &packet.Config{DefaultHash: crypto.SHA256, RSABits: 1024, Time: func() time.Time { return created }}
@@ -168,8 +168,12 @@ func TestSignerRejectsMultipleUsableSigningKeys(t *testing.T) {
 		t.Fatalf("add signing subkey: %v", err)
 	}
 	key := serializePrivateEntities(t, []*openpgp.Entity{entity}, true, created)
-	if _, err := NewSignerBytes(key, nil); !errors.Is(err, ErrInvalidSigningKey) {
-		t.Fatalf("multiple signing key error = %v, want %v", err, ErrInvalidSigningKey)
+	signer, err := NewSignerBytes(key, nil)
+	if err != nil {
+		t.Fatalf("standard primary+subkey GPG key rejected: %v", err)
+	}
+	if err := signer.Validate(created.Add(time.Hour)); err != nil {
+		t.Fatalf("signer.Validate: %v", err)
 	}
 }
 

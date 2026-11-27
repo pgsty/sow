@@ -74,16 +74,17 @@ func VerifyPackageDigests(ctx context.Context, r io.ReadSeeker) (resultErr error
 		}
 		headerOK = true
 	}
-	// RPM v6 writes PAYLOADSHA256 without the algorithm tag that v4 requires.
-	// Name the unsupported format instead of reporting algorithm 0.
-	if pkg.Header.GetTag(rpmTagPayloadDigest) != nil && pkg.Header.GetTag(rpmTagPayloadDigestAlgo) == nil {
-		return fmt.Errorf("%w: RPM v6 packages are not supported (payload digest has no algorithm tag)", ErrInvalidPackage)
-	}
+	// RPM v6 writes PAYLOADSHA256 without PAYLOADSHA256ALGO because v6 defines
+	// tag 5092 as always SHA-256.
 	if pkg.Header.GetTag(rpmTagPayloadDigest) != nil || pkg.Header.GetTag(rpmTagPayloadDigestAlgo) != nil {
+		payloadHashAlgo := int(pkg.Header.GetTag(rpmTagPayloadDigestAlgo).Int64())
+		if pkg.Header.GetTag(rpmTagPayloadDigest) != nil && pkg.Header.GetTag(rpmTagPayloadDigestAlgo) == nil {
+			payloadHashAlgo = rpmHashSHA256
+		}
 		layout := rpmVerificationLayout{
 			mainHeaderStart: int64(start), mainHeaderEnd: int64(end), fileEnd: fileEnd,
 			payloadDigests:  pkg.Header.GetTag(rpmTagPayloadDigest).StringSlice(),
-			payloadHashAlgo: int(pkg.Header.GetTag(rpmTagPayloadDigestAlgo).Int64()),
+			payloadHashAlgo: payloadHashAlgo,
 		}
 		if _, _, err := verifySignedRPMPayloadDigest(ctx, r, layout); err != nil {
 			return fmt.Errorf("%w: RPM payload digest: %w", ErrInvalidPackage, err)

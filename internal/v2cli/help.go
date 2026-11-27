@@ -6,7 +6,7 @@ import (
 )
 
 // Version is a link-time replaceable binary version.
-var Version = "0.8.0"
+var Version = "0.9.0"
 
 func VersionString() string {
 	return "sow " + Version + " " + runtime.GOOS + "/" + runtime.GOARCH + " " + runtime.Version()
@@ -55,10 +55,10 @@ Signing credentials:
 
 Paths from CLI/environment are relative to the process working directory.
 Config passfile paths are relative to the workspace root. No default file is searched.
-Use one non-empty UTF-8 line without BOM, NUL or embedded CR/LF.
+Use one non-empty line without NUL or embedded CR/LF; an optional UTF-8 BOM is removed.
 The 64 KiB limit includes any final newline.
 An optional final LF or CRLF is removed; spaces and tabs are preserved literally.
-Keep the file outside the repository, normally mode 0600; symlinks inside the workspace are rejected.
+Regular files, symlinks, and named pipes (2s deadline) are supported; keep outside published paths, normally mode 0600.
 Selected credentials never fall back to a prompt.
 Without a source, existing key/GPG/RPM behavior is unchanged.
 `
@@ -113,13 +113,14 @@ Commands:
 Use "sow help COMMAND" for command help.
 `,
 	"create": `Usage:
-  sow create [DIR] [-j N] [--metadata-timestamp SECONDS] [--pigsty] [-S KEY [--overwrite] [--passfile PATH]] [-T DUR | -N] [--json]
+  sow create [DIR] [-j N] [--metadata-timestamp SECONDS] [--pigsty] [--strict] [-S KEY [--overwrite] [--passfile PATH]] [-T DUR | -N] [--json]
 
 Options:
   -j, --jobs N          Workers for the single content pass; defaults to CPU count
       --metadata-timestamp SECONDS
                          RPM data timestamps; nonnegative Unix seconds, default 0
       --pigsty          Enable Pigsty cleanup and the repo_complete gate
+      --strict          Fail non-zero on corrupt, source, or conflicting packages instead of skipping with a warning
   -S, --sign-with KEY   Sign unsigned RPMs with a 16/40/64-hex GPG key ID
       --overwrite       Re-sign every RPM; requires --sign-with
   -T, --timeout DUR     Maximum lock wait; 0 waits indefinitely
@@ -127,26 +128,31 @@ Options:
       --json            Emit the versioned JSON envelope
   -h, --help            Show help
 
+By default, corrupt, unreadable, source, or conflicting packages are skipped
+with a warning so the remaining valid packages are still indexed. Pass --strict
+to fail on any skipped package. If an entire format fails, its old index is
+preserved. In successful JSON output warnings and skipped paths are in stdout.
 --passfile requires --sign-with; SOW_GPG_PASSFILE alone does not enable signing.
 An existing repomd.xml is replaced. Data types SOW does not generate, such as
 group or modules, are reported as dropped.
 `,
 	"prune": `Usage:
-  sow prune DIR [--dry-run] [--protect NAME]... [-j N] [--metadata-timestamp SECONDS] [-T DUR | -N] [--json]
+  sow prune DIR [--dry-run] [--strict] [--protect NAME]... [-j N] [--metadata-timestamp SECONDS] [-T DUR | -N] [--json]
 
 Keep the highest RPM Epoch/Version/Release for each package name and architecture.
 By default, rebuild the flat index and then delete superseded RPM files.
-Only top-level regular binary RPM packages are indexed; subdirectories are not
-scanned. Equal-version files are rejected. Replacement RPMs must pass embedded
-digest checks; their verified file identity is checked before each deletion and
-completion. Managed workspaces, DEB
-repositories, signed repomd.xml, repomd.xml entries SOW does not generate (such as
-comps groups), and RPM v6 packages are not supported. Each --protect NAME must
-match a package. An existing repo_complete marker is refreshed after success.
+Corrupt packages, unmatched --protect names, and equal-version conflicts are
+reported as warnings and skipped safely unless --strict is set. Replacement RPMs
+are digest-verified before superseded files are deleted. Managed workspaces are
+rejected; signed repomd.xml.asc and unsupported repomd.xml metadata are rejected
+on live runs. In mixed directories prune preserves the DEB index and reuses
+existing marker entries for DEBs still present. An all-skipped RPM scan keeps
+the previous metadata and marker.
 Use on a local publication source; clients caching old indexes may still need old RPMs.
 
 Options:
       --dry-run        Preview candidates without changing any files
+      --strict         Fail non-zero on corrupt packages, unmatched --protect names, or equal-version conflicts
       --protect NAME   Keep every version of this exact package name; repeatable
   -j, --jobs N         Package inspection workers; defaults to CPU count
       --metadata-timestamp SECONDS

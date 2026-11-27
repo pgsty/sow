@@ -113,14 +113,14 @@ func TestWorkdirChangesRepositoryInferenceStart(t *testing.T) {
 	}
 }
 
-func TestRepositoryPathRejectsSymlinkAndEscape(t *testing.T) {
+func TestRepositoryPathAllowsSymlinkAndRejectsEscape(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
 	if err := os.Symlink(outside, filepath.Join(root, "pgsql")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RepositoryPath(root, "pgsql"); err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("RepositoryPath symlink error = %v", err)
+	if _, err := RepositoryPath(root, "pgsql"); err != nil {
+		t.Fatalf("RepositoryPath symlink should succeed: %v", err)
 	}
 	for _, name := range []string{"../escape", ".sow", "dists", "sow.yml"} {
 		if _, err := RepositoryPath(root, name); err == nil {
@@ -146,12 +146,12 @@ func TestSelectRepositoryRejectsSymlinkedStartComponent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := SelectRepository(ws, cfg, SelectRepositoryOptions{StartDir: filepath.Join(root, "pgsql", "link")}); err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("symlinked start selection error = %v", err)
+	if _, err := SelectRepository(ws, cfg, SelectRepositoryOptions{StartDir: filepath.Join(root, "pgsql", "link")}); err == nil {
+		t.Fatal("symlinked start component inside repository was accepted")
 	}
 }
 
-func TestDiscoveredWorkdirRetainsSymlinkEvidenceForSelection(t *testing.T) {
+func TestDiscoveredWorkdirRejectsSymlinkedInternalDirectory(t *testing.T) {
 	root := t.TempDir()
 	writeConfigFixture(t, root)
 	if err := os.MkdirAll(filepath.Join(root, "pgsql", "real", "nested"), 0o755); err != nil {
@@ -173,12 +173,12 @@ func TestDiscoveredWorkdirRetainsSymlinkEvidenceForSelection(t *testing.T) {
 	if ws.StartDir != realPath(t, workdir) {
 		t.Fatalf("physical start = %q", ws.StartDir)
 	}
-	if _, err := SelectRepository(ws, cfg, SelectRepositoryOptions{}); err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("discovered symlinked workdir selection error = %v", err)
+	if _, err := SelectRepository(ws, cfg, SelectRepositoryOptions{}); err == nil {
+		t.Fatal("symlinked internal workdir component was accepted")
 	}
 }
 
-func TestDistContainingCWDUsesPhysicalSelectedRepositoryScope(t *testing.T) {
+func TestDistContainingCWDUsesSelectedRepositoryScope(t *testing.T) {
 	root := t.TempDir()
 	writeConfigFixture(t, root)
 	for _, directory := range []string{
@@ -214,20 +214,5 @@ repos:
 	}
 	if dist, inside, err := DistContainingCWD(ws, cfg, "infra"); err != nil || inside || dist != "" {
 		t.Fatalf("explicit other repository must suppress cwd dist selection = %q, %t, %v", dist, inside, err)
-	}
-
-	if err := os.MkdirAll(filepath.Join(root, "pgsql", "dists", "noble", "nested"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	link := filepath.Join(root, "pgsql", "dists", "el9", "linked")
-	if err := os.Symlink(filepath.Join(root, "pgsql", "dists", "noble"), link); err != nil {
-		t.Fatal(err)
-	}
-	ws, err = Discover(DiscoverOptions{Workdir: filepath.Join(link, "nested"), CWD: root})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := DistContainingCWD(ws, cfg, "pgsql"); err == nil || !strings.Contains(err.Error(), "symlink") {
-		t.Fatalf("symlinked dist cwd error = %v", err)
 	}
 }

@@ -22,9 +22,10 @@ repos:
     # Passfile support requires SOW 0.7 or later. Priority: --passfile > per-key
     # passfile (or legacy metadata passphrase) > SOW_GPG_PASSFILE.
     # Config-relative paths start at the workspace root; no default file is searched.
-    # The file is one nonempty UTF-8 line (<= 64 KiB including an optional LF/CRLF).
-    # Only that final newline is removed; spaces/tabs are literal. Keep the file
-    # outside the repository, normally mode 0600; symlinks inside the workspace are rejected.
+    # Use one nonempty line (<= 64 KiB including an optional LF/CRLF, no NUL or embedded
+    # CR/LF). An optional UTF-8 BOM and that final newline are removed; spaces/tabs are
+    # literal. Regular files, symlinks (including Secret mounts), and named pipes (2s
+    # deadline) are supported; keep credentials outside published paths, normally mode 0600.
     # Full format and compatibility: https://sow.pgsty.com/docs/reference/config/#passfile
     dists:
       el9:

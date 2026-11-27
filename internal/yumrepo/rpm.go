@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"unicode/utf8"
 
 	crpm "github.com/cavaliergopher/rpm"
@@ -166,11 +167,49 @@ func safeRPMBasename(value string) bool {
 			continue
 		}
 		switch c {
-		case '.', '-', '_', '+', '~', '^':
+		case '.', '-', '_', '+', '~', '^', ':', '@':
+			continue
+		case '%':
+			if i+2 >= len(value) || !isASCIIHexDigit(value[i+1]) || !isASCIIHexDigit(value[i+2]) {
+				return false
+			}
+			if !isSafePercentEscapedByte(value[i+1], value[i+2]) {
+				return false
+			}
+			i += 2
 			continue
 		default:
 			return false
 		}
+	}
+	return true
+}
+
+func isASCIIHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func hexNibble(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
+}
+
+// isSafePercentEscapedByte rejects encoded control chars, whitespace, path
+// separators, dots, percent double-encoding, and URL query/fragment/HTML chars.
+func isSafePercentEscapedByte(hi, lo byte) bool {
+	b := (hexNibble(hi) << 4) | hexNibble(lo)
+	if b <= 0x20 || b >= 0x7f {
+		return false
+	}
+	switch b {
+	case '/', '\\', '.', '%', '?', '#', '"', '<', '>':
+		return false
 	}
 	return true
 }
@@ -330,21 +369,17 @@ func readPackageWithManagedBasename(ctx context.Context, in PackageInput, allowM
 	if in.Path == "" {
 		return nil, fmt.Errorf("%w: empty path", ErrInvalidPackage)
 	}
-	pathInfo, err := os.Lstat(in.Path)
-	if err != nil {
-		return nil, fmt.Errorf("%w: stat %q: %v", ErrInvalidPackage, in.Path, err)
-	}
-	if !pathInfo.Mode().IsRegular() {
-		return nil, fmt.Errorf("%w: %q is not a regular file", ErrInvalidPackage, in.Path)
-	}
-	f, err := os.Open(in.Path)
+	f, err := os.OpenFile(in.Path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: open %q: %v", ErrInvalidPackage, in.Path, err)
 	}
 	defer f.Close()
 	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || !os.SameFile(pathInfo, info) {
-		return nil, fmt.Errorf("%w: %q changed while opening", ErrInvalidPackage, in.Path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: stat %q: %v", ErrInvalidPackage, in.Path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %q is not a regular file", ErrInvalidPackage, in.Path)
 	}
 
 	h := sha256.New()
@@ -369,21 +404,12 @@ func readPackageWithManagedBasename(ctx context.Context, in PackageInput, allowM
 	if err := validatePackageSizeTags(pkg); err != nil {
 		return nil, fmt.Errorf("%w: parse %q: %v", ErrInvalidPackage, in.Path, err)
 	}
-	afterInfo, err := f.Stat()
-	if err != nil || !afterInfo.Mode().IsRegular() || afterInfo.Size() != info.Size() ||
-		!afterInfo.ModTime().Equal(info.ModTime()) || afterInfo.Mode() != info.Mode() {
-		return nil, fmt.Errorf("%w: %q changed while hashing/parsing", ErrInvalidPackage, in.Path)
-	}
-	pathAfter, err := os.Lstat(in.Path)
-	if err != nil || !pathAfter.Mode().IsRegular() || pathAfter.Mode()&os.ModeSymlink != 0 || !os.SameFile(pathInfo, pathAfter) {
-		return nil, fmt.Errorf("%w: %q changed while hashing/parsing", ErrInvalidPackage, in.Path)
-	}
 
 	basename := in.Basename
 	if basename == "" {
 		basename = filepath.Base(in.Path)
 	}
-	return packageMetadataFromParsedRPM(pkg, in, basename, hex.EncodeToString(h.Sum(nil)), info.Size(), info.ModTime().Unix(), allowManagedBasename)
+	return packageMetadataFromParsedRPM(pkg, in, basename, hex.EncodeToString(h.Sum(nil)), read, info.ModTime().Unix(), allowManagedBasename)
 }
 
 func packageMetadataFromParsedRPM(pkg *crpm.Package, in PackageInput, basename, checksum string, packageSize, fileTime int64, allowManagedBasename bool) (*packageMetadata, error) {
@@ -490,8 +516,14 @@ func packageMetadataFromParsedRPM(pkg *crpm.Package, in PackageInput, basename, 
 		!validXMLString(m.Name) || !validXMLString(m.Version) || !validXMLString(m.Release) || !validXMLString(m.Arch) {
 		return nil, fmt.Errorf("%w: %q lacks required NEVRA fields", ErrInvalidPackage, in.Path)
 	}
-	if m.Epoch < 0 || m.FileTime < 0 || m.BuildTime < 0 || m.PackageSize < 0 {
-		return nil, fmt.Errorf("%w: %q has negative time or size metadata", ErrInvalidPackage, in.Path)
+	if m.FileTime < 0 {
+		m.FileTime = 0
+	}
+	if m.BuildTime < 0 {
+		m.BuildTime = 0
+	}
+	if m.Epoch < 0 || m.PackageSize < 0 {
+		return nil, fmt.Errorf("%w: %q has negative epoch or size metadata", ErrInvalidPackage, in.Path)
 	}
 	return m, nil
 }
@@ -598,9 +630,6 @@ func validatePackageSizeTags(pkg *crpm.Package) error {
 	if pkg == nil {
 		return fmt.Errorf("nil RPM package")
 	}
-	if pkg.Header.GetTag(rpmTagPayloadDigest) != nil && pkg.Header.GetTag(rpmTagPayloadDigestAlgo) == nil {
-		return fmt.Errorf("RPM v6 packages are not supported (payload digest has no algorithm tag)")
-	}
 	checks := []struct {
 		label  string
 		header *crpm.Header
@@ -641,17 +670,25 @@ func joinTag(h *crpm.Header, id int) string      { return strings.Join(tagString
 
 func readDependencies(h *crpm.Header, namesID, flagsID, evrsID int, requires bool) ([]dependency, error) {
 	names, flags, evrs := tagStrings(h, namesID), tagInts(h, flagsID), tagStrings(h, evrsID)
-	if len(names) != len(flags) || len(names) != len(evrs) {
-		return nil, fmt.Errorf("misaligned RPM dependency tags: names=%d flags=%d evrs=%d", len(names), len(flags), len(evrs))
+	switch namesID {
+	case tagProvideNames, tagRequireNames, tagConflictNames, tagObsoleteNames:
+		if len(names) != len(flags) || len(names) != len(evrs) {
+			return nil, fmt.Errorf("misaligned RPM dependency tags: names=%d flags=%d evrs=%d", len(names), len(flags), len(evrs))
+		}
 	}
 	out := make([]dependency, 0, len(names))
-	for i, name := range names {
-		if name == "" || !validXMLString(name) {
-			return nil, fmt.Errorf("invalid dependency name at index %d", i)
+	for i, rawName := range names {
+		name := cleanXMLString(rawName)
+		if name == "" {
+			continue
 		}
-		rawFlags, evr := flags[i], evrs[i]
-		if !validXMLString(evr) {
-			return nil, fmt.Errorf("invalid dependency EVR at index %d", i)
+		var rawFlags int64
+		if i < len(flags) {
+			rawFlags = flags[i]
+		}
+		var evr string
+		if i < len(evrs) {
+			evr = cleanXMLString(evrs[i])
 		}
 		epoch, version, release := splitEVR(evr)
 		out = append(out, dependency{
@@ -887,20 +924,21 @@ func readFiles(h *crpm.Header) ([]rpmFile, error) {
 
 func readChangelogs(h *crpm.Header) ([]changelog, error) {
 	names, dates, texts := tagStrings(h, tagChangelogName), tagInts(h, tagChangelogTime), tagStrings(h, tagChangelogText)
-	if len(names) != len(dates) || len(names) != len(texts) {
-		return nil, fmt.Errorf("misaligned RPM changelog tags: names=%d dates=%d texts=%d", len(names), len(dates), len(texts))
-	}
+	total := min(len(names), len(dates), len(texts))
 	// RPM stores changelogs newest first. createrepo_c's current default keeps
 	// the newest ten, emits them oldest first, and makes equal timestamps
 	// strictly increasing so libdnf presents the newest entry first.
 	const createrepoChangelogLimit = 10
-	count := len(names)
+	count := total
 	if count > createrepoChangelogLimit {
 		count = createrepoChangelogLimit
 	}
 	out := make([]changelog, 0, count)
 	for i := count - 1; i >= 0; i-- {
 		date := dates[i]
+		if date < 0 {
+			date = 0
+		}
 		if len(out) != 0 && date <= out[len(out)-1].Date {
 			date = out[len(out)-1].Date + 1
 		}

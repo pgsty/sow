@@ -17,16 +17,9 @@ import (
 	"pault.ag/go/debian/version"
 )
 
-// ValidateFlatPackages also reauthenticates every package source.
+// ValidateFlatPackages validates the staged flat index and reauthenticates every package source.
 func ValidateFlatPackages(ctx context.Context, packagesPath, gzipPath string, expected []Package) error {
 	return validateFlatPackages(ctx, packagesPath, gzipPath, expected, true)
-}
-
-// ValidateInspectedFlatPackages validates only the staged index bytes against
-// packages already returned by InspectFlatPackage. It deliberately does not
-// reopen package payloads; the Plain caller performs a final stat-set check.
-func ValidateInspectedFlatPackages(ctx context.Context, packagesPath, gzipPath string, expected []Package) error {
-	return validateFlatPackages(ctx, packagesPath, gzipPath, expected, false)
 }
 
 func validateFlatPackages(ctx context.Context, packagesPath, gzipPath string, expected []Package, verifySource bool) error {

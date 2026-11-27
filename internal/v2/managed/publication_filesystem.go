@@ -126,7 +126,7 @@ func newFilesystemPublicationBackend(target config.TargetConfig) (*filesystemPub
 		}
 	}
 	return &filesystemPublicationBackend{
-		root: physicalTarget, publicBase: publicBase, publicClient: newPublicVerificationClient(),
+		root: physicalTarget, publicBase: publicBase, publicClient: newPublicVerificationClient(publicBase),
 		maxCacheTTL: maxCacheTTL, transientRetryWindow: publicTransientWindow, publicReadIdleTimeout: publicResponseTimeout,
 	}, nil
 }
@@ -320,43 +320,49 @@ func (b *filesystemPublicationBackend) Provider() string { return "filesystem" }
 
 func (b *filesystemPublicationBackend) List(ctx context.Context, ignored map[string]struct{}) ([]publicationRemoteObject, error) {
 	objects := []publicationRemoteObject{}
-	err := walkRootedTree(ctx, b.root, func(relative string, file *os.File, info os.FileInfo) error {
-		path := filepath.ToSlash(relative)
-		if _, skip := ignored[path]; skip {
-			return nil
+	for _, subtree := range []string{"pool", "dists"} {
+		subRoot := filepath.Join(b.root, subtree)
+		info, statErr := os.Lstat(subRoot)
+		if errors.Is(statErr, os.ErrNotExist) {
+			continue
 		}
-		if !strings.HasPrefix(path, "pool/") && !strings.HasPrefix(path, "dists/") || publicFilePhase(path) == "" {
-			return fmt.Errorf("%w: filesystem target contains foreign public object %q", ErrIntegrity, path)
+		if statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, errors.Join(fmt.Errorf("%w: filesystem target %s is not a real directory", ErrIntegrity, subtree), statErr)
 		}
-		beforeIdentity, beforeErr := snapshotRegularDescriptorIdentity(file)
-		if beforeErr == nil {
-			if cached, ok := b.lookupCachedHash(beforeIdentity); ok {
-				objects = append(objects, publicationRemoteObject{Path: path, Size: info.Size(), SHA256: cached, RemoteIdentity: cached})
+		err := walkRootedTree(ctx, subRoot, func(relative string, file *os.File, info os.FileInfo) error {
+			path := subtree + "/" + filepath.ToSlash(relative)
+			if _, skip := ignored[path]; skip {
 				return nil
 			}
-		}
-		hash := sha256.New()
-		count, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
-		if err != nil || count != info.Size() {
-			return errors.Join(fmt.Errorf("%w: hash filesystem target object %q", ErrIntegrity, path), err)
-		}
-		digest := hex.EncodeToString(hash.Sum(nil))
-		if beforeErr == nil {
-			if afterIdentity, afterErr := snapshotRegularDescriptorIdentity(file); afterErr == nil && afterIdentity == beforeIdentity {
-				b.storeCachedHash(beforeIdentity, digest)
+			if publicFilePhase(path) == "" {
+				return fmt.Errorf("%w: filesystem target contains unmanaged file %q", ErrIntegrity, path)
 			}
+			beforeIdentity, beforeErr := snapshotRegularDescriptorIdentity(file)
+			if beforeErr == nil {
+				if cached, ok := b.lookupCachedHash(beforeIdentity); ok {
+					objects = append(objects, publicationRemoteObject{Path: path, Size: info.Size(), SHA256: cached, RemoteIdentity: cached})
+					return nil
+				}
+			}
+			hash := sha256.New()
+			count, err := io.Copy(hash, &managedContextReader{ctx: ctx, reader: file})
+			if err != nil || count != info.Size() {
+				return errors.Join(fmt.Errorf("%w: hash filesystem target object %q", ErrIntegrity, path), err)
+			}
+			digest := hex.EncodeToString(hash.Sum(nil))
+			if beforeErr == nil {
+				if afterIdentity, afterErr := snapshotRegularDescriptorIdentity(file); afterErr == nil && afterIdentity == beforeIdentity {
+					b.storeCachedHash(beforeIdentity, digest)
+				}
+			}
+			objects = append(objects, publicationRemoteObject{Path: path, Size: info.Size(), SHA256: digest, RemoteIdentity: digest})
+			return nil
+		}, func(_ string, _ *os.File, _ os.FileInfo) error {
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-		objects = append(objects, publicationRemoteObject{Path: path, Size: info.Size(), SHA256: digest, RemoteIdentity: digest})
-		return nil
-	}, func(relative string, _ *os.File, _ os.FileInfo) error {
-		path := filepath.ToSlash(relative)
-		if path != "" && path != "pool" && path != "dists" && !strings.HasPrefix(path, "pool/") && !strings.HasPrefix(path, "dists/") {
-			return fmt.Errorf("%w: filesystem target contains foreign directory %q", ErrIntegrity, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	sort.Slice(objects, func(i, j int) bool { return objects[i].Path < objects[j].Path })
 	return objects, nil

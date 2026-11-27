@@ -89,21 +89,21 @@ func openExistingLockFile(filename string, flags int) (*os.File, error) {
 			return nil, errors.New("managed: lock path is not a regular file")
 		}
 	} else if errors.Is(statErr, os.ErrNotExist) {
-		return nil, fmt.Errorf("managed: lock file is missing: %w", statErr)
-	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("managed: lock file %s is missing: %w", filename, statErr)
+	} else {
 		return nil, fmt.Errorf("managed: inspect lock: %w", statErr)
 	}
-	file, err := root.OpenFile(base, flags, 0o600)
+	file, err := root.OpenFile(base, flags|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("managed: open lock: %w", err)
 	}
 	opened, openErr := file.Stat()
 	current, pathErr := root.Lstat(base)
-	var openedRaw unix.Stat_t
-	rawErr := unix.Fstat(int(file.Fd()), &openedRaw)
-	if openErr != nil || pathErr != nil || rawErr != nil || !opened.Mode().IsRegular() || current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(opened, current) || openedRaw.Nlink != 1 {
+	var st unix.Stat_t
+	statErr := unix.Fstat(int(file.Fd()), &st)
+	if openErr != nil || pathErr != nil || statErr != nil || st.Nlink != 1 || !opened.Mode().IsRegular() || current.Mode()&os.ModeSymlink != 0 || !current.Mode().IsRegular() || !os.SameFile(opened, current) {
 		_ = file.Close()
-		return nil, fmt.Errorf("managed: lock path changed, is multiply linked, or is unsafe while opening: %w", errors.Join(openErr, pathErr, rawErr))
+		return nil, errors.Join(errors.New("managed: lock file changed, has multiple links, or is unsafe"), openErr, pathErr, statErr)
 	}
 	if err := verifyActiveWorkspaceRoot(filename); err != nil {
 		_ = file.Close()

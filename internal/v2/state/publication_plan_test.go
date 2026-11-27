@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -114,8 +115,8 @@ func TestBuildPublicationPlanRejectsNonCanonicalAndIncompleteInputs(t *testing.T
 	}
 	unsignedTarget := []GenerationFile{{Path: "dists/noble/Release", Phase: "pointer", Size: 0, SHA256: strings.Repeat("4", 64)}}
 	modeChange := PublicationPlanInput{RepositoryID: valid.RepositoryID, TargetIdentity: valid.TargetIdentity, BaseCheckpoint: valid.BaseCheckpoint, TargetGeneration: 3, BaseManifest: signedBase, TargetManifest: unsignedTarget, Changes: DiffManifests(signedBase, unsignedTarget)}
-	if _, err := BuildPublicationPlan(modeChange); err == nil || !strings.Contains(err.Error(), "pointer removal") {
-		t.Fatalf("signed-to-unsigned transition error=%v", err)
+	if _, err := BuildPublicationPlan(modeChange); !errors.Is(err, ErrConflict) {
+		t.Fatalf("signed-to-unsigned pointer deletion error=%v, want ErrConflict", err)
 	}
 	zeroPlan, err := BuildPublicationPlan(PublicationPlanInput{RepositoryID: valid.RepositoryID, TargetIdentity: valid.TargetIdentity, TargetGeneration: 1, TargetManifest: unsignedTarget, Changes: DiffManifests(nil, unsignedTarget)})
 	if err != nil {

@@ -43,14 +43,11 @@ func readLead(r io.Reader) (*Lead, error) {
 	if !bytes.Equal(lead.Magic(), []byte{0xED, 0xAB, 0xEE, 0xDB}) {
 		return nil, ErrNotRPMFile
 	}
-	if lead.VersionMajor() < 3 || lead.VersionMajor() > 4 {
+	if lead.VersionMajor() < 3 || lead.VersionMajor() > 6 {
 		return nil, errorf("unsupported rpm version: %d", lead.VersionMajor())
 	}
 	if lead.Type() != 0 && lead.Type() != 1 {
 		return nil, errorf("unsupported rpm package type: %d", lead.Type())
-	}
-	if !allZero(lead[80:]) {
-		return nil, errorf("invalid rpm lead reserved bytes")
 	}
 	return &Lead{
 		VersionMajor:    lead.VersionMajor(),
