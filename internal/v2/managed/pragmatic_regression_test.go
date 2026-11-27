@@ -351,6 +351,9 @@ func TestManagedFillDualSignedRPMv6PassesCheckAndDetectsTampering(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(tools, "gpg"), []byte("#!/bin/sh\nlast=\nfor arg in \"$@\"; do last=\"$arg\"; done\ncase \" $* \" in\n *\" --list-secret-keys \"*) printf 'sec::::::::::\\nfpr:::::::::%s:\\n' \"$last\";;\nesac\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(tools, "rpm"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("PATH", tools+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	t.Setenv("SOW_TEST_DUAL_KEY_A", string(pubA))
